@@ -1,0 +1,21 @@
+{
+  "name": "@cortex/engine",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.0.0",
+    "better-sqlite3": "^11.7.0",
+    "ts-pattern": "^5.9.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.2",
+    "fast-check": "^4.5.3",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

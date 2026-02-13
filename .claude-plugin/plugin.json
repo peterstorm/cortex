@@ -1,0 +1,6 @@
+{
+  "name": "cortex",
+  "version": "0.1.0",
+  "description": "Persistent memory plugin for Claude Code - extracts session knowledge, surfaces ranked context, provides semantic recall",
+  "author": { "name": "peterstorm" }
+}
