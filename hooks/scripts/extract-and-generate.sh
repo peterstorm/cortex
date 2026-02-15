@@ -83,6 +83,20 @@ main() {
     log_error "Could not parse cwd from stdin JSON, skipping generate"
   fi
 
+  # Step 4: Fire-and-forget lifecycle prune (detached, cross-platform)
+  # Smart trigger: skips if no new memories and last run <2h ago
+  if [[ -n "$cwd" ]]; then
+    log_info "Spawning detached lifecycle prune"
+    if command -v setsid >/dev/null 2>&1; then
+      # Linux: setsid detaches from session process group
+      setsid bun "$CLI_PATH" lifecycle "$cwd" --if-needed >/dev/null 2>&1 &
+    else
+      # macOS: nohup + disown achieves same detachment
+      nohup bun "$CLI_PATH" lifecycle "$cwd" --if-needed >/dev/null 2>&1 &
+      disown
+    fi
+  fi
+
   log_info "Stop hook complete"
 }
 

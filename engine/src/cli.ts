@@ -52,7 +52,7 @@ import { executeRemember } from './commands/remember.js';
 import { executeIndexCode } from './commands/index-code.js';
 import { forgetById, forgetByQuery } from './commands/forget.js';
 import { findSimilarPairs } from './commands/consolidate.js';
-import { runLifecycle } from './commands/lifecycle.js';
+import { runLifecycle, runLifecycleIfNeeded } from './commands/lifecycle.js';
 import { executeTraverse } from './commands/traverse.js';
 import { runInspect } from './commands/inspect.js';
 import { backfill } from './commands/backfill.js';
@@ -557,20 +557,33 @@ async function handleConsolidate(args: string[]): Promise<CommandResult> {
 /**
  * Handle 'lifecycle' subcommand
  * Apply decay + archival + pruning
+ * --if-needed: smart trigger — skip if no new memories and last run <2h ago
  */
 async function handleLifecycle(args: string[]): Promise<CommandResult> {
-  // Args: [cwd]
+  // Args: [cwd] [--if-needed]
   if (args.length < 1) {
     return {
       success: false,
-      error: 'Usage: lifecycle <cwd>',
+      error: 'Usage: lifecycle <cwd> [--if-needed]',
     };
   }
 
   const cwd = args[0];
+  const ifNeeded = args.includes('--if-needed');
   const [projectDb, globalDb] = initDatabases(cwd);
 
   try {
+    if (ifNeeded) {
+      const result = runLifecycleIfNeeded(projectDb, globalDb, getTelemetryPath(cwd));
+      if (result.skipped) {
+        return { success: true, output: 'Lifecycle skipped (no changes needed)' };
+      }
+      return {
+        success: true,
+        output: `Lifecycle complete: archived ${result.archived}, pruned ${result.pruned}`,
+      };
+    }
+
     const projectResult = runLifecycle(projectDb);
     const globalResult = runLifecycle(globalDb);
 

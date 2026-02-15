@@ -636,6 +636,22 @@ export function searchByKeyword(
   }));
 }
 
+/**
+ * Get the most recent created_at timestamp across all active/archived memories.
+ * Used by lifecycle --if-needed to detect new memories since last run.
+ * I/O: Reads from database
+ *
+ * @param db - Database instance
+ * @returns ISO timestamp string or null if no memories exist
+ */
+export function getLatestMemoryTimestamp(db: Database): string | null {
+  const stmt = db.prepare(`
+    SELECT MAX(created_at) as latest FROM memories WHERE status IN ('active', 'archived')
+  `);
+  const row = stmt.get() as { latest: string | null } | null;
+  return row?.latest ?? null;
+}
+
 // ============================================================================
 // EDGE CRUD OPERATIONS
 // ============================================================================

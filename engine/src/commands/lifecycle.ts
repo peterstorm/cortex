@@ -6,15 +6,114 @@
  */
 
 import type { Database } from 'bun:sqlite';
+import * as fs from 'node:fs';
 import type { Memory } from '../core/types.js';
-import { getActiveMemories, getArchivedMemories, getAllEdges, updateMemory } from '../infra/db.js';
+import { getActiveMemories, getArchivedMemories, getAllEdges, updateMemory, getLatestMemoryTimestamp } from '../infra/db.js';
 import { computeAllCentrality } from '../core/graph.js';
 import { decayConfidence, determineLifecycleAction } from '../core/decay.js';
+import { LIFECYCLE_FALLBACK_HOURS } from '../config.js';
 
 export interface LifecycleResult {
   readonly decayed: number;
   readonly archived: number;
   readonly pruned: number;
+  readonly skipped?: boolean;
+}
+
+/**
+ * Check whether lifecycle should run (pure logic, I/O-provided inputs).
+ *
+ * Runs if EITHER:
+ * - New memories exist since last lifecycle run
+ * - Fallback interval exceeded (catches time-based decay on idle projects)
+ *
+ * @returns true if lifecycle should execute
+ */
+export function shouldRunLifecycle(
+  lastLifecycleAt: string | null,
+  latestMemoryAt: string | null,
+  now: Date,
+  fallbackHours: number
+): boolean {
+  // Never run before → always run
+  if (!lastLifecycleAt) return true;
+
+  const lastRun = new Date(lastLifecycleAt).getTime();
+
+  // New memories since last run
+  if (latestMemoryAt) {
+    const latestMemory = new Date(latestMemoryAt).getTime();
+    if (latestMemory > lastRun) return true;
+  }
+
+  // Fallback: time since last run exceeds threshold
+  const hoursSinceLastRun = (now.getTime() - lastRun) / (1000 * 60 * 60);
+  return hoursSinceLastRun >= fallbackHours;
+}
+
+/**
+ * Read last_lifecycle_at from telemetry file.
+ * Returns null if file missing or field absent.
+ */
+function readLastLifecycleAt(telemetryPath: string): string | null {
+  try {
+    const data = JSON.parse(fs.readFileSync(telemetryPath, 'utf8'));
+    return typeof data.last_lifecycle_at === 'string' ? data.last_lifecycle_at : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Write last_lifecycle_at to telemetry file (merge, don't overwrite).
+ */
+function writeLastLifecycleAt(telemetryPath: string, timestamp: string): void {
+  let data: Record<string, unknown> = {};
+  try {
+    data = JSON.parse(fs.readFileSync(telemetryPath, 'utf8'));
+  } catch {
+    // file doesn't exist or invalid — start fresh
+  }
+  data.last_lifecycle_at = timestamp;
+  fs.writeFileSync(telemetryPath, JSON.stringify(data, null, 2), 'utf8');
+}
+
+/**
+ * Run lifecycle only if needed (smart trigger).
+ * Checks last_lifecycle_at vs latest memory created_at and fallback interval.
+ *
+ * @returns LifecycleResult with skipped=true if no work was needed
+ */
+export function runLifecycleIfNeeded(
+  projectDb: Database,
+  globalDb: Database,
+  telemetryPath: string
+): LifecycleResult {
+  const now = new Date();
+  const lastLifecycleAt = readLastLifecycleAt(telemetryPath);
+
+  // Check latest memory across both DBs
+  const projectLatest = getLatestMemoryTimestamp(projectDb);
+  const globalLatest = getLatestMemoryTimestamp(globalDb);
+  const latestMemoryAt = [projectLatest, globalLatest]
+    .filter((t): t is string => t !== null)
+    .sort()
+    .pop() ?? null;
+
+  if (!shouldRunLifecycle(lastLifecycleAt, latestMemoryAt, now, LIFECYCLE_FALLBACK_HOURS)) {
+    return { decayed: 0, archived: 0, pruned: 0, skipped: true };
+  }
+
+  const projectResult = runLifecycle(projectDb);
+  const globalResult = runLifecycle(globalDb);
+
+  writeLastLifecycleAt(telemetryPath, now.toISOString());
+
+  return {
+    decayed: projectResult.decayed + globalResult.decayed,
+    archived: projectResult.archived + globalResult.archived,
+    pruned: projectResult.pruned + globalResult.pruned,
+  };
 }
 
 /**

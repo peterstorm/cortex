@@ -172,6 +172,13 @@ export const ARCHIVE_THRESHOLD_DAYS = 7;
 export const PRUNE_THRESHOLD_DAYS = 90;
 
 /**
+ * Lifecycle auto-prune fallback interval in hours.
+ * Even without new memories, lifecycle runs if last run was this long ago
+ * (catches time-based decay on idle projects).
+ */
+export const LIFECYCLE_FALLBACK_HOURS = 2;
+
+/**
  * Default search result limit
  */
 export const DEFAULT_SEARCH_LIMIT = 10;
