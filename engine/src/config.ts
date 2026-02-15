@@ -179,6 +179,21 @@ export const PRUNE_THRESHOLD_DAYS = 90;
 export const LIFECYCLE_FALLBACK_HOURS = 2;
 
 /**
+ * AI prune: run every N sessions (whichever fires first with memory threshold)
+ */
+export const AI_PRUNE_SESSION_INTERVAL = 5;
+
+/**
+ * AI prune: trigger when active memory count exceeds this
+ */
+export const AI_PRUNE_MEMORY_THRESHOLD = 50;
+
+/**
+ * AI prune timeout in ms (longer than extraction — evaluating many memories)
+ */
+export const AI_PRUNE_TIMEOUT_MS = 60_000;
+
+/**
  * Default search result limit
  */
 export const DEFAULT_SEARCH_LIMIT = 10;

@@ -97,6 +97,18 @@ main() {
     fi
   fi
 
+  # Step 5: Fire-and-forget AI prune (detached, cross-platform)
+  # Smart trigger: skips if session count < 5 AND memory count < 50
+  if [[ -n "$cwd" ]]; then
+    log_info "Spawning detached AI prune"
+    if command -v setsid >/dev/null 2>&1; then
+      setsid bun "$CLI_PATH" ai-prune "$cwd" --if-needed >/dev/null 2>&1 &
+    else
+      nohup bun "$CLI_PATH" ai-prune "$cwd" --if-needed >/dev/null 2>&1 &
+      disown
+    fi
+  fi
+
   log_info "Stop hook complete"
 }
 

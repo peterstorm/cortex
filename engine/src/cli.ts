@@ -53,6 +53,7 @@ import { executeIndexCode } from './commands/index-code.js';
 import { forgetById, forgetByQuery } from './commands/forget.js';
 import { findSimilarPairs } from './commands/consolidate.js';
 import { runLifecycle, runLifecycleIfNeeded } from './commands/lifecycle.js';
+import { runAiPrune, runAiPruneIfNeeded } from './commands/ai-prune.js';
 import { executeTraverse } from './commands/traverse.js';
 import { runInspect } from './commands/inspect.js';
 import { backfill } from './commands/backfill.js';
@@ -603,6 +604,49 @@ async function handleLifecycle(args: string[]): Promise<CommandResult> {
 }
 
 /**
+ * Handle 'ai-prune' subcommand
+ * AI-powered memory pruning via claude -p
+ * --if-needed: smart trigger — skip if session count < 5 AND memory count < 50
+ */
+async function handleAiPrune(args: string[]): Promise<CommandResult> {
+  if (args.length < 1) {
+    return {
+      success: false,
+      error: 'Usage: ai-prune <cwd> [--if-needed]',
+    };
+  }
+
+  const cwd = args[0];
+  const ifNeeded = args.includes('--if-needed');
+  const [projectDb, globalDb] = initDatabases(cwd);
+
+  try {
+    const result = ifNeeded
+      ? await runAiPruneIfNeeded(projectDb, globalDb, getTelemetryPath(cwd))
+      : await runAiPrune(projectDb, globalDb, getTelemetryPath(cwd));
+
+    if (result.skipped) {
+      return { success: true, output: 'AI prune skipped (thresholds not met)' };
+    }
+    if (result.error) {
+      return { success: false, error: `AI prune failed: ${result.error}` };
+    }
+    return {
+      success: true,
+      output: `AI prune complete: archived ${result.archived} of ${result.reviewed} reviewed`,
+    };
+  } catch (err) {
+    return {
+      success: false,
+      error: `AI prune failed: ${err}`,
+    };
+  } finally {
+    projectDb.close();
+    globalDb.close();
+  }
+}
+
+/**
  * Handle 'traverse' subcommand
  * BFS graph traversal from memory ID
  */
@@ -775,7 +819,7 @@ async function main() {
 
   if (args.length === 0) {
     logError('Usage: cli.ts <subcommand> [args...]');
-    logError('Subcommands: extract, generate, recall, remember, index-code, forget, consolidate, lifecycle, traverse, inspect, backfill, load-surface');
+    logError('Subcommands: extract, generate, recall, remember, index-code, forget, consolidate, lifecycle, ai-prune, traverse, inspect, backfill, load-surface');
     process.exit(1);
   }
 
@@ -809,6 +853,9 @@ async function main() {
         break;
       case 'lifecycle':
         result = await handleLifecycle(subcommandArgs);
+        break;
+      case 'ai-prune':
+        result = await handleAiPrune(subcommandArgs);
         break;
       case 'traverse':
         result = await handleTraverse(subcommandArgs);
