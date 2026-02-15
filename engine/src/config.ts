@@ -172,6 +172,33 @@ export const ARCHIVE_THRESHOLD_DAYS = 7;
 export const PRUNE_THRESHOLD_DAYS = 90;
 
 /**
+ * Lifecycle auto-prune fallback interval in hours.
+ * Even without new memories, lifecycle runs if last run was this long ago
+ * (catches time-based decay on idle projects).
+ */
+export const LIFECYCLE_FALLBACK_HOURS = 2;
+
+/**
+ * AI prune: run every N sessions (whichever fires first with memory threshold)
+ */
+export const AI_PRUNE_SESSION_INTERVAL = 5;
+
+/**
+ * AI prune: trigger when active memory count exceeds this
+ */
+export const AI_PRUNE_MEMORY_THRESHOLD = 50;
+
+/**
+ * AI prune timeout in ms per batch
+ */
+export const AI_PRUNE_TIMEOUT_MS = 60_000;
+
+/**
+ * AI prune batch size — max memories per LLM call to stay within context/timeout
+ */
+export const AI_PRUNE_BATCH_SIZE = 80;
+
+/**
  * Default search result limit
  */
 export const DEFAULT_SEARCH_LIMIT = 10;

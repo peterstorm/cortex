@@ -52,7 +52,8 @@ import { executeRemember } from './commands/remember.js';
 import { executeIndexCode } from './commands/index-code.js';
 import { forgetById, forgetByQuery } from './commands/forget.js';
 import { findSimilarPairs } from './commands/consolidate.js';
-import { runLifecycle } from './commands/lifecycle.js';
+import { runLifecycle, runLifecycleIfNeeded } from './commands/lifecycle.js';
+import { runAiPrune, runAiPruneIfNeeded } from './commands/ai-prune.js';
 import { executeTraverse } from './commands/traverse.js';
 import { runInspect } from './commands/inspect.js';
 import { backfill } from './commands/backfill.js';
@@ -557,20 +558,33 @@ async function handleConsolidate(args: string[]): Promise<CommandResult> {
 /**
  * Handle 'lifecycle' subcommand
  * Apply decay + archival + pruning
+ * --if-needed: smart trigger — skip if no new memories and last run <2h ago
  */
 async function handleLifecycle(args: string[]): Promise<CommandResult> {
-  // Args: [cwd]
+  // Args: [cwd] [--if-needed]
   if (args.length < 1) {
     return {
       success: false,
-      error: 'Usage: lifecycle <cwd>',
+      error: 'Usage: lifecycle <cwd> [--if-needed]',
     };
   }
 
   const cwd = args[0];
+  const ifNeeded = args.includes('--if-needed');
   const [projectDb, globalDb] = initDatabases(cwd);
 
   try {
+    if (ifNeeded) {
+      const result = runLifecycleIfNeeded(projectDb, globalDb, getTelemetryPath(cwd));
+      if (result.skipped) {
+        return { success: true, output: 'Lifecycle skipped (no changes needed)' };
+      }
+      return {
+        success: true,
+        output: `Lifecycle complete: archived ${result.archived}, pruned ${result.pruned}`,
+      };
+    }
+
     const projectResult = runLifecycle(projectDb);
     const globalResult = runLifecycle(globalDb);
 
@@ -582,6 +596,49 @@ async function handleLifecycle(args: string[]): Promise<CommandResult> {
     return {
       success: false,
       error: `Lifecycle failed: ${err}`,
+    };
+  } finally {
+    projectDb.close();
+    globalDb.close();
+  }
+}
+
+/**
+ * Handle 'ai-prune' subcommand
+ * AI-powered memory pruning via claude -p
+ * --if-needed: smart trigger — skip if session count < 5 AND memory count < 50
+ */
+async function handleAiPrune(args: string[]): Promise<CommandResult> {
+  if (args.length < 1) {
+    return {
+      success: false,
+      error: 'Usage: ai-prune <cwd> [--if-needed]',
+    };
+  }
+
+  const cwd = args[0];
+  const ifNeeded = args.includes('--if-needed');
+  const [projectDb, globalDb] = initDatabases(cwd);
+
+  try {
+    const result = ifNeeded
+      ? await runAiPruneIfNeeded(projectDb, globalDb, getTelemetryPath(cwd))
+      : await runAiPrune(projectDb, globalDb, getTelemetryPath(cwd));
+
+    if (result.skipped) {
+      return { success: true, output: 'AI prune skipped (thresholds not met)' };
+    }
+    if (result.error) {
+      return { success: false, error: `AI prune failed: ${result.error}` };
+    }
+    return {
+      success: true,
+      output: `AI prune complete: archived ${result.archived} of ${result.reviewed} reviewed`,
+    };
+  } catch (err) {
+    return {
+      success: false,
+      error: `AI prune failed: ${err}`,
     };
   } finally {
     projectDb.close();
@@ -762,7 +819,7 @@ async function main() {
 
   if (args.length === 0) {
     logError('Usage: cli.ts <subcommand> [args...]');
-    logError('Subcommands: extract, generate, recall, remember, index-code, forget, consolidate, lifecycle, traverse, inspect, backfill, load-surface');
+    logError('Subcommands: extract, generate, recall, remember, index-code, forget, consolidate, lifecycle, ai-prune, traverse, inspect, backfill, load-surface');
     process.exit(1);
   }
 
@@ -796,6 +853,9 @@ async function main() {
         break;
       case 'lifecycle':
         result = await handleLifecycle(subcommandArgs);
+        break;
+      case 'ai-prune':
+        result = await handleAiPrune(subcommandArgs);
         break;
       case 'traverse':
         result = await handleTraverse(subcommandArgs);
