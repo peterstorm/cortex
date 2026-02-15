@@ -189,9 +189,14 @@ export const AI_PRUNE_SESSION_INTERVAL = 5;
 export const AI_PRUNE_MEMORY_THRESHOLD = 50;
 
 /**
- * AI prune timeout in ms (longer than extraction — evaluating many memories)
+ * AI prune timeout in ms per batch
  */
 export const AI_PRUNE_TIMEOUT_MS = 60_000;
+
+/**
+ * AI prune batch size — max memories per LLM call to stay within context/timeout
+ */
+export const AI_PRUNE_BATCH_SIZE = 80;
 
 /**
  * Default search result limit

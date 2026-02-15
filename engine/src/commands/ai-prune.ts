@@ -16,6 +16,7 @@ import {
   AI_PRUNE_SESSION_INTERVAL,
   AI_PRUNE_MEMORY_THRESHOLD,
   AI_PRUNE_TIMEOUT_MS,
+  AI_PRUNE_BATCH_SIZE,
 } from '../config.js';
 
 // ============================================================================
@@ -229,7 +230,19 @@ export async function runAiPruneIfNeeded(
 }
 
 /**
+ * Split array into chunks of given size (pure).
+ */
+function chunk<T>(arr: readonly T[], size: number): T[][] {
+  const result: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) {
+    result.push(arr.slice(i, i + size));
+  }
+  return result;
+}
+
+/**
  * Run AI prune unconditionally (for manual /ai-prune invocation).
+ * Batches memories into chunks of AI_PRUNE_BATCH_SIZE for large stores.
  */
 export async function runAiPrune(
   projectDb: Database,
@@ -249,7 +262,7 @@ export async function runAiPrune(
     return { archived: 0, reviewed: 0 };
   }
 
-  // Build prompt from summaries
+  // Build memory data for prompt
   const memoryData = allMemories.map(m => ({
     id: m.id,
     memory_type: m.memory_type,
@@ -260,55 +273,61 @@ export async function runAiPrune(
     created_at: m.created_at,
   }));
 
-  const prompt = buildPrunePrompt(memoryData);
-
-  logInfo(`AI pruning ${allMemories.length} memories...`);
-
-  let response: string;
-  try {
-    response = await callClaudePrune(prompt);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    logError(`AI prune LLM call failed: ${message}`);
-    return { archived: 0, reviewed: allMemories.length, error: message };
-  }
-
-  const candidates = parsePruneResponse(response);
-
-  // Build a set of valid memory IDs for safety
+  // Build ID lookup sets for archive routing
   const projectIds = new Set(projectMemories.map(m => m.id));
   const globalIds = new Set(globalMemories.map(m => m.id));
   const pinnedIds = new Set(allMemories.filter(m => m.pinned).map(m => m.id));
 
-  let archivedCount = 0;
-  const now = new Date().toISOString();
+  const batches = chunk(memoryData, AI_PRUNE_BATCH_SIZE);
+  const totalBatches = batches.length;
 
-  for (const candidate of candidates) {
-    // Never archive pinned (safety check even though prompt says not to)
-    if (pinnedIds.has(candidate.id)) {
-      logInfo(`Skipping pinned memory ${candidate.id.slice(0, 8)}`);
-      continue;
+  logInfo(`AI pruning ${allMemories.length} memories in ${totalBatches} batch(es)...`);
+
+  let totalArchived = 0;
+
+  for (let i = 0; i < batches.length; i++) {
+    const batch = batches[i];
+    logInfo(`Batch ${i + 1}/${totalBatches}: ${batch.length} memories`);
+
+    const prompt = buildPrunePrompt(batch);
+
+    let response: string;
+    try {
+      response = await callClaudePrune(prompt);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logError(`Batch ${i + 1} LLM call failed: ${message}`);
+      continue; // skip failed batch, try next
     }
 
-    if (projectIds.has(candidate.id)) {
-      updateMemory(projectDb, candidate.id, { status: 'archived' });
-      archivedCount++;
-      logInfo(`Archived ${candidate.id.slice(0, 8)}: ${candidate.reason}`);
-    } else if (globalIds.has(candidate.id)) {
-      updateMemory(globalDb, candidate.id, { status: 'archived' });
-      archivedCount++;
-      logInfo(`Archived ${candidate.id.slice(0, 8)}: ${candidate.reason}`);
-    } else {
-      logError(`AI suggested unknown memory ID: ${candidate.id}`);
+    const candidates = parsePruneResponse(response);
+
+    for (const candidate of candidates) {
+      if (pinnedIds.has(candidate.id)) {
+        logInfo(`Skipping pinned memory ${candidate.id.slice(0, 8)}`);
+        continue;
+      }
+
+      if (projectIds.has(candidate.id)) {
+        updateMemory(projectDb, candidate.id, { status: 'archived' });
+        totalArchived++;
+        logInfo(`Archived ${candidate.id.slice(0, 8)}: ${candidate.reason}`);
+      } else if (globalIds.has(candidate.id)) {
+        updateMemory(globalDb, candidate.id, { status: 'archived' });
+        totalArchived++;
+        logInfo(`Archived ${candidate.id.slice(0, 8)}: ${candidate.reason}`);
+      } else {
+        logError(`AI suggested unknown memory ID: ${candidate.id}`);
+      }
     }
   }
 
   resetSessionCounter(telemetryPath);
 
-  logInfo(`AI prune complete: ${archivedCount} archived out of ${allMemories.length} reviewed`);
+  logInfo(`AI prune complete: ${totalArchived} archived out of ${allMemories.length} reviewed`);
 
   return {
-    archived: archivedCount,
+    archived: totalArchived,
     reviewed: allMemories.length,
   };
 }
