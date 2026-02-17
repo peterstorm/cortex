@@ -63,6 +63,7 @@ export interface ExtractionResult {
   readonly extracted_count: number;
   readonly edge_count: number;
   readonly cursor_position: number;
+  readonly dedup_skipped?: number;
   readonly error?: string;
 }
 
@@ -185,11 +186,22 @@ export async function executeExtract(
       };
     }
 
+    // I/O: Fetch existing memories once — used for dedup and edge computation
+    const existingMemories = getActiveMemories(projectDb);
+
+    // Pure: Dedup candidates against existing memories (Jaccard ≥ 0.6)
+    const { kept: dedupedCandidates, skipped: dedupSkipped } =
+      deduplicateCandidates(candidates, existingMemories, 0.6);
+
+    if (dedupSkipped > 0) {
+      logInfo(`Dedup: skipped ${dedupSkipped} near-duplicate candidates`);
+    }
+
     // Process each candidate — individual insert failures are non-fatal.
     // Intentional: we continue inserting remaining candidates even if one fails,
     // because partial extraction is better than none (FR-010).
     const insertedMemories: Memory[] = [];
-    for (const candidate of candidates) {
+    for (const candidate of dedupedCandidates) {
       try {
         const memory = candidateToMemory(candidate, input.session_id, gitContext);
         insertMemory(projectDb, memory);
@@ -206,7 +218,8 @@ export async function executeExtract(
       try {
         edgeCount = computeSimilarityAndCreateEdges(
           projectDb,
-          insertedMemories
+          insertedMemories,
+          existingMemories
         );
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -247,6 +260,7 @@ export async function executeExtract(
       extracted_count: insertedMemories.length,
       edge_count: edgeCount,
       cursor_position: newCursor,
+      dedup_skipped: dedupSkipped > 0 ? dedupSkipped : undefined,
     };
   } catch (err) {
     // Catch-all for unexpected errors (FR-010, FR-011)
@@ -308,22 +322,78 @@ function candidateToMemory(
 }
 
 /**
+ * Deduplicate extraction candidates against existing memories and each other.
+ * Pure function — uses Jaccard similarity at the "definitely_similar" threshold (≥0.6)
+ * to filter near-duplicate candidates before DB insertion.
+ *
+ * @param candidates - Parsed extraction candidates
+ * @param existingMemories - All active memories from DB
+ * @param threshold - Jaccard similarity threshold for dedup (default 0.6)
+ * @returns Kept candidates and count of skipped duplicates
+ */
+export function deduplicateCandidates(
+  candidates: readonly MemoryCandidate[],
+  existingMemories: readonly Memory[],
+  threshold: number = 0.6
+): { kept: MemoryCandidate[]; skipped: number } {
+  // Pre-tokenize existing memories once
+  const existingTokenSets = existingMemories.map(
+    (m) => tokenize(`${m.summary} ${m.content}`)
+  );
+
+  const kept: MemoryCandidate[] = [];
+  const keptTokenSets: ReadonlySet<string>[] = [];
+  let skipped = 0;
+
+  for (const candidate of candidates) {
+    const candidateTokens = tokenize(`${candidate.summary} ${candidate.content}`);
+
+    // Check against existing memories
+    let isDuplicate = false;
+    for (const existingTokens of existingTokenSets) {
+      if (jaccardSimilarity(candidateTokens, existingTokens) >= threshold) {
+        isDuplicate = true;
+        break;
+      }
+    }
+
+    // Check against already-kept candidates in this batch (intra-batch dedup)
+    if (!isDuplicate) {
+      for (const keptTokens of keptTokenSets) {
+        if (jaccardSimilarity(candidateTokens, keptTokens) >= threshold) {
+          isDuplicate = true;
+          break;
+        }
+      }
+    }
+
+    if (isDuplicate) {
+      skipped++;
+    } else {
+      kept.push(candidate);
+      keptTokenSets.push(candidateTokens);
+    }
+  }
+
+  return { kept, skipped };
+}
+
+/**
  * Compute similarity between new memories and existing, create edges
- * I/O boundary - reads existing memories, inserts edges
+ * I/O boundary - inserts edges into DB
  *
  * Uses Jaccard pre-filter to avoid unnecessary comparisons (FR-061)
  *
  * @param db - Database instance
  * @param newMemories - Newly inserted memories
+ * @param existingMemories - Pre-fetched active memories (avoids redundant DB call)
  * @returns Number of edges created
  */
 function computeSimilarityAndCreateEdges(
   db: Database,
-  newMemories: readonly Memory[]
+  newMemories: readonly Memory[],
+  existingMemories: readonly Memory[]
 ): number {
-  // I/O: Get all active memories for comparison
-  const existingMemories = getActiveMemories(db);
-
   let edgeCount = 0;
 
   for (const newMem of newMemories) {
