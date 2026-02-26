@@ -32,13 +32,17 @@ export async function extractMemories(prompt: string): Promise<string> {
     throw new Error('Claude CLI not found on PATH — install claude or verify PATH');
   }
 
+  // Remove Claude Code env vars that block nested sessions.
+  // Setting CLAUDECODE='' is insufficient — Claude Code checks existence, not value.
+  const { CLAUDECODE: _, CLAUDE_CODE_ENTRYPOINT: __, ...cleanEnv } = process.env;
+
   const proc = Bun.spawn(
     ['claude', '-p', '--model', 'haiku', '--output-format', 'text', '--allowedTools', ''],
     {
       stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'pipe',
-      env: { ...process.env, CORTEX_EXTRACTING: '1' },
+      env: { ...cleanEnv, CORTEX_EXTRACTING: '1' },
     }
   );
 
