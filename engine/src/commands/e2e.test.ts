@@ -340,10 +340,11 @@ describe('Cortex E2E Integration Tests', () => {
     expect(pinnedMem!.confidence).toBe(1.0); // No decay
     expect(pinnedMem!.status).toBe('active');
 
-    // Normal memory should have decayed
+    // Normal memory: stored confidence stays at original (lifecycle no longer mutates it)
+    // but effective confidence would be lower — lifecycle uses on-the-fly decay for decisions
     const normalMem = getMemory(projectDb, normalResult.memory_id);
     expect(normalMem).not.toBeNull();
-    expect(normalMem!.confidence).toBeLessThan(1.0); // Decayed
+    expect(normalMem!.confidence).toBe(1.0); // Stored confidence unchanged
   });
 
   test('empty database handles gracefully', async () => {

@@ -147,54 +147,41 @@ export function runLifecycle(db: Database): LifecycleResult {
   let prunedCount = 0;
 
   // Process each active memory
+  // Note: We compute effective (decayed) confidence for lifecycle decisions
+  // but do NOT write it back to DB. Stored confidence stays at the original
+  // value — decay is recomputed on-the-fly from last_accessed_at each run.
+  // This prevents the double-decay bug and lets recall reset the decay clock.
   for (const memory of activeMemories) {
     const centrality = centralityMap.get(memory.id) ?? 0;
 
-    // Pure: Compute decayed confidence
-    const newConfidence = decayConfidence(memory, centrality, now);
+    // Pure: Compute effective confidence (not stored)
+    const effectiveConfidence = decayConfidence(memory, centrality, now);
 
-    // Track if confidence changed (decayed)
-    const confidenceChanged = Math.abs(newConfidence - memory.confidence) > 0.001;
-    if (confidenceChanged) {
+    // Track if confidence has effectively decayed
+    const hasDecayed = Math.abs(effectiveConfidence - memory.confidence) > 0.001;
+    if (hasDecayed) {
       decayedCount++;
     }
 
     // Pure: Approximate daysBelowThreshold
-    // If confidence < 0.3 and last_accessed_at >= 14 days ago
+    // If effective confidence < 0.3 and last_accessed_at >= 14 days ago
     const daysSinceAccess = computeDaysSince(memory.last_accessed_at, now);
-    const daysBelowThreshold = newConfidence < 0.3 && daysSinceAccess >= 14 ? daysSinceAccess : 0;
+    const daysBelowThreshold = effectiveConfidence < 0.3 && daysSinceAccess >= 14 ? daysSinceAccess : 0;
 
     // Pure: Determine lifecycle action
-    const action = determineLifecycleAction(memory, newConfidence, daysBelowThreshold, centrality, now);
+    const action = determineLifecycleAction(memory, effectiveConfidence, daysBelowThreshold, centrality, now);
 
-    // I/O: Apply action
+    // I/O: Only write to DB on status transitions
     if (action.action === 'archive') {
-      updateMemory(db, memory.id, {
-        confidence: newConfidence,
-        status: 'archived',
-      });
+      updateMemory(db, memory.id, { status: 'archived' });
       deleteEdgesForMemory(db, memory.id);
       archivedCount++;
     } else if (action.action === 'prune') {
-      updateMemory(db, memory.id, {
-        confidence: newConfidence,
-        status: 'pruned',
-      });
+      updateMemory(db, memory.id, { status: 'pruned' });
       deleteEdgesForMemory(db, memory.id);
       prunedCount++;
-    } else if (action.action === 'exempt') {
-      // Exempt memories don't decay, but update timestamp
-      updateMemory(db, memory.id, {
-        confidence: memory.confidence, // keep original
-      });
-    } else {
-      // No action or just confidence update
-      if (confidenceChanged) {
-        updateMemory(db, memory.id, {
-          confidence: newConfidence,
-        });
-      }
     }
+    // exempt and none: no DB write needed
   }
 
   // Also process archived memories for pruning

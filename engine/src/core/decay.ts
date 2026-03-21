@@ -17,16 +17,16 @@ export const HALF_LIFE_DAYS: Record<MemoryType, number | null> = {
   progress: 7,
 };
 
-// Helper: Compute age in days from now
-function computeAgeDays(createdAt: string, now: Date): number {
-  const created = new Date(createdAt);
-  const diffMs = now.getTime() - created.getTime();
+// Helper: Compute days between two timestamps
+function computeDaysBetween(from: string, to: Date): number {
+  const fromDate = new Date(from);
+  const diffMs = to.getTime() - fromDate.getTime();
   return Math.max(0, diffMs / (1000 * 60 * 60 * 24));
 }
 
 // FR-085, FR-086: Compute effective half-life with modifiers
-// Double half-life for access_count > 10
-// Double half-life for centrality > 0.5
+// Graduated access boost: each access improves retention
+// Proportional centrality boost
 export function getHalfLife(
   memoryType: MemoryType,
   modifiers: { access_count: number; centrality: number }
@@ -34,19 +34,14 @@ export function getHalfLife(
   const baseHalfLife = HALF_LIFE_DAYS[memoryType];
   if (baseHalfLife === null) return null; // stable types never decay
 
-  let effectiveHalfLife = baseHalfLife;
+  // Graduated access boost: each recall extends half-life
+  // 0 accesses → 1x, 1 → 1.3x, 3 → 1.6x, 7 → 1.9x, 15 → 2.2x
+  const accessMultiplier = 1 + Math.log2(1 + modifiers.access_count) * 0.3;
 
-  // FR-086: Double for high access
-  if (modifiers.access_count > 10) {
-    effectiveHalfLife *= 2;
-  }
+  // Proportional centrality boost: up to 2x for centrality 1.0
+  const centralityMultiplier = 1 + modifiers.centrality;
 
-  // FR-087: Double for high centrality
-  if (modifiers.centrality > 0.5) {
-    effectiveHalfLife *= 2;
-  }
-
-  return effectiveHalfLife;
+  return baseHalfLife * accessMultiplier * centralityMultiplier;
 }
 
 // FR-087: Apply exponential decay formula
@@ -84,7 +79,7 @@ export function determineLifecycleAction(
   centrality: number,
   now: Date
 ): LifecycleAction {
-  const daysSinceAccess = computeAgeDays(memory.last_accessed_at, now);
+  const daysSinceAccess = computeDaysBetween(memory.last_accessed_at, now);
 
   // FR-090: Handle archived memories
   if (memory.status === 'archived') {
@@ -125,7 +120,9 @@ export function determineLifecycleAction(
 }
 
 // Canonical export matching plan signature
-// Computes decayed confidence for a memory
+// Computes effective (decayed) confidence for a memory.
+// Uses last_accessed_at as anchor — accessing a memory resets the decay clock.
+// Does NOT mutate stored confidence; caller uses result for lifecycle decisions only.
 export function decayConfidence(
   memory: Memory,
   centrality: number,
@@ -136,11 +133,11 @@ export function decayConfidence(
     return memory.confidence;
   }
 
-  const ageDays = computeAgeDays(memory.created_at, now);
+  const daysSinceAccess = computeDaysBetween(memory.last_accessed_at, now);
   const halfLife = getHalfLife(memory.memory_type, {
     access_count: memory.access_count,
     centrality,
   });
 
-  return applyDecay(memory.confidence, ageDays, halfLife);
+  return applyDecay(memory.confidence, daysSinceAccess, halfLife);
 }
