@@ -11,7 +11,7 @@
 
 import type { Database } from 'bun:sqlite';
 import type { Memory } from '../core/types.js';
-import { getMemory, updateMemory, searchByKeyword } from '../infra/db.js';
+import { getMemory, updateMemory, searchByKeyword, deleteEdgesForMemory } from '../infra/db.js';
 
 // ============================================================================
 // RESULT TYPES (discriminated unions)
@@ -80,8 +80,9 @@ export function forgetById(db: Database, id: string): ForgetResult {
     return { status: 'not_found', memoryId: id };
   }
 
-  // Archive memory (I/O)
+  // Archive memory and clean up edges (I/O)
   updateMemory(db, id, { status: 'archived' });
+  deleteEdgesForMemory(db, id);
 
   return {
     status: 'archived',

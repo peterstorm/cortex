@@ -8,7 +8,7 @@
 import type { Database } from 'bun:sqlite';
 import * as fs from 'node:fs';
 import type { Memory } from '../core/types.js';
-import { getActiveMemories, getArchivedMemories, getAllEdges, updateMemory, getLatestMemoryTimestamp } from '../infra/db.js';
+import { getActiveMemories, getArchivedMemories, getAllEdges, updateMemory, deleteEdgesForMemory, getLatestMemoryTimestamp } from '../infra/db.js';
 import { computeAllCentrality } from '../core/graph.js';
 import { decayConfidence, determineLifecycleAction } from '../core/decay.js';
 import { LIFECYCLE_FALLBACK_HOURS } from '../config.js';
@@ -173,12 +173,14 @@ export function runLifecycle(db: Database): LifecycleResult {
         confidence: newConfidence,
         status: 'archived',
       });
+      deleteEdgesForMemory(db, memory.id);
       archivedCount++;
     } else if (action.action === 'prune') {
       updateMemory(db, memory.id, {
         confidence: newConfidence,
         status: 'pruned',
       });
+      deleteEdgesForMemory(db, memory.id);
       prunedCount++;
     } else if (action.action === 'exempt') {
       // Exempt memories don't decay, but update timestamp
@@ -214,6 +216,7 @@ export function runLifecycle(db: Database): LifecycleResult {
       updateMemory(db, memory.id, {
         status: 'pruned',
       });
+      deleteEdgesForMemory(db, memory.id);
       prunedCount++;
     }
   }

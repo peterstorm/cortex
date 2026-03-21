@@ -38,7 +38,11 @@ export async function extractMemories(prompt: string): Promise<string> {
       stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'pipe',
-      env: { ...process.env, CORTEX_EXTRACTING: '1' },
+      env: (() => {
+        const env = { ...process.env, CORTEX_EXTRACTING: '1' };
+        delete env.CLAUDECODE;
+        return env;
+      })(),
     }
   );
 
@@ -78,7 +82,7 @@ export async function extractMemories(prompt: string): Promise<string> {
 
 /**
  * Classify edges between memory pairs using Claude CLI.
- * Kept for parity with gemini-llm — not wired in v1.
+ * Wired via semantic-edges command in extract-and-generate hook.
  *
  * @param pairs - Memory pairs to classify
  * @returns Array of edge classifications

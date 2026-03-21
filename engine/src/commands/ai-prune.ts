@@ -10,7 +10,7 @@
 
 import type { Database } from 'bun:sqlite';
 import * as fs from 'node:fs';
-import { getActiveMemories, updateMemory } from '../infra/db.js';
+import { getActiveMemories, updateMemory, deleteEdgesForMemory } from '../infra/db.js';
 import { isClaudeLlmAvailable } from '../infra/claude-llm.js';
 import {
   AI_PRUNE_SESSION_INTERVAL,
@@ -169,7 +169,11 @@ async function callClaudePrune(prompt: string): Promise<string> {
       stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'pipe',
-      env: { ...process.env, CORTEX_EXTRACTING: '1' },
+      env: (() => {
+        const env = { ...process.env, CORTEX_EXTRACTING: '1' };
+        delete env.CLAUDECODE;
+        return env;
+      })(),
     }
   );
 
@@ -310,10 +314,12 @@ export async function runAiPrune(
 
       if (projectIds.has(candidate.id)) {
         updateMemory(projectDb, candidate.id, { status: 'archived' });
+        deleteEdgesForMemory(projectDb, candidate.id);
         totalArchived++;
         logInfo(`Archived ${candidate.id.slice(0, 8)}: ${candidate.reason}`);
       } else if (globalIds.has(candidate.id)) {
         updateMemory(globalDb, candidate.id, { status: 'archived' });
+        deleteEdgesForMemory(globalDb, candidate.id);
         totalArchived++;
         logInfo(`Archived ${candidate.id.slice(0, 8)}: ${candidate.reason}`);
       } else {
