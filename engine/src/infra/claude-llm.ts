@@ -1,5 +1,5 @@
 /**
- * Claude CLI client for memory extraction.
+ * Claude CLI client for memory extraction and edge classification.
  * Shells out to `claude -p` via Bun.spawn — leverages user's Anthropic subscription.
  *
  * FR-001: Extract memories automatically at session end
@@ -10,6 +10,7 @@ import type { MemoryPair, EdgeClassification } from './gemini-llm.js';
 import { buildEdgeClassificationPrompt, parseEdgeClassificationResponse } from './gemini-llm.js';
 
 const EXTRACTION_TIMEOUT_MS = 30_000;
+const EDGE_CLASSIFICATION_TIMEOUT_MS = 90_000;
 
 /**
  * Check if `claude` binary is available on PATH.
@@ -19,15 +20,15 @@ export function isClaudeLlmAvailable(): boolean {
 }
 
 /**
- * Extract memories from transcript using Claude CLI.
- * Pipes prompt to `claude -p` via stdin and returns raw response text.
- * Caller is responsible for parsing via parseExtractionResponse.
+ * Run a prompt through Claude CLI and return raw response text.
+ * Shared by extraction and edge classification with configurable timeout.
  *
- * @param prompt - Extraction prompt (from buildExtractionPrompt)
+ * @param prompt - Prompt to send via stdin
+ * @param timeoutMs - Timeout in milliseconds
  * @returns Raw Claude response text
  * @throws Error if binary not found, non-zero exit, or timeout
  */
-export async function extractMemories(prompt: string): Promise<string> {
+async function runClaudePrompt(prompt: string, timeoutMs: number): Promise<string> {
   if (!isClaudeLlmAvailable()) {
     throw new Error('Claude CLI not found on PATH — install claude or verify PATH');
   }
@@ -60,8 +61,8 @@ export async function extractMemories(prompt: string): Promise<string> {
   const timeout = new Promise<never>((_, reject) =>
     setTimeout(() => {
       proc.kill('SIGKILL');
-      reject(new Error(`Claude extraction timed out after ${EXTRACTION_TIMEOUT_MS}ms`));
-    }, EXTRACTION_TIMEOUT_MS)
+      reject(new Error(`Claude CLI timed out after ${timeoutMs}ms`));
+    }, timeoutMs)
   );
 
   const result = await Promise.race([proc.exited, timeout]);
@@ -81,8 +82,22 @@ export async function extractMemories(prompt: string): Promise<string> {
 }
 
 /**
+ * Extract memories from transcript using Claude CLI.
+ * Pipes prompt to `claude -p` via stdin and returns raw response text.
+ * Caller is responsible for parsing via parseExtractionResponse.
+ *
+ * @param prompt - Extraction prompt (from buildExtractionPrompt)
+ * @returns Raw Claude response text
+ * @throws Error if binary not found, non-zero exit, or timeout
+ */
+export async function extractMemories(prompt: string): Promise<string> {
+  return runClaudePrompt(prompt, EXTRACTION_TIMEOUT_MS);
+}
+
+/**
  * Classify edges between memory pairs using Claude CLI.
- * Wired via semantic-edges command in extract-and-generate hook.
+ * Uses a longer timeout (90s) since this runs fire-and-forget
+ * and the classification prompt is larger than extraction.
  *
  * @param pairs - Memory pairs to classify
  * @returns Array of edge classifications
@@ -93,6 +108,6 @@ export async function classifyEdges(
   if (pairs.length === 0) return [];
 
   const prompt = buildEdgeClassificationPrompt(pairs);
-  const response = await extractMemories(prompt);
+  const response = await runClaudePrompt(prompt, EDGE_CLASSIFICATION_TIMEOUT_MS);
   return parseEdgeClassificationResponse(response);
 }
