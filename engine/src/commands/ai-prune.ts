@@ -183,14 +183,20 @@ async function callClaudePrune(prompt: string): Promise<string> {
   const stdoutPromise = new Response(proc.stdout).text();
   const stderrPromise = new Response(proc.stderr).text();
 
-  const timeout = new Promise<never>((_, reject) =>
-    setTimeout(() => {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
       proc.kill('SIGKILL');
       reject(new Error(`AI prune timed out after ${AI_PRUNE_TIMEOUT_MS}ms`));
-    }, AI_PRUNE_TIMEOUT_MS)
-  );
+    }, AI_PRUNE_TIMEOUT_MS);
+  });
 
-  const exitCode = await Promise.race([proc.exited, timeout]);
+  let exitCode: number;
+  try {
+    exitCode = await Promise.race([proc.exited, timeout]);
+  } finally {
+    clearTimeout(timer!);
+  }
 
   if (exitCode !== 0) {
     const stderr = await stderrPromise;

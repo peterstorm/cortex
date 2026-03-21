@@ -57,15 +57,22 @@ async function runClaudePrompt(prompt: string, timeoutMs: number): Promise<strin
   const stdoutPromise = new Response(proc.stdout).text();
   const stderrPromise = new Response(proc.stderr).text();
 
-  // Race between process completion and timeout
-  const timeout = new Promise<never>((_, reject) =>
-    setTimeout(() => {
+  // Race between process completion and timeout.
+  // Timer must be cleared after resolution to prevent keeping the event loop alive.
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
       proc.kill('SIGKILL');
       reject(new Error(`Claude CLI timed out after ${timeoutMs}ms`));
-    }, timeoutMs)
-  );
+    }, timeoutMs);
+  });
 
-  const result = await Promise.race([proc.exited, timeout]);
+  let result: number;
+  try {
+    result = await Promise.race([proc.exited, timeout]);
+  } finally {
+    clearTimeout(timer!);
+  }
 
   if (result !== 0) {
     const stderr = await stderrPromise;

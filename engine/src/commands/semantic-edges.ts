@@ -15,6 +15,8 @@
  * Designed to run as fire-and-forget step in extract-and-generate hook.
  */
 
+import { existsSync, unlinkSync, writeFileSync, readFileSync, mkdirSync } from 'fs';
+import { join } from 'path';
 import type { Database } from 'bun:sqlite';
 import type { Memory } from '../core/types.js';
 import type { MemoryPair, EdgeClassification } from '../infra/gemini-llm.js';
@@ -24,6 +26,48 @@ import { isClaudeLlmAvailable } from '../infra/claude-llm.js';
 
 /** Max pairs per LLM call to stay within 90s timeout */
 const BATCH_SIZE = 10;
+
+/** Lock file directory (inside cortex memory dir) */
+const LOCK_DIR = join(
+  process.env.HOME ?? '/tmp',
+  '.claude/plugins/cache/local/cortex/0.1.0/.memory'
+);
+const LOCK_FILE = join(LOCK_DIR, 'semantic-edges.lock');
+
+/**
+ * Acquire a lock file with PID. Returns true if acquired.
+ * Stale locks (PID no longer running) are automatically reclaimed.
+ */
+function acquireLock(): boolean {
+  try {
+    if (existsSync(LOCK_FILE)) {
+      const existingPid = parseInt(readFileSync(LOCK_FILE, 'utf-8').trim(), 10);
+      if (!isNaN(existingPid)) {
+        try {
+          // Signal 0 checks if process exists without killing it
+          process.kill(existingPid, 0);
+          return false; // Process still alive, lock is held
+        } catch {
+          // Process gone, stale lock — reclaim it
+          logInfo(`Reclaiming stale lock from PID ${existingPid}`);
+        }
+      }
+    }
+    mkdirSync(LOCK_DIR, { recursive: true });
+    writeFileSync(LOCK_FILE, String(process.pid));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function releaseLock(): void {
+  try {
+    unlinkSync(LOCK_FILE);
+  } catch {
+    // Ignore — lock already removed
+  }
+}
 
 export interface SemanticEdgesOptions {
   /** Max edges to process (0 = all) */
@@ -77,6 +121,11 @@ export async function executeSemanticEdges(
   db: Database,
   options: SemanticEdgesOptions = { limit: 0 }
 ): Promise<SemanticEdgesResult> {
+  if (!acquireLock()) {
+    logInfo('Another semantic-edges instance is already running, skipping');
+    return { ok: true, classified: 0, failed: 0, skipped: 0 };
+  }
+
   try {
     if (!isClaudeLlmAvailable()) {
       return { ok: false, error: 'Claude CLI not found on PATH' };
@@ -174,6 +223,8 @@ export async function executeSemanticEdges(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { ok: false, error: `Semantic edges failed: ${message}` };
+  } finally {
+    releaseLock();
   }
 }
 
