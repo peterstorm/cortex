@@ -22,8 +22,8 @@ import { getRelatesToEdges, getMemoryById, deleteEdge, insertEdge } from '../inf
 import { classifyEdges } from '../infra/claude-llm.js';
 import { isClaudeLlmAvailable } from '../infra/claude-llm.js';
 
-/** Max pairs per LLM call to stay within timeout */
-const BATCH_SIZE = 15;
+/** Max pairs per LLM call to stay within 30s timeout */
+const BATCH_SIZE = 5;
 
 export interface SemanticEdgesOptions {
   /** Max edges to process (0 = all) */
