@@ -765,6 +765,98 @@ export function getAllEdges(db: Database): readonly Edge[] {
   });
 }
 
+/**
+ * Get all 'relates_to' edges (Jaccard-created, candidates for semantic classification)
+ * I/O: Reads from database
+ *
+ * @param db - Database instance
+ * @returns Readonly array of relates_to edges
+ */
+export function getRelatesToEdges(db: Database): readonly Edge[] {
+  const stmt = db.prepare(`
+    SELECT * FROM edges WHERE relation_type = 'relates_to'
+  `);
+
+  const rows = stmt.all() as any[];
+
+  return rows.flatMap(row => {
+    if (!isEdgeRelation(row.relation_type)) {
+      return [];
+    }
+    return [createEdge({
+      id: row.id,
+      source_id: row.source_id,
+      target_id: row.target_id,
+      relation_type: row.relation_type,
+      strength: row.strength,
+      bidirectional: row.bidirectional === 1,
+      status: row.status,
+      created_at: row.created_at,
+    })];
+  });
+}
+
+/**
+ * Delete an edge by ID
+ * I/O: Writes to database
+ *
+ * @param db - Database instance
+ * @param edgeId - Edge ID to delete
+ */
+export function deleteEdge(db: Database, edgeId: string): void {
+  db.prepare(`DELETE FROM edges WHERE id = ?`).run(edgeId);
+}
+
+/**
+ * Delete all edges connected to a memory (source or target)
+ * I/O: Writes to database
+ *
+ * @param db - Database instance
+ * @param memoryId - Memory ID whose edges to remove
+ * @returns Number of edges deleted
+ */
+export function deleteEdgesForMemory(db: Database, memoryId: string): number {
+  const result = db.prepare(`DELETE FROM edges WHERE source_id = ? OR target_id = ?`).run(memoryId, memoryId);
+  return result.changes;
+}
+
+/**
+ * Get a memory by ID
+ * I/O: Reads from database
+ *
+ * @param db - Database instance
+ * @param id - Memory ID
+ * @returns Memory or null if not found
+ */
+export function getMemoryById(db: Database, id: string): Memory | null {
+  const stmt = db.prepare(`SELECT * FROM memories WHERE id = ?`);
+  const row = stmt.get(id) as any;
+
+  if (!row) return null;
+
+  return createMemory({
+    id: row.id,
+    content: row.content,
+    summary: row.summary,
+    memory_type: row.memory_type,
+    scope: row.scope,
+    embedding: row.embedding ? deserializeFloat64Array(row.embedding) : null,
+    local_embedding: row.local_embedding ? deserializeFloat32Array(row.local_embedding) : null,
+    confidence: row.confidence,
+    priority: row.priority,
+    pinned: row.pinned === 1,
+    source_type: row.source_type,
+    source_session: row.source_session,
+    source_context: row.source_context,
+    tags: JSON.parse(row.tags),
+    access_count: row.access_count,
+    last_accessed_at: row.last_accessed_at,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    status: row.status,
+  });
+}
+
 // ============================================================================
 // EXTRACTION CHECKPOINT OPERATIONS
 // ============================================================================

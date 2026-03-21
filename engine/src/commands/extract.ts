@@ -191,7 +191,7 @@ export async function executeExtract(
 
     // Pure: Dedup candidates against existing memories (Jaccard ≥ 0.6)
     const { kept: dedupedCandidates, skipped: dedupSkipped } =
-      deduplicateCandidates(candidates, existingMemories, 0.6);
+      deduplicateCandidates(candidates, existingMemories, 0.45);
 
     if (dedupSkipped > 0) {
       logInfo(`Dedup: skipped ${dedupSkipped} near-duplicate candidates`);

@@ -14,7 +14,10 @@ import { randomUUID } from 'crypto';
 import type { Database } from 'bun:sqlite';
 import type { MemoryType, MemoryScope, Memory } from '../core/types.js';
 import { createMemory, isMemoryType } from '../core/types.js';
-import { insertMemory, routeToDatabase } from '../infra/db.js';
+import { insertMemory, routeToDatabase, getActiveMemories } from '../infra/db.js';
+import { tokenize, jaccardSimilarity } from '../core/similarity.js';
+
+const DEDUP_THRESHOLD = 0.45;
 
 // ============================================================================
 // FUNCTIONAL CORE - PURE FUNCTIONS
@@ -180,6 +183,32 @@ export function buildMemoryFromArgs(args: RememberArgs): Memory {
 }
 
 /**
+ * Check if content is a near-duplicate of any existing memory.
+ * Pure function — uses Jaccard similarity on tokenized text.
+ *
+ * @param content - New memory content to check
+ * @param existingMemories - Active memories from DB
+ * @param threshold - Jaccard similarity threshold (default DEDUP_THRESHOLD)
+ * @returns The matching memory summary if duplicate, null otherwise
+ */
+export function findDuplicate(
+  content: string,
+  existingMemories: readonly Memory[],
+  threshold: number = DEDUP_THRESHOLD
+): string | null {
+  const candidateTokens = tokenize(content);
+
+  for (const existing of existingMemories) {
+    const existingTokens = tokenize(`${existing.summary} ${existing.content}`);
+    if (jaccardSimilarity(candidateTokens, existingTokens) >= threshold) {
+      return existing.summary;
+    }
+  }
+
+  return null;
+}
+
+/**
  * Format success result as JSON
  * Pure function
  */
@@ -255,6 +284,19 @@ export function executeRemember(
 
   // Route to appropriate database based on scope (pure routing)
   const targetDb = routeToDatabase(memory.scope, projectDb, globalDb);
+
+  // Dedup check against existing memories in target database
+  try {
+    const existingMemories = getActiveMemories(targetDb);
+    const duplicateOf = findDuplicate(memory.content, existingMemories);
+    if (duplicateOf) {
+      return formatErrorResult(`near-duplicate of existing memory: "${duplicateOf}"`);
+    }
+  } catch (err) {
+    // Non-fatal — proceed with insert if dedup check fails
+    const message = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`[cortex:remember] WARN: dedup check failed: ${message}\n`);
+  }
 
   // Insert into database (I/O)
   try {

@@ -422,15 +422,18 @@ describe('recall command', () => {
   test('format recall result', () => {
     const mem = createTestMemory();
     const formatted = formatRecallResult({
-      results: [
-        {
-          memory: mem,
-          score: 0.95,
-          source: 'project',
-          related: [],
-        },
-      ],
-      method: 'semantic',
+      success: true,
+      result: {
+        results: [
+          {
+            memory: mem,
+            score: 0.95,
+            source: 'project',
+            related: [],
+          },
+        ],
+        method: 'semantic',
+      },
     });
 
     expect(formatted).toContain('semantic');

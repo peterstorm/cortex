@@ -73,6 +73,18 @@ main() {
     fi
   fi
 
+  # Step 2b: Semantic edge classification (fire-and-forget, uses claude -p --model haiku)
+  # Upgrades Jaccard-created 'relates_to' edges to typed relationships
+  if [[ "$extract_ok" == true ]] && [[ -n "$cwd" ]]; then
+    log_info "Spawning detached semantic edge classification"
+    if command -v setsid >/dev/null 2>&1; then
+      setsid bun "$CLI_PATH" semantic-edges "$cwd" >/dev/null 2>&1 &
+    else
+      nohup bun "$CLI_PATH" semantic-edges "$cwd" >/dev/null 2>&1 &
+      disown
+    fi
+  fi
+
   # Step 3: Generate push surface (always — stale memories still need fresh surface)
   if [[ -n "$cwd" ]]; then
     log_info "Generating push surface for cwd: $cwd"

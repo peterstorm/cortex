@@ -57,6 +57,7 @@ import { runAiPrune, runAiPruneIfNeeded } from './commands/ai-prune.js';
 import { executeTraverse } from './commands/traverse.js';
 import { runInspect } from './commands/inspect.js';
 import { backfill } from './commands/backfill.js';
+import { executeSemanticEdges } from './commands/semantic-edges.js';
 
 // ============================================================================
 // TYPES
@@ -770,6 +771,48 @@ async function handleBackfill(args: string[]): Promise<CommandResult> {
 }
 
 /**
+ * Handle 'semantic-edges' subcommand
+ * Classify relates_to edges with typed relationships via Claude Haiku
+ */
+async function handleSemanticEdges(args: string[]): Promise<CommandResult> {
+  if (args.length < 1) {
+    return {
+      success: false,
+      error: 'Usage: semantic-edges <cwd>',
+    };
+  }
+
+  const cwd = args[0];
+  const [projectDb, globalDb] = initDatabases(cwd);
+
+  const limit = (() => {
+    const limitArg = args.find(a => a.startsWith('--limit='));
+    return limitArg ? parseInt(limitArg.split('=')[1], 10) : 0;
+  })();
+
+  try {
+    const result = await executeSemanticEdges(projectDb, { limit });
+
+    if (!result.ok) {
+      return { success: false, error: result.error };
+    }
+
+    return {
+      success: true,
+      output: `Semantic edges: classified=${result.classified}, failed=${result.failed}, skipped=${result.skipped}`,
+    };
+  } catch (err) {
+    return {
+      success: false,
+      error: `Semantic edges failed: ${err}`,
+    };
+  } finally {
+    projectDb.close();
+    globalDb.close();
+  }
+}
+
+/**
  * Handle 'load-surface' subcommand (SessionStart hook)
  * Load cached push surface if available
  */
@@ -819,7 +862,7 @@ async function main() {
 
   if (args.length === 0) {
     logError('Usage: cli.ts <subcommand> [args...]');
-    logError('Subcommands: extract, generate, recall, remember, index-code, forget, consolidate, lifecycle, ai-prune, traverse, inspect, backfill, load-surface');
+    logError('Subcommands: extract, generate, recall, remember, index-code, forget, consolidate, lifecycle, ai-prune, traverse, inspect, backfill, semantic-edges, load-surface');
     process.exit(1);
   }
 
@@ -865,6 +908,9 @@ async function main() {
         break;
       case 'backfill':
         result = await handleBackfill(subcommandArgs);
+        break;
+      case 'semantic-edges':
+        result = await handleSemanticEdges(subcommandArgs);
         break;
       case 'load-surface':
         result = await handleLoadSurface(subcommandArgs);
