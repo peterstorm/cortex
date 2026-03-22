@@ -487,7 +487,21 @@ async function handleForget(args: string[]): Promise<CommandResult> {
         success: true,
         output: `Archived memory: ${result.memoryId}`,
       };
-    } else if (result.status === 'candidates' && result.memories.length > 0) {
+    } else if (result.status === 'candidates' && result.memories.length === 1) {
+      // Single match — auto-archive without confirmation
+      const candidate = result.memories[0];
+      const archiveResult = forgetById(
+        candidate.scope === 'global' ? globalDb : projectDb,
+        candidate.id,
+      );
+      if (archiveResult.status === 'archived') {
+        return {
+          success: true,
+          output: `Archived memory: ${archiveResult.memoryId}`,
+        };
+      }
+      return { success: false, output: `Failed to archive ${candidate.id}` };
+    } else if (result.status === 'candidates' && result.memories.length > 1) {
       const list = result.memories.map(m => `  ${m.id} - ${m.summary}`).join('\n');
       return {
         success: true,
