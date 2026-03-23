@@ -1,8 +1,8 @@
 /**
  * Local embedding fallback using Hugging Face transformers.
  *
- * Provides local embedding when Voyage AI unavailable.
- * Uses all-MiniLM-L6-v2 model (384 dimensions, Float32Array).
+ * Provides local embedding when Gemini unavailable.
+ * Uses BGE-small-en-v1.5 model (384 dimensions, Float32Array).
  *
  * Requirements:
  * - FR-110: Support fallback to local embedding model
@@ -48,7 +48,7 @@ async function loadModel(): Promise<ModelAvailabilityResult> {
     const { pipeline } = await getTransformers();
     cachedPipeline = await pipeline(
       'feature-extraction',
-      'Xenova/all-MiniLM-L6-v2',
+      'Xenova/bge-small-en-v1.5',
       { quantized: true }
     );
     return { ok: true };
@@ -56,34 +56,6 @@ async function loadModel(): Promise<ModelAvailabilityResult> {
     const errorMsg = err instanceof Error ? err.message : String(err);
     return { ok: false, error: `Failed to load local embedding model: ${errorMsg}` };
   }
-}
-
-/**
- * Mean pooling: average embeddings across all tokens.
- * Pure function for embedding transformation.
- */
-function meanPooling(embeddings: number[][][]): Float32Array {
-  // embeddings shape: [batch_size, sequence_length, hidden_size]
-  // We process batch_size=1, so take first element
-  const tokenEmbeddings = embeddings[0];
-  const numTokens = tokenEmbeddings.length;
-  const hiddenSize = tokenEmbeddings[0].length;
-
-  const pooled = new Float32Array(hiddenSize);
-
-  // Sum across tokens
-  for (let i = 0; i < numTokens; i++) {
-    for (let j = 0; j < hiddenSize; j++) {
-      pooled[j] += tokenEmbeddings[i][j];
-    }
-  }
-
-  // Average
-  for (let j = 0; j < hiddenSize; j++) {
-    pooled[j] /= numTokens;
-  }
-
-  return pooled;
 }
 
 /**
@@ -149,17 +121,15 @@ export async function embedLocal(text: string): Promise<Float32Array> {
   }
 
   try {
-    // Generate embeddings
+    // Generate embeddings with BGE's recommended pooling + normalization
     const output = await cachedPipeline(trimmed, {
-      pooling: 'none',
-      normalize: false,
+      pooling: 'mean',
+      normalize: true,
     });
 
-    // Extract raw embeddings (nested array)
-    const rawEmbeddings = output.tolist() as number[][][];
-
-    // Apply mean pooling
-    const embedding = meanPooling(rawEmbeddings);
+    // Extract embedding (already pooled + normalized by pipeline)
+    const rawEmbedding = output.tolist() as number[][];
+    const embedding = new Float32Array(rawEmbedding[0]);
 
     // Validate dimensions
     if (embedding.length !== 384) {
