@@ -137,6 +137,48 @@ export function jaccardPreFilter(score: number): JaccardPreFilter {
 }
 
 /**
+ * Compute hybrid similarity using Jaccard pre-filter + cosine for the "maybe" range.
+ * Pure function — takes pre-computed tokens and optional embeddings.
+ *
+ * Algorithm:
+ * 1. Jaccard pre-filter on token sets
+ * 2. definitely_different (<0.1): return 0
+ * 3. definitely_similar (>0.6): return Jaccard score
+ * 4. maybe (0.1-0.6): use cosine if embeddings available + dimensions match, else Jaccard
+ *
+ * @param tokensA - Pre-tokenized first item
+ * @param tokensB - Pre-tokenized second item
+ * @param embeddingA - Optional embedding (Float32 or Float64)
+ * @param embeddingB - Optional embedding (Float32 or Float64)
+ * @returns Similarity score in [0, 1], or 0 if definitely_different
+ */
+export function hybridSimilarity(
+  tokensA: ReadonlySet<string>,
+  tokensB: ReadonlySet<string>,
+  embeddingA: Float64Array | Float32Array | null,
+  embeddingB: Float64Array | Float32Array | null
+): number {
+  const jaccardScore = jaccardSimilarity(tokensA, tokensB);
+  const preFilter = jaccardPreFilter(jaccardScore);
+
+  if (preFilter.result === 'definitely_different') {
+    return 0;
+  }
+
+  if (preFilter.result === 'definitely_similar') {
+    return jaccardScore;
+  }
+
+  // "maybe" range: use cosine if both embeddings present and dimensions match
+  if (embeddingA && embeddingB && embeddingA.length === embeddingB.length) {
+    return cosineSimilarity(embeddingA, embeddingB);
+  }
+
+  // Fallback: return Jaccard score
+  return jaccardScore;
+}
+
+/**
  * Batch similarity comparison result
  */
 export type SimilarityResult = {

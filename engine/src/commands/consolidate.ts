@@ -17,7 +17,7 @@ import {
   insertEdge,
   updateMemory,
 } from '../infra/db.js';
-import { tokenize, jaccardSimilarity, cosineSimilarity, jaccardPreFilter } from '../core/similarity.js';
+import { tokenize, hybridSimilarity } from '../core/similarity.js';
 import { createMemory } from '../core/types.js';
 
 // ============================================================================
@@ -57,47 +57,15 @@ export function findSimilarPairs(
       const memoryA = memories[i];
       const memoryB = memories[j];
 
-      // Jaccard pre-filter (cheap text-based similarity)
       const tokensA = tokenize(memoryA.summary);
       const tokensB = tokenize(memoryB.summary);
-      const jaccardScore = jaccardSimilarity(tokensA, tokensB);
-      const preFilter = jaccardPreFilter(jaccardScore);
-
-      // Skip if definitely different (Jaccard < 0.1)
-      if (preFilter.result === 'definitely_different') {
-        continue;
-      }
-
-      // If definitely similar (Jaccard > 0.6), use Jaccard score
-      if (preFilter.result === 'definitely_similar') {
-        pairs.push({ memoryA, memoryB, similarity: jaccardScore });
-        continue;
-      }
-
-      // "maybe" range (0.1 <= Jaccard <= 0.6) - use cosine if embeddings available
-      // Prefer gemini embeddings over local
       const embeddingA = memoryA.embedding ?? memoryA.local_embedding;
       const embeddingB = memoryB.embedding ?? memoryB.local_embedding;
 
-      if (embeddingA && embeddingB) {
-        // Check dimension match (gemini=768, local=384)
-        if (embeddingA.length !== embeddingB.length) {
-          // Dimension mismatch - fall back to Jaccard
-          if (jaccardScore >= threshold) {
-            pairs.push({ memoryA, memoryB, similarity: jaccardScore });
-          }
-          continue;
-        }
+      const similarity = hybridSimilarity(tokensA, tokensB, embeddingA, embeddingB);
 
-        const cosineSim = cosineSimilarity(embeddingA, embeddingB);
-        if (cosineSim >= threshold) {
-          pairs.push({ memoryA, memoryB, similarity: cosineSim });
-        }
-      } else {
-        // No embeddings - fall back to Jaccard
-        if (jaccardScore >= threshold) {
-          pairs.push({ memoryA, memoryB, similarity: jaccardScore });
-        }
+      if (similarity >= threshold) {
+        pairs.push({ memoryA, memoryB, similarity });
       }
     }
   }

@@ -34,14 +34,14 @@ import {
   truncateTranscript,
   buildExtractionPrompt,
   parseExtractionResponse,
+  buildEmbeddingText,
 } from '../core/extraction.js';
 import {
   tokenize,
-  jaccardSimilarity,
-  jaccardPreFilter,
-  cosineSimilarity,
+  hybridSimilarity,
   classifySimilarity,
 } from '../core/similarity.js';
+import { embedLocal, ensureModelLoaded } from '../infra/local-embed.ts';
 import {
   insertMemory,
   getExtractionCheckpoint,
@@ -189,12 +189,16 @@ export async function executeExtract(
     // I/O: Fetch existing memories once — used for dedup and edge computation
     const existingMemories = getActiveMemories(projectDb);
 
-    // Pure: Dedup candidates against existing memories (Jaccard ≥ 0.6)
+    // I/O: Generate local embeddings for candidates (async, for hybrid dedup)
+    // Non-fatal: if embedding fails, dedup falls back to Jaccard-only
+    const candidateEmbeddings = await generateCandidateEmbeddings(candidates, projectName);
+
+    // Pure: Dedup candidates against existing memories (hybrid Jaccard + cosine)
     const { kept: dedupedCandidates, skipped: dedupSkipped } =
-      deduplicateCandidates(candidates, existingMemories, 0.45);
+      deduplicateCandidates(candidates, existingMemories, 0.45, candidateEmbeddings);
 
     if (dedupSkipped > 0) {
-      logInfo(`Dedup: skipped ${dedupSkipped} near-duplicate candidates`);
+      logInfo(`Dedup: skipped ${dedupSkipped} near-duplicate candidates (hybrid)`);
     }
 
     // Process each candidate — individual insert failures are non-fatal.
@@ -203,7 +207,9 @@ export async function executeExtract(
     const insertedMemories: Memory[] = [];
     for (const candidate of dedupedCandidates) {
       try {
-        const memory = candidateToMemory(candidate, input.session_id, gitContext);
+        const candidateIndex = candidates.indexOf(candidate);
+        const localEmbedding = candidateEmbeddings.get(candidateIndex) ?? null;
+        const memory = candidateToMemory(candidate, input.session_id, gitContext, localEmbedding);
         insertMemory(projectDb, memory);
         insertedMemories.push(memory);
       } catch (err) {
@@ -287,7 +293,8 @@ export async function executeExtract(
 function candidateToMemory(
   candidate: MemoryCandidate,
   sessionId: string,
-  gitContext: { branch: string; recent_commits: readonly string[]; changed_files: readonly string[] }
+  gitContext: { branch: string; recent_commits: readonly string[]; changed_files: readonly string[] },
+  localEmbedding: Float32Array | null = null
 ): Memory {
   const id = randomUUID();
   const now = new Date().toISOString();
@@ -311,8 +318,8 @@ function candidateToMemory(
     source_session: sessionId,
     source_context: sourceContext,
     tags: candidate.tags,
-    embedding: null, // Queue for backfill
-    local_embedding: null,  // Queue for backfill
+    embedding: null, // Queue Gemini for backfill
+    local_embedding: localEmbedding, // Store if generated (saves backfill step)
     access_count: 0,
     last_accessed_at: now,
     created_at: now,
@@ -323,35 +330,49 @@ function candidateToMemory(
 
 /**
  * Deduplicate extraction candidates against existing memories and each other.
- * Pure function — uses Jaccard similarity at the "definitely_similar" threshold (≥0.6)
- * to filter near-duplicate candidates before DB insertion.
+ * Pure function — uses hybrid Jaccard+cosine similarity to filter near-duplicates.
  *
  * @param candidates - Parsed extraction candidates
  * @param existingMemories - All active memories from DB
- * @param threshold - Jaccard similarity threshold for dedup (default 0.6)
+ * @param threshold - Similarity threshold for dedup (default 0.6)
+ * @param candidateEmbeddings - Map of candidate index → local embedding (optional)
  * @returns Kept candidates and count of skipped duplicates
  */
 export function deduplicateCandidates(
   candidates: readonly MemoryCandidate[],
   existingMemories: readonly Memory[],
-  threshold: number = 0.6
+  threshold: number = 0.6,
+  candidateEmbeddings: Map<number, Float32Array> = new Map()
 ): { kept: MemoryCandidate[]; skipped: number } {
   // Pre-tokenize existing memories once
   const existingTokenSets = existingMemories.map(
     (m) => tokenize(`${m.summary} ${m.content}`)
   );
+  // Pre-extract existing embeddings (prefer local to match candidate dimensions)
+  const existingEmbeddings = existingMemories.map(
+    (m) => m.local_embedding ?? m.embedding ?? null
+  );
 
   const kept: MemoryCandidate[] = [];
   const keptTokenSets: ReadonlySet<string>[] = [];
+  const keptEmbeddings: (Float32Array | null)[] = [];
   let skipped = 0;
 
-  for (const candidate of candidates) {
+  for (let i = 0; i < candidates.length; i++) {
+    const candidate = candidates[i];
     const candidateTokens = tokenize(`${candidate.summary} ${candidate.content}`);
+    const candidateEmbedding = candidateEmbeddings.get(i) ?? null;
 
-    // Check against existing memories
+    // Check against existing memories (hybrid)
     let isDuplicate = false;
-    for (const existingTokens of existingTokenSets) {
-      if (jaccardSimilarity(candidateTokens, existingTokens) >= threshold) {
+    for (let j = 0; j < existingTokenSets.length; j++) {
+      const score = hybridSimilarity(
+        candidateTokens,
+        existingTokenSets[j],
+        candidateEmbedding,
+        existingEmbeddings[j]
+      );
+      if (score >= threshold) {
         isDuplicate = true;
         break;
       }
@@ -359,8 +380,14 @@ export function deduplicateCandidates(
 
     // Check against already-kept candidates in this batch (intra-batch dedup)
     if (!isDuplicate) {
-      for (const keptTokens of keptTokenSets) {
-        if (jaccardSimilarity(candidateTokens, keptTokens) >= threshold) {
+      for (let j = 0; j < keptTokenSets.length; j++) {
+        const score = hybridSimilarity(
+          candidateTokens,
+          keptTokenSets[j],
+          candidateEmbedding,
+          keptEmbeddings[j]
+        );
+        if (score >= threshold) {
           isDuplicate = true;
           break;
         }
@@ -372,6 +399,7 @@ export function deduplicateCandidates(
     } else {
       kept.push(candidate);
       keptTokenSets.push(candidateTokens);
+      keptEmbeddings.push(candidateEmbedding);
     }
   }
 
@@ -397,80 +425,61 @@ function computeSimilarityAndCreateEdges(
   let edgeCount = 0;
 
   for (const newMem of newMemories) {
-    // Pure: Tokenize new memory for Jaccard comparison
     const newTokens = tokenize(`${newMem.summary} ${newMem.content}`);
+    const newEmbedding = newMem.local_embedding ?? newMem.embedding;
 
     for (const existingMem of existingMemories) {
-      // Skip self-comparison
       if (newMem.id === existingMem.id) continue;
 
-      // Pure: Tokenize existing memory
       const existingTokens = tokenize(`${existingMem.summary} ${existingMem.content}`);
+      const existingEmbedding = existingMem.local_embedding ?? existingMem.embedding;
 
-      // Pure: Jaccard pre-filter (FR-061)
-      const jaccardScore = jaccardSimilarity(newTokens, existingTokens);
-      const preFilter = jaccardPreFilter(jaccardScore);
+      const score = hybridSimilarity(newTokens, existingTokens, newEmbedding, existingEmbedding);
 
-      // Skip if definitely different
-      if (preFilter.result === 'definitely_different') {
-        continue;
-      }
+      if (score < 0.1) continue;
 
-      // For "maybe" range: compute cosine similarity if embeddings available
-      // Since we queue embeddings for backfill, skip cosine for now
-      // In future, this would use gemini/local embeddings if available
+      const action = classifySimilarity(score);
 
-      // For now, use Jaccard score directly for "maybe" range
-      if (preFilter.result === 'maybe') {
-        // Pure: Classify similarity action
-        const action = classifySimilarity(jaccardScore);
-
-        // Create edge based on action
-        if (action.action === 'relate') {
-          try {
-            insertEdge(db, {
-              source_id: newMem.id,
-              target_id: existingMem.id,
-              relation_type: 'relates_to',
-              strength: action.strength,
-              bidirectional: true,
-              status: 'active',
-            });
-            edgeCount++;
-          } catch (err) {
-            // Duplicate edge constraint - skip silently
-          }
-        } else if (action.action === 'suggest') {
-          try {
-            insertEdge(db, {
-              source_id: newMem.id,
-              target_id: existingMem.id,
-              relation_type: 'relates_to',
-              strength: action.strength,
-              bidirectional: true,
-              status: 'suggested',
-            });
-            edgeCount++;
-          } catch (err) {
-            // Duplicate edge constraint - skip silently
-          }
-        }
-        // Note: 'consolidate' action logged but not handled in v1
-      }
-
-      // If definitely_similar, create strong edge
-      if (preFilter.result === 'definitely_similar') {
+      if (action.action === 'relate') {
         try {
           insertEdge(db, {
             source_id: newMem.id,
             target_id: existingMem.id,
             relation_type: 'relates_to',
-            strength: jaccardScore,
+            strength: action.strength,
             bidirectional: true,
             status: 'active',
           });
           edgeCount++;
-        } catch (err) {
+        } catch {
+          // Duplicate edge constraint - skip silently
+        }
+      } else if (action.action === 'suggest') {
+        try {
+          insertEdge(db, {
+            source_id: newMem.id,
+            target_id: existingMem.id,
+            relation_type: 'relates_to',
+            strength: action.strength,
+            bidirectional: true,
+            status: 'suggested',
+          });
+          edgeCount++;
+        } catch {
+          // Duplicate edge constraint - skip silently
+        }
+      } else if (action.action === 'consolidate') {
+        try {
+          insertEdge(db, {
+            source_id: newMem.id,
+            target_id: existingMem.id,
+            relation_type: 'relates_to',
+            strength: score,
+            bidirectional: true,
+            status: 'active',
+          });
+          edgeCount++;
+        } catch {
           // Duplicate edge constraint - skip silently
         }
       }
@@ -478,6 +487,44 @@ function computeSimilarityAndCreateEdges(
   }
 
   return edgeCount;
+}
+
+/**
+ * Generate local embeddings for extraction candidates.
+ * I/O boundary — calls async local embedding model.
+ * Returns Map<candidateIndex, Float32Array> for successfully embedded candidates.
+ * Non-fatal: returns empty map if model unavailable.
+ */
+async function generateCandidateEmbeddings(
+  candidates: readonly MemoryCandidate[],
+  projectName: string
+): Promise<Map<number, Float32Array>> {
+  const embeddings = new Map<number, Float32Array>();
+
+  try {
+    const modelReady = await ensureModelLoaded();
+    if (!modelReady) {
+      logInfo('Local embedding model unavailable — falling back to Jaccard-only dedup');
+      return embeddings;
+    }
+  } catch {
+    logInfo('Local embedding model failed to load — falling back to Jaccard-only dedup');
+    return embeddings;
+  }
+
+  for (let i = 0; i < candidates.length; i++) {
+    try {
+      const text = buildEmbeddingText(candidates[i], projectName);
+      const embedding = await embedLocal(text);
+      embeddings.set(i, embedding);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logError(`Failed to embed candidate ${i}: ${message}`);
+      // Non-fatal: this candidate will use Jaccard-only
+    }
+  }
+
+  return embeddings;
 }
 
 /**

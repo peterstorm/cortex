@@ -7,6 +7,7 @@ import {
   classifySimilarity,
   jaccardPreFilter,
   batchCosineSimilarity,
+  hybridSimilarity,
   type JaccardPreFilter,
 } from './similarity';
 import type { SimilarityAction } from './types';
@@ -436,6 +437,72 @@ describe('batchCosineSimilarity', () => {
     // After sorting, highest score (index 1) comes first
     expect(results[0].targetIndex).toBe(1);
     expect(results[1].targetIndex).toBe(0);
+  });
+});
+
+describe('hybridSimilarity', () => {
+  it('returns 0 for definitely_different (Jaccard < 0.1)', () => {
+    const tokensA = tokenize('python data processing pipeline');
+    const tokensB = tokenize('css flexbox layout grid');
+    expect(hybridSimilarity(tokensA, tokensB, null, null)).toBe(0);
+  });
+
+  it('returns Jaccard score for definitely_similar (Jaccard > 0.6)', () => {
+    const text = 'the quick brown fox jumps over the lazy dog';
+    const tokensA = tokenize(text);
+    const tokensB = tokenize(text);
+    const score = hybridSimilarity(tokensA, tokensB, null, null);
+    expect(score).toBeCloseTo(1.0);
+  });
+
+  it('uses cosine similarity in maybe range when embeddings available', () => {
+    // Tokens have partial Jaccard overlap (lands in "maybe" range 0.1-0.6)
+    const tokensA = tokenize('react state management with hooks');
+    const tokensB = tokenize('react context state provider pattern');
+    // Verify we're in "maybe" range
+    const jaccard = jaccardSimilarity(tokensA, tokensB);
+    expect(jaccard).toBeGreaterThanOrEqual(0.1);
+    expect(jaccard).toBeLessThanOrEqual(0.6);
+    // Embeddings are very similar → cosine should override Jaccard
+    const embA = new Float32Array([0.8, 0.1, 0.1]);
+    const embB = new Float32Array([0.7, 0.2, 0.1]);
+    const score = hybridSimilarity(tokensA, tokensB, embA, embB);
+    // Should use cosine (~0.98), not Jaccard
+    expect(score).toBeGreaterThan(0.9);
+  });
+
+  it('falls back to Jaccard in maybe range when dimensions mismatch', () => {
+    const tokensA = tokenize('similar text content here today');
+    const tokensB = tokenize('similar text content here also');
+    const embA = new Float32Array([0.1, 0.2, 0.3]); // 3-dim
+    const embB = new Float64Array([0.1, 0.2, 0.3, 0.4]); // 4-dim
+    const score = hybridSimilarity(tokensA, tokensB, embA, embB);
+    // Falls back to Jaccard
+    expect(score).toBe(jaccardSimilarity(tokensA, tokensB));
+  });
+
+  it('falls back to Jaccard when one embedding is null', () => {
+    const tokensA = tokenize('test content one two');
+    const tokensB = tokenize('test content one three');
+    const embA = new Float32Array([0.1, 0.2]);
+    const score = hybridSimilarity(tokensA, tokensB, embA, null);
+    expect(score).toBe(jaccardSimilarity(tokensA, tokensB));
+  });
+
+  it('falls back to Jaccard when both embeddings are null', () => {
+    const tokensA = tokenize('partial overlap tokens here');
+    const tokensB = tokenize('partial overlap different words');
+    const score = hybridSimilarity(tokensA, tokensB, null, null);
+    expect(score).toBe(jaccardSimilarity(tokensA, tokensB));
+  });
+
+  it('is symmetric', () => {
+    const tokensA = tokenize('react hooks state management');
+    const tokensB = tokenize('react context state provider');
+    const embA = new Float32Array([0.5, 0.3, 0.2]);
+    const embB = new Float32Array([0.4, 0.3, 0.3]);
+    expect(hybridSimilarity(tokensA, tokensB, embA, embB))
+      .toBeCloseTo(hybridSimilarity(tokensB, tokensA, embB, embA));
   });
 });
 
