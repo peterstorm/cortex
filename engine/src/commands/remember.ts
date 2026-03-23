@@ -15,7 +15,7 @@ import type { Database } from 'bun:sqlite';
 import type { MemoryType, MemoryScope, Memory } from '../core/types.js';
 import { createMemory, isMemoryType } from '../core/types.js';
 import { insertMemory, routeToDatabase, getActiveMemories } from '../infra/db.js';
-import { tokenize, jaccardSimilarity } from '../core/similarity.js';
+import { tokenize, hybridSimilarity } from '../core/similarity.js';
 
 const DEDUP_THRESHOLD = 0.45;
 
@@ -184,23 +184,29 @@ export function buildMemoryFromArgs(args: RememberArgs): Memory {
 
 /**
  * Check if content is a near-duplicate of any existing memory.
- * Pure function — uses Jaccard similarity on tokenized text.
+ * Pure function — uses hybrid Jaccard+cosine similarity.
  *
  * @param content - New memory content to check
+ * @param summary - New memory summary (derived from content)
  * @param existingMemories - Active memories from DB
- * @param threshold - Jaccard similarity threshold (default DEDUP_THRESHOLD)
+ * @param threshold - Similarity threshold (default DEDUP_THRESHOLD)
  * @returns The matching memory summary if duplicate, null otherwise
  */
 export function findDuplicate(
   content: string,
+  summary: string,
   existingMemories: readonly Memory[],
   threshold: number = DEDUP_THRESHOLD
 ): string | null {
-  const candidateTokens = tokenize(content);
+  // Symmetric tokenization: summary+content for both candidate and existing
+  const candidateTokens = tokenize(`${summary} ${content}`);
 
   for (const existing of existingMemories) {
     const existingTokens = tokenize(`${existing.summary} ${existing.content}`);
-    if (jaccardSimilarity(candidateTokens, existingTokens) >= threshold) {
+    const existingEmbedding = existing.local_embedding ?? existing.embedding ?? null;
+    // Candidate has no embedding (sync path), but existing may — cosine works for "maybe" range
+    const score = hybridSimilarity(candidateTokens, existingTokens, null, existingEmbedding);
+    if (score >= threshold) {
       return existing.summary;
     }
   }
@@ -288,7 +294,7 @@ export function executeRemember(
   // Dedup check against existing memories in target database
   try {
     const existingMemories = getActiveMemories(targetDb);
-    const duplicateOf = findDuplicate(memory.content, existingMemories);
+    const duplicateOf = findDuplicate(memory.content, memory.summary, existingMemories);
     if (duplicateOf) {
       return formatErrorResult(`near-duplicate of existing memory: "${duplicateOf}"`);
     }

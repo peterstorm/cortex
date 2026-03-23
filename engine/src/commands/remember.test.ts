@@ -5,11 +5,14 @@ import {
   formatSuccessResult,
   formatErrorResult,
   executeRemember,
+  findDuplicate,
   type RememberArgs,
 } from './remember.js';
 import { openDatabase } from '../infra/db.js';
 import { getMemory } from '../infra/db.js';
+import { createMemory } from '../core/types.js';
 import type { Database } from 'bun:sqlite';
+import type { Memory } from '../core/types.js';
 
 describe('Remember Command', () => {
   // ============================================================================
@@ -544,6 +547,77 @@ describe('Remember Command', () => {
 
       const memory = getMemory(projectDb, result.memory_id);
       expect(memory?.status).toBe('active');
+    });
+  });
+
+  describe('findDuplicate', () => {
+    const now = new Date().toISOString();
+
+    function makeMemory(overrides: Partial<Memory>): Memory {
+      return createMemory({
+        id: 'test-id',
+        content: 'default content',
+        summary: 'default content',
+        memory_type: 'context',
+        scope: 'project',
+        confidence: 0.9,
+        priority: 5,
+        pinned: false,
+        source_type: 'extraction',
+        source_session: 'sess',
+        source_context: '{}',
+        tags: [],
+        embedding: null,
+        local_embedding: null,
+        access_count: 0,
+        last_accessed_at: now,
+        created_at: now,
+        updated_at: now,
+        status: 'active',
+        ...overrides,
+      });
+    }
+
+    it('detects exact duplicate content', () => {
+      const existing = [makeMemory({
+        summary: 'Use Redux for state management',
+        content: 'Use Redux for state management in the application',
+      })];
+
+      const result = findDuplicate(
+        'Use Redux for state management in the application',
+        'Use Redux for state management in the application',
+        existing
+      );
+
+      expect(result).not.toBeNull();
+    });
+
+    it('symmetric tokenization: matches when content equals existing', () => {
+      // Regression test for the asymmetric tokenization bug
+      const content = 'Prefer functional patterns over OOP in all modules';
+      const existing = [makeMemory({
+        summary: content,
+        content: content,
+      })];
+
+      const result = findDuplicate(content, content, existing);
+      expect(result).not.toBeNull();
+    });
+
+    it('returns null for unrelated content', () => {
+      const existing = [makeMemory({
+        summary: 'Database optimization techniques for PostgreSQL',
+        content: 'Database optimization techniques for PostgreSQL queries',
+      })];
+
+      const result = findDuplicate(
+        'CSS grid layout patterns for responsive design',
+        'CSS grid layout patterns for responsive design',
+        existing
+      );
+
+      expect(result).toBeNull();
     });
   });
 });

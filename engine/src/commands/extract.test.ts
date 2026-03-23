@@ -5,10 +5,12 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Database } from 'bun:sqlite';
-import type { HookInput } from '../core/types.js';
+import type { HookInput, MemoryCandidate, Memory } from '../core/types.js';
+import { createMemory } from '../core/types.js';
 import { openDatabase } from '../infra/db.js';
 import { truncateTranscript, buildExtractionPrompt, parseExtractionResponse } from '../core/extraction.js';
 import { tokenize, jaccardSimilarity, classifySimilarity } from '../core/similarity.js';
+import { deduplicateCandidates } from './extract.js';
 
 describe('extract command - core logic', () => {
   let db: Database;
@@ -240,6 +242,135 @@ describe('extract command - core logic', () => {
 
       expect(checkpoint!.cursor_position).toBe(200);
     });
+  });
+});
+
+describe('deduplicateCandidates', () => {
+  const now = new Date().toISOString();
+
+  function makeMemory(overrides: Partial<Memory>): Memory {
+    return createMemory({
+      id: 'test-id',
+      content: 'default content',
+      summary: 'default content',
+      memory_type: 'context',
+      scope: 'project',
+      confidence: 0.9,
+      priority: 5,
+      pinned: false,
+      source_type: 'extraction',
+      source_session: 'sess',
+      source_context: '{}',
+      tags: [],
+      embedding: null,
+      local_embedding: null,
+      access_count: 0,
+      last_accessed_at: now,
+      created_at: now,
+      updated_at: now,
+      status: 'active',
+      ...overrides,
+    });
+  }
+
+  function makeCandidate(overrides: Partial<MemoryCandidate>): MemoryCandidate {
+    return {
+      content: 'default content',
+      summary: 'default content',
+      memory_type: 'context',
+      scope: 'project',
+      confidence: 0.8,
+      priority: 5,
+      tags: [],
+      ...overrides,
+    };
+  }
+
+  it('filters candidates matching existing memories by Jaccard', () => {
+    const existing = [makeMemory({
+      summary: 'Use functional core imperative shell pattern',
+      content: 'Use functional core imperative shell pattern for all commands',
+    })];
+    const candidates = [makeCandidate({
+      summary: 'Use functional core imperative shell pattern',
+      content: 'Functional core imperative shell pattern used in all commands',
+    })];
+
+    const { kept, skipped } = deduplicateCandidates(candidates, existing, 0.45);
+    expect(skipped).toBe(1);
+    expect(kept).toHaveLength(0);
+  });
+
+  it('keeps candidates that differ from existing memories', () => {
+    const existing = [makeMemory({
+      summary: 'Database uses PostgreSQL',
+      content: 'Database uses PostgreSQL for persistence',
+    })];
+    const candidates = [makeCandidate({
+      summary: 'Frontend uses React hooks',
+      content: 'Frontend uses React hooks for state management',
+    })];
+
+    const { kept, skipped } = deduplicateCandidates(candidates, existing, 0.45);
+    expect(skipped).toBe(0);
+    expect(kept).toHaveLength(1);
+  });
+
+  it('catches semantic duplicates via cosine when Jaccard is in maybe range', () => {
+    // Create an embedding vector — same for both to simulate semantic similarity
+    const sharedEmbedding = new Float32Array(384);
+    for (let i = 0; i < 384; i++) sharedEmbedding[i] = Math.sin(i * 0.1);
+
+    // Texts with partial word overlap — enough for "maybe" range (Jaccard 0.1-0.6)
+    // but not enough for Jaccard alone to exceed 0.45
+    const existing = [makeMemory({
+      summary: 'Prefer immutable data structures in TypeScript code',
+      content: 'Prefer immutable data structures in TypeScript code for safety',
+      local_embedding: sharedEmbedding,
+    })];
+
+    const candidates = [makeCandidate({
+      summary: 'Use readonly data types in TypeScript modules',
+      content: 'Use readonly data types in TypeScript modules for correctness',
+    })];
+
+    // Candidate embedding is identical to existing → cosine = 1.0
+    const candidateEmbeddings = new Map<number, Float32Array>();
+    candidateEmbeddings.set(0, sharedEmbedding);
+
+    const { kept, skipped } = deduplicateCandidates(
+      candidates, existing, 0.45, candidateEmbeddings
+    );
+    // Cosine of identical embeddings = 1.0, well above 0.45
+    expect(skipped).toBe(1);
+  });
+
+  it('performs intra-batch dedup', () => {
+    const candidates = [
+      makeCandidate({
+        summary: 'Use TypeScript strict mode always',
+        content: 'Enable TypeScript strict mode in tsconfig',
+      }),
+      makeCandidate({
+        summary: 'Use TypeScript strict mode always',
+        content: 'Enable TypeScript strict mode in tsconfig for safety',
+      }),
+    ];
+
+    const { kept, skipped } = deduplicateCandidates(candidates, [], 0.45);
+    expect(skipped).toBe(1);
+    expect(kept).toHaveLength(1);
+  });
+
+  it('gracefully handles empty candidateEmbeddings map', () => {
+    const candidates = [makeCandidate({
+      summary: 'Test content here',
+      content: 'Test content here for dedup',
+    })];
+
+    const { kept, skipped } = deduplicateCandidates(candidates, [], 0.45);
+    expect(kept).toHaveLength(1);
+    expect(skipped).toBe(0);
   });
 });
 
