@@ -16,6 +16,7 @@ import {
   insertMemory,
   insertEdge,
   updateMemory,
+  deleteEdgesForMemory,
 } from '../infra/db.js';
 import { tokenize, hybridSimilarity } from '../core/similarity.js';
 import { createMemory } from '../core/types.js';
@@ -260,6 +261,14 @@ export function mergePair(
   const tx = db.transaction(() => {
     insertMemory(db, mergedMemory);
 
+    // Clean up old edges before superseding (must precede new edge insertion)
+    deleteEdgesForMemory(db, pair.memoryA.id);
+    deleteEdgesForMemory(db, pair.memoryB.id);
+
+    // Mark old memories as superseded (FR-077)
+    updateMemory(db, pair.memoryA.id, { status: 'superseded' });
+    updateMemory(db, pair.memoryB.id, { status: 'superseded' });
+
     // Create supersedes edges (FR-076)
     insertEdge(db, {
       source_id: mergedMemory.id,
@@ -278,10 +287,6 @@ export function mergePair(
       bidirectional: false,
       status: 'active',
     });
-
-    // Mark old memories as superseded (FR-077)
-    updateMemory(db, pair.memoryA.id, { status: 'superseded' });
-    updateMemory(db, pair.memoryB.id, { status: 'superseded' });
   });
 
   tx();

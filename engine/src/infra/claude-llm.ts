@@ -4,13 +4,42 @@
  *
  * FR-001: Extract memories automatically at session end
  * FR-009: Complete extraction within 30 seconds (p95)
+ * FR-056: Support typed edges between memories
  */
 
-import type { MemoryPair, EdgeClassification } from './gemini-llm.js';
-import { buildEdgeClassificationPrompt, parseEdgeClassificationResponse } from './gemini-llm.js';
+import type { EdgeRelation } from '../core/types.js';
+import { isEdgeRelation } from '../core/types.js';
 
 const EXTRACTION_TIMEOUT_MS = 30_000;
 const EDGE_CLASSIFICATION_TIMEOUT_MS = 90_000;
+
+/**
+ * Memory pair for edge classification.
+ */
+export interface MemoryPair {
+  readonly source: {
+    readonly id: string;
+    readonly content: string;
+    readonly summary: string;
+    readonly memory_type: string;
+  };
+  readonly target: {
+    readonly id: string;
+    readonly content: string;
+    readonly summary: string;
+    readonly memory_type: string;
+  };
+}
+
+/**
+ * Edge classification result.
+ */
+export interface EdgeClassification {
+  readonly source_id: string;
+  readonly target_id: string;
+  readonly relation_type: EdgeRelation;
+  readonly strength: number;
+}
 
 /**
  * Check if `claude` binary is available on PATH.
@@ -117,4 +146,130 @@ export async function classifyEdges(
   const prompt = buildEdgeClassificationPrompt(pairs);
   const response = await runClaudePrompt(prompt, EDGE_CLASSIFICATION_TIMEOUT_MS);
   return parseEdgeClassificationResponse(response);
+}
+
+/**
+ * Build prompt for edge classification.
+ * Pure function - no side effects.
+ */
+export function buildEdgeClassificationPrompt(
+  pairs: readonly MemoryPair[]
+): string {
+  const pairDescriptions = pairs
+    .map(
+      (pair, idx) => `
+Pair ${idx + 1}:
+  Source [${pair.source.id}]:
+    Type: ${pair.source.memory_type}
+    Summary: ${pair.source.summary}
+    Content: ${pair.source.content}
+
+  Target [${pair.target.id}]:
+    Type: ${pair.target.memory_type}
+    Summary: ${pair.target.summary}
+    Content: ${pair.target.content}
+`
+    )
+    .join('\n');
+
+  return `Classify relationships between memory pairs.
+
+Memory Pairs:
+${pairDescriptions}
+
+Edge Relation Types:
+- relates_to: General semantic connection
+- derived_from: Target derived from source
+- contradicts: Target contradicts source
+- exemplifies: Target is example of source
+- refines: Target refines/improves source
+- supersedes: Target replaces source
+- source_of: Source is origin of target
+
+Rules:
+1. Assign relation_type based on semantic relationship
+2. Assign strength 0-1 based on relationship strength:
+   - 0.8-1.0: Strong, clear relationship
+   - 0.5-0.79: Moderate relationship
+   - 0.3-0.49: Weak relationship
+3. Only return edges with strength >= 0.3
+
+Return JSON array:
+[
+  {
+    "source_id": "id1",
+    "target_id": "id2",
+    "relation_type": "relates_to",
+    "strength": 0.75
+  }
+]
+
+If no strong relationships, return empty array [].`;
+}
+
+/**
+ * Parse edge classification response.
+ * Pure function - returns parsed edges or empty array on failure.
+ */
+export function parseEdgeClassificationResponse(
+  response: string
+): readonly EdgeClassification[] {
+  try {
+    // Extract JSON from response (handle markdown code blocks)
+    const jsonMatch = response.match(/```json\s*([\s\S]*?)\s*```/) || [
+      null,
+      response,
+    ];
+    const jsonText = jsonMatch[1] || response;
+
+    const parsed = JSON.parse(jsonText.trim());
+
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    // Validate and filter classifications
+    return parsed
+      .filter(isValidEdgeClassification)
+      .map((c) => ({
+        source_id: String(c.source_id),
+        target_id: String(c.target_id),
+        relation_type: c.relation_type,
+        strength: Number(c.strength),
+      }));
+  } catch (e) {
+    process.stderr.write(`WARNING: Failed to parse edge classification response: ${(e as Error).message}\n`);
+    return [];
+  }
+}
+
+/**
+ * Validate edge classification object.
+ * Type guard for runtime validation.
+ */
+function isValidEdgeClassification(
+  obj: unknown
+): obj is EdgeClassification {
+  if (typeof obj !== 'object' || obj === null) return false;
+
+  const classification = obj as Record<string, unknown>;
+
+  if (
+    typeof classification.source_id !== 'string' ||
+    typeof classification.target_id !== 'string' ||
+    typeof classification.relation_type !== 'string' ||
+    typeof classification.strength !== 'number'
+  ) {
+    return false;
+  }
+
+  if (!isEdgeRelation(classification.relation_type)) {
+    return false;
+  }
+
+  if (classification.strength < 0 || classification.strength > 1) {
+    return false;
+  }
+
+  return true;
 }
