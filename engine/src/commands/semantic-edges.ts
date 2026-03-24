@@ -19,10 +19,9 @@ import { existsSync, unlinkSync, writeFileSync, readFileSync, mkdirSync } from '
 import { join } from 'path';
 import type { Database } from 'bun:sqlite';
 import type { Memory } from '../core/types.js';
-import type { MemoryPair, EdgeClassification } from '../infra/gemini-llm.js';
+import type { MemoryPair, EdgeClassification } from '../infra/claude-llm.js';
+import { classifyEdges, isClaudeLlmAvailable } from '../infra/claude-llm.js';
 import { getRelatesToEdges, getMemoryById, deleteEdge, insertEdge } from '../infra/db.js';
-import { classifyEdges } from '../infra/claude-llm.js';
-import { isClaudeLlmAvailable } from '../infra/claude-llm.js';
 
 /** Max pairs per LLM call to stay within 90s timeout */
 const BATCH_SIZE = 10;
