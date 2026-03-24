@@ -1,3 +1,4 @@
 .memory/
 .claude/cortex-memory.local.md
 node_modules/
+*.checkpoint-*
