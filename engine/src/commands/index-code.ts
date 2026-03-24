@@ -21,7 +21,7 @@ import type { Database } from 'bun:sqlite';
 import type { Memory } from '../core/types.js';
 import { createMemory } from '../core/types.js';
 import { buildEmbeddingText } from '../core/extraction.js';
-import { insertMemory, insertEdge, updateMemory, routeToDatabase, getActiveCodeMemoriesByFilePath, getActiveProseMemoriesByFilePath } from '../infra/db.js';
+import { insertMemory, insertEdge, updateMemory, deleteEdgesForMemory, routeToDatabase, getActiveCodeMemoriesByFilePath, getActiveProseMemoriesByFilePath } from '../infra/db.js';
 import { embedTexts, isGeminiAvailable } from '../infra/gemini-embed.ts';
 import { readFileSync } from 'fs';
 
@@ -430,9 +430,10 @@ export async function executeIndexCode(
       insertMemory(targetDb, proseMemory);
       insertMemory(targetDb, codeMemory);
 
-      // Supersede old code memories
+      // Supersede old code memories — delete stale edges before inserting new ones
       for (const oldMemory of matchingCodeMemories) {
         if (oldMemory.status === 'active') {
+          deleteEdgesForMemory(targetDb, oldMemory.id);
           updateMemory(targetDb, oldMemory.id, { status: 'superseded' });
           supersededCount++;
 
@@ -447,9 +448,10 @@ export async function executeIndexCode(
         }
       }
 
-      // Supersede old prose (code_description) memories
+      // Supersede old prose (code_description) memories — delete stale edges before inserting new ones
       for (const oldProse of matchingProseMemories) {
         if (oldProse.status === 'active') {
+          deleteEdgesForMemory(targetDb, oldProse.id);
           updateMemory(targetDb, oldProse.id, { status: 'superseded' });
           supersededCount++;
 
