@@ -137,20 +137,21 @@ export function jaccardPreFilter(score: number): JaccardPreFilter {
 }
 
 /**
- * Compute hybrid similarity using Jaccard pre-filter + cosine for the "maybe" range.
+ * Compute hybrid similarity preferring cosine (semantic) over Jaccard (lexical).
  * Pure function — takes pre-computed tokens and optional embeddings.
  *
  * Algorithm:
- * 1. Jaccard pre-filter on token sets
- * 2. definitely_different (<0.1): return 0
- * 3. definitely_similar (>0.6): return Jaccard score
- * 4. maybe (0.1-0.6): use cosine if embeddings available + dimensions match, else Jaccard
+ * 1. If both embeddings available + dimensions match → use cosine (catches semantic dupes)
+ * 2. Otherwise fall back to Jaccard pre-filter:
+ *    a. definitely_different (<0.1): return 0
+ *    b. definitely_similar (>0.6): return Jaccard score
+ *    c. maybe (0.1-0.6): return Jaccard score
  *
  * @param tokensA - Pre-tokenized first item
  * @param tokensB - Pre-tokenized second item
  * @param embeddingA - Optional embedding (Float32 or Float64)
  * @param embeddingB - Optional embedding (Float32 or Float64)
- * @returns Similarity score in [0, 1], or 0 if definitely_different
+ * @returns Similarity score in [0, 1], or 0 if definitely_different (no embeddings)
  */
 export function hybridSimilarity(
   tokensA: ReadonlySet<string>,
@@ -158,6 +159,13 @@ export function hybridSimilarity(
   embeddingA: Float64Array | Float32Array | null,
   embeddingB: Float64Array | Float32Array | null
 ): number {
+  // Prefer cosine when embeddings are available — catches semantic duplicates
+  // that use different vocabulary but mean the same thing
+  if (embeddingA && embeddingB && embeddingA.length === embeddingB.length) {
+    return cosineSimilarity(embeddingA, embeddingB);
+  }
+
+  // Fallback: Jaccard with pre-filter when embeddings unavailable
   const jaccardScore = jaccardSimilarity(tokensA, tokensB);
   const preFilter = jaccardPreFilter(jaccardScore);
 
@@ -165,16 +173,6 @@ export function hybridSimilarity(
     return 0;
   }
 
-  if (preFilter.result === 'definitely_similar') {
-    return jaccardScore;
-  }
-
-  // "maybe" range: use cosine if both embeddings present and dimensions match
-  if (embeddingA && embeddingB && embeddingA.length === embeddingB.length) {
-    return cosineSimilarity(embeddingA, embeddingB);
-  }
-
-  // Fallback: return Jaccard score
   return jaccardScore;
 }
 

@@ -441,13 +441,13 @@ describe('batchCosineSimilarity', () => {
 });
 
 describe('hybridSimilarity', () => {
-  it('returns 0 for definitely_different (Jaccard < 0.1)', () => {
+  it('returns 0 for definitely_different when no embeddings (Jaccard < 0.1)', () => {
     const tokensA = tokenize('python data processing pipeline');
     const tokensB = tokenize('css flexbox layout grid');
     expect(hybridSimilarity(tokensA, tokensB, null, null)).toBe(0);
   });
 
-  it('returns Jaccard score for definitely_similar (Jaccard > 0.6)', () => {
+  it('returns Jaccard score for definitely_similar when no embeddings (Jaccard > 0.6)', () => {
     const text = 'the quick brown fox jumps over the lazy dog';
     const tokensA = tokenize(text);
     const tokensB = tokenize(text);
@@ -455,15 +455,11 @@ describe('hybridSimilarity', () => {
     expect(score).toBeCloseTo(1.0);
   });
 
-  it('uses cosine similarity in maybe range when embeddings available', () => {
-    // Tokens have partial Jaccard overlap (lands in "maybe" range 0.1-0.6)
+  it('prefers cosine over Jaccard when embeddings available', () => {
+    // Tokens have partial Jaccard overlap
     const tokensA = tokenize('react state management with hooks');
     const tokensB = tokenize('react context state provider pattern');
-    // Verify we're in "maybe" range
-    const jaccard = jaccardSimilarity(tokensA, tokensB);
-    expect(jaccard).toBeGreaterThanOrEqual(0.1);
-    expect(jaccard).toBeLessThanOrEqual(0.6);
-    // Embeddings are very similar → cosine should override Jaccard
+    // Embeddings are very similar → cosine should be used regardless of Jaccard range
     const embA = new Float32Array([0.8, 0.1, 0.1]);
     const embB = new Float32Array([0.7, 0.2, 0.1]);
     const score = hybridSimilarity(tokensA, tokensB, embA, embB);
@@ -471,7 +467,21 @@ describe('hybridSimilarity', () => {
     expect(score).toBeGreaterThan(0.9);
   });
 
-  it('falls back to Jaccard in maybe range when dimensions mismatch', () => {
+  it('uses cosine even when Jaccard would be definitely_different', () => {
+    // Completely different vocabulary but semantically similar embeddings
+    const tokensA = tokenize('python data processing pipeline');
+    const tokensB = tokenize('css flexbox layout grid');
+    // Verify Jaccard < 0.1 (would be "definitely_different" without embeddings)
+    expect(jaccardSimilarity(tokensA, tokensB)).toBeLessThan(0.1);
+    // But embeddings say they're similar
+    const embA = new Float32Array([0.9, 0.1, 0.0]);
+    const embB = new Float32Array([0.85, 0.15, 0.0]);
+    const score = hybridSimilarity(tokensA, tokensB, embA, embB);
+    // Should use cosine (~0.99), NOT return 0
+    expect(score).toBeGreaterThan(0.9);
+  });
+
+  it('falls back to Jaccard when dimensions mismatch', () => {
     const tokensA = tokenize('similar text content here today');
     const tokensB = tokenize('similar text content here also');
     const embA = new Float32Array([0.1, 0.2, 0.3]); // 3-dim
