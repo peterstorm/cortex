@@ -637,6 +637,65 @@ export function searchByKeyword(
 }
 
 /**
+ * Search memories by keyword using FTS5 with OR semantics
+ * I/O: Reads from database
+ *
+ * @param db - Database instance
+ * @param tokens - Pre-tokenized keywords (caller handles stop-word filtering)
+ * @param limit - Maximum number of results
+ * @returns Readonly array of active memories ranked by FTS5 relevance
+ */
+export function searchByKeywordOr(
+  db: Database,
+  tokens: readonly string[],
+  limit: number
+): readonly Memory[] {
+  if (tokens.length === 0) return [];
+
+  const stmt = db.prepare(`
+    SELECT m.*
+    FROM memories m
+    JOIN memories_fts fts ON m.id = fts.id
+    WHERE memories_fts MATCH ?
+    AND m.status = 'active'
+    ORDER BY rank
+    LIMIT ?
+  `);
+
+  // Quote each token individually and join with OR for broad matching
+  const safeQuery = tokens
+    .filter(t => t.length > 0)
+    .map(t => '"' + t.replace(/"/g, '""') + '"')
+    .join(' OR ');
+
+  if (safeQuery.length === 0) return [];
+
+  const rows = stmt.all(safeQuery, limit) as any[];
+
+  return rows.map(row => createMemory({
+    id: row.id,
+    content: row.content,
+    summary: row.summary,
+    memory_type: row.memory_type,
+    scope: row.scope,
+    embedding: row.embedding ? deserializeFloat64Array(row.embedding) : null,
+    local_embedding: row.local_embedding ? deserializeFloat32Array(row.local_embedding) : null,
+    confidence: row.confidence,
+    priority: row.priority,
+    pinned: row.pinned === 1,
+    source_type: row.source_type,
+    source_session: row.source_session,
+    source_context: row.source_context,
+    tags: JSON.parse(row.tags),
+    access_count: row.access_count,
+    last_accessed_at: row.last_accessed_at,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    status: row.status,
+  }));
+}
+
+/**
  * Get the most recent created_at timestamp across all active/archived memories.
  * Used by lifecycle --if-needed to detect new memories since last run.
  * I/O: Reads from database
