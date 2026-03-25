@@ -21,10 +21,11 @@
  * - traverse: Graph traversal
  * - inspect: Telemetry display
  * - backfill: Process embedding queue
+ * - prompt-recall: Keyword recall from user prompt (UserPromptSubmit hook)
  */
 
 import { Database } from 'bun:sqlite';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { HookInput } from './core/types.js';
 import {
@@ -58,6 +59,7 @@ import { executeTraverse } from './commands/traverse.js';
 import { runInspect } from './commands/inspect.js';
 import { backfill } from './commands/backfill.js';
 import { executeSemanticEdges } from './commands/semantic-edges.js';
+import { executePromptRecall, formatPromptRecall } from './commands/prompt-recall.js';
 
 // ============================================================================
 // TYPES
@@ -863,6 +865,89 @@ async function handleLoadSurface(args: string[]): Promise<CommandResult> {
   }
 }
 
+/**
+ * Handle 'prompt-recall' subcommand (UserPromptSubmit hook)
+ * Reads stdin JSON with prompt + cwd, runs keyword FTS5 recall
+ * Always succeeds — never exits non-zero
+ */
+async function handlePromptRecall(): Promise<CommandResult> {
+  try {
+    // Read raw stdin
+    const stdin = Bun.stdin.stream();
+    const reader = stdin.getReader();
+    const chunks: Uint8Array[] = [];
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+
+    if (chunks.length === 0) {
+      return { success: true };
+    }
+
+    const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const buffer = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      buffer.set(chunk, offset);
+      offset += chunk.length;
+    }
+
+    const text = new TextDecoder().decode(buffer);
+    const parsed = JSON.parse(text);
+
+    const prompt = parsed?.prompt;
+    const cwd = parsed?.cwd;
+    if (typeof prompt !== 'string' || typeof cwd !== 'string') {
+      return { success: true };
+    }
+
+    // Check DBs exist — don't create empty ones for a read-only hook
+    const projectDbPath = getProjectDbPath(cwd);
+    const globalDbPath = getGlobalDbPath();
+    const hasProjectDb = existsSync(projectDbPath);
+    const hasGlobalDb = existsSync(globalDbPath);
+
+    if (!hasProjectDb && !hasGlobalDb) {
+      return { success: true };
+    }
+
+    // Read surface file for dedup
+    const surfacePath = getSurfaceOutputPath(cwd);
+    let surfaceContent = '';
+    try {
+      if (existsSync(surfacePath)) {
+        surfaceContent = readFileSync(surfacePath, 'utf8');
+      }
+    } catch {
+      // Ignore read errors
+    }
+
+    const projectDb = hasProjectDb ? openDatabase(projectDbPath) : null;
+    const globalDb = hasGlobalDb ? openDatabase(globalDbPath) : null;
+
+    try {
+      const memories = executePromptRecall(projectDb, globalDb, {
+        prompt,
+        surfaceContent,
+      });
+      const output = formatPromptRecall(memories);
+
+      return {
+        success: true,
+        output: output || undefined,
+      };
+    } finally {
+      projectDb?.close();
+      globalDb?.close();
+    }
+  } catch {
+    // Never fail — prompt-recall is best-effort
+    return { success: true };
+  }
+}
+
 // ============================================================================
 // MAIN DISPATCH
 // ============================================================================
@@ -876,7 +961,7 @@ async function main() {
 
   if (args.length === 0) {
     logError('Usage: cli.ts <subcommand> [args...]');
-    logError('Subcommands: extract, generate, recall, remember, index-code, forget, consolidate, lifecycle, ai-prune, traverse, inspect, backfill, semantic-edges, load-surface');
+    logError('Subcommands: extract, generate, recall, remember, index-code, forget, consolidate, lifecycle, ai-prune, traverse, inspect, backfill, semantic-edges, load-surface, prompt-recall');
     process.exit(1);
   }
 
@@ -928,6 +1013,9 @@ async function main() {
         break;
       case 'load-surface':
         result = await handleLoadSurface(subcommandArgs);
+        break;
+      case 'prompt-recall':
+        result = await handlePromptRecall();
         break;
       default:
         result = {
