@@ -20,6 +20,7 @@ import {
 } from '../infra/db.js';
 import { tokenize, hybridSimilarity } from '../core/similarity.js';
 import { createMemory } from '../core/types.js';
+import { CONSOLIDATION_SIMILARITY_THRESHOLD } from '../config.js';
 
 // ============================================================================
 // FUNCTIONAL CORE - PURE FUNCTIONS
@@ -48,25 +49,21 @@ export interface MemoryPair {
  */
 export function findSimilarPairs(
   memories: readonly Memory[],
-  threshold: number = 0.5
+  threshold: number = CONSOLIDATION_SIMILARITY_THRESHOLD
 ): readonly MemoryPair[] {
   const pairs: MemoryPair[] = [];
+
+  // Pre-tokenize all memories once (summary+content) to avoid O(n^2) re-tokenization
+  const tokenSets = memories.map(m => tokenize(`${m.summary} ${m.content}`));
+  const embeddings = memories.map(m => m.embedding ?? m.local_embedding);
 
   // Compare each pair exactly once (i < j ensures no duplicates)
   for (let i = 0; i < memories.length; i++) {
     for (let j = i + 1; j < memories.length; j++) {
-      const memoryA = memories[i];
-      const memoryB = memories[j];
-
-      const tokensA = tokenize(memoryA.summary);
-      const tokensB = tokenize(memoryB.summary);
-      const embeddingA = memoryA.embedding ?? memoryA.local_embedding;
-      const embeddingB = memoryB.embedding ?? memoryB.local_embedding;
-
-      const similarity = hybridSimilarity(tokensA, tokensB, embeddingA, embeddingB);
+      const similarity = hybridSimilarity(tokenSets[i], tokenSets[j], embeddings[i], embeddings[j]);
 
       if (similarity >= threshold) {
-        pairs.push({ memoryA, memoryB, similarity });
+        pairs.push({ memoryA: memories[i], memoryB: memories[j], similarity });
       }
     }
   }
@@ -217,7 +214,7 @@ export function detectDuplicates(
   db: Database,
   options: ConsolidateOptions = {}
 ): readonly MemoryPair[] {
-  const threshold = options.threshold ?? 0.5;
+  const threshold = options.threshold ?? CONSOLIDATION_SIMILARITY_THRESHOLD;
 
   // I/O: Fetch all active memories
   const activeMemories = getActiveMemories(db);
@@ -316,7 +313,7 @@ export function executeConsolidate(
   db: Database,
   options: ConsolidateOptions = {}
 ): ConsolidateResult {
-  const threshold = options.threshold ?? 0.5;
+  const threshold = options.threshold ?? CONSOLIDATION_SIMILARITY_THRESHOLD;
   const maxPasses = options.maxPasses ?? 3; // FR-081: default 3, enforced below
   const sessionId = options.sessionId ?? 'consolidate-session';
 

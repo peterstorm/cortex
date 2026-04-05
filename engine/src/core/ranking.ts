@@ -47,8 +47,8 @@ export function computeRank(
   if (!memory.pinned) {
     const halfLife = options.recencyHalfLifeDays ?? RECENCY_HALF_LIFE_DAYS;
     const now = options.now ?? new Date();
-    const createdAt = new Date(memory.created_at);
-    const ageDays = (now.getTime() - createdAt.getTime()) / (1000 * 60 * 60 * 24);
+    const lastAccessed = new Date(memory.last_accessed_at);
+    const ageDays = (now.getTime() - lastAccessed.getTime()) / (1000 * 60 * 60 * 24);
     const recencyMultiplier = 1 / (1 + Math.max(0, ageDays) / halfLife);
     rank *= recencyMultiplier;
   }

@@ -8,7 +8,9 @@ import type { SearchResult, Memory, Edge } from '../core/types.js';
 import { isGeminiAvailable, embedTexts } from '../infra/gemini-embed.ts';
 import {
   getMemoriesWithEmbedding,
+  getMemoriesWithEmbeddingByIds,
   searchByKeyword,
+  searchByKeywordOr,
   getEdgesForMemory,
   getMemoriesByIds,
   getAllEdges,
@@ -16,6 +18,7 @@ import {
 } from '../infra/db.js';
 import { rankBySimilarity } from '../core/similarity.js';
 import { mergeResults } from '../core/ranking.js';
+import { MIN_COSINE_SCORE, SEMANTIC_PRE_FILTER_LIMIT } from '../config.js';
 import { traverseGraph } from '../core/graph.js';
 
 // Command options (validated externally)
@@ -204,12 +207,30 @@ export async function executeRecall(
         throw new Error('No embedding returned');
       }
 
-      // I/O: Fetch candidates, then pure ranking
+      // I/O: Pre-filter via FTS5, then cosine rank the subset
       const embType = queryEmbedding instanceof Float64Array ? 'gemini' : 'local' as const;
-      const projectCandidates = getMemoriesWithEmbedding(projectDb, embType);
-      const globalCandidates = getMemoriesWithEmbedding(globalDb, embType);
-      const projectEmbedResults = rankBySimilarity(projectCandidates, queryEmbedding, limit);
-      const globalEmbedResults = rankBySimilarity(globalCandidates, queryEmbedding, limit);
+
+      // Split query into tokens for OR search
+      const queryTokens = query.split(/\s+/).filter(t => t.length > 0);
+
+      // Pre-filter: get FTS5 candidate IDs, then fetch only those with embeddings
+      const projectFts = queryTokens.length > 0
+        ? searchByKeywordOr(projectDb, queryTokens, SEMANTIC_PRE_FILTER_LIMIT)
+        : [];
+      const globalFts = queryTokens.length > 0
+        ? searchByKeywordOr(globalDb, queryTokens, SEMANTIC_PRE_FILTER_LIMIT)
+        : [];
+
+      // If FTS returns candidates, rank only those; otherwise fall back to full scan
+      const projectCandidates = projectFts.length > 0
+        ? getMemoriesWithEmbeddingByIds(projectDb, projectFts.map(m => m.id), embType)
+        : getMemoriesWithEmbedding(projectDb, embType);
+      const globalCandidates = globalFts.length > 0
+        ? getMemoriesWithEmbeddingByIds(globalDb, globalFts.map(m => m.id), embType)
+        : getMemoriesWithEmbedding(globalDb, embType);
+
+      const projectEmbedResults = rankBySimilarity(projectCandidates, queryEmbedding, limit, MIN_COSINE_SCORE);
+      const globalEmbedResults = rankBySimilarity(globalCandidates, queryEmbedding, limit, MIN_COSINE_SCORE);
 
       projectSearchResults = projectEmbedResults.map(({ memory, score }) => ({
         memory,

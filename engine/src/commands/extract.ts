@@ -53,6 +53,7 @@ import { extractMemories, isClaudeLlmAvailable } from '../infra/claude-llm.js';
 import { getGitContext } from '../infra/git-context.js';
 import { runLifecycle } from './lifecycle.js';
 import { invalidateSurfaceCache } from './generate.js';
+import { DEDUP_SIMILARITY_THRESHOLD } from '../config.js';
 
 // ============================================================================
 // RESULT TYPES
@@ -195,7 +196,7 @@ export async function executeExtract(
 
     // Pure: Dedup candidates against existing memories (hybrid Jaccard + cosine)
     const { kept: dedupedCandidates, skipped: dedupSkipped } =
-      deduplicateCandidates(candidates, existingMemories, 0.45, candidateEmbeddings);
+      deduplicateCandidates(candidates, existingMemories, DEDUP_SIMILARITY_THRESHOLD, candidateEmbeddings);
 
     if (dedupSkipped > 0) {
       logInfo(`Dedup: skipped ${dedupSkipped} near-duplicate candidates (hybrid)`);
@@ -334,14 +335,14 @@ function candidateToMemory(
  *
  * @param candidates - Parsed extraction candidates
  * @param existingMemories - All active memories from DB
- * @param threshold - Similarity threshold for dedup (default 0.6)
+ * @param threshold - Similarity threshold for dedup (default DEDUP_SIMILARITY_THRESHOLD)
  * @param candidateEmbeddings - Map of candidate index → local embedding (optional)
  * @returns Kept candidates and count of skipped duplicates
  */
 export function deduplicateCandidates(
   candidates: readonly MemoryCandidate[],
   existingMemories: readonly Memory[],
-  threshold: number = 0.6,
+  threshold: number = DEDUP_SIMILARITY_THRESHOLD,
   candidateEmbeddings: Map<number, Float32Array> = new Map()
 ): { kept: MemoryCandidate[]; skipped: number } {
   // Pre-tokenize existing memories once

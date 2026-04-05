@@ -161,8 +161,13 @@ export function hybridSimilarity(
 ): number {
   // Prefer cosine when embeddings are available — catches semantic duplicates
   // that use different vocabulary but mean the same thing
-  if (embeddingA && embeddingB && embeddingA.length === embeddingB.length) {
-    return cosineSimilarity(embeddingA, embeddingB);
+  if (embeddingA && embeddingB) {
+    if (embeddingA.length === embeddingB.length) {
+      return cosineSimilarity(embeddingA, embeddingB);
+    }
+    process.stderr.write(
+      `[cortex:similarity] WARN: embedding dimension mismatch (${embeddingA.length} vs ${embeddingB.length}), falling back to Jaccard\n`
+    );
   }
 
   // Fallback: Jaccard with pre-filter when embeddings unavailable
@@ -218,10 +223,12 @@ export function batchCosineSimilarity(
 export function rankBySimilarity(
   candidates: readonly { memory: Memory; embedding: Float64Array | Float32Array }[],
   queryEmbedding: Float64Array | Float32Array,
-  limit: number
+  limit: number,
+  minScore: number = 0
 ): readonly { memory: Memory; score: number }[] {
   return candidates
     .map(({ memory, embedding }) => ({ memory, score: cosineSimilarity(queryEmbedding, embedding) }))
+    .filter(({ score }) => score >= minScore)
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
 }

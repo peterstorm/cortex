@@ -82,8 +82,7 @@ describe('Cortex E2E Integration Tests', () => {
     expect(archivedMemory).not.toBeNull();
     expect(archivedMemory!.status).toBe('archived');
 
-    // Step 5: Recall again - archived memories are still searchable in current implementation
-    // (This tests that recall works with archived memories, which may be useful for recovery)
+    // Step 5: Recall again - archived memories should NOT appear in search results
     const recallResult2 = await executeRecall(projectDb, globalDb, {
       query: 'database architecture',
       limit: 10,
@@ -92,10 +91,9 @@ describe('Cortex E2E Integration Tests', () => {
     expect(recallResult2.success).toBe(true);
     if (!recallResult2.success) return;
 
-    // Memory is found but status shows it's archived
+    // Memory should no longer be found (status='active' filter in searchByKeyword)
     const foundAfterArchive = recallResult2.result.results.find((r) => r.memory.id === memoryId);
-    expect(foundAfterArchive).toBeDefined();
-    expect(foundAfterArchive?.memory.status).toBe('archived');
+    expect(foundAfterArchive).toBeUndefined();
   });
 
   test('lifecycle: decay -> archive -> prune', () => {
