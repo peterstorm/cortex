@@ -8,10 +8,10 @@
 import type { Database } from 'bun:sqlite';
 import * as fs from 'node:fs';
 import type { Memory } from '../core/types.js';
-import { getActiveMemories, getArchivedMemories, getAllEdges, updateMemory, deleteEdgesForMemory, getLatestMemoryTimestamp } from '../infra/db.js';
+import { getActiveMemories, getArchivedMemories, getAllEdges, updateMemory, deleteEdgesForMemory, archiveEdgesForMemory, getLatestMemoryTimestamp, vacuumPrunedMemories } from '../infra/db.js';
 import { computeAllCentrality } from '../core/graph.js';
 import { decayConfidence, determineLifecycleAction } from '../core/decay.js';
-import { LIFECYCLE_FALLBACK_HOURS } from '../config.js';
+import { LIFECYCLE_FALLBACK_HOURS, VACUUM_RETENTION_DAYS } from '../config.js';
 
 export interface LifecycleResult {
   readonly decayed: number;
@@ -107,6 +107,10 @@ export function runLifecycleIfNeeded(
   const projectResult = runLifecycle(projectDb);
   const globalResult = runLifecycle(globalDb);
 
+  // Hard-delete pruned memories past retention period
+  vacuumPrunedMemories(projectDb, VACUUM_RETENTION_DAYS);
+  vacuumPrunedMemories(globalDb, VACUUM_RETENTION_DAYS);
+
   writeLastLifecycleAt(telemetryPath, now.toISOString());
 
   return {
@@ -174,7 +178,7 @@ export function runLifecycle(db: Database): LifecycleResult {
     // I/O: Only write to DB on status transitions
     if (action.action === 'archive') {
       updateMemory(db, memory.id, { status: 'archived' });
-      deleteEdgesForMemory(db, memory.id);
+      archiveEdgesForMemory(db, memory.id);
       archivedCount++;
     } else if (action.action === 'prune') {
       updateMemory(db, memory.id, { status: 'pruned' });

@@ -57,13 +57,21 @@ export const PROMPT_RECALL_LIMIT = 5;
  * @returns Array of meaningful keyword tokens
  */
 export function extractKeywords(prompt: string): readonly string[] {
-  return prompt
+  const unigrams = prompt
     .toLowerCase()
-    .replace(/[^\w\s-]/g, ' ')  // Strip punctuation (keep hyphens for compound words)
+    .replace(/[^\w\s.\-]/g, ' ')  // Strip punctuation (keep hyphens and dots for compound words / versions)
     .split(/\s+/)
     .filter(t => t.length > 1)  // Drop single chars
     .filter(t => !STOP_WORDS.has(t))
     .filter((t, i, arr) => arr.indexOf(t) === i);  // Deduplicate
+
+  // Generate bigrams (adjacent token pairs) for multi-word terms
+  const bigrams: string[] = [];
+  for (let i = 0; i < unigrams.length - 1 && bigrams.length < 10; i++) {
+    bigrams.push(`${unigrams[i]} ${unigrams[i + 1]}`);
+  }
+
+  return [...unigrams, ...bigrams];
 }
 
 /**

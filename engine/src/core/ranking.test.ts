@@ -141,6 +141,7 @@ describe('computeRank recency decay', () => {
       priority: 5,
       access_count: 0,
       created_at: '2024-06-15T00:00:00Z',
+      last_accessed_at: '2024-06-15T00:00:00Z',
     });
     const old = createTestMemory({
       id: '2',
@@ -148,6 +149,7 @@ describe('computeRank recency decay', () => {
       priority: 5,
       access_count: 0,
       created_at: '2024-05-16T00:00:00Z',
+      last_accessed_at: '2024-05-16T00:00:00Z',
     });
 
     const recentRank = computeRank(recent, { maxAccessLog: 1, now });
@@ -164,6 +166,7 @@ describe('computeRank recency decay', () => {
       priority: 5,
       access_count: 0,
       created_at: '2024-06-01T00:00:00Z',
+      last_accessed_at: '2024-06-01T00:00:00Z',
     });
     const fresh = createTestMemory({
       id: '2',
@@ -171,6 +174,7 @@ describe('computeRank recency decay', () => {
       priority: 5,
       access_count: 0,
       created_at: '2024-06-15T00:00:00Z',
+      last_accessed_at: '2024-06-15T00:00:00Z',
     });
 
     const halfLifeRank = computeRank(atHalfLife, { maxAccessLog: 1, now });
@@ -188,6 +192,7 @@ describe('computeRank recency decay', () => {
       access_count: 0,
       pinned: true,
       created_at: '2024-01-01T00:00:00Z',
+      last_accessed_at: '2024-01-01T00:00:00Z',
     });
     const unpinned = createTestMemory({
       id: '2',
@@ -196,6 +201,7 @@ describe('computeRank recency decay', () => {
       access_count: 0,
       pinned: false,
       created_at: '2024-01-01T00:00:00Z',
+      last_accessed_at: '2024-01-01T00:00:00Z',
     });
 
     const pinnedRank = computeRank(pinned, { maxAccessLog: 1, now });
@@ -212,6 +218,7 @@ describe('computeRank recency decay', () => {
       priority: 5,
       access_count: 0,
       created_at: '2024-06-08T00:00:00Z',
+      last_accessed_at: '2024-06-08T00:00:00Z',
     });
 
     const rank7 = computeRank(memory, { maxAccessLog: 1, now, recencyHalfLifeDays: 7 });

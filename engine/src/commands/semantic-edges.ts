@@ -21,7 +21,7 @@ import type { Database } from 'bun:sqlite';
 import type { Memory } from '../core/types.js';
 import type { MemoryPair, EdgeClassification } from '../infra/claude-llm.js';
 import { classifyEdges, isClaudeLlmAvailable } from '../infra/claude-llm.js';
-import { getRelatesToEdges, getMemoryById, deleteEdge, insertEdge } from '../infra/db.js';
+import { getRelatesToEdges, getMemory, deleteEdge, insertEdge } from '../infra/db.js';
 
 /** Max pairs per LLM call to stay within 90s timeout */
 const BATCH_SIZE = 10;
@@ -39,23 +39,34 @@ const LOCK_FILE = join(LOCK_DIR, 'semantic-edges.lock');
  */
 function acquireLock(): boolean {
   try {
-    if (existsSync(LOCK_FILE)) {
+    mkdirSync(LOCK_DIR, { recursive: true });
+    // O_EXCL: atomic create-if-not-exists — eliminates TOCTOU race
+    writeFileSync(LOCK_FILE, String(process.pid), { flag: 'wx' });
+    return true;
+  } catch (err: any) {
+    if (err?.code !== 'EEXIST') return false;
+    // Lock file exists — check if holder is still alive
+    try {
       const existingPid = parseInt(readFileSync(LOCK_FILE, 'utf-8').trim(), 10);
       if (!isNaN(existingPid)) {
         try {
-          // Signal 0 checks if process exists without killing it
           process.kill(existingPid, 0);
           return false; // Process still alive, lock is held
         } catch {
           // Process gone, stale lock — reclaim it
           logInfo(`Reclaiming stale lock from PID ${existingPid}`);
+          unlinkSync(LOCK_FILE);
+          try {
+            writeFileSync(LOCK_FILE, String(process.pid), { flag: 'wx' });
+            return true;
+          } catch {
+            return false; // Another process beat us to reclaim
+          }
         }
       }
+    } catch {
+      return false;
     }
-    mkdirSync(LOCK_DIR, { recursive: true });
-    writeFileSync(LOCK_FILE, String(process.pid));
-    return true;
-  } catch {
     return false;
   }
 }
@@ -149,8 +160,8 @@ export async function executeSemanticEdges(
     let skipped = 0;
 
     for (const edge of relatesToEdges) {
-      const source = getMemoryById(db, edge.source_id);
-      const target = getMemoryById(db, edge.target_id);
+      const source = getMemory(db, edge.source_id);
+      const target = getMemory(db, edge.target_id);
 
       if (!source || !target) {
         skipped++;
@@ -191,17 +202,20 @@ export async function executeSemanticEdges(
           const classification = classMap.get(key);
 
           if (classification && classification.relation_type !== 'relates_to') {
-            // Delete old generic edge, insert typed one
+            // Delete old generic edge + insert typed one atomically
             try {
-              deleteEdge(db, edgeId);
-              insertEdge(db, {
-                source_id: classification.source_id,
-                target_id: classification.target_id,
-                relation_type: classification.relation_type,
-                strength: classification.strength,
-                bidirectional: true,
-                status: 'active',
+              const replaceEdge = db.transaction(() => {
+                deleteEdge(db, edgeId);
+                insertEdge(db, {
+                  source_id: classification.source_id,
+                  target_id: classification.target_id,
+                  relation_type: classification.relation_type,
+                  strength: classification.strength,
+                  bidirectional: true,
+                  status: 'active',
+                });
               });
+              replaceEdge();
               classified++;
             } catch (err) {
               // Unique constraint or other DB error — non-fatal

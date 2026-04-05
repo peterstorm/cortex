@@ -117,7 +117,7 @@ export const EDGE_RELATIONS: readonly EdgeRelation[] = [
 ] as const;
 
 // Edge Status
-export type EdgeStatus = 'active' | 'suggested';
+export type EdgeStatus = 'active' | 'suggested' | 'archived';
 
 // Graph edge (FR-104)
 export interface Edge {

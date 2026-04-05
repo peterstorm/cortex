@@ -199,6 +199,36 @@ export const AI_PRUNE_TIMEOUT_MS = 60_000;
 export const AI_PRUNE_BATCH_SIZE = 80;
 
 /**
+ * Dedup similarity threshold for extraction and remember commands.
+ * Candidates scoring above this against existing memories are skipped as near-duplicates.
+ */
+export const DEDUP_SIMILARITY_THRESHOLD = 0.45;
+
+/**
+ * Consolidation similarity threshold for detecting duplicate memory pairs.
+ * Pairs scoring above this are flagged for merge review.
+ */
+export const CONSOLIDATION_SIMILARITY_THRESHOLD = 0.5;
+
+/**
+ * Retention period in days for pruned memories before hard-delete.
+ * After this period, pruned memories are permanently removed to reclaim space.
+ */
+export const VACUUM_RETENTION_DAYS = 90;
+
+/**
+ * Max FTS5 candidates to pre-filter before cosine ranking in semantic recall.
+ * Limits the O(n) cosine scan to a manageable subset.
+ */
+export const SEMANTIC_PRE_FILTER_LIMIT = 100;
+
+/**
+ * Minimum cosine similarity score for semantic search results.
+ * Results below this threshold are noise and filtered out before ranking.
+ */
+export const MIN_COSINE_SCORE = 0.25;
+
+/**
  * Default search result limit
  */
 export const DEFAULT_SEARCH_LIMIT = 10;

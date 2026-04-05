@@ -16,8 +16,7 @@ import type { MemoryType, MemoryScope, Memory } from '../core/types.js';
 import { createMemory, isMemoryType } from '../core/types.js';
 import { insertMemory, routeToDatabase, getActiveMemories } from '../infra/db.js';
 import { tokenize, hybridSimilarity } from '../core/similarity.js';
-
-const DEDUP_THRESHOLD = 0.45;
+import { DEDUP_SIMILARITY_THRESHOLD } from '../config.js';
 
 // ============================================================================
 // FUNCTIONAL CORE - PURE FUNCTIONS
@@ -196,7 +195,7 @@ export function findDuplicate(
   content: string,
   summary: string,
   existingMemories: readonly Memory[],
-  threshold: number = DEDUP_THRESHOLD
+  threshold: number = DEDUP_SIMILARITY_THRESHOLD
 ): string | null {
   // Symmetric tokenization: summary+content for both candidate and existing
   const candidateTokens = tokenize(`${summary} ${content}`);

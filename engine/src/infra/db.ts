@@ -156,6 +156,34 @@ function deserializeFloat32Array(buffer: Buffer): Float32Array {
 }
 
 /**
+ * Convert a raw database row to a Memory domain object.
+ * Pure helper — centralizes the row-to-Memory mapping used by all query functions.
+ */
+function rowToMemory(row: any): Memory {
+  return createMemory({
+    id: row.id,
+    content: row.content,
+    summary: row.summary,
+    memory_type: row.memory_type,
+    scope: row.scope,
+    embedding: row.embedding ? deserializeFloat64Array(row.embedding) : null,
+    local_embedding: row.local_embedding ? deserializeFloat32Array(row.local_embedding) : null,
+    confidence: row.confidence,
+    priority: row.priority,
+    pinned: row.pinned === 1,
+    source_type: row.source_type,
+    source_session: row.source_session,
+    source_context: row.source_context,
+    tags: JSON.parse(row.tags),
+    access_count: row.access_count,
+    last_accessed_at: row.last_accessed_at,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    status: row.status,
+  });
+}
+
+/**
  * Insert memory into database
  * I/O: Writes to database
  *
@@ -301,27 +329,7 @@ export function getMemory(db: Database, id: string): Memory | null {
     return null;
   }
 
-  return createMemory({
-    id: row.id,
-    content: row.content,
-    summary: row.summary,
-    memory_type: row.memory_type,
-    scope: row.scope,
-    embedding: row.embedding ? deserializeFloat64Array(row.embedding) : null,
-    local_embedding: row.local_embedding ? deserializeFloat32Array(row.local_embedding) : null,
-    confidence: row.confidence,
-    priority: row.priority,
-    pinned: row.pinned === 1,
-    source_type: row.source_type,
-    source_session: row.source_session,
-    source_context: row.source_context,
-    tags: JSON.parse(row.tags),
-    access_count: row.access_count,
-    last_accessed_at: row.last_accessed_at,
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-    status: row.status,
-  });
+  return rowToMemory(row);
 }
 
 /**
@@ -345,27 +353,7 @@ export function getMemoriesByIds(db: Database, ids: readonly string[]): readonly
 
   const rows = stmt.all(...ids) as any[];
 
-  return rows.map(row => createMemory({
-    id: row.id,
-    content: row.content,
-    summary: row.summary,
-    memory_type: row.memory_type,
-    scope: row.scope,
-    embedding: row.embedding ? deserializeFloat64Array(row.embedding) : null,
-    local_embedding: row.local_embedding ? deserializeFloat32Array(row.local_embedding) : null,
-    confidence: row.confidence,
-    priority: row.priority,
-    pinned: row.pinned === 1,
-    source_type: row.source_type,
-    source_session: row.source_session,
-    source_context: row.source_context,
-    tags: JSON.parse(row.tags),
-    access_count: row.access_count,
-    last_accessed_at: row.last_accessed_at,
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-    status: row.status,
-  }));
+  return rows.map(rowToMemory);
 }
 
 /**
@@ -382,27 +370,7 @@ export function getActiveMemories(db: Database): readonly Memory[] {
 
   const rows = stmt.all() as any[];
 
-  return rows.map(row => createMemory({
-    id: row.id,
-    content: row.content,
-    summary: row.summary,
-    memory_type: row.memory_type,
-    scope: row.scope,
-    embedding: row.embedding ? deserializeFloat64Array(row.embedding) : null,
-    local_embedding: row.local_embedding ? deserializeFloat32Array(row.local_embedding) : null,
-    confidence: row.confidence,
-    priority: row.priority,
-    pinned: row.pinned === 1,
-    source_type: row.source_type,
-    source_session: row.source_session,
-    source_context: row.source_context,
-    tags: JSON.parse(row.tags),
-    access_count: row.access_count,
-    last_accessed_at: row.last_accessed_at,
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-    status: row.status,
-  }));
+  return rows.map(rowToMemory);
 }
 
 /**
@@ -424,27 +392,7 @@ export function getActiveCodeMemoriesByFilePath(
   `);
   const rows = stmt.all(pattern) as any[];
 
-  return rows.map(row => createMemory({
-    id: row.id,
-    content: row.content,
-    summary: row.summary,
-    memory_type: row.memory_type,
-    scope: row.scope,
-    embedding: row.embedding ? deserializeFloat64Array(row.embedding) : null,
-    local_embedding: row.local_embedding ? deserializeFloat32Array(row.local_embedding) : null,
-    confidence: row.confidence,
-    priority: row.priority,
-    pinned: row.pinned === 1,
-    source_type: row.source_type,
-    source_session: row.source_session,
-    source_context: row.source_context,
-    tags: JSON.parse(row.tags),
-    access_count: row.access_count,
-    last_accessed_at: row.last_accessed_at,
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-    status: row.status,
-  }));
+  return rows.map(rowToMemory);
 }
 
 /**
@@ -465,27 +413,7 @@ export function getActiveProseMemoriesByFilePath(
   `);
   const rows = stmt.all(pattern) as any[];
 
-  return rows.map(row => createMemory({
-    id: row.id,
-    content: row.content,
-    summary: row.summary,
-    memory_type: row.memory_type,
-    scope: row.scope,
-    embedding: row.embedding ? deserializeFloat64Array(row.embedding) : null,
-    local_embedding: row.local_embedding ? deserializeFloat32Array(row.local_embedding) : null,
-    confidence: row.confidence,
-    priority: row.priority,
-    pinned: row.pinned === 1,
-    source_type: row.source_type,
-    source_session: row.source_session,
-    source_context: row.source_context,
-    tags: JSON.parse(row.tags),
-    access_count: row.access_count,
-    last_accessed_at: row.last_accessed_at,
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-    status: row.status,
-  }));
+  return rows.map(rowToMemory);
 }
 
 /**
@@ -502,27 +430,7 @@ export function getArchivedMemories(db: Database): readonly Memory[] {
 
   const rows = stmt.all() as any[];
 
-  return rows.map(row => createMemory({
-    id: row.id,
-    content: row.content,
-    summary: row.summary,
-    memory_type: row.memory_type,
-    scope: row.scope,
-    embedding: row.embedding ? deserializeFloat64Array(row.embedding) : null,
-    local_embedding: row.local_embedding ? deserializeFloat32Array(row.local_embedding) : null,
-    confidence: row.confidence,
-    priority: row.priority,
-    pinned: row.pinned === 1,
-    source_type: row.source_type,
-    source_session: row.source_session,
-    source_context: row.source_context,
-    tags: JSON.parse(row.tags),
-    access_count: row.access_count,
-    last_accessed_at: row.last_accessed_at,
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-    status: row.status,
-  }));
+  return rows.map(rowToMemory);
 }
 
 /**
@@ -546,27 +454,7 @@ export function getMemoriesWithEmbedding(
   const results: { memory: Memory; embedding: Float64Array | Float32Array }[] = [];
 
   for (const row of rows) {
-    const memory = createMemory({
-      id: row.id,
-      content: row.content,
-      summary: row.summary,
-      memory_type: row.memory_type,
-      scope: row.scope,
-      embedding: row.embedding ? deserializeFloat64Array(row.embedding) : null,
-      local_embedding: row.local_embedding ? deserializeFloat32Array(row.local_embedding) : null,
-      confidence: row.confidence,
-      priority: row.priority,
-      pinned: row.pinned === 1,
-      source_type: row.source_type,
-      source_session: row.source_session,
-      source_context: row.source_context,
-      tags: JSON.parse(row.tags),
-      access_count: row.access_count,
-      last_accessed_at: row.last_accessed_at,
-      created_at: row.created_at,
-      updated_at: row.updated_at,
-      status: row.status,
-    });
+    const memory = rowToMemory(row);
 
     const memoryEmbedding = type === 'gemini' ? memory.embedding : memory.local_embedding;
     if (!memoryEmbedding) {
@@ -600,6 +488,7 @@ export function searchByKeyword(
     FROM memories m
     JOIN memories_fts fts ON m.id = fts.id
     WHERE memories_fts MATCH ?
+    AND m.status = 'active'
     ORDER BY rank
     LIMIT ?
   `);
@@ -613,27 +502,7 @@ export function searchByKeyword(
     .join(' ');
   const rows = stmt.all(safeQuery, limit) as any[];
 
-  return rows.map(row => createMemory({
-    id: row.id,
-    content: row.content,
-    summary: row.summary,
-    memory_type: row.memory_type,
-    scope: row.scope,
-    embedding: row.embedding ? deserializeFloat64Array(row.embedding) : null,
-    local_embedding: row.local_embedding ? deserializeFloat32Array(row.local_embedding) : null,
-    confidence: row.confidence,
-    priority: row.priority,
-    pinned: row.pinned === 1,
-    source_type: row.source_type,
-    source_session: row.source_session,
-    source_context: row.source_context,
-    tags: JSON.parse(row.tags),
-    access_count: row.access_count,
-    last_accessed_at: row.last_accessed_at,
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-    status: row.status,
-  }));
+  return rows.map(rowToMemory);
 }
 
 /**
@@ -672,27 +541,38 @@ export function searchByKeywordOr(
 
   const rows = stmt.all(safeQuery, limit) as any[];
 
-  return rows.map(row => createMemory({
-    id: row.id,
-    content: row.content,
-    summary: row.summary,
-    memory_type: row.memory_type,
-    scope: row.scope,
-    embedding: row.embedding ? deserializeFloat64Array(row.embedding) : null,
-    local_embedding: row.local_embedding ? deserializeFloat32Array(row.local_embedding) : null,
-    confidence: row.confidence,
-    priority: row.priority,
-    pinned: row.pinned === 1,
-    source_type: row.source_type,
-    source_session: row.source_session,
-    source_context: row.source_context,
-    tags: JSON.parse(row.tags),
-    access_count: row.access_count,
-    last_accessed_at: row.last_accessed_at,
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-    status: row.status,
-  }));
+  return rows.map(rowToMemory);
+}
+
+/**
+ * Fetch memories with embeddings filtered to a set of IDs.
+ * Used by semantic pre-filter: FTS5 narrows candidates, then cosine ranks the subset.
+ * I/O: Reads from database
+ */
+export function getMemoriesWithEmbeddingByIds(
+  db: Database,
+  ids: readonly string[],
+  type: 'gemini' | 'local'
+): readonly { memory: Memory; embedding: Float64Array | Float32Array }[] {
+  if (ids.length === 0) return [];
+
+  const column = type === 'gemini' ? 'embedding' : 'local_embedding';
+  const placeholders = ids.map(() => '?').join(',');
+  const stmt = db.prepare(`
+    SELECT * FROM memories WHERE id IN (${placeholders}) AND ${column} IS NOT NULL
+  `);
+
+  const rows = stmt.all(...ids) as any[];
+  const results: { memory: Memory; embedding: Float64Array | Float32Array }[] = [];
+
+  for (const row of rows) {
+    const memory = rowToMemory(row);
+    const memoryEmbedding = type === 'gemini' ? memory.embedding : memory.local_embedding;
+    if (!memoryEmbedding) continue;
+    results.push({ memory, embedding: memoryEmbedding });
+  }
+
+  return results;
 }
 
 /**
@@ -772,7 +652,8 @@ export function insertEdge(
 export function getEdgesForMemory(db: Database, memoryId: string): readonly Edge[] {
   const stmt = db.prepare(`
     SELECT * FROM edges
-    WHERE source_id = ? OR (target_id = ? AND bidirectional = 1)
+    WHERE (source_id = ? OR (target_id = ? AND bidirectional = 1))
+    AND status IN ('active', 'suggested')
   `);
 
   const rows = stmt.all(memoryId, memoryId) as any[];
@@ -803,7 +684,7 @@ export function getEdgesForMemory(db: Database, memoryId: string): readonly Edge
  * @returns Readonly array of all edges
  */
 export function getAllEdges(db: Database): readonly Edge[] {
-  const stmt = db.prepare(`SELECT * FROM edges`);
+  const stmt = db.prepare(`SELECT * FROM edges WHERE status IN ('active', 'suggested')`);
   const rows = stmt.all() as any[];
 
   return rows.flatMap(row => {
@@ -833,7 +714,7 @@ export function getAllEdges(db: Database): readonly Edge[] {
  */
 export function getRelatesToEdges(db: Database): readonly Edge[] {
   const stmt = db.prepare(`
-    SELECT * FROM edges WHERE relation_type = 'relates_to'
+    SELECT * FROM edges WHERE relation_type = 'relates_to' AND status IN ('active', 'suggested')
   `);
 
   const rows = stmt.all() as any[];
@@ -867,6 +748,22 @@ export function deleteEdge(db: Database, edgeId: string): void {
 }
 
 /**
+ * Soft-delete (archive) all edges connected to a memory.
+ * Used on memory archive — preserves edges for potential recovery.
+ * I/O: Writes to database
+ *
+ * @param db - Database instance
+ * @param memoryId - Memory ID whose edges to archive
+ * @returns Number of edges archived
+ */
+export function archiveEdgesForMemory(db: Database, memoryId: string): number {
+  const result = db.prepare(
+    `UPDATE edges SET status = 'archived' WHERE source_id = ? OR target_id = ?`
+  ).run(memoryId, memoryId);
+  return result.changes;
+}
+
+/**
  * Delete all edges connected to a memory (source or target)
  * I/O: Writes to database
  *
@@ -880,40 +777,20 @@ export function deleteEdgesForMemory(db: Database, memoryId: string): number {
 }
 
 /**
- * Get a memory by ID
- * I/O: Reads from database
+ * Hard-delete pruned memories older than retentionDays.
+ * Permanently removes data to reclaim space. Run after lifecycle.
+ * I/O: Deletes from database
  *
  * @param db - Database instance
- * @param id - Memory ID
- * @returns Memory or null if not found
+ * @param retentionDays - Days to keep pruned memories before hard-delete
+ * @returns Number of memories permanently deleted
  */
-export function getMemoryById(db: Database, id: string): Memory | null {
-  const stmt = db.prepare(`SELECT * FROM memories WHERE id = ?`);
-  const row = stmt.get(id) as any;
-
-  if (!row) return null;
-
-  return createMemory({
-    id: row.id,
-    content: row.content,
-    summary: row.summary,
-    memory_type: row.memory_type,
-    scope: row.scope,
-    embedding: row.embedding ? deserializeFloat64Array(row.embedding) : null,
-    local_embedding: row.local_embedding ? deserializeFloat32Array(row.local_embedding) : null,
-    confidence: row.confidence,
-    priority: row.priority,
-    pinned: row.pinned === 1,
-    source_type: row.source_type,
-    source_session: row.source_session,
-    source_context: row.source_context,
-    tags: JSON.parse(row.tags),
-    access_count: row.access_count,
-    last_accessed_at: row.last_accessed_at,
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-    status: row.status,
-  });
+export function vacuumPrunedMemories(db: Database, retentionDays: number): number {
+  const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
+  const result = db.prepare(
+    `DELETE FROM memories WHERE status = 'pruned' AND updated_at < ?`
+  ).run(cutoff);
+  return result.changes;
 }
 
 // ============================================================================
