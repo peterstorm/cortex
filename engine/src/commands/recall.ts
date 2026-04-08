@@ -16,7 +16,7 @@ import {
   getAllEdges,
   updateMemory,
 } from '../infra/db.js';
-import { rankBySimilarity } from '../core/similarity.js';
+import { rankByFusedSimilarity, tokenize } from '../core/similarity.js';
 import { mergeResults } from '../core/ranking.js';
 import { MIN_COSINE_SCORE, SEMANTIC_PRE_FILTER_LIMIT } from '../config.js';
 import { traverseGraph } from '../core/graph.js';
@@ -229,8 +229,9 @@ export async function executeRecall(
         ? getMemoriesWithEmbeddingByIds(globalDb, globalFts.map(m => m.id), embType)
         : getMemoriesWithEmbedding(globalDb, embType);
 
-      const projectEmbedResults = rankBySimilarity(projectCandidates, queryEmbedding, limit, MIN_COSINE_SCORE);
-      const globalEmbedResults = rankBySimilarity(globalCandidates, queryEmbedding, limit, MIN_COSINE_SCORE);
+      const fusedQueryTokens = tokenize(query);
+      const projectEmbedResults = rankByFusedSimilarity(projectCandidates, queryEmbedding, fusedQueryTokens, limit, MIN_COSINE_SCORE);
+      const globalEmbedResults = rankByFusedSimilarity(globalCandidates, queryEmbedding, fusedQueryTokens, limit, MIN_COSINE_SCORE);
 
       projectSearchResults = projectEmbedResults.map(({ memory, score }) => ({
         memory,

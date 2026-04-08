@@ -36,6 +36,7 @@ import {
   parseExtractionResponse,
   buildEmbeddingText,
 } from '../core/extraction.js';
+import type { EntityFactCandidate, EntityProfile } from '../core/entities.js';
 import {
   tokenize,
   hybridSimilarity,
@@ -44,20 +45,34 @@ import {
 import { embedLocal, ensureModelLoaded } from '../infra/local-embed.ts';
 import {
   insertMemory,
+  updateMemory,
+  getMemory,
   getExtractionCheckpoint,
   saveExtractionCheckpoint,
   getActiveMemories,
   insertEdge,
+  upsertEntity,
+  insertFact,
+  getCurrentFacts,
+  supersedeFact,
+  getAllEntities,
 } from '../infra/db.js';
 import { extractMemories, isClaudeLlmAvailable } from '../infra/claude-llm.js';
 import { getGitContext } from '../infra/git-context.js';
 import { runLifecycle } from './lifecycle.js';
 import { invalidateSurfaceCache } from './generate.js';
-import { DEDUP_SIMILARITY_THRESHOLD } from '../config.js';
+import { DEDUP_SIMILARITY_THRESHOLD, MERGE_CEILING_THRESHOLD } from '../config.js';
 
 // ============================================================================
 // RESULT TYPES
 // ============================================================================
+
+export interface FactConflict {
+  readonly entityName: string;
+  readonly predicate: string;
+  readonly oldValue: string;
+  readonly newValue: string;
+}
 
 export interface ExtractionResult {
   readonly success: boolean;
@@ -65,6 +80,8 @@ export interface ExtractionResult {
   readonly edge_count: number;
   readonly cursor_position: number;
   readonly dedup_skipped?: number;
+  readonly dedup_merged?: number;
+  readonly entity_conflicts?: readonly FactConflict[];
   readonly error?: string;
 }
 
@@ -142,8 +159,14 @@ export async function executeExtract(
     // Pure: Derive project name from cwd
     const projectName = basename(input.cwd);
 
-    // Pure: Build extraction prompt
-    const prompt = buildExtractionPrompt(truncated, gitContext, projectName);
+    // I/O: Fetch known entities to inject context into extraction prompt
+    const knownEntityProfiles = buildKnownEntityProfiles(projectDb);
+    if (knownEntityProfiles.length > 0) {
+      logInfo(`Injecting ${knownEntityProfiles.length} known entities into extraction prompt`);
+    }
+
+    // Pure: Build extraction prompt (with entity context)
+    const prompt = buildExtractionPrompt(truncated, gitContext, projectName, knownEntityProfiles);
 
     // I/O: Call Claude CLI for extraction (async)
     logInfo('Using Claude for memory extraction');
@@ -168,10 +191,12 @@ export async function executeExtract(
       };
     }
 
-    // Pure: Parse extraction response
-    const candidates = parseExtractionResponse(response);
+    // Pure: Parse extraction response (memories + entities)
+    const extractionResult = parseExtractionResponse(response);
+    const candidates = extractionResult.memories;
+    const entityCandidates = extractionResult.entities;
 
-    if (candidates.length === 0) {
+    if (candidates.length === 0 && entityCandidates.length === 0) {
       // No memories extracted - still save checkpoint
       saveExtractionCheckpoint(projectDb, {
         session_id: input.session_id,
@@ -195,11 +220,31 @@ export async function executeExtract(
     const candidateEmbeddings = await generateCandidateEmbeddings(candidates, projectName);
 
     // Pure: Dedup candidates against existing memories (hybrid Jaccard + cosine)
-    const { kept: dedupedCandidates, skipped: dedupSkipped } =
-      deduplicateCandidates(candidates, existingMemories, DEDUP_SIMILARITY_THRESHOLD, candidateEmbeddings);
+    const { kept: dedupedCandidates, skipped: dedupSkipped, merges: dedupMerges } =
+      deduplicateCandidates(candidates, existingMemories, DEDUP_SIMILARITY_THRESHOLD, candidateEmbeddings, MERGE_CEILING_THRESHOLD);
 
     if (dedupSkipped > 0) {
       logInfo(`Dedup: skipped ${dedupSkipped} near-duplicate candidates (hybrid)`);
+    }
+
+    // Process merges: append new content to existing memories
+    if (dedupMerges.length > 0) {
+      logInfo(`Dedup: merging ${dedupMerges.length} candidates into existing memories`);
+      for (const merge of dedupMerges) {
+        try {
+          const existing = getMemory(projectDb, merge.existingMemoryId);
+          if (!existing) continue;
+          updateMemory(projectDb, merge.existingMemoryId, {
+            content: `${existing.content}\n---\n${merge.candidate.content}`,
+            // Null out embeddings so backfill regenerates with updated content
+            embedding: null,
+            local_embedding: null,
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          logError(`Failed to merge into ${merge.existingMemoryId}: ${message}`);
+        }
+      }
     }
 
     // Process each candidate — individual insert failures are non-fatal.
@@ -231,6 +276,26 @@ export async function executeExtract(
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         logError(`Failed to compute similarity: ${message}`);
+        // Non-fatal - continue
+      }
+    }
+
+    // Process entity-fact candidates from extraction
+    let entityConflicts: readonly FactConflict[] = [];
+    if (entityCandidates.length > 0 && insertedMemories.length > 0) {
+      try {
+        const entityResult = processEntityFacts(projectDb, entityCandidates, insertedMemories);
+        if (entityResult.entitiesCreated > 0 || entityResult.factsCreated > 0) {
+          logInfo(`Entities: ${entityResult.entitiesCreated} entities, ${entityResult.factsCreated} facts created`);
+        }
+        // Log conflicts prominently
+        for (const conflict of entityResult.conflicts) {
+          logInfo(`FACT CHANGED: ${conflict.entityName} "${conflict.predicate}" was "${conflict.oldValue}" → now "${conflict.newValue}"`);
+        }
+        entityConflicts = entityResult.conflicts;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        logError(`Entity processing failed: ${message}`);
         // Non-fatal - continue
       }
     }
@@ -268,6 +333,8 @@ export async function executeExtract(
       edge_count: edgeCount,
       cursor_position: newCursor,
       dedup_skipped: dedupSkipped > 0 ? dedupSkipped : undefined,
+      dedup_merged: dedupMerges.length > 0 ? dedupMerges.length : undefined,
+      entity_conflicts: entityConflicts.length > 0 ? entityConflicts : undefined,
     };
   } catch (err) {
     // Catch-all for unexpected errors (FR-010, FR-011)
@@ -329,34 +396,49 @@ function candidateToMemory(
   });
 }
 
+/** A merge target: candidate content should be appended to an existing memory */
+export interface DeduplicateMerge {
+  readonly candidate: MemoryCandidate;
+  readonly existingMemoryId: string;
+}
+
 /**
  * Deduplicate extraction candidates against existing memories and each other.
  * Pure function — uses hybrid Jaccard+cosine similarity to filter near-duplicates.
+ *
+ * Three outcomes per candidate:
+ * - score >= mergeCeiling: **skip** (true duplicate)
+ * - score in [threshold, mergeCeiling): **merge** into existing memory
+ * - score < threshold: **keep** (new memory)
  *
  * @param candidates - Parsed extraction candidates
  * @param existingMemories - All active memories from DB
  * @param threshold - Similarity threshold for dedup (default DEDUP_SIMILARITY_THRESHOLD)
  * @param candidateEmbeddings - Map of candidate index → local embedding (optional)
- * @returns Kept candidates and count of skipped duplicates
+ * @param mergeCeiling - Score at or above which candidates are skipped instead of merged (default MERGE_CEILING_THRESHOLD)
+ * @returns Kept candidates, count of skipped duplicates, and merge targets
  */
 export function deduplicateCandidates(
   candidates: readonly MemoryCandidate[],
   existingMemories: readonly Memory[],
   threshold: number = DEDUP_SIMILARITY_THRESHOLD,
-  candidateEmbeddings: Map<number, Float32Array> = new Map()
-): { kept: MemoryCandidate[]; skipped: number } {
+  candidateEmbeddings: Map<number, Float32Array> = new Map(),
+  mergeCeiling: number = MERGE_CEILING_THRESHOLD
+): { kept: MemoryCandidate[]; skipped: number; merges: DeduplicateMerge[] } {
   // Pre-tokenize existing memories once
   const existingTokenSets = existingMemories.map(
     (m) => tokenize(`${m.summary} ${m.content}`)
   );
-  // Pre-extract existing embeddings (prefer local to match candidate dimensions)
+  // Only use local_embedding (384-dim) for cosine comparison — avoids dimension
+  // mismatch with candidate embeddings which are always 384-dim local.
   const existingEmbeddings = existingMemories.map(
-    (m) => m.local_embedding ?? m.embedding ?? null
+    (m) => m.local_embedding ?? null
   );
 
   const kept: MemoryCandidate[] = [];
   const keptTokenSets: ReadonlySet<string>[] = [];
   const keptEmbeddings: (Float32Array | null)[] = [];
+  const merges: DeduplicateMerge[] = [];
   let skipped = 0;
 
   for (let i = 0; i < candidates.length; i++) {
@@ -365,7 +447,8 @@ export function deduplicateCandidates(
     const candidateEmbedding = candidateEmbeddings.get(i) ?? null;
 
     // Check against existing memories (hybrid)
-    let isDuplicate = false;
+    let bestScore = 0;
+    let bestMatchIndex = -1;
     for (let j = 0; j < existingTokenSets.length; j++) {
       const score = hybridSimilarity(
         candidateTokens,
@@ -373,14 +456,14 @@ export function deduplicateCandidates(
         candidateEmbedding,
         existingEmbeddings[j]
       );
-      if (score >= threshold) {
-        isDuplicate = true;
-        break;
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatchIndex = j;
       }
     }
 
     // Check against already-kept candidates in this batch (intra-batch dedup)
-    if (!isDuplicate) {
+    if (bestScore < threshold) {
       for (let j = 0; j < keptTokenSets.length; j++) {
         const score = hybridSimilarity(
           candidateTokens,
@@ -389,13 +472,25 @@ export function deduplicateCandidates(
           keptEmbeddings[j]
         );
         if (score >= threshold) {
-          isDuplicate = true;
+          // Intra-batch duplicates are always skipped (no merge target)
+          bestScore = score;
+          bestMatchIndex = -1; // no existing memory to merge into
           break;
         }
       }
     }
 
-    if (isDuplicate) {
+    if (bestScore >= mergeCeiling) {
+      // True duplicate — skip entirely
+      skipped++;
+    } else if (bestScore >= threshold && bestMatchIndex >= 0) {
+      // Similar but not identical — merge into existing memory
+      merges.push({
+        candidate,
+        existingMemoryId: existingMemories[bestMatchIndex].id,
+      });
+    } else if (bestScore >= threshold) {
+      // Intra-batch duplicate with no merge target — skip
       skipped++;
     } else {
       kept.push(candidate);
@@ -404,7 +499,7 @@ export function deduplicateCandidates(
     }
   }
 
-  return { kept, skipped };
+  return { kept, skipped, merges };
 }
 
 /**
@@ -526,6 +621,101 @@ async function generateCandidateEmbeddings(
   }
 
   return embeddings;
+}
+
+/**
+ * Process extracted entity-fact candidates: upsert entities, insert facts,
+ * supersede conflicting facts (same entity + predicate, different object).
+ * I/O boundary — writes to database.
+ *
+ * @param db - Database instance
+ * @param candidates - Extracted entity-fact candidates
+ * @param sourceMemories - Memories from this extraction batch (for source linking)
+ * @returns Count of entities/facts created and any detected conflicts
+ */
+function processEntityFacts(
+  db: Database,
+  candidates: readonly EntityFactCandidate[],
+  sourceMemories: readonly Memory[]
+): { entitiesCreated: number; factsCreated: number; conflicts: readonly FactConflict[] } {
+  let entitiesCreated = 0;
+  let factsCreated = 0;
+  const conflicts: FactConflict[] = [];
+
+  // Use the first inserted memory as default source (best we can do without per-fact attribution)
+  const defaultSourceId = sourceMemories[0]?.id;
+  if (!defaultSourceId) return { entitiesCreated: 0, factsCreated: 0, conflicts: [] };
+
+  const now = new Date().toISOString();
+
+  for (const candidate of candidates) {
+    // Upsert entity (returns existing ID if already known)
+    const entityId = upsertEntity(db, candidate.entity_name, candidate.entity_type);
+
+    // Check if this is a new entity (no existing facts = likely new)
+    const existingFacts = getCurrentFacts(db, entityId);
+    if (existingFacts.length === 0) {
+      entitiesCreated++;
+    }
+
+    // Check for conflicting fact: same predicate, different object → supersede
+    const conflicting = existingFacts.find(
+      (f) => f.predicate.toLowerCase() === candidate.predicate.toLowerCase() &&
+             f.object.toLowerCase() !== candidate.object.toLowerCase()
+    );
+    if (conflicting) {
+      supersedeFact(db, conflicting.id);
+      conflicts.push({
+        entityName: candidate.entity_name,
+        predicate: candidate.predicate,
+        oldValue: conflicting.object,
+        newValue: candidate.object,
+      });
+    }
+
+    // Skip if exact duplicate fact already exists
+    const exactDup = existingFacts.find(
+      (f) => f.predicate.toLowerCase() === candidate.predicate.toLowerCase() &&
+             f.object.toLowerCase() === candidate.object.toLowerCase()
+    );
+    if (exactDup) continue;
+
+    // Insert new fact
+    const factId = randomUUID();
+    insertFact(db, {
+      id: factId,
+      entity_id: entityId,
+      predicate: candidate.predicate,
+      object: candidate.object,
+      source_memory_id: defaultSourceId,
+      confidence: 0.7, // Default confidence for extracted facts
+      valid_from: now,
+      valid_to: null,
+      created_at: now,
+    });
+    factsCreated++;
+  }
+
+  return { entitiesCreated, factsCreated, conflicts };
+}
+
+/**
+ * Build entity profiles from the project DB for injection into extraction prompt.
+ * Skips entities with no current facts. Max 20 entities (prompt budget).
+ * I/O: Reads from database.
+ */
+function buildKnownEntityProfiles(db: Database): readonly EntityProfile[] {
+  const entities = getAllEntities(db);
+  const profiles: EntityProfile[] = [];
+
+  for (const entity of entities) {
+    const facts = getCurrentFacts(db, entity.id);
+    if (facts.length === 0) continue;
+    profiles.push({ entity, currentFacts: facts, sourceMemories: [] });
+    if (profiles.length >= 20) break;
+  }
+
+  return profiles;
 }
 
 /**

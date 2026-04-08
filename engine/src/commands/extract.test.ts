@@ -102,27 +102,27 @@ describe('extract command - core logic', () => {
         },
       ]);
 
-      const candidates = parseExtractionResponse(response);
+      const result = parseExtractionResponse(response);
 
-      expect(candidates.length).toBe(1);
-      expect(candidates[0].content).toBe('Test content');
-      expect(candidates[0].memory_type).toBe('decision');
+      expect(result.memories.length).toBe(1);
+      expect(result.memories[0].content).toBe('Test content');
+      expect(result.memories[0].memory_type).toBe('decision');
     });
 
     it('handles markdown code blocks', () => {
       const response = '```json\n[{"content":"test","summary":"test","memory_type":"context","scope":"project","confidence":0.5,"priority":5,"tags":[]}]\n```';
 
-      const candidates = parseExtractionResponse(response);
+      const result = parseExtractionResponse(response);
 
-      expect(candidates.length).toBe(1);
+      expect(result.memories.length).toBe(1);
     });
 
-    it('returns empty array for invalid JSON', () => {
+    it('returns empty for invalid JSON', () => {
       const response = 'not json';
 
-      const candidates = parseExtractionResponse(response);
+      const result = parseExtractionResponse(response);
 
-      expect(candidates.length).toBe(0);
+      expect(result.memories.length).toBe(0);
     });
 
     it('filters invalid candidates', () => {
@@ -156,10 +156,10 @@ describe('extract command - core logic', () => {
         },
       ]);
 
-      const candidates = parseExtractionResponse(response);
+      const result = parseExtractionResponse(response);
 
-      expect(candidates.length).toBe(1);
-      expect(candidates[0].content).toBe('Valid');
+      expect(result.memories.length).toBe(1);
+      expect(result.memories[0].content).toBe('Valid');
     });
   });
 
