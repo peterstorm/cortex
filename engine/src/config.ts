@@ -211,6 +211,14 @@ export const DEDUP_SIMILARITY_THRESHOLD = 0.45;
 export const CONSOLIDATION_SIMILARITY_THRESHOLD = 0.5;
 
 /**
+ * Score ceiling for merge-into-existing during extraction dedup.
+ * Candidates with score in [DEDUP_SIMILARITY_THRESHOLD, MERGE_CEILING_THRESHOLD)
+ * are merged into the existing memory rather than skipped.
+ * Candidates with score >= MERGE_CEILING_THRESHOLD are true duplicates and skipped.
+ */
+export const MERGE_CEILING_THRESHOLD = 0.5;
+
+/**
  * Retention period in days for pruned memories before hard-delete.
  * After this period, pruned memories are permanently removed to reclaim space.
  */
@@ -227,6 +235,13 @@ export const SEMANTIC_PRE_FILTER_LIMIT = 100;
  * Results below this threshold are noise and filtered out before ranking.
  */
 export const MIN_COSINE_SCORE = 0.25;
+
+/**
+ * Weight for keyword overlap boost in fused ranking.
+ * Controls how much lexical overlap amplifies cosine similarity.
+ * 0 = pure cosine, 1.0 = keyword overlap doubles score at full match.
+ */
+export const KEYWORD_OVERLAP_WEIGHT = 0.3;
 
 /**
  * Default search result limit

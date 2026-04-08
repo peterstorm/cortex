@@ -5,6 +5,14 @@
 
 import type { MemoryType, MemoryScope, MemoryCandidate, GitContext } from './types.js';
 import { MEMORY_TYPES, isMemoryType } from './types.js';
+import type { EntityFactCandidate, EntityProfile } from './entities.js';
+import { isValidEntityFactCandidate } from './entities.js';
+
+/** Result of parsing an extraction response — memories and optional entity-facts */
+export interface ParsedExtractionResult {
+  readonly memories: readonly MemoryCandidate[];
+  readonly entities: readonly EntityFactCandidate[];
+}
 
 export interface TruncationResult {
   readonly truncated: string;
@@ -86,7 +94,8 @@ export function truncateTranscript(
 export function buildExtractionPrompt(
   transcript: string,
   gitContext: GitContext,
-  projectName: string
+  projectName: string,
+  knownEntities: readonly EntityProfile[] = []
 ): string {
   const { branch, recent_commits, changed_files } = gitContext;
 
@@ -103,11 +112,13 @@ export function buildExtractionPrompt(
     .filter(Boolean)
     .join("\n");
 
+  const knownEntitiesBlock = formatKnownEntities(knownEntities);
+
   return `Extract memories from this Claude Code session transcript.
 
 Git Context:
 ${contextBlock}
-
+${knownEntitiesBlock}
 Transcript (JSONL format):
 ${transcript}
 
@@ -140,35 +151,54 @@ Extract memories following these rules:
 
 5. Tags: Extract relevant keywords/topics as array of strings
 
-Return JSON array of memories:
-[
-  {
-    "content": "Full detailed content",
-    "summary": "Concise 1-2 sentence summary",
-    "memory_type": "decision",
-    "scope": "project",
-    "confidence": 0.85,
-    "priority": 8,
-    "tags": ["api-design", "performance"]
-  }
-]
+6. Entity Extraction:
+   Extract notable entities and facts as subject-predicate-object triples.
+   Entity types: person, project, tool, concept, org, other.
+   Only extract concrete, factual assertions — not vague observations.
 
-If no significant memories, return empty array [].`;
+Return JSON object with memories and entities:
+{
+  "memories": [
+    {
+      "content": "Full detailed content",
+      "summary": "Concise 1-2 sentence summary",
+      "memory_type": "decision",
+      "scope": "project",
+      "confidence": 0.85,
+      "priority": 8,
+      "tags": ["api-design", "performance"]
+    }
+  ],
+  "entities": [
+    {
+      "entity_name": "NixOS",
+      "entity_type": "tool",
+      "predicate": "used for",
+      "object": "system configuration"
+    }
+  ]
+}
+
+If no significant memories or entities, return empty arrays.`;
 }
 
 /**
- * Parses LLM extraction response into memory candidates.
+ * Parses LLM extraction response into memory candidates and entity-fact candidates.
+ *
+ * Supports two response formats for backward compatibility:
+ * - Old format: JSON array of memories → { memories: [...], entities: [] }
+ * - New format: JSON object with "memories" and optional "entities" keys
  *
  * FR-005: Validate memory types
  * FR-006: Validate confidence range
  * FR-007: Validate priority range
  *
  * @param response - Raw LLM response text
- * @returns Array of validated memory candidates, or empty array on parse failure
+ * @returns Parsed memories and entity-fact candidates
  */
 export function parseExtractionResponse(
   response: string
-): readonly MemoryCandidate[] {
+): ParsedExtractionResult {
   try {
     // Extract JSON from response (handle markdown code blocks)
     const jsonMatch = response.match(/```json\s*([\s\S]*?)\s*```/) || [
@@ -179,18 +209,30 @@ export function parseExtractionResponse(
 
     const parsed = JSON.parse(jsonText.trim());
 
-    if (!Array.isArray(parsed)) {
-      process.stderr.write(`[cortex:extraction] WARN: Expected array, got ${typeof parsed}. Returning empty.\n`);
-      return [];
+    // Determine format: old (plain array) or new (object with memories key)
+    let rawMemories: unknown[];
+    let rawEntities: unknown[];
+
+    if (Array.isArray(parsed)) {
+      // Old format: plain JSON array of memories
+      rawMemories = parsed;
+      rawEntities = [];
+    } else if (typeof parsed === 'object' && parsed !== null && Array.isArray(parsed.memories)) {
+      // New format: { memories: [...], entities: [...] }
+      rawMemories = parsed.memories;
+      rawEntities = Array.isArray(parsed.entities) ? parsed.entities : [];
+    } else {
+      process.stderr.write(`[cortex:extraction] WARN: Expected array or {memories:[]}, got ${typeof parsed}. Returning empty.\n`);
+      return { memories: [], entities: [] };
     }
 
-    // Validate and filter candidates
-    const valid = parsed.filter(isValidCandidate);
-    if (valid.length === 0 && parsed.length > 0) {
-      process.stderr.write(`[cortex:extraction] WARN: 0 valid from ${parsed.length} raw candidates\n`);
+    // Validate and filter memory candidates
+    const validMemories = rawMemories.filter(isValidCandidate);
+    if (validMemories.length === 0 && rawMemories.length > 0) {
+      process.stderr.write(`[cortex:extraction] WARN: 0 valid from ${rawMemories.length} raw candidates\n`);
     }
 
-    return valid.map((c) => ({
+    const memories: readonly MemoryCandidate[] = validMemories.map((c) => ({
       content: String(c.content),
       summary: String(c.summary),
       memory_type: isMemoryType(c.memory_type) ? c.memory_type : 'context',
@@ -199,11 +241,57 @@ export function parseExtractionResponse(
       priority: Number(c.priority),
       tags: Array.isArray(c.tags) ? c.tags.map(String) : [],
     }));
+
+    // Validate and filter entity-fact candidates
+    const entities: readonly EntityFactCandidate[] = rawEntities
+      .filter(isValidEntityFactCandidate)
+      .map((c) => ({
+        entity_name: String((c as any).entity_name).trim(),
+        entity_type: (c as any).entity_type,
+        predicate: String((c as any).predicate).trim(),
+        object: String((c as any).object).trim(),
+      }));
+
+    return { memories, entities };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     process.stderr.write(`[cortex:extraction] WARN: Parse failure: ${message}. Response (truncated): ${response.slice(0, 200)}\n`);
-    return [];
+    return { memories: [], entities: [] };
   }
+}
+
+/**
+ * Format known entities as a prompt section for extraction context.
+ * Max 20 entities, max 3 facts each. Compact one-line-per-entity format.
+ * Pure function.
+ */
+export function formatKnownEntities(
+  profiles: readonly EntityProfile[],
+  maxEntities: number = 20,
+  maxFactsPerEntity: number = 3
+): string {
+  const withFacts = profiles.filter(p => p.currentFacts.length > 0);
+  if (withFacts.length === 0) return '';
+
+  const lines: string[] = [];
+  lines.push('');
+  lines.push('Known Entities (already tracked):');
+
+  const selected = withFacts.slice(0, maxEntities);
+  for (const profile of selected) {
+    const facts = profile.currentFacts
+      .slice(0, maxFactsPerEntity)
+      .map(f => `${f.predicate} → ${f.object}`)
+      .join('; ');
+    lines.push(`- ${profile.entity.name} (${profile.entity.entity_type}): ${facts}`);
+  }
+
+  lines.push('');
+  lines.push('Do NOT re-extract facts that are already known unless the transcript contradicts them.');
+  lines.push('When a new fact contradicts an existing one, extract the new fact — it will supersede the old one.');
+  lines.push('');
+
+  return lines.join('\n');
 }
 
 /**

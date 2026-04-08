@@ -271,8 +271,8 @@ describe("parseExtractionResponse", () => {
 
     const result = parseExtractionResponse(response);
 
-    expect(result).toHaveLength(1);
-    expect(result[0]).toEqual({
+    expect(result.memories).toHaveLength(1);
+    expect(result.memories[0]).toEqual({
       content: "Test content",
       summary: "Test summary",
       memory_type: "decision",
@@ -281,6 +281,7 @@ describe("parseExtractionResponse", () => {
       priority: 7,
       tags: ["api", "design"],
     });
+    expect(result.entities).toEqual([]);
   });
 
   it("parses JSON wrapped in markdown code block", () => {
@@ -300,22 +301,24 @@ describe("parseExtractionResponse", () => {
 
     const result = parseExtractionResponse(response);
 
-    expect(result).toHaveLength(1);
-    expect(result[0].memory_type).toBe("pattern");
+    expect(result.memories).toHaveLength(1);
+    expect(result.memories[0].memory_type).toBe("pattern");
   });
 
-  it("returns empty array for invalid JSON", () => {
+  it("returns empty for invalid JSON", () => {
     const response = "not valid json";
     const result = parseExtractionResponse(response);
 
-    expect(result).toEqual([]);
+    expect(result.memories).toEqual([]);
+    expect(result.entities).toEqual([]);
   });
 
-  it("returns empty array for non-array JSON", () => {
+  it("returns empty for non-array JSON without memories key", () => {
     const response = JSON.stringify({ notAnArray: true });
     const result = parseExtractionResponse(response);
 
-    expect(result).toEqual([]);
+    expect(result.memories).toEqual([]);
+    expect(result.entities).toEqual([]);
   });
 
   it("filters out invalid memory types (FR-005)", () => {
@@ -342,8 +345,8 @@ describe("parseExtractionResponse", () => {
 
     const result = parseExtractionResponse(response);
 
-    expect(result).toHaveLength(1);
-    expect(result[0].memory_type).toBe("decision");
+    expect(result.memories).toHaveLength(1);
+    expect(result.memories[0].memory_type).toBe("decision");
   });
 
   it("filters out invalid confidence values (FR-006)", () => {
@@ -379,8 +382,8 @@ describe("parseExtractionResponse", () => {
 
     const result = parseExtractionResponse(response);
 
-    expect(result).toHaveLength(1);
-    expect(result[0].confidence).toBe(0.5);
+    expect(result.memories).toHaveLength(1);
+    expect(result.memories[0].confidence).toBe(0.5);
   });
 
   it("filters out invalid priority values (FR-007)", () => {
@@ -425,8 +428,8 @@ describe("parseExtractionResponse", () => {
 
     const result = parseExtractionResponse(response);
 
-    expect(result).toHaveLength(1);
-    expect(result[0].priority).toBe(5);
+    expect(result.memories).toHaveLength(1);
+    expect(result.memories[0].priority).toBe(5);
   });
 
   it("validates all 8 memory types", () => {
@@ -455,8 +458,8 @@ describe("parseExtractionResponse", () => {
       ]);
 
       const result = parseExtractionResponse(response);
-      expect(result).toHaveLength(1);
-      expect(result[0].memory_type).toBe(type);
+      expect(result.memories).toHaveLength(1);
+      expect(result.memories[0].memory_type).toBe(type);
     });
   });
 
@@ -474,8 +477,8 @@ describe("parseExtractionResponse", () => {
     ]);
 
     const result = parseExtractionResponse(response);
-    expect(result).toHaveLength(1);
-    expect(result[0].tags).toEqual(["api", "performance", "security"]);
+    expect(result.memories).toHaveLength(1);
+    expect(result.memories[0].tags).toEqual(["api", "performance", "security"]);
   });
 
   it("handles missing tags field", () => {
@@ -491,11 +494,11 @@ describe("parseExtractionResponse", () => {
     ]);
 
     const result = parseExtractionResponse(response);
-    expect(result).toHaveLength(1);
-    expect(result[0].tags).toEqual([]);
+    expect(result.memories).toHaveLength(1);
+    expect(result.memories[0].tags).toEqual([]);
   });
 
-  it("returns empty array when all candidates are invalid", () => {
+  it("returns empty when all candidates are invalid", () => {
     const response = JSON.stringify([
       {
         content: "Missing fields",
@@ -512,7 +515,7 @@ describe("parseExtractionResponse", () => {
     ]);
 
     const result = parseExtractionResponse(response);
-    expect(result).toEqual([]);
+    expect(result.memories).toEqual([]);
   });
 
   // Property-based tests
@@ -543,12 +546,12 @@ describe("parseExtractionResponse", () => {
       tags: fc.array(fc.string()),
     });
 
-    it("always returns array", () => {
+    it("always returns memories array", () => {
       fc.assert(
         fc.property(fc.array(validMemoryArb), (memories) => {
           const response = JSON.stringify(memories);
           const result = parseExtractionResponse(response);
-          expect(Array.isArray(result)).toBe(true);
+          expect(Array.isArray(result.memories)).toBe(true);
         })
       );
     });
@@ -559,7 +562,7 @@ describe("parseExtractionResponse", () => {
           const response = JSON.stringify(memories);
           const result = parseExtractionResponse(response);
 
-          result.forEach((memory) => {
+          result.memories.forEach((memory) => {
             expect(memory.memory_type).toMatch(
               /^(architecture|decision|pattern|gotcha|context|progress|code_description|code)$/
             );
@@ -574,7 +577,7 @@ describe("parseExtractionResponse", () => {
           const response = JSON.stringify(memories);
           const result = parseExtractionResponse(response);
 
-          result.forEach((memory) => {
+          result.memories.forEach((memory) => {
             expect(memory.confidence).toBeGreaterThanOrEqual(0);
             expect(memory.confidence).toBeLessThanOrEqual(1);
           });
@@ -588,7 +591,7 @@ describe("parseExtractionResponse", () => {
           const response = JSON.stringify(memories);
           const result = parseExtractionResponse(response);
 
-          result.forEach((memory) => {
+          result.memories.forEach((memory) => {
             expect(memory.priority).toBeGreaterThanOrEqual(1);
             expect(memory.priority).toBeLessThanOrEqual(10);
             expect(Number.isInteger(memory.priority)).toBe(true);
@@ -603,7 +606,7 @@ describe("parseExtractionResponse", () => {
           const response = JSON.stringify(memories);
           const result = parseExtractionResponse(response);
 
-          result.forEach((memory) => {
+          result.memories.forEach((memory) => {
             expect(Array.isArray(memory.tags)).toBe(true);
           });
         })

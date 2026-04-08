@@ -4,6 +4,7 @@
  */
 
 import type { SimilarityAction, Memory } from './types.js';
+import { KEYWORD_OVERLAP_WEIGHT } from '../config.js';
 
 /**
  * Discriminated union for Jaccard pre-filter results
@@ -229,6 +230,48 @@ export function rankBySimilarity(
   return candidates
     .map(({ memory, embedding }) => ({ memory, score: cosineSimilarity(queryEmbedding, embedding) }))
     .filter(({ score }) => score >= minScore)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+}
+
+/**
+ * Rank memory candidates by fused cosine + keyword overlap score.
+ * Pure function — takes pre-fetched candidates and returns sorted results.
+ *
+ * Formula: fused_score = cosine_score * (1 + keywordWeight * overlap_ratio)
+ * where overlap_ratio is Jaccard(queryTokens, memoryTokens).
+ *
+ * The keyword boost helps proper noun queries ("NixOS", "BullMQ") rank
+ * exact lexical matches above semantically similar but different-vocabulary results.
+ *
+ * @param candidates - Memories with their embeddings (from I/O layer)
+ * @param queryEmbedding - Query embedding vector
+ * @param queryTokens - Pre-tokenized query for keyword overlap
+ * @param limit - Maximum results to return
+ * @param minScore - Minimum raw cosine score before fusion (default 0)
+ * @param keywordWeight - Weight for keyword overlap boost (default KEYWORD_OVERLAP_WEIGHT)
+ * @returns Sorted array of {memory, score} by fused score descending
+ */
+export function rankByFusedSimilarity(
+  candidates: readonly { memory: Memory; embedding: Float64Array | Float32Array }[],
+  queryEmbedding: Float64Array | Float32Array,
+  queryTokens: ReadonlySet<string>,
+  limit: number,
+  minScore: number = 0,
+  keywordWeight: number = KEYWORD_OVERLAP_WEIGHT
+): readonly { memory: Memory; score: number }[] {
+  return candidates
+    .map(({ memory, embedding }) => {
+      const cosineScore = cosineSimilarity(queryEmbedding, embedding);
+      if (cosineScore < minScore) return null;
+
+      const memoryTokens = tokenize(`${memory.summary} ${memory.tags.join(' ')}`);
+      const overlapRatio = jaccardSimilarity(queryTokens, memoryTokens);
+      const fusedScore = cosineScore * (1 + keywordWeight * overlapRatio);
+
+      return { memory, score: fusedScore };
+    })
+    .filter((r): r is { memory: Memory; score: number } => r !== null)
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
 }
