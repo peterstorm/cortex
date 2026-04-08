@@ -66,6 +66,12 @@ export function generateSurface(
 
   sections.push('');
 
+  // Render entity profiles section early — compact and high-value, survives truncation
+  const entitySection = renderEntitySection(entityProfiles);
+  if (entitySection) {
+    sections.push(entitySection);
+  }
+
   // Group by category and render
   const byCategory = groupByCategory(memories);
 
@@ -83,12 +89,6 @@ export function generateSurface(
     }
 
     sections.push('');
-  }
-
-  // Render entity profiles section (max 5 entities, max 3 facts each)
-  const entitySection = renderEntitySection(entityProfiles);
-  if (entitySection) {
-    sections.push(entitySection);
   }
 
   const content = sections.join('\n');
