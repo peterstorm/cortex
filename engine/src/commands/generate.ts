@@ -11,8 +11,9 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { Memory } from '../core/types.js';
 import type { RankedMemory } from '../core/surface.js';
+import type { EntityProfile } from '../core/entities.js';
 import { SURFACE_STALE_HOURS, SURFACE_OVERHEAD_TOKENS } from '../config.js';
-import { getActiveMemories, getAllEdges } from '../infra/db.js';
+import { getActiveMemories, getAllEdges, getAllEntities, getCurrentFacts } from '../infra/db.js';
 import { computeAllCentrality } from '../core/graph.js';
 import { selectForSurface } from '../core/ranking.js';
 import { generateSurface, wrapInMarkers } from '../core/surface.js';
@@ -67,6 +68,9 @@ export function runGenerate(options: GenerateOptions): GenerateResult {
   const globalMemories = getActiveMemories(options.globalDb);
   const allMemories = [...projectMemories, ...globalMemories];
 
+  // I/O: Fetch entities and current facts for surface entity section
+  const entityProfiles = buildEntityProfiles(options.projectDb, options.globalDb);
+
   // I/O: Fetch all edges for centrality computation
   const projectEdges = getAllEdges(options.projectDb);
   const globalEdges = getAllEdges(options.globalDb);
@@ -89,8 +93,8 @@ export function runGenerate(options: GenerateOptions): GenerateResult {
     maxTokens: 2000 - SURFACE_OVERHEAD_TOKENS,
   });
 
-  // Pure: Generate surface markdown
-  const surfaceContent = generateSurface(rankedMemories, branch, null);
+  // Pure: Generate surface markdown (includes entity profiles section)
+  const surfaceContent = generateSurface(rankedMemories, branch, null, {}, entityProfiles);
 
   // Pure: Wrap in markers
   const markedContent = wrapInMarkers(surfaceContent);
@@ -194,6 +198,36 @@ function writeCache(cacheDir: string, branch: string, cwd: string, surface: stri
 function computeCacheKey(branch: string, cwd: string): string {
   const input = `${branch}:${cwd}`;
   return crypto.createHash('sha256').update(input).digest('hex').slice(0, 16);
+}
+
+/**
+ * Build entity profiles from both DBs for surface rendering.
+ * Deduplicates by entity name (case-insensitive). Skips entities with no current facts.
+ * I/O: Reads from database.
+ */
+function buildEntityProfiles(projectDb: Database, globalDb: Database): readonly EntityProfile[] {
+  const profiles: EntityProfile[] = [];
+  const seen = new Set<string>();
+
+  for (const db of [projectDb, globalDb]) {
+    const entities = getAllEntities(db);
+    for (const entity of entities) {
+      const key = entity.name.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const facts = getCurrentFacts(db, entity.id);
+      if (facts.length === 0) continue;
+
+      profiles.push({
+        entity,
+        currentFacts: facts,
+        sourceMemories: [],
+      });
+    }
+  }
+
+  return profiles;
 }
 
 /**

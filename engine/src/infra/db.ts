@@ -14,6 +14,8 @@ import type {
   EdgeRelation,
 } from '../core/types.js';
 import { createMemory, createEdge, createExtractionCheckpoint, isEdgeRelation, isMemoryType } from '../core/types.js';
+import type { Entity, Fact, EntityType } from '../core/entities.js';
+import { createEntity, createFact, isEntityType } from '../core/entities.js';
 
 // ============================================================================
 // SCHEMA INITIALIZATION
@@ -100,6 +102,54 @@ CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON extraction_checkpoints(ses
 -- Indexes on edges for graph traversal
 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
+
+-- Entity table: named things (people, projects, tools, concepts)
+CREATE TABLE IF NOT EXISTS entities (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  entity_type TEXT NOT NULL,
+  aliases TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_name_type
+  ON entities(LOWER(name), entity_type);
+
+-- FTS5 for entity name search
+CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(
+  id UNINDEXED, name, aliases
+);
+
+CREATE TRIGGER IF NOT EXISTS entities_ai AFTER INSERT ON entities BEGIN
+  INSERT INTO entities_fts(id, name, aliases) VALUES (new.id, new.name, new.aliases);
+END;
+CREATE TRIGGER IF NOT EXISTS entities_ad AFTER DELETE ON entities BEGIN
+  DELETE FROM entities_fts WHERE id = old.id;
+END;
+CREATE TRIGGER IF NOT EXISTS entities_au AFTER UPDATE ON entities BEGIN
+  DELETE FROM entities_fts WHERE id = old.id;
+  INSERT INTO entities_fts(id, name, aliases) VALUES (new.id, new.name, new.aliases);
+END;
+
+-- Fact table: temporal assertions about entities (subject-predicate-object)
+CREATE TABLE IF NOT EXISTS facts (
+  id TEXT PRIMARY KEY,
+  entity_id TEXT NOT NULL,
+  predicate TEXT NOT NULL,
+  object TEXT NOT NULL,
+  source_memory_id TEXT NOT NULL,
+  confidence REAL NOT NULL,
+  valid_from TEXT NOT NULL,
+  valid_to TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+  FOREIGN KEY (source_memory_id) REFERENCES memories(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_facts_entity ON facts(entity_id);
+CREATE INDEX IF NOT EXISTS idx_facts_source ON facts(source_memory_id);
+CREATE INDEX IF NOT EXISTS idx_facts_valid ON facts(valid_to);
 `;
 
 /**
@@ -927,7 +977,7 @@ export function createCheckpoint(db: Database): string {
 /**
  * Allowlist of known table names to prevent SQL injection
  */
-const ALLOWED_TABLES = new Set(['memories', 'edges', 'extraction_checkpoints']);
+const ALLOWED_TABLES = new Set(['memories', 'edges', 'extraction_checkpoints', 'entities', 'facts']);
 
 /**
  * Validate table name against allowlist
@@ -996,4 +1046,225 @@ export function routeToDatabase(
   globalDb: Database
 ): Database {
   return scope === 'project' ? projectDb : globalDb;
+}
+
+// ============================================================================
+// ENTITY CRUD OPERATIONS
+// ============================================================================
+
+/**
+ * Upsert entity by name + type (case-insensitive match).
+ * Returns existing entity ID if found, otherwise inserts and returns new ID.
+ * I/O: Reads/writes database
+ */
+export function upsertEntity(
+  db: Database,
+  name: string,
+  entityType: EntityType,
+  aliases: readonly string[] = []
+): string {
+  // Try exact match first (case-insensitive)
+  const existing = db.prepare(
+    `SELECT * FROM entities WHERE LOWER(name) = LOWER(?) AND entity_type = ?`
+  ).get(name, entityType) as any;
+
+  if (existing) {
+    return existing.id;
+  }
+
+  const id = randomUUID();
+  const now = new Date().toISOString();
+  const entity = createEntity({
+    id,
+    name,
+    entity_type: entityType,
+    aliases,
+    created_at: now,
+    updated_at: now,
+  });
+
+  db.prepare(`
+    INSERT INTO entities (id, name, entity_type, aliases, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(entity.id, entity.name, entity.entity_type, JSON.stringify(entity.aliases), entity.created_at, entity.updated_at);
+
+  return entity.id;
+}
+
+/**
+ * Get entity by exact name (case-insensitive).
+ * I/O: Reads from database
+ */
+export function getEntityByName(db: Database, name: string): Entity | null {
+  const row = db.prepare(
+    `SELECT * FROM entities WHERE LOWER(name) = LOWER(?)`
+  ).get(name) as any;
+
+  if (!row) return null;
+
+  return createEntity({
+    id: row.id,
+    name: row.name,
+    entity_type: row.entity_type,
+    aliases: JSON.parse(row.aliases),
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  });
+}
+
+/**
+ * Search entities via FTS5 on name and aliases.
+ * I/O: Reads from database
+ */
+export function searchEntities(
+  db: Database,
+  query: string,
+  limit: number = 10
+): readonly Entity[] {
+  const safeQuery = query
+    .split(/\s+/)
+    .filter(t => t.length > 0)
+    .map(t => '"' + t.replace(/"/g, '""') + '"')
+    .join(' OR ');
+
+  if (safeQuery.length === 0) return [];
+
+  const rows = db.prepare(`
+    SELECT e.*
+    FROM entities e
+    JOIN entities_fts fts ON e.id = fts.id
+    WHERE entities_fts MATCH ?
+    LIMIT ?
+  `).all(safeQuery, limit) as any[];
+
+  return rows.map(row => createEntity({
+    id: row.id,
+    name: row.name,
+    entity_type: row.entity_type,
+    aliases: JSON.parse(row.aliases),
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  }));
+}
+
+/**
+ * Get all entities from database, ordered by name.
+ * I/O: Reads from database
+ */
+export function getAllEntities(db: Database): readonly Entity[] {
+  const rows = db.prepare(
+    `SELECT * FROM entities ORDER BY name`
+  ).all() as any[];
+
+  return rows.map(row => createEntity({
+    id: row.id,
+    name: row.name,
+    entity_type: row.entity_type,
+    aliases: JSON.parse(row.aliases),
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  }));
+}
+
+// ============================================================================
+// FACT CRUD OPERATIONS
+// ============================================================================
+
+/**
+ * Insert a new fact.
+ * I/O: Writes to database
+ */
+export function insertFact(db: Database, fact: Fact): string {
+  db.prepare(`
+    INSERT INTO facts (id, entity_id, predicate, object, source_memory_id, confidence, valid_from, valid_to, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    fact.id,
+    fact.entity_id,
+    fact.predicate,
+    fact.object,
+    fact.source_memory_id,
+    fact.confidence,
+    fact.valid_from,
+    fact.valid_to,
+    fact.created_at
+  );
+
+  return fact.id;
+}
+
+/**
+ * Get current (non-superseded) facts for an entity.
+ * I/O: Reads from database
+ */
+export function getCurrentFacts(db: Database, entityId: string): readonly Fact[] {
+  const rows = db.prepare(
+    `SELECT * FROM facts WHERE entity_id = ? AND valid_to IS NULL ORDER BY created_at DESC`
+  ).all(entityId) as any[];
+
+  return rows.map(row => createFact({
+    id: row.id,
+    entity_id: row.entity_id,
+    predicate: row.predicate,
+    object: row.object,
+    source_memory_id: row.source_memory_id,
+    confidence: row.confidence,
+    valid_from: row.valid_from,
+    valid_to: row.valid_to,
+    created_at: row.created_at,
+  }));
+}
+
+/**
+ * Get all facts for an entity (including superseded).
+ * I/O: Reads from database
+ */
+export function getAllFacts(db: Database, entityId: string): readonly Fact[] {
+  const rows = db.prepare(
+    `SELECT * FROM facts WHERE entity_id = ? ORDER BY created_at DESC`
+  ).all(entityId) as any[];
+
+  return rows.map(row => createFact({
+    id: row.id,
+    entity_id: row.entity_id,
+    predicate: row.predicate,
+    object: row.object,
+    source_memory_id: row.source_memory_id,
+    confidence: row.confidence,
+    valid_from: row.valid_from,
+    valid_to: row.valid_to,
+    created_at: row.created_at,
+  }));
+}
+
+/**
+ * Supersede a fact by setting valid_to to now.
+ * I/O: Writes to database
+ */
+export function supersedeFact(db: Database, factId: string): void {
+  db.prepare(
+    `UPDATE facts SET valid_to = ? WHERE id = ?`
+  ).run(new Date().toISOString(), factId);
+}
+
+/**
+ * Get all facts sourced from a specific memory.
+ * I/O: Reads from database
+ */
+export function getFactsByMemory(db: Database, memoryId: string): readonly Fact[] {
+  const rows = db.prepare(
+    `SELECT * FROM facts WHERE source_memory_id = ?`
+  ).all(memoryId) as any[];
+
+  return rows.map(row => createFact({
+    id: row.id,
+    entity_id: row.entity_id,
+    predicate: row.predicate,
+    object: row.object,
+    source_memory_id: row.source_memory_id,
+    confidence: row.confidence,
+    valid_from: row.valid_from,
+    valid_to: row.valid_to,
+    created_at: row.created_at,
+  }));
 }

@@ -3,6 +3,7 @@
 
 import type { Memory, MemoryType } from './types.js';
 import { isMemoryType } from './types.js';
+import type { EntityProfile } from './entities.js';
 
 // Ranked memory - memory with rank attached by ranking module
 export type RankedMemory = Memory & { readonly rank: number };
@@ -38,7 +39,8 @@ export function generateSurface(
   memories: readonly RankedMemory[],
   branch: string,
   staleness: StalenessInfo | null,
-  options: SurfaceOptions = {}
+  options: SurfaceOptions = {},
+  entityProfiles: readonly EntityProfile[] = []
 ): string {
   const maxTokens = options.maxTokens ?? 2000;
   const allowOverflow = options.allowOverflow ?? true;
@@ -63,6 +65,12 @@ export function generateSurface(
   }
 
   sections.push('');
+
+  // Render entity profiles section early — compact and high-value, survives truncation
+  const entitySection = renderEntitySection(entityProfiles);
+  if (entitySection) {
+    sections.push(entitySection);
+  }
 
   // Group by category and render
   const byCategory = groupByCategory(memories);
@@ -231,6 +239,37 @@ function capitalizeCategory(category: string): string {
     .split('_')
     .map(word => word.charAt(0).toUpperCase() + word.slice(1))
     .join(' ');
+}
+
+/**
+ * Render entity profiles as a compact surface section.
+ * Max 5 entities, max 3 facts each. One line per entity.
+ * Pure function.
+ */
+export function renderEntitySection(
+  profiles: readonly EntityProfile[],
+  maxEntities: number = 5,
+  maxFactsPerEntity: number = 3
+): string | null {
+  // Filter to entities with at least 1 current fact
+  const withFacts = profiles.filter(p => p.currentFacts.length > 0);
+  if (withFacts.length === 0) return null;
+
+  const lines: string[] = [];
+  lines.push('## Entities');
+  lines.push('');
+
+  const selected = withFacts.slice(0, maxEntities);
+  for (const profile of selected) {
+    const facts = profile.currentFacts
+      .slice(0, maxFactsPerEntity)
+      .map(f => `${f.predicate}: ${f.object}`)
+      .join('; ');
+    lines.push(`- **${profile.entity.name}** (${profile.entity.entity_type}): ${facts}`);
+  }
+
+  lines.push('');
+  return lines.join('\n');
 }
 
 // Helper: truncate content to token limit

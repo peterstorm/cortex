@@ -60,6 +60,7 @@ import { runInspect } from './commands/inspect.js';
 import { backfill } from './commands/backfill.js';
 import { executeSemanticEdges } from './commands/semantic-edges.js';
 import { executePromptRecall, formatPromptRecall } from './commands/prompt-recall.js';
+import { executeEntityQuery, formatEntityQueryResult } from './commands/entity-query.js';
 
 // ============================================================================
 // TYPES
@@ -866,6 +867,48 @@ async function handleLoadSurface(args: string[]): Promise<CommandResult> {
 }
 
 /**
+ * Handle 'entity-query' subcommand
+ * Entity-first temporal retrieval
+ */
+async function handleEntityQuery(args: string[]): Promise<CommandResult> {
+  if (args.length < 2) {
+    return {
+      success: false,
+      error: 'Usage: entity-query <cwd> <query> [--history] [--limit=N]',
+    };
+  }
+
+  const cwd = args[0];
+  const query = args[1];
+  const includeHistory = args.includes('--history');
+  const limitArg = args.find(a => a.startsWith('--limit='));
+  const limit = limitArg ? parseInt(limitArg.split('=')[1], 10) : 5;
+
+  const [projectDb, globalDb] = initDatabases(cwd);
+
+  try {
+    const result = executeEntityQuery(projectDb, globalDb, {
+      query,
+      includeHistory,
+      limit,
+    });
+
+    return {
+      success: true,
+      output: formatEntityQueryResult(result),
+    };
+  } catch (err) {
+    return {
+      success: false,
+      error: `Entity query failed: ${err}`,
+    };
+  } finally {
+    projectDb.close();
+    globalDb.close();
+  }
+}
+
+/**
  * Handle 'prompt-recall' subcommand (UserPromptSubmit hook)
  * Reads stdin JSON with prompt + cwd, runs keyword FTS5 recall
  * Always succeeds — never exits non-zero
@@ -961,7 +1004,7 @@ async function main() {
 
   if (args.length === 0) {
     logError('Usage: cli.ts <subcommand> [args...]');
-    logError('Subcommands: extract, generate, recall, remember, index-code, forget, consolidate, lifecycle, ai-prune, traverse, inspect, backfill, semantic-edges, load-surface, prompt-recall');
+    logError('Subcommands: extract, generate, recall, remember, index-code, forget, consolidate, lifecycle, ai-prune, traverse, inspect, backfill, semantic-edges, load-surface, prompt-recall, entity-query');
     process.exit(1);
   }
 
@@ -1016,6 +1059,9 @@ async function main() {
         break;
       case 'prompt-recall':
         result = await handlePromptRecall();
+        break;
+      case 'entity-query':
+        result = await handleEntityQuery(subcommandArgs);
         break;
       default:
         result = {
