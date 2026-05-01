@@ -60,10 +60,14 @@ export function truncateTranscript(
   const lastNewline = truncatedStr.lastIndexOf("\n");
 
   if (lastNewline === -1) {
-    // No newline found - return empty, cursor stays at current position
+    // Single JSONL line exceeds maxBytes (common with large tool outputs).
+    // Returning empty + unchanged cursor causes a permanent silent skip:
+    // every subsequent run finds the same oversized first line and bails.
+    // Fall back to the raw byte slice — Claude tolerates partial JSONL —
+    // and advance cursor by the bytes consumed so progress is guaranteed.
     return {
-      truncated: "",
-      newCursor: cursor,
+      truncated: truncatedStr,
+      newCursor: cursor + truncatedBuffer.length,
     };
   }
 
@@ -91,6 +95,22 @@ export function truncateTranscript(
  * @param projectName - Project name for context
  * @returns Prompt string for LLM
  */
+/**
+ * Strip injected cortex memory surface blocks from transcript content.
+ * The UserPromptSubmit hook re-injects the surface markdown on every user
+ * turn, so a multi-turn transcript repeats the same memory text dozens of
+ * times. Feeding that to extraction creates a feedback loop: Claude
+ * summarizes what it sees → produces candidates that echo existing
+ * memories → dedup correctly skips them as duplicates → no new memories
+ * ever land. Strip the marker-bracketed blocks before building the prompt.
+ */
+export function stripInjectedMemorySurface(content: string): string {
+  return content.replace(
+    /<!-- CORTEX_MEMORY_START -->[\s\S]*?<!-- CORTEX_MEMORY_END -->/g,
+    ""
+  );
+}
+
 export function buildExtractionPrompt(
   transcript: string,
   gitContext: GitContext,
@@ -98,6 +118,7 @@ export function buildExtractionPrompt(
   knownEntities: readonly EntityProfile[] = []
 ): string {
   const { branch, recent_commits, changed_files } = gitContext;
+  const cleanTranscript = stripInjectedMemorySurface(transcript);
 
   const contextBlock = [
     `Project: ${projectName}`,
@@ -120,7 +141,7 @@ Git Context:
 ${contextBlock}
 ${knownEntitiesBlock}
 Transcript (JSONL format):
-${transcript}
+${cleanTranscript}
 
 Extract memories following these rules:
 

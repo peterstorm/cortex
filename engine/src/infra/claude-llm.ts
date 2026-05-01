@@ -10,7 +10,7 @@
 import type { EdgeRelation } from '../core/types.js';
 import { isEdgeRelation } from '../core/types.js';
 
-const EXTRACTION_TIMEOUT_MS = 30_000;
+const EXTRACTION_TIMEOUT_MS = 90_000;
 const EDGE_CLASSIFICATION_TIMEOUT_MS = 90_000;
 
 /**
