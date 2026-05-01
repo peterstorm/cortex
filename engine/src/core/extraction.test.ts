@@ -10,6 +10,7 @@ import {
   buildExtractionPrompt,
   parseExtractionResponse,
   buildEmbeddingText,
+  stripInjectedMemorySurface,
 } from "./extraction";
 import type { MemoryCandidate, GitContext, MemoryType } from "./types";
 
@@ -46,12 +47,31 @@ describe("truncateTranscript", () => {
     expect(result.newCursor).toBe(content.length);
   });
 
-  it("returns empty when no newline within maxBytes", () => {
+  it("falls back to raw byte slice when no newline within maxBytes", () => {
+    // Regression: when a single JSONL line exceeds maxBytes (e.g. one large
+    // tool message), the function previously returned empty + unchanged cursor,
+    // causing every subsequent extraction to silently skip the same line.
+    // Now it returns the raw slice and advances the cursor so progress is made.
     const content = "very_long_line_without_newline";
     const result = truncateTranscript(content, 10);
 
-    expect(result.truncated).toBe("");
-    expect(result.newCursor).toBe(0);
+    expect(result.truncated).toBe("very_long_");
+    expect(result.newCursor).toBe(10);
+  });
+
+  it("makes forward progress across multiple runs when a line exceeds maxBytes", () => {
+    const content = "a".repeat(250) + "\nshort\n";
+    const first = truncateTranscript(content, 100, 0);
+    expect(first.truncated.length).toBe(100);
+    expect(first.newCursor).toBe(100);
+
+    const second = truncateTranscript(content, 100, first.newCursor);
+    expect(second.truncated.length).toBe(100);
+    expect(second.newCursor).toBe(200);
+
+    const third = truncateTranscript(content, 100, second.newCursor);
+    expect(third.truncated).toBe("a".repeat(50) + "\nshort\n");
+    expect(third.newCursor).toBe(content.length);
   });
 
   it("handles multi-byte UTF-8 characters correctly", () => {
@@ -165,7 +185,56 @@ describe("truncateTranscript", () => {
   });
 });
 
+describe("stripInjectedMemorySurface", () => {
+  it("removes a single CORTEX_MEMORY block", () => {
+    const input =
+      "before <!-- CORTEX_MEMORY_START -->\n# Cortex Memory Surface\n- foo\n<!-- CORTEX_MEMORY_END --> after";
+    expect(stripInjectedMemorySurface(input)).toBe("before  after");
+  });
+
+  it("removes multiple repeated blocks (every UserPromptSubmit re-injects)", () => {
+    const block =
+      "<!-- CORTEX_MEMORY_START -->\n## Architecture\n- DAG framework\n<!-- CORTEX_MEMORY_END -->";
+    const input = `turn1 ${block} turn2 ${block} turn3 ${block} end`;
+    const result = stripInjectedMemorySurface(input);
+    expect(result).toBe("turn1  turn2  turn3  end");
+    expect(result).not.toContain("CORTEX_MEMORY");
+    expect(result).not.toContain("DAG framework");
+  });
+
+  it("uses non-greedy matching across multiple blocks", () => {
+    const input =
+      "<!-- CORTEX_MEMORY_START -->A<!-- CORTEX_MEMORY_END -->mid<!-- CORTEX_MEMORY_START -->B<!-- CORTEX_MEMORY_END -->";
+    expect(stripInjectedMemorySurface(input)).toBe("mid");
+  });
+
+  it("leaves content without markers unchanged", () => {
+    const input =
+      '{"role":"user","content":"normal turn"}\n{"role":"assistant","content":"reply"}';
+    expect(stripInjectedMemorySurface(input)).toBe(input);
+  });
+
+  it("handles a stray START with no END (no match — leave intact)", () => {
+    const input = "<!-- CORTEX_MEMORY_START --> dangling content";
+    expect(stripInjectedMemorySurface(input)).toBe(input);
+  });
+});
+
 describe("buildExtractionPrompt", () => {
+  it("strips injected cortex memory blocks from the embedded transcript", () => {
+    const transcript =
+      'turn1\n<!-- CORTEX_MEMORY_START -->\n- DAG framework noise\n<!-- CORTEX_MEMORY_END -->\nturn2';
+    const prompt = buildExtractionPrompt(
+      transcript,
+      { branch: "main", recent_commits: [], changed_files: [] },
+      "test-proj"
+    );
+    expect(prompt).toContain("turn1");
+    expect(prompt).toContain("turn2");
+    expect(prompt).not.toContain("CORTEX_MEMORY");
+    expect(prompt).not.toContain("DAG framework noise");
+  });
+
   it("includes project name and branch", () => {
     const gitContext: GitContext = {
       branch: "main",

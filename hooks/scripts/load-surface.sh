@@ -11,7 +11,8 @@
 # ALL errors caught and logged, NEVER block session (exit 0 always).
 #
 # Usage (invoked by SessionStart hook):
-# ./load-surface.sh <cwd>
+# echo '{"session_id":"...","cwd":"..."}' | ./load-surface.sh
+# Falls back to ./load-surface.sh <cwd> when invoked manually without stdin.
 
 set -euo pipefail
 
@@ -31,11 +32,19 @@ log_info() {
 
 # Main execution wrapped in error handler
 main() {
-  # SessionStart hook receives cwd as argument
+  # SessionStart hook passes JSON on stdin; manual invocation may pass cwd as $1.
   local cwd="${1:-}"
 
+  if [[ -z "$cwd" ]] && [[ ! -t 0 ]]; then
+    local stdin_json
+    stdin_json=$(cat)
+    if [[ -n "$stdin_json" ]]; then
+      cwd=$(echo "$stdin_json" | bun -e "console.log(JSON.parse(require('fs').readFileSync(0, 'utf8')).cwd ?? '')" 2>/dev/null || echo "")
+    fi
+  fi
+
   if [[ -z "$cwd" ]]; then
-    log_error "No cwd provided (usage: load-surface.sh <cwd>)"
+    log_error "No cwd provided (expected SessionStart JSON on stdin or cwd as \$1)"
     return 0  # Never block session
   fi
 

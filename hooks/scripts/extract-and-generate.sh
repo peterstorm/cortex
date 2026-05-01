@@ -124,10 +124,34 @@ main() {
   log_info "Stop hook complete"
 }
 
-# Execute main with full error handling - NEVER let errors propagate
-if ! main "$@"; then
-  log_error "Unhandled error in Stop hook"
+# Worker mode: invoked by the detached child to actually run the pipeline.
+# Reaches this branch only via the parent's setsid/nohup self-reinvocation
+# below; stdin is the JSON payload piped through from the parent.
+if [[ "${1:-}" == "--worker" ]]; then
+  if ! main; then
+    log_error "Unhandled error in detached worker"
+  fi
+  exit 0
 fi
 
-# Always exit 0 - never block session
+# Parent mode: Claude Code declares a 300s SessionEnd timeout in hooks.json,
+# but in practice the parent reaps this hook's process group before claude -p
+# finishes, leaving extract.log with only the "Using Claude" line and no DB
+# writes. Detaching the pipeline (same setsid/nohup pattern used for the
+# trailing lifecycle/ai-prune steps) lets bun + claude -p outlive the parent.
+# Tradeoff: errors no longer surface to the session UI; rely on /tmp/cortex-*.log.
+stdin_json=$(cat)
+if [[ -z "$stdin_json" ]]; then
+  log_error "No stdin input — nothing to detach"
+  exit 0
+fi
+
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+if command -v setsid >/dev/null 2>&1; then
+  echo "$stdin_json" | setsid bash "$SCRIPT_PATH" --worker >/dev/null 2>&1 &
+else
+  echo "$stdin_json" | nohup bash "$SCRIPT_PATH" --worker >/dev/null 2>&1 &
+  disown
+fi
+
 exit 0
