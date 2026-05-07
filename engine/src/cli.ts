@@ -59,7 +59,7 @@ import { executeTraverse } from './commands/traverse.js';
 import { runInspect } from './commands/inspect.js';
 import { backfill } from './commands/backfill.js';
 import { executeSemanticEdges } from './commands/semantic-edges.js';
-import { executePromptRecall, formatPromptRecall } from './commands/prompt-recall.js';
+import { executePromptRecallWithFallback, formatPromptRecall } from './commands/prompt-recall.js';
 import { executeEntityQuery, formatEntityQueryResult } from './commands/entity-query.js';
 
 // ============================================================================
@@ -971,9 +971,10 @@ async function handlePromptRecall(): Promise<CommandResult> {
     const globalDb = hasGlobalDb ? openDatabase(globalDbPath) : null;
 
     try {
-      const memories = executePromptRecall(projectDb, globalDb, {
+      const memories = await executePromptRecallWithFallback(projectDb, globalDb, {
         prompt,
         surfaceContent,
+        geminiApiKey: getGeminiApiKey(),
       });
       const output = formatPromptRecall(memories);
 

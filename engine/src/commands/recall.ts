@@ -264,8 +264,9 @@ export async function executeRecall(
       }
     }
   } else {
-    // Keyword search via FTS5 (fallback)
-    process.stderr.write(`[cortex:recall] INFO: Gemini unavailable — falling back to keyword search\n`);
+    // Keyword search via FTS5
+    const reason = forceKeyword ? 'forced via --keyword flag' : 'Gemini unavailable';
+    process.stderr.write(`[cortex:recall] INFO: Using keyword search (${reason})\n`);
     try {
       const projectKw = searchByKeyword(projectDb, query, limit);
       const globalKw = searchByKeyword(globalDb, query, limit);

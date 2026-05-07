@@ -3,17 +3,30 @@
  * Uses in-memory SQLite for integration testing
  */
 
-import { describe, test, expect } from 'vitest';
+import { describe, test, expect, vi, beforeEach } from 'vitest';
 import { Database } from 'bun:sqlite';
 import { openDatabase, insertMemory } from '../infra/db.js';
 import { createMemory } from '../core/types.js';
 import {
   extractKeywords,
+  extractUnigrams,
   executePromptRecall,
+  executePromptRecallWithFallback,
   formatPromptRecall,
   STOP_WORDS,
   MIN_MEANINGFUL_TOKENS,
+  SEMANTIC_FALLBACK_MIN_UNIGRAMS,
+  SEMANTIC_FALLBACK_COSINE_FLOOR,
 } from './prompt-recall.js';
+
+// Mock gemini-embed at module level so the fallback path doesn't call out.
+// Each test sets the desired behavior via the exposed mockEmbedTexts.
+const mockEmbedTexts = vi.fn();
+vi.mock('../infra/gemini-embed.ts', () => ({
+  isGeminiAvailable: (key: string | undefined) =>
+    typeof key === 'string' && key.trim().length > 0,
+  embedTexts: (texts: string[], key: string) => mockEmbedTexts(texts, key),
+}));
 
 // Helper: create in-memory test DBs
 function setupTestDbs(): { projectDb: Database; globalDb: Database } {
@@ -43,6 +56,8 @@ function createTestMemory(overrides: Partial<Parameters<typeof createMemory>[0]>
     last_accessed_at: overrides.last_accessed_at ?? now,
     access_count: overrides.access_count ?? 0,
     pinned: overrides.pinned ?? false,
+    embedding: overrides.embedding,
+    local_embedding: overrides.local_embedding,
   });
 }
 
@@ -265,6 +280,201 @@ describe('executePromptRecall', () => {
     });
 
     expect(results.find(r => r.id === 'mem-archived')).toBeUndefined();
+
+    projectDb.close();
+    globalDb.close();
+  });
+});
+
+describe('extractUnigrams', () => {
+  test('returns unigrams without bigrams', () => {
+    const result = extractUnigrams('background memory consolidation forked subagent');
+    expect(result).toEqual(['background', 'memory', 'consolidation', 'forked', 'subagent']);
+  });
+
+  test('filters stop words and single chars', () => {
+    const result = extractUnigrams('how does X work in this code');
+    expect(result).toEqual(['work', 'code']);
+  });
+});
+
+describe('executePromptRecallWithFallback — gates', () => {
+  beforeEach(() => {
+    mockEmbedTexts.mockReset();
+  });
+
+  test('returns keyword results without calling embed when keyword non-empty', async () => {
+    const { projectDb, globalDb } = setupTestDbs();
+    insertMemory(projectDb, createTestMemory({
+      id: 'mem-1',
+      content: 'Extraction pipeline transcripts',
+      summary: 'Extraction pipeline transcripts',
+    }));
+
+    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+      prompt: 'extraction pipeline transcripts running',
+      surfaceContent: '',
+      geminiApiKey: 'test-key',
+    });
+
+    expect(results.length).toBeGreaterThan(0);
+    expect(mockEmbedTexts).not.toHaveBeenCalled();
+
+    projectDb.close();
+    globalDb.close();
+  });
+
+  test('skips fallback when prompt has too few unigrams', async () => {
+    const { projectDb, globalDb } = setupTestDbs();
+    // 3 unigrams (< SEMANTIC_FALLBACK_MIN_UNIGRAMS=4); each is non-stopword and >1 char
+    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+      prompt: 'completely unmatched zxqdpr',
+      surfaceContent: '',
+      geminiApiKey: 'test-key',
+    });
+
+    expect(results.length).toBe(0);
+    expect(mockEmbedTexts).not.toHaveBeenCalled();
+
+    projectDb.close();
+    globalDb.close();
+  });
+
+  test('skips fallback when API key missing', async () => {
+    const { projectDb, globalDb } = setupTestDbs();
+    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+      prompt: 'truly novel xyzzy plugh frobnicate quux blorpify',
+      surfaceContent: '',
+      geminiApiKey: '',
+    });
+
+    expect(results.length).toBe(0);
+    expect(mockEmbedTexts).not.toHaveBeenCalled();
+
+    projectDb.close();
+    globalDb.close();
+  });
+
+  test('keyword path runs without API key when keyword has results', async () => {
+    const { projectDb, globalDb } = setupTestDbs();
+    insertMemory(projectDb, createTestMemory({
+      id: 'mem-1',
+      content: 'Extraction pipeline content',
+      summary: 'Extraction pipeline summary',
+    }));
+
+    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+      prompt: 'extraction pipeline content keywords',
+      surfaceContent: '',
+      // no geminiApiKey
+    });
+
+    expect(results.length).toBeGreaterThan(0);
+    expect(mockEmbedTexts).not.toHaveBeenCalled();
+
+    projectDb.close();
+    globalDb.close();
+  });
+});
+
+describe('executePromptRecallWithFallback — semantic firing', () => {
+  beforeEach(() => {
+    mockEmbedTexts.mockReset();
+  });
+
+  test('fires semantic fallback when keyword empty + gates pass', async () => {
+    const { projectDb, globalDb } = setupTestDbs();
+    // Memory with content/summary that has zero overlap with the query tokens
+    // Embedding [1, 0, 0, ...] gives cosine 1.0 against the same query embedding
+    const embedding = new Float64Array(768);
+    embedding[0] = 1.0;
+    insertMemory(projectDb, createTestMemory({
+      id: 'mem-semantic',
+      content: 'Anchor content',
+      summary: 'Anchor summary',
+      embedding,
+    }));
+
+    mockEmbedTexts.mockResolvedValue([embedding]);
+
+    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+      prompt: 'truly novel xyzzy plugh frobnicate quux blorpify',
+      surfaceContent: '',
+      geminiApiKey: 'test-key',
+    });
+
+    expect(mockEmbedTexts).toHaveBeenCalledOnce();
+    expect(results.length).toBe(1);
+    expect(results[0].id).toBe('mem-semantic');
+
+    projectDb.close();
+    globalDb.close();
+  });
+
+  test('filters out memories below cosine floor', async () => {
+    const { projectDb, globalDb } = setupTestDbs();
+    // Below-floor memory: orthogonal embedding gives cosine 0
+    const memEmbedding = new Float64Array(768);
+    memEmbedding[1] = 1.0;
+    insertMemory(projectDb, createTestMemory({
+      id: 'mem-orthogonal',
+      content: 'Orthogonal content',
+      summary: 'Orthogonal summary',
+      embedding: memEmbedding,
+    }));
+
+    const queryEmbedding = new Float64Array(768);
+    queryEmbedding[0] = 1.0;
+    mockEmbedTexts.mockResolvedValue([queryEmbedding]);
+
+    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+      prompt: 'truly novel xyzzy plugh frobnicate quux blorpify',
+      surfaceContent: '',
+      geminiApiKey: 'test-key',
+    });
+
+    expect(results.length).toBe(0);
+
+    projectDb.close();
+    globalDb.close();
+  });
+
+  test('returns empty when embed call throws', async () => {
+    const { projectDb, globalDb } = setupTestDbs();
+    mockEmbedTexts.mockRejectedValue(new Error('Network failure'));
+
+    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+      prompt: 'truly novel xyzzy plugh frobnicate quux blorpify',
+      surfaceContent: '',
+      geminiApiKey: 'test-key',
+    });
+
+    expect(results.length).toBe(0);
+
+    projectDb.close();
+    globalDb.close();
+  });
+
+  test('respects surface dedup in semantic fallback', async () => {
+    const { projectDb, globalDb } = setupTestDbs();
+    const embedding = new Float64Array(768);
+    embedding[0] = 1.0;
+    insertMemory(projectDb, createTestMemory({
+      id: 'mem-dup',
+      content: 'Duplicated anchor content',
+      summary: 'Already in surface',
+      embedding,
+    }));
+
+    mockEmbedTexts.mockResolvedValue([embedding]);
+
+    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+      prompt: 'truly novel xyzzy plugh frobnicate quux blorpify',
+      surfaceContent: 'Already in surface',
+      geminiApiKey: 'test-key',
+    });
+
+    expect(results.length).toBe(0);
 
     projectDb.close();
     globalDb.close();
