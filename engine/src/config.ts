@@ -166,10 +166,12 @@ export const DECAY_CHECK_INTERVAL_DAYS = 1;
 export const ARCHIVE_THRESHOLD_DAYS = 7;
 
 /**
- * Lifecycle prune threshold in days
- * How long archived memory must remain before pruning (90 days)
+ * Lifecycle prune threshold in days.
+ * Once archived, a memory transitions to 'pruned' if untouched for this long.
+ * Matches FR-091; previously this constant said 90 but `decay.ts` hard-coded 30 —
+ * aligned to the running behavior (30) on 2026-05-07.
  */
-export const PRUNE_THRESHOLD_DAYS = 90;
+export const PRUNE_THRESHOLD_DAYS = 30;
 
 /**
  * Lifecycle auto-prune fallback interval in hours.

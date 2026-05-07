@@ -569,6 +569,33 @@ export function searchByKeywordOr(
   tokens: readonly string[],
   limit: number
 ): readonly Memory[] {
+  return searchByKeywordWithJoiner(db, tokens, limit, ' OR ');
+}
+
+/**
+ * Search memories where ALL tokens appear (FTS5 implicit-AND).
+ * Stricter than OR — only returns memories matching every token.
+ * Caller should fall back to OR if this returns empty for short prompts.
+ *
+ * @param db - Database instance
+ * @param tokens - Pre-tokenized keywords (caller handles stop-word filtering)
+ * @param limit - Maximum number of results
+ * @returns Readonly array of active memories ranked by FTS5 relevance
+ */
+export function searchByKeywordAnd(
+  db: Database,
+  tokens: readonly string[],
+  limit: number
+): readonly Memory[] {
+  return searchByKeywordWithJoiner(db, tokens, limit, ' ');
+}
+
+function searchByKeywordWithJoiner(
+  db: Database,
+  tokens: readonly string[],
+  limit: number,
+  joiner: ' ' | ' OR '
+): readonly Memory[] {
   if (tokens.length === 0) return [];
 
   const stmt = db.prepare(`
@@ -581,11 +608,10 @@ export function searchByKeywordOr(
     LIMIT ?
   `);
 
-  // Quote each token individually and join with OR for broad matching
   const safeQuery = tokens
     .filter(t => t.length > 0)
     .map(t => '"' + t.replace(/"/g, '""') + '"')
-    .join(' OR ');
+    .join(joiner);
 
   if (safeQuery.length === 0) return [];
 

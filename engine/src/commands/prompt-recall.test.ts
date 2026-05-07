@@ -13,6 +13,7 @@ import {
   executePromptRecall,
   executePromptRecallWithFallback,
   formatPromptRecall,
+  isTagOnlyMatch,
   STOP_WORDS,
   MIN_MEANINGFUL_TOKENS,
   SEMANTIC_FALLBACK_MIN_UNIGRAMS,
@@ -280,6 +281,113 @@ describe('executePromptRecall', () => {
     });
 
     expect(results.find(r => r.id === 'mem-archived')).toBeUndefined();
+
+    projectDb.close();
+    globalDb.close();
+  });
+});
+
+describe('isTagOnlyMatch', () => {
+  test('flags memory whose tokens appear only via tags', () => {
+    const memory = createTestMemory({
+      content: 'Completely unrelated narrative without the keyword',
+      summary: 'Generic summary text',
+      tags: ['kubernetes'],
+    });
+    // The OR FTS query found this memory only via its tags
+    expect(isTagOnlyMatch(memory, ['kubernetes'])).toBe(true);
+  });
+
+  test('does not flag when token appears in content', () => {
+    const memory = createTestMemory({
+      content: 'kubernetes cluster bootstrap order',
+      summary: 'Generic summary',
+      tags: ['unrelated'],
+    });
+    expect(isTagOnlyMatch(memory, ['kubernetes'])).toBe(false);
+  });
+
+  test('does not flag when token appears in summary', () => {
+    const memory = createTestMemory({
+      content: 'unrelated content',
+      summary: 'Pattern for kubernetes scheduling',
+      tags: ['unrelated'],
+    });
+    expect(isTagOnlyMatch(memory, ['kubernetes'])).toBe(false);
+  });
+
+  test('returns false when no tokens given', () => {
+    const memory = createTestMemory({});
+    expect(isTagOnlyMatch(memory, [])).toBe(false);
+  });
+});
+
+describe('executePromptRecall — AND-first precedence', () => {
+  test('multi-token match outranks single-token OR match', () => {
+    const { projectDb, globalDb } = setupTestDbs();
+
+    // Memory 1: matches both tokens (AND hit)
+    insertMemory(projectDb, createTestMemory({
+      id: 'mem-and',
+      content: 'extraction pipeline transcripts in detail',
+      summary: 'Extraction pipeline transcript processing',
+    }));
+    // Memory 2: matches only one token (OR-only hit)
+    insertMemory(projectDb, createTestMemory({
+      id: 'mem-or',
+      content: 'some other extraction concern entirely',
+      summary: 'Extraction notes',
+    }));
+
+    const results = executePromptRecall(projectDb, globalDb, {
+      prompt: 'extraction pipeline transcripts how',
+      surfaceContent: '',
+    });
+
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0].id).toBe('mem-and');
+
+    projectDb.close();
+    globalDb.close();
+  });
+
+  test('filters tag-only matches', () => {
+    const { projectDb, globalDb } = setupTestDbs();
+
+    insertMemory(projectDb, createTestMemory({
+      id: 'mem-tagonly',
+      content: 'Generic narrative content with no overlap',
+      summary: 'Generic summary text only',
+      tags: ['kubernetes'],
+    }));
+
+    const results = executePromptRecall(projectDb, globalDb, {
+      prompt: 'kubernetes cluster pods deployment workflow',
+      surfaceContent: '',
+    });
+
+    expect(results.find(r => r.id === 'mem-tagonly')).toBeUndefined();
+
+    projectDb.close();
+    globalDb.close();
+  });
+
+  test('keeps memory when content has token even if also in tags', () => {
+    const { projectDb, globalDb } = setupTestDbs();
+
+    insertMemory(projectDb, createTestMemory({
+      id: 'mem-contentmatch',
+      content: 'kubernetes pod scheduling notes inside the body',
+      summary: 'kubernetes scheduling',
+      tags: ['kubernetes'],
+    }));
+
+    const results = executePromptRecall(projectDb, globalDb, {
+      prompt: 'kubernetes pod scheduling deployment workflow',
+      surfaceContent: '',
+    });
+
+    expect(results.find(r => r.id === 'mem-contentmatch')).toBeDefined();
 
     projectDb.close();
     globalDb.close();

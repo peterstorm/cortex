@@ -14,7 +14,7 @@
 
 import type { Database } from 'bun:sqlite';
 import type { Memory } from '../core/types.js';
-import { searchByKeywordOr, getMemoriesWithEmbedding } from '../infra/db.js';
+import { searchByKeywordOr, searchByKeywordAnd, getMemoriesWithEmbedding } from '../infra/db.js';
 import { embedTexts, isGeminiAvailable } from '../infra/gemini-embed.ts';
 import { rankBySimilarity } from '../core/similarity.js';
 
@@ -59,6 +59,12 @@ export const SEMANTIC_FALLBACK_COSINE_FLOOR = 0.65;
 /** Max results from semantic fallback (intentionally smaller than keyword limit — fallback noise tolerance is lower) */
 export const SEMANTIC_FALLBACK_LIMIT = 3;
 
+/** Min unigrams required to attempt strict AND search before falling back to OR */
+export const AND_FIRST_MIN_UNIGRAMS = 2;
+
+/** Max unigrams sent to AND search — beyond this, AND is too restrictive to be useful */
+export const AND_FIRST_MAX_UNIGRAMS = 6;
+
 // ============================================================================
 // PURE FUNCTIONS
 // ============================================================================
@@ -90,6 +96,22 @@ export function extractKeywords(prompt: string): readonly string[] {
   }
 
   return [...unigrams, ...bigrams];
+}
+
+/**
+ * Returns true when none of the query tokens appear in the memory's content
+ * or summary — i.e. the FTS5 hit was carried entirely by tag column matches.
+ * Tag-only matches are usually low-precision (tags are short labels that
+ * collide with common words), so the prompt-recall hook excludes them.
+ *
+ * @param memory - Candidate memory from FTS5 search
+ * @param tokens - Lowercased query unigrams
+ * @returns true if the match was tag-only (caller should drop the result)
+ */
+export function isTagOnlyMatch(memory: Memory, tokens: readonly string[]): boolean {
+  if (tokens.length === 0) return false;
+  const haystack = `${memory.content} ${memory.summary}`.toLowerCase();
+  return !tokens.some(tok => haystack.includes(tok));
 }
 
 /**
@@ -144,29 +166,45 @@ export function executePromptRecall(
   }
 
   const limit = options.limit ?? PROMPT_RECALL_LIMIT;
+  const unigrams = extractUnigrams(options.prompt);
 
-  // Search both DBs
-  const projectResults = projectDb ? searchByKeywordOr(projectDb, tokens, limit) : [];
-  const globalResults = globalDb ? searchByKeywordOr(globalDb, tokens, limit) : [];
+  // Tier 1: strict AND over unigrams, when we have enough but not too many.
+  // Returns precise multi-token matches; misses are common, so OR still runs as fallback.
+  const andEligible =
+    unigrams.length >= AND_FIRST_MIN_UNIGRAMS &&
+    unigrams.length <= AND_FIRST_MAX_UNIGRAMS;
+  const projectAnd = andEligible && projectDb
+    ? searchByKeywordAnd(projectDb, unigrams, limit)
+    : [];
+  const globalAnd = andEligible && globalDb
+    ? searchByKeywordAnd(globalDb, unigrams, limit)
+    : [];
 
-  // Merge and deduplicate by ID
+  // Tier 2: broad OR over unigrams + bigrams (preserves prior behaviour).
+  const projectOr = projectDb ? searchByKeywordOr(projectDb, tokens, limit) : [];
+  const globalOr = globalDb ? searchByKeywordOr(globalDb, tokens, limit) : [];
+
+  // Merge: AND results first (higher precision), then OR results, dedup by ID.
+  // Filter tag-only matches (FTS5 hit only in tag column) — usually low precision.
+  // Filter against the static surface so we don't repeat what's already in context.
   const seenIds = new Set<string>();
   const merged: Memory[] = [];
 
-  for (const mem of [...projectResults, ...globalResults]) {
+  for (const mem of [...projectAnd, ...globalAnd, ...projectOr, ...globalOr]) {
     if (seenIds.has(mem.id)) continue;
     seenIds.add(mem.id);
 
-    // Deduplicate against surface content — skip if summary already present
+    if (isTagOnlyMatch(mem, unigrams)) continue;
+
     if (options.surfaceContent && options.surfaceContent.includes(mem.summary)) {
       continue;
     }
 
     merged.push(mem);
+    if (merged.length >= limit) break;
   }
 
-  // Respect limit after dedup
-  return merged.slice(0, limit);
+  return merged;
 }
 
 /**

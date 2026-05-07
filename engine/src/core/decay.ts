@@ -2,6 +2,7 @@
 // Pure functions for FR-083 through FR-091
 
 import type { Memory, MemoryType } from './types.js';
+import { PRUNE_THRESHOLD_DAYS } from '../config.js';
 
 // FR-083, FR-084: Type-based half-life map
 // null = stable (no decay)
@@ -71,7 +72,7 @@ export type LifecycleAction =
 // FR-088, FR-089, FR-090, FR-091: Determine lifecycle transition
 // Archive if confidence < 0.3 for 14 consecutive days
 // Exempt if centrality > 0.5 (hub protection)
-// Prune if archived and untouched for 30 days
+// Prune if archived and untouched for PRUNE_THRESHOLD_DAYS
 export function determineLifecycleAction(
   memory: Memory,
   decayedConfidence: number,
@@ -83,9 +84,9 @@ export function determineLifecycleAction(
 
   // FR-090: Handle archived memories
   if (memory.status === 'archived') {
-    // FR-091: Prune if archived and untouched for 30 days
-    if (daysSinceAccess >= 30) {
-      return { action: 'prune', reason: 'archived_30d_no_access' };
+    // FR-091: Prune if archived and untouched past threshold
+    if (daysSinceAccess >= PRUNE_THRESHOLD_DAYS) {
+      return { action: 'prune', reason: `archived_${PRUNE_THRESHOLD_DAYS}d_no_access` };
     }
     return { action: 'none' };
   }
