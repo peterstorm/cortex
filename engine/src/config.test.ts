@@ -124,8 +124,9 @@ describe('config - path composition', () => {
     expect(telemetryPath).toContain('.memory');
   });
 
-  it('surface output path is under .claude/', () => {
+  it('surface output path is under harness directory', () => {
     const result = getSurfaceOutputPath('/project');
-    expect(result).toContain('.claude');
+    // In test context (no PI_CODING_AGENT_DIR), defaults to .claude
+    expect(result).toMatch(/\.(claude|pi)/);
   });
 });

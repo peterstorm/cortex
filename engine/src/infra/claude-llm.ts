@@ -42,10 +42,21 @@ export interface EdgeClassification {
 }
 
 /**
- * Check if `claude` binary is available on PATH.
+ * Detect which CLI binary to use for headless LLM calls.
+ * Prefers pi (if PI_CODING_AGENT_DIR is set), falls back to claude.
+ */
+function getLlmBinary(): string {
+  const env = typeof Bun !== 'undefined' ? Bun.env : process.env;
+  if (env.PI_CODING_AGENT_DIR) return 'pi';
+  return 'claude';
+}
+
+/**
+ * Check if the LLM binary is available on PATH.
  */
 export function isClaudeLlmAvailable(): boolean {
-  return Bun.which('claude') !== null;
+  const binary = getLlmBinary();
+  return Bun.which(binary) !== null;
 }
 
 /**
@@ -58,12 +69,17 @@ export function isClaudeLlmAvailable(): boolean {
  * @throws Error if binary not found, non-zero exit, or timeout
  */
 async function runClaudePrompt(prompt: string, timeoutMs: number): Promise<string> {
+  const binary = getLlmBinary();
+  const args = binary === 'pi'
+    ? [binary, '-p', '--model', 'haiku', '--no-session']
+    : [binary, '-p', '--model', 'haiku', '--output-format', 'text', '--allowedTools', ''];
+
   if (!isClaudeLlmAvailable()) {
-    throw new Error('Claude CLI not found on PATH — install claude or verify PATH');
+    throw new Error(`${binary} CLI not found on PATH`);
   }
 
   const proc = Bun.spawn(
-    ['claude', '-p', '--model', 'haiku', '--output-format', 'text', '--allowedTools', ''],
+    args,
     {
       stdin: 'pipe',
       stdout: 'pipe',
