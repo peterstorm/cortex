@@ -69,7 +69,7 @@ export function getSurfaceCacheDir(projectRoot: string): string {
 /** Detect which harness is active */
 export function detectHarness(): "claude" | "pi" {
   const env = typeof Bun !== 'undefined' ? Bun.env : process.env;
-  if (env.PI_CODING_AGENT_DIR) return "pi";
+  if (env.PI_CODING_AGENT_DIR || env.PI_CODING_AGENT) return "pi";
   return "claude";
 }
 

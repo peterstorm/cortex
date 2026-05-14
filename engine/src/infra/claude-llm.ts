@@ -47,8 +47,28 @@ export interface EdgeClassification {
  */
 function getLlmBinary(): string {
   const env = typeof Bun !== 'undefined' ? Bun.env : process.env;
-  if (env.PI_CODING_AGENT_DIR) return 'pi';
+  if (env.PI_CODING_AGENT_DIR || env.PI_CODING_AGENT) return 'pi';
   return 'claude';
+}
+
+/**
+ * Read the user's default provider from pi agent settings.
+ * Returns undefined if not configured or unreadable.
+ */
+function getDefaultProvider(): string | undefined {
+  const env = typeof Bun !== 'undefined' ? Bun.env : process.env;
+  const override = env.CORTEX_LLM_PROVIDER;
+  if (override) return override;
+
+  try {
+    const home = env.HOME || env.USERPROFILE || '';
+    const settingsPath = `${home}/.pi/agent/settings.json`;
+    const content = require('fs').readFileSync(settingsPath, 'utf-8');
+    const settings = JSON.parse(content);
+    return settings.defaultProvider || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -70,9 +90,15 @@ export function isClaudeLlmAvailable(): boolean {
  */
 async function runClaudePrompt(prompt: string, timeoutMs: number): Promise<string> {
   const binary = getLlmBinary();
-  const args = binary === 'pi'
-    ? [binary, '-p', '--model', 'haiku', '--no-session']
-    : [binary, '-p', '--model', 'haiku', '--output-format', 'text', '--allowedTools', ''];
+  let args: string[];
+  if (binary === 'pi') {
+    const provider = getDefaultProvider();
+    args = provider
+      ? [binary, '-p', '--model', 'haiku', '--provider', provider, '--no-session']
+      : [binary, '-p', '--model', 'haiku', '--no-session'];
+  } else {
+    args = [binary, '-p', '--model', 'haiku', '--output-format', 'text'];
+  }
 
   if (!isClaudeLlmAvailable()) {
     throw new Error(`${binary} CLI not found on PATH`);
