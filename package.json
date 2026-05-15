@@ -1,0 +1,15 @@
+{
+  "name": "@peterstorm/cortex",
+  "version": "0.1.0",
+  "description": "Persistent memory plugin - extracts session knowledge, surfaces ranked context, provides semantic recall",
+  "keywords": ["pi-package"],
+  "type": "module",
+  "author": { "name": "peterstorm" },
+  "pi": {
+    "extensions": ["./pi"],
+    "prompts": ["./commands"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

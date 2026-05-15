@@ -144,11 +144,28 @@ export async function embedLocal(text: string): Promise<Float32Array> {
 }
 
 /**
- * Reset cached state (for testing).
- * Clears all module-level state including import errors.
+ * Dispose the cached pipeline to release ONNX native resources.
+ * Must be called before process exit to avoid Bun C++ teardown crashes.
+ * Safe to call even if no model is loaded.
  */
-export function resetLocalEmbedCache(): void {
-  cachedPipeline = null;
+export async function disposeLocalModel(): Promise<void> {
+  if (cachedPipeline) {
+    try {
+      await cachedPipeline.dispose();
+    } catch {
+      // Best-effort — ignore errors during disposal
+    }
+    cachedPipeline = null;
+  }
+}
+
+/**
+ * Reset cached state (for testing).
+ * Disposes the ONNX pipeline (if loaded) to prevent native resource leaks,
+ * then clears all module-level state including import errors.
+ */
+export async function resetLocalEmbedCache(): Promise<void> {
+  await disposeLocalModel();
   modelAvailabilityCache = null;
   failureCachedAt = null;
   transformersModule = null;

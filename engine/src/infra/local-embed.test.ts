@@ -4,18 +4,24 @@
  * Handles cases where model may/may not be available in test environment.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterAll } from 'vitest';
 import {
   embedLocal,
   isLocalModelAvailable,
   ensureModelLoaded,
   resetLocalEmbedCache,
+  disposeLocalModel,
 } from './local-embed';
 
 describe('local-embed', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     // Reset cache before each test for isolation
-    resetLocalEmbedCache();
+    await resetLocalEmbedCache();
+  });
+
+  afterAll(async () => {
+    // Dispose ONNX pipeline to prevent Bun C++ teardown crash
+    await disposeLocalModel();
   });
 
   describe('isLocalModelAvailable', () => {

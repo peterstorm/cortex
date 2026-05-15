@@ -42,10 +42,41 @@ export interface EdgeClassification {
 }
 
 /**
- * Check if `claude` binary is available on PATH.
+ * Detect which CLI binary to use for headless LLM calls.
+ * Prefers pi (if PI_CODING_AGENT_DIR is set), falls back to claude.
+ */
+function getLlmBinary(): string {
+  const env = typeof Bun !== 'undefined' ? Bun.env : process.env;
+  if (env.PI_CODING_AGENT_DIR || env.PI_CODING_AGENT) return 'pi';
+  return 'claude';
+}
+
+/**
+ * Read the user's default provider from pi agent settings.
+ * Returns undefined if not configured or unreadable.
+ */
+function getDefaultProvider(): string | undefined {
+  const env = typeof Bun !== 'undefined' ? Bun.env : process.env;
+  const override = env.CORTEX_LLM_PROVIDER;
+  if (override) return override;
+
+  try {
+    const home = env.HOME || env.USERPROFILE || '';
+    const settingsPath = `${home}/.pi/agent/settings.json`;
+    const content = require('fs').readFileSync(settingsPath, 'utf-8');
+    const settings = JSON.parse(content);
+    return settings.defaultProvider || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Check if the LLM binary is available on PATH.
  */
 export function isClaudeLlmAvailable(): boolean {
-  return Bun.which('claude') !== null;
+  const binary = getLlmBinary();
+  return Bun.which(binary) !== null;
 }
 
 /**
@@ -58,12 +89,23 @@ export function isClaudeLlmAvailable(): boolean {
  * @throws Error if binary not found, non-zero exit, or timeout
  */
 async function runClaudePrompt(prompt: string, timeoutMs: number): Promise<string> {
+  const binary = getLlmBinary();
+  let args: string[];
+  if (binary === 'pi') {
+    const provider = getDefaultProvider();
+    args = provider
+      ? [binary, '-p', '--model', 'haiku', '--provider', provider, '--no-session']
+      : [binary, '-p', '--model', 'haiku', '--no-session'];
+  } else {
+    args = [binary, '-p', '--model', 'haiku', '--output-format', 'text'];
+  }
+
   if (!isClaudeLlmAvailable()) {
-    throw new Error('Claude CLI not found on PATH — install claude or verify PATH');
+    throw new Error(`${binary} CLI not found on PATH`);
   }
 
   const proc = Bun.spawn(
-    ['claude', '-p', '--model', 'haiku', '--output-format', 'text', '--allowedTools', ''],
+    args,
     {
       stdin: 'pipe',
       stdout: 'pipe',

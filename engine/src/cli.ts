@@ -61,6 +61,7 @@ import { backfill } from './commands/backfill.js';
 import { executeSemanticEdges } from './commands/semantic-edges.js';
 import { executePromptRecallWithFallback, formatPromptRecall } from './commands/prompt-recall.js';
 import { executeEntityQuery, formatEntityQueryResult } from './commands/entity-query.js';
+import { disposeLocalModel } from './infra/local-embed.js';
 
 // ============================================================================
 // TYPES
@@ -1087,6 +1088,9 @@ async function main() {
   if (result.output) {
     console.log(result.output);
   }
+
+  // Dispose ONNX model resources before exit
+  await disposeLocalModel();
 
   if (!result.success) {
     if (result.error) {

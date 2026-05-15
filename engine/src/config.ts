@@ -20,11 +20,13 @@ export function getGeminiApiKey(): string | undefined {
 }
 
 /**
- * Get plugin root directory from environment
- * Returns undefined if not set
+ * Get plugin root directory from environment.
+ * Supports both Claude Code (CLAUDE_PLUGIN_ROOT) and pi (CORTEX_PLUGIN_ROOT).
+ * Returns undefined if not set.
  */
 export function getPluginRoot(): string | undefined {
-  return Bun.env.CLAUDE_PLUGIN_ROOT;
+  return (typeof Bun !== 'undefined' ? Bun.env : process.env).CLAUDE_PLUGIN_ROOT
+    ?? (typeof Bun !== 'undefined' ? Bun.env : process.env).CORTEX_PLUGIN_ROOT;
 }
 
 // ============================================================================
@@ -49,7 +51,8 @@ export function getProjectDbPath(projectRoot: string): string {
  * @returns Absolute path to global database
  */
 export function getGlobalDbPath(): string {
-  return join(homedir(), '.claude', 'memory', 'cortex-global.db');
+  const dir = detectHarness() === "pi" ? '.pi/agent' : '.claude';
+  return join(homedir(), dir, 'memory', 'cortex-global.db');
 }
 
 /**
@@ -63,15 +66,21 @@ export function getSurfaceCacheDir(projectRoot: string): string {
   return join(projectRoot, '.memory', 'surface-cache');
 }
 
+/** Detect which harness is active */
+export function detectHarness(): "claude" | "pi" {
+  const env = typeof Bun !== 'undefined' ? Bun.env : process.env;
+  if (env.PI_CODING_AGENT_DIR || env.PI_CODING_AGENT) return "pi";
+  return "claude";
+}
+
 /**
- * Resolve push surface output file path
- * Pure function - output file written to .claude/cortex-memory.local.md
- *
- * @param projectRoot - Absolute path to project root
- * @returns Absolute path to surface output file
+ * Resolve push surface output file path.
+ * Claude Code: .claude/cortex-memory.local.md
+ * Pi: .pi/cortex-memory.local.md
  */
 export function getSurfaceOutputPath(projectRoot: string): string {
-  return join(projectRoot, '.claude', 'cortex-memory.local.md');
+  const dir = detectHarness() === "pi" ? '.pi' : '.claude';
+  return join(projectRoot, dir, 'cortex-memory.local.md');
 }
 
 /**
@@ -285,4 +294,5 @@ export const DEFAULT_TRAVERSAL_DEPTH = 2;
 export const GITIGNORE_PATTERNS = [
   '.memory/',
   '.claude/cortex-memory.local.md',
+  '.pi/cortex-memory.local.md',
 ] as const;

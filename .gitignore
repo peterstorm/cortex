@@ -2,3 +2,4 @@
 .claude/cortex-memory.local.md
 node_modules/
 *.checkpoint-*
+.pi/cortex-memory.local.md
