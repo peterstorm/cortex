@@ -27,7 +27,8 @@ describe('config - path resolution', () => {
 
   it('getGlobalDbPath returns path in home directory', () => {
     const result = getGlobalDbPath();
-    expect(result).toContain('.claude/memory/cortex-global.db');
+    // Harness-dependent: .claude or .pi/agent
+    expect(result).toMatch(/\.(claude|pi\/agent)\/memory\/cortex-global\.db/);
   });
 
   it('getSurfaceCacheDir returns correct path', () => {
@@ -37,7 +38,8 @@ describe('config - path resolution', () => {
 
   it('getSurfaceOutputPath returns correct path', () => {
     const result = getSurfaceOutputPath('/project');
-    expect(result).toBe('/project/.claude/cortex-memory.local.md');
+    // Harness-dependent: .claude or .pi
+    expect(result).toMatch(/\/project\/\.(claude|pi)\/cortex-memory\.local\.md/);
   });
 
   it('getLockDir returns correct path', () => {

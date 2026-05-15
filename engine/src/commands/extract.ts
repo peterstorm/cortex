@@ -61,7 +61,7 @@ import { extractMemories, isClaudeLlmAvailable } from '../infra/claude-llm.js';
 import { getGitContext } from '../infra/git-context.js';
 import { runLifecycle } from './lifecycle.js';
 import { invalidateSurfaceCache } from './generate.js';
-import { DEDUP_SIMILARITY_THRESHOLD, MERGE_CEILING_THRESHOLD } from '../config.js';
+import { DEDUP_SIMILARITY_THRESHOLD, MERGE_CEILING_THRESHOLD, INTRA_BATCH_DEDUP_THRESHOLD } from '../config.js';
 
 // ============================================================================
 // RESULT TYPES
@@ -423,7 +423,8 @@ export function deduplicateCandidates(
   existingMemories: readonly Memory[],
   threshold: number = DEDUP_SIMILARITY_THRESHOLD,
   candidateEmbeddings: Map<number, Float32Array> = new Map(),
-  mergeCeiling: number = MERGE_CEILING_THRESHOLD
+  mergeCeiling: number = MERGE_CEILING_THRESHOLD,
+  intraBatchThreshold: number = INTRA_BATCH_DEDUP_THRESHOLD
 ): { kept: MemoryCandidate[]; skipped: number; merges: DeduplicateMerge[] } {
   // Pre-tokenize existing memories once
   const existingTokenSets = existingMemories.map(
@@ -463,6 +464,8 @@ export function deduplicateCandidates(
     }
 
     // Check against already-kept candidates in this batch (intra-batch dedup)
+    // Uses a higher threshold than cross-session dedup because candidates from
+    // the same session naturally share domain vocabulary and semantic space.
     if (bestScore < threshold) {
       for (let j = 0; j < keptTokenSets.length; j++) {
         const score = hybridSimilarity(
@@ -471,7 +474,7 @@ export function deduplicateCandidates(
           candidateEmbedding,
           keptEmbeddings[j]
         );
-        if (score >= threshold) {
+        if (score >= intraBatchThreshold) {
           // Intra-batch duplicates are always skipped (no merge target)
           bestScore = score;
           bestMatchIndex = -1; // no existing memory to merge into

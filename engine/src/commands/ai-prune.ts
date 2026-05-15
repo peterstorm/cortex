@@ -17,6 +17,7 @@ import {
   AI_PRUNE_MEMORY_THRESHOLD,
   AI_PRUNE_TIMEOUT_MS,
   AI_PRUNE_BATCH_SIZE,
+  AI_PRUNE_MIN_MEMORIES,
 } from '../config.js';
 
 // ============================================================================
@@ -76,8 +77,12 @@ ARCHIVE if:
 - Generic: general best practices an LLM already knows
 - Superseded: a newer memory in the list covers this with updated info
 
-NEVER archive pinned memories (marked PIN).
-Be aggressive — archived memories are recoverable, not deleted.
+NEVER archive:
+- Pinned memories (marked PIN)
+- Memories less than 3 days old with confidence >= 0.7 (too new to evaluate)
+- Architecture or decision memories with confidence >= 0.8 (high-value stable knowledge)
+
+Be selective — only archive when clearly justified. When in doubt, keep.
 One per concept: if multiple memories describe the same thing, keep the most comprehensive.
 
 Respond ONLY with a JSON array. No markdown fences, no explanation.
@@ -270,6 +275,14 @@ export async function runAiPrune(
   if (allMemories.length === 0) {
     resetSessionCounter(telemetryPath);
     return { archived: 0, reviewed: 0 };
+  }
+
+  // Guard: don't prune when memory count is very low.
+  // With few memories, aggressive pruning wipes out ALL context.
+  if (allMemories.length < AI_PRUNE_MIN_MEMORIES) {
+    logInfo(`Skipping AI prune: only ${allMemories.length} active memories (min: ${AI_PRUNE_MIN_MEMORIES})`);
+    resetSessionCounter(telemetryPath);
+    return { archived: 0, reviewed: allMemories.length, skipped: true };
   }
 
   // Build memory data for prompt

@@ -191,6 +191,13 @@ export const AI_PRUNE_SESSION_INTERVAL = 5;
 export const AI_PRUNE_MEMORY_THRESHOLD = 50;
 
 /**
+ * AI prune: minimum active memory count below which pruning is skipped.
+ * With very few memories, aggressive pruning wipes out ALL context.
+ * Wait until enough memories accumulate before evaluating quality.
+ */
+export const AI_PRUNE_MIN_MEMORIES = 8;
+
+/**
  * AI prune timeout in ms per batch
  */
 export const AI_PRUNE_TIMEOUT_MS = 60_000;
@@ -202,9 +209,23 @@ export const AI_PRUNE_BATCH_SIZE = 80;
 
 /**
  * Dedup similarity threshold for extraction and remember commands.
- * Candidates scoring above this against existing memories are skipped as near-duplicates.
+ * Candidates scoring above this against existing memories are merged.
+ *
+ * CALIBRATION NOTE: For 384-dim local embeddings (BGE-small-en-v1.5),
+ * same-domain memories about different aspects routinely score 0.6-0.75.
+ * A threshold of 0.75 ensures only truly overlapping content triggers merge,
+ * not merely related concepts within the same project domain.
  */
-export const DEDUP_SIMILARITY_THRESHOLD = 0.45;
+export const DEDUP_SIMILARITY_THRESHOLD = 0.75;
+
+/**
+ * Intra-batch dedup threshold for candidates within a single extraction.
+ * Higher than cross-session threshold because candidates from the same session
+ * naturally share domain vocabulary and semantic space. At 0.45, a focused session
+ * about one subsystem would have most candidates killed by intra-batch dedup.
+ * 0.75 catches only truly redundant candidates (near-identical content).
+ */
+export const INTRA_BATCH_DEDUP_THRESHOLD = 0.75;
 
 /**
  * Consolidation similarity threshold for detecting duplicate memory pairs.
@@ -217,8 +238,11 @@ export const CONSOLIDATION_SIMILARITY_THRESHOLD = 0.5;
  * Candidates with score in [DEDUP_SIMILARITY_THRESHOLD, MERGE_CEILING_THRESHOLD)
  * are merged into the existing memory rather than skipped.
  * Candidates with score >= MERGE_CEILING_THRESHOLD are true duplicates and skipped.
+ *
+ * CALIBRATION NOTE: For 384-dim local embeddings, true content duplicates
+ * score 0.85+. Same-topic-different-detail pairs score 0.75-0.85.
  */
-export const MERGE_CEILING_THRESHOLD = 0.5;
+export const MERGE_CEILING_THRESHOLD = 0.85;
 
 /**
  * Retention period in days for pruned memories before hard-delete.

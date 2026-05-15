@@ -288,16 +288,17 @@ describe('deduplicateCandidates', () => {
 
   it('filters candidates matching existing memories by Jaccard', () => {
     const existing = [makeMemory({
-      summary: 'Use functional core imperative shell pattern',
-      content: 'Use functional core imperative shell pattern for all commands',
+      summary: 'Use functional core imperative shell pattern for commands',
+      content: 'Use functional core imperative shell pattern to separate pure logic from IO in all commands',
     })];
     const candidates = [makeCandidate({
-      summary: 'Use functional core imperative shell pattern',
-      content: 'Functional core imperative shell pattern used in all commands',
+      summary: 'Functional core imperative shell pattern for commands',
+      content: 'Apply functional core imperative shell pattern to separate pure logic from IO in all services',
     })];
 
-    const { kept, skipped } = deduplicateCandidates(candidates, existing, 0.45);
-    expect(skipped).toBe(1);
+    // High Jaccard overlap (~0.82) + no embeddings → merge (between threshold and ceiling)
+    const { kept, merges } = deduplicateCandidates(candidates, existing, 0.75, new Map(), 0.90);
+    expect(merges).toHaveLength(1);
     expect(kept).toHaveLength(0);
   });
 
