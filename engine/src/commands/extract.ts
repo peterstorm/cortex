@@ -525,13 +525,15 @@ function computeSimilarityAndCreateEdges(
 
   for (const newMem of newMemories) {
     const newTokens = tokenize(`${newMem.summary} ${newMem.content}`);
-    const newEmbedding = newMem.local_embedding ?? newMem.embedding;
+    // Only use local_embedding (384-dim) for cosine comparison — avoids dimension
+    // mismatch with Gemini embeddings (768-dim). Matches dedup strategy.
+    const newEmbedding = newMem.local_embedding ?? null;
 
     for (const existingMem of existingMemories) {
       if (newMem.id === existingMem.id) continue;
 
       const existingTokens = tokenize(`${existingMem.summary} ${existingMem.content}`);
-      const existingEmbedding = existingMem.local_embedding ?? existingMem.embedding;
+      const existingEmbedding = existingMem.local_embedding ?? null;
 
       const score = hybridSimilarity(newTokens, existingTokens, newEmbedding, existingEmbedding);
 

@@ -179,31 +179,43 @@ export async function backfill(
     // Imperative Shell: fetch data (I/O)
     const allMemories = getActiveMemories(db);
 
-    // Imperative Shell: choose method and use appropriate filter
+    let totalProcessed = 0;
+    let totalFailed = 0;
+    const allErrors: string[] = [];
+    let primaryMethod: 'gemini' | 'local' = 'local';
+
+    // Step 1: Backfill Gemini embeddings if API available
     if (isGeminiAvailable(geminiApiKey)) {
-      const unembedded = filterGeminiUnembedded(allMemories);
-      if (unembedded.length === 0) {
-        return { ok: true, processed: 0, failed: 0, errors: [], method: 'gemini' };
+      primaryMethod = 'gemini';
+      const geminiUnembedded = filterGeminiUnembedded(allMemories);
+      if (geminiUnembedded.length > 0) {
+        const texts = buildEmbeddingTexts(geminiUnembedded, projectName);
+        process.stderr.write(`[cortex:backfill] INFO: Using Gemini for ${geminiUnembedded.length} embeddings\n`);
+        const { processed, failed, errors } = await backfillGemini(
+          db,
+          geminiUnembedded,
+          texts,
+          geminiApiKey!
+        );
+        totalProcessed += processed;
+        totalFailed += failed;
+        allErrors.push(...errors);
       }
-      const texts = buildEmbeddingTexts(unembedded, projectName);
-      process.stderr.write(`[cortex:backfill] INFO: Using Gemini for ${unembedded.length} embeddings\n`);
-      const { processed, failed, errors } = await backfillGemini(
-        db,
-        unembedded,
-        texts,
-        geminiApiKey!
-      );
-      return { ok: true, processed, failed, errors, method: 'gemini' };
-    } else {
-      const unembedded = filterLocalUnembedded(allMemories);
-      if (unembedded.length === 0) {
-        return { ok: true, processed: 0, failed: 0, errors: [], method: 'local' };
-      }
-      const texts = buildEmbeddingTexts(unembedded, projectName);
-      process.stderr.write(`[cortex:backfill] INFO: Gemini unavailable — falling back to local model for ${unembedded.length} embeddings\n`);
-      const { processed, failed, errors } = await backfillLocal(db, unembedded, texts);
-      return { ok: true, processed, failed, errors, method: 'local' };
     }
+
+    // Step 2: Always backfill local embeddings (needed for same-dimension
+    // cosine comparison during dedup and edge creation)
+    const localUnembedded = filterLocalUnembedded(allMemories);
+    if (localUnembedded.length > 0) {
+      const texts = buildEmbeddingTexts(localUnembedded, projectName);
+      process.stderr.write(`[cortex:backfill] INFO: Backfilling local embeddings for ${localUnembedded.length} memories\n`);
+      const { processed, failed, errors } = await backfillLocal(db, localUnembedded, texts);
+      totalProcessed += processed;
+      totalFailed += failed;
+      allErrors.push(...errors);
+    }
+
+    return { ok: true, processed: totalProcessed, failed: totalFailed, errors: allErrors, method: primaryMethod };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { ok: false, error: `Backfill failed: ${message}` };
