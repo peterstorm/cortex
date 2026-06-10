@@ -75,12 +75,10 @@ export function detectHarness(): "claude" | "pi" {
 
 /**
  * Resolve push surface output file path.
- * Claude Code: .claude/cortex-memory.local.md
- * Pi: .pi/cortex-memory.local.md
+ * Always uses .claude/ for consistency across all harnesses (Claude Code, pi, opencode).
  */
 export function getSurfaceOutputPath(projectRoot: string): string {
-  const dir = detectHarness() === "pi" ? '.pi' : '.claude';
-  return join(projectRoot, dir, 'cortex-memory.local.md');
+  return join(projectRoot, '.claude', 'cortex-memory.local.md');
 }
 
 /**
@@ -294,5 +292,4 @@ export const DEFAULT_TRAVERSAL_DEPTH = 2;
 export const GITIGNORE_PATTERNS = [
   '.memory/',
   '.claude/cortex-memory.local.md',
-  '.pi/cortex-memory.local.md',
 ] as const;

@@ -26,7 +26,7 @@
 
 import { Database } from 'bun:sqlite';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, isAbsolute } from 'node:path';
 import type { HookInput } from './core/types.js';
 import {
   getGeminiApiKey,
@@ -998,6 +998,34 @@ async function handlePromptRecall(): Promise<CommandResult> {
 // ============================================================================
 
 /**
+ * Subcommands whose first positional argument is a project root (cwd).
+ * extract and prompt-recall receive cwd via stdin JSON instead.
+ */
+const CWD_SUBCOMMANDS = new Set([
+  'generate', 'recall', 'remember', 'index-code', 'forget', 'consolidate',
+  'lifecycle', 'ai-prune', 'traverse', 'inspect', 'backfill', 'semantic-edges',
+  'load-surface', 'entity-query',
+]);
+
+/**
+ * Validate a cwd positional argument before any handler touches the filesystem.
+ * Pure function - no I/O, testable.
+ *
+ * Rejects flag-like strings (e.g. '--session') and relative paths: handlers
+ * mkdir/write under cwd, so a bad value silently creates a phantom project.
+ *
+ * @param cwd - First positional argument (may be undefined; handlers report usage)
+ * @returns Error message, or null if acceptable
+ */
+export function validateCwdArg(cwd: string | undefined): string | null {
+  if (cwd === undefined) return null;
+  if (cwd.startsWith('-') || !isAbsolute(cwd)) {
+    return `Invalid cwd argument: "${cwd}" - must be an absolute path`;
+  }
+  return null;
+}
+
+/**
  * Main CLI entry point
  * Parses subcommand and dispatches to appropriate handler
  */
@@ -1014,6 +1042,14 @@ async function main() {
   const subcommandArgs = args.slice(1);
 
   let result: CommandResult;
+
+  if (CWD_SUBCOMMANDS.has(subcommand)) {
+    const cwdError = validateCwdArg(subcommandArgs[0]);
+    if (cwdError) {
+      logError(cwdError);
+      process.exit(1);
+    }
+  }
 
   try {
     switch (subcommand) {
@@ -1086,7 +1122,7 @@ async function main() {
 
   // Output result
   if (result.output) {
-    console.log(result.output);
+    process.stdout.write(`${result.output}\n`);
   }
 
   // Dispose ONNX model resources before exit

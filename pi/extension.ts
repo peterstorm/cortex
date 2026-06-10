@@ -8,7 +8,7 @@
 
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync } from "node:fs";
 import { execSync, spawn } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -35,9 +35,13 @@ function runCli(args: string[], options?: {
     }).trim();
   } catch (e) {
     // Never block — log and return empty
-    const msg = (e as Error).message ?? "";
+    const err = e as Error & { stderr?: string | Buffer };
+    const msg = err.message ?? "";
     if (msg.includes("TIMEOUT")) {
       process.stderr.write(`[cortex] CLI timeout: ${args.join(" ")}\n`);
+    } else {
+      const detail = err.stderr?.toString().trim();
+      process.stderr.write(`[cortex] CLI failed: ${args.join(" ")}${detail ? ` — ${detail}` : ""}\n`);
     }
     return "";
   }
@@ -63,12 +67,38 @@ function runCliDetached(args: string[], options?: {
       proc.stdin.end();
     }
     proc.unref();
-  } catch {}
+  } catch (e) {
+    process.stderr.write(`[cortex] failed to spawn detached CLI (${args.join(" ")}): ${e}\n`);
+  }
 }
 
 /** Get the surface file path for current project */
 function getSurfacePath(cwd: string): string {
-  return join(cwd, ".pi", "cortex-memory.local.md");
+  return join(cwd, ".claude", "cortex-memory.local.md");
+}
+
+/**
+ * One-time migration from the pre-unification surface location.
+ * Pi projects created before the .claude/ unification have their surface at
+ * .pi/cortex-memory.local.md — nothing reads or updates that file anymore,
+ * so move it to the new path (or drop it if the new path already exists).
+ */
+function migrateLegacySurface(cwd: string): void {
+  const legacyPath = join(cwd, ".pi", "cortex-memory.local.md");
+  if (!existsSync(legacyPath)) return;
+  const surfacePath = getSurfacePath(cwd);
+  try {
+    if (existsSync(surfacePath)) {
+      unlinkSync(legacyPath);
+      process.stderr.write(`[cortex] removed stale legacy surface ${legacyPath}\n`);
+    } else {
+      mkdirSync(dirname(surfacePath), { recursive: true });
+      renameSync(legacyPath, surfacePath);
+      process.stderr.write(`[cortex] migrated surface ${legacyPath} -> ${surfacePath}\n`);
+    }
+  } catch (e) {
+    process.stderr.write(`[cortex] legacy surface migration failed: ${e}\n`);
+  }
 }
 
 /** Source Gemini API key if available */
@@ -97,13 +127,16 @@ export default function (pi: ExtensionAPI) {
       + `\n\n# Cortex Memory CLI\nWhen cortex commands reference \`\${CLAUDE_PLUGIN_ROOT}\`, use this resolved path instead:\n\`${PACKAGE_ROOT}\`\nFor example: \`bun ${CLI_PATH} recall ${cwd} "query"\`\n`;
 
     // 2. Load cached surface file
+    migrateLegacySurface(cwd);
     const parts: string[] = [];
     const surfacePath = getSurfacePath(cwd);
     if (existsSync(surfacePath)) {
       try {
         const surface = readFileSync(surfacePath, "utf-8").trim();
         if (surface) parts.push(surface);
-      } catch {}
+      } catch (e) {
+        process.stderr.write(`[cortex] failed to read surface ${surfacePath}: ${e}\n`);
+      }
     }
 
     // 3. Prompt recall (keyword search based on user's prompt)
@@ -133,6 +166,7 @@ export default function (pi: ExtensionAPI) {
   // ─── Session Start: Load cached surface ─────────────────────────────
   pi.on("session_start", async (_event, ctx) => {
     const cwd = ctx.cwd;
+    migrateLegacySurface(cwd);
     runCli(["load-surface", cwd], { timeout: 10_000, cwd });
   });
 

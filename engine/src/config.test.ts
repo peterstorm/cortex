@@ -3,8 +3,11 @@
  * Pure function tests - no I/O mocks needed
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 import {
+  detectHarness,
   getProjectDbPath,
   getGlobalDbPath,
   getSurfaceCacheDir,
@@ -27,8 +30,8 @@ describe('config - path resolution', () => {
 
   it('getGlobalDbPath returns path in home directory', () => {
     const result = getGlobalDbPath();
-    // Harness-dependent: .claude or .pi/agent
-    expect(result).toMatch(/\.(claude|pi\/agent)\/memory\/cortex-global\.db/);
+    expect(result).toContain(homedir());
+    expect(result).toContain('cortex-global.db');
   });
 
   it('getSurfaceCacheDir returns correct path', () => {
@@ -38,8 +41,7 @@ describe('config - path resolution', () => {
 
   it('getSurfaceOutputPath returns correct path', () => {
     const result = getSurfaceOutputPath('/project');
-    // Harness-dependent: .claude or .pi
-    expect(result).toMatch(/\/project\/\.(claude|pi)\/cortex-memory\.local\.md/);
+    expect(result).toBe('/project/.claude/cortex-memory.local.md');
   });
 
   it('getLockDir returns correct path', () => {
@@ -97,8 +99,44 @@ describe('config - constants', () => {
     expect(GITIGNORE_PATTERNS).toContain('.memory/');
   });
 
-  it('GITIGNORE_PATTERNS includes cortex-memory.local.md', () => {
-    expect(GITIGNORE_PATTERNS).toContain('.claude/cortex-memory.local.md');
+  it('GITIGNORE_PATTERNS contains exactly the live cortex paths', () => {
+    // .pi/cortex-memory.local.md was removed when the surface unified on .claude/
+    expect([...GITIGNORE_PATTERNS]).toEqual([
+      '.memory/',
+      '.claude/cortex-memory.local.md',
+    ]);
+  });
+});
+
+describe('config - harness detection', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('detectHarness returns claude when pi env vars are absent', () => {
+    vi.stubEnv('PI_CODING_AGENT_DIR', '');
+    vi.stubEnv('PI_CODING_AGENT', '');
+    expect(detectHarness()).toBe('claude');
+  });
+
+  it('detectHarness returns pi when PI_CODING_AGENT_DIR is set', () => {
+    vi.stubEnv('PI_CODING_AGENT_DIR', '/home/user/.pi');
+    expect(detectHarness()).toBe('pi');
+  });
+
+  it('getGlobalDbPath uses .claude under claude harness', () => {
+    vi.stubEnv('PI_CODING_AGENT_DIR', '');
+    vi.stubEnv('PI_CODING_AGENT', '');
+    expect(getGlobalDbPath()).toBe(
+      join(homedir(), '.claude', 'memory', 'cortex-global.db')
+    );
+  });
+
+  it('getGlobalDbPath uses .pi/agent under pi harness', () => {
+    vi.stubEnv('PI_CODING_AGENT_DIR', '/home/user/.pi');
+    expect(getGlobalDbPath()).toBe(
+      join(homedir(), '.pi', 'agent', 'memory', 'cortex-global.db')
+    );
   });
 });
 
@@ -124,9 +162,14 @@ describe('config - path composition', () => {
     expect(telemetryPath).toContain('.memory');
   });
 
-  it('surface output path is under harness directory', () => {
-    const result = getSurfaceOutputPath('/project');
-    // In test context (no PI_CODING_AGENT_DIR), defaults to .claude
-    expect(result).toMatch(/\.(claude|pi)/);
+  it('surface output path stays under .claude even under pi harness', () => {
+    vi.stubEnv('PI_CODING_AGENT_DIR', '/home/user/.pi');
+    try {
+      expect(getSurfaceOutputPath('/project')).toBe(
+        '/project/.claude/cortex-memory.local.md'
+      );
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });

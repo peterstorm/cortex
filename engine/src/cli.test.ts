@@ -5,7 +5,7 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Database } from 'bun:sqlite';
-import { parseHookInput, parseRecallArgs } from './cli.js';
+import { parseHookInput, parseRecallArgs, validateCwdArg } from './cli.js';
 import { openDatabase, insertMemory } from './infra/db.js';
 import { createMemory } from './core/types.js';
 import { getProjectName } from './config.js';
@@ -75,6 +75,24 @@ describe('cli - parseHookInput', () => {
 
     const result = parseHookInput(jsonText);
     expect(result).toBeNull();
+  });
+});
+
+describe('cli - validateCwdArg', () => {
+  it('accepts an absolute path', () => {
+    expect(validateCwdArg('/home/user/project')).toBeNull();
+  });
+
+  it('passes undefined through (handlers report their own usage errors)', () => {
+    expect(validateCwdArg(undefined)).toBeNull();
+  });
+
+  it('rejects flag-like strings', () => {
+    expect(validateCwdArg('--session')).toContain('Invalid cwd argument');
+  });
+
+  it('rejects relative paths', () => {
+    expect(validateCwdArg('some/relative/path')).toContain('Invalid cwd argument');
   });
 });
 
