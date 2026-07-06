@@ -11,7 +11,8 @@
 
 import type { Database } from 'bun:sqlite';
 import type { Memory } from '../core/types.js';
-import { getMemory, updateMemory, searchByKeyword, archiveEdgesForMemory } from '../infra/db.js';
+import { getMemory, updateMemory, searchByKeyword, archiveEdgesForMemory, supersedeFactsForMemory } from '../infra/db.js';
+import { invalidateSurfaceCache } from './generate.js';
 
 // ============================================================================
 // RESULT TYPES (discriminated unions)
@@ -70,9 +71,11 @@ function filterActive(memories: readonly Memory[]): readonly Memory[] {
  *
  * @param db - Database instance
  * @param id - Memory ID to archive
+ * @param cwd - Project root; when provided, the surface cache is invalidated
+ *              so the archived memory can't be served from a stale cache
  * @returns ForgetResult indicating success or not found
  */
-export function forgetById(db: Database, id: string): ForgetResult {
+export function forgetById(db: Database, id: string, cwd?: string): ForgetResult {
   // Fetch memory (I/O)
   const memory = getMemory(db, id);
 
@@ -81,8 +84,18 @@ export function forgetById(db: Database, id: string): ForgetResult {
   }
 
   // Archive memory and soft-delete edges (I/O)
-  updateMemory(db, id, { status: 'archived' });
+  // archived_at anchors the archive→prune grace period (FR-091)
+  updateMemory(db, id, { status: 'archived', archived_at: new Date().toISOString() });
   archiveEdgesForMemory(db, id);
+
+  // Supersede facts sourced from this memory — entity-query must stop
+  // reporting knowledge whose source was just retracted (FR-096 spirit)
+  supersedeFactsForMemory(db, id);
+
+  // Invalidate cached surfaces: the visible memory set changed
+  if (cwd !== undefined) {
+    invalidateSurfaceCache(cwd);
+  }
 
   return {
     status: 'archived',
@@ -126,6 +139,6 @@ export function forgetByQuery(db: Database, query: string, limit: number = 10): 
  * @param ids - Array of memory IDs to archive
  * @returns Array of ForgetResult for each ID
  */
-export function forgetByIds(db: Database, ids: readonly string[]): readonly ForgetResult[] {
-  return ids.map(id => forgetById(db, id));
+export function forgetByIds(db: Database, ids: readonly string[], cwd?: string): readonly ForgetResult[] {
+  return ids.map(id => forgetById(db, id, cwd));
 }

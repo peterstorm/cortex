@@ -67,8 +67,10 @@ When your session ends, the hook detaches a background worker (so nothing blocks
 4. **Parse response** — validate each memory candidate (type, confidence, priority); global-scoped candidates go to the global DB
 5. **Store in DB** — insert memories, compute similarity edges to existing memories
 6. **Backfill embeddings** — embed newly stored memories (Gemini, or local fallback)
-7. **Regenerate surface** — rebuild so the next session starts fresh
-8. **Maintenance (sequential)** — semantic edge classification, then lifecycle (decay/archive/prune), then AI prune. These used to be concurrent detached spawns, but SQLite allows one writer and lifecycle + AI prune both read-modify-write telemetry — so they now run one after another. Logs go to `/tmp/cortex-semantic-edges.log`, `/tmp/cortex-lifecycle.log`, `/tmp/cortex-ai-prune.log` (extract/backfill/generate log to `/tmp/cortex-*.log` too).
+7. **Maintenance (sequential)** — semantic edge classification, then lifecycle (decay/archive/prune), then AI prune. These used to be concurrent detached spawns, but SQLite allows one writer and lifecycle + AI prune both read-modify-write telemetry — so they now run one after another.
+8. **Regenerate surface LAST** — after all archival, so the surface never contains memories archived earlier in the same pipeline; the next session starts fresh
+
+Each step logs to a per-process file `/tmp/cortex-<step>.<pid>.log` (extract, backfill, semantic-edges, lifecycle, ai-prune, generate).
 
 ---
 
@@ -146,21 +148,22 @@ The "push surface" is the markdown file Claude reads at session start. It's gene
 
 When new memories are inserted, they're compared to all existing active memories. The system uses a **two-tier similarity** approach:
 
-### Tier 1: Jaccard Pre-Filter (at insertion time)
+### Tier 1: Edge classification (at insertion time)
 
-Cheap token-overlap comparison used for edge creation during extraction:
+Hybrid similarity per pair — cosine on local embeddings when both sides have one, Jaccard token overlap otherwise. Classification bands are calibrated PER SIMILARITY SPACE, because raw 384-dim local (BGE) cosine runs "hot": same-domain memories about different aspects routinely score 0.6-0.75, while Jaccard is much better separated:
 
-| Jaccard Score | Pre-filter | Action |
-|---|---|---|
-| < 0.1 | `definitely_different` | Skip entirely |
-| 0.1 - 0.4 | `maybe` | Create `relates_to` edge (strength = score) |
-| 0.4 - 0.5 | `maybe` | Create `suggested` edge for review |
-| 0.5+ | `maybe` | Flag for consolidation (logged, not auto-merged in v1) |
-| 0.6+ | `definitely_similar` | Create strong `relates_to` edge (strength = 0.9) |
+| Band | Jaccard score | Local cosine score | Action |
+|---|---|---|---|
+| ignore | < 0.1 | < 0.6 | Skip entirely |
+| relate | 0.1 - 0.4 | 0.6 - 0.75 | Create `relates_to` edge (strength = score) |
+| suggest | 0.4 - 0.5 | 0.75 - 0.82 | Create `suggested` edge for review |
+| consolidate | > 0.5 | ≥ 0.82 | Create strong `relates_to` edge (strength = score) |
+
+Each new memory keeps at most its 3 strongest edges — a structural guard against O(n²) edge explosion in dense projects.
 
 ### Tier 2: Cosine Similarity on Embeddings (wired)
 
-`cosineSimilarity()` in `core/similarity.ts` is used throughout: `/recall` and the prompt-recall hook rank results by cosine similarity, and `/consolidate` detects duplicate pairs via `hybridSimilarity()` (Jaccard + cosine combined).
+`cosineSimilarity()` in `core/similarity.ts` is used throughout: `/recall` and the prompt-recall hook rank results by cosine similarity, and `/consolidate` detects duplicate pairs via hybrid similarity (Jaccard + cosine) with per-space thresholds — 0.5 for Jaccard and Gemini-768 cosine, 0.8 for raw local-BGE cosine.
 
 ### Semantic Edge Classification
 

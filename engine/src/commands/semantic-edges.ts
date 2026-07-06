@@ -15,64 +15,16 @@
  * Designed to run as fire-and-forget step in extract-and-generate hook.
  */
 
-import { unlinkSync, writeFileSync, readFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import type { Database } from 'bun:sqlite';
 import type { Memory } from '../core/types.js';
 import type { MemoryPair, EdgeClassification } from '../infra/claude-llm.js';
 import { classifyEdges, isClaudeLlmAvailable } from '../infra/claude-llm.js';
 import { getRelatesToEdges, getMemory, deleteEdge, insertEdge } from '../infra/db.js';
+import { acquireLock, releaseLock } from '../infra/lock.js';
 
 /** Max pairs per LLM call to stay within 90s timeout */
 const BATCH_SIZE = 10;
-
-/**
- * Acquire a lock file with PID. Returns true if acquired.
- * Stale locks (PID no longer running) are automatically reclaimed.
- * The lock lives in the project's .memory/locks dir — a global lock would
- * make semantic-edges runs for unrelated projects silently skip each other.
- */
-function acquireLock(lockFile: string): boolean {
-  try {
-    mkdirSync(join(lockFile, '..'), { recursive: true });
-    // O_EXCL: atomic create-if-not-exists — eliminates TOCTOU race
-    writeFileSync(lockFile, String(process.pid), { flag: 'wx' });
-    return true;
-  } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') return false;
-    // Lock file exists — check if holder is still alive
-    try {
-      const existingPid = parseInt(readFileSync(lockFile, 'utf-8').trim(), 10);
-      if (!isNaN(existingPid)) {
-        try {
-          process.kill(existingPid, 0);
-          return false; // Process still alive, lock is held
-        } catch {
-          // Process gone, stale lock — reclaim it
-          logInfo(`Reclaiming stale lock from PID ${existingPid}`);
-          unlinkSync(lockFile);
-          try {
-            writeFileSync(lockFile, String(process.pid), { flag: 'wx' });
-            return true;
-          } catch {
-            return false; // Another process beat us to reclaim
-          }
-        }
-      }
-    } catch {
-      return false;
-    }
-    return false;
-  }
-}
-
-function releaseLock(lockFile: string): void {
-  try {
-    unlinkSync(lockFile);
-  } catch {
-    // Ignore — lock already removed
-  }
-}
 
 export interface SemanticEdgesOptions {
   /** Max edges to process (0 = all) */

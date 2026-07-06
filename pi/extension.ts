@@ -15,6 +15,21 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const CLI_PATH = join(PACKAGE_ROOT, "engine", "src", "cli.ts");
 
+/**
+ * Env for spawned engine CLIs. The engine decides harness-specific paths
+ * (surface file, global DB) by sniffing PI_CODING_AGENT* env vars
+ * (engine/src/config.ts detectHarness/getSurfaceOutputPath). If pi's own
+ * process doesn't carry that var, the spawned CLI would silently write the
+ * surface to .claude/ while this extension reads .pi/ — so force the marker.
+ */
+function cliEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    CORTEX_PLUGIN_ROOT: PACKAGE_ROOT,
+    PI_CODING_AGENT: process.env.PI_CODING_AGENT ?? "1",
+  };
+}
+
 /** Run a bun CLI command, returning stdout. Never throws. */
 function runCli(args: string[], options?: {
   stdin?: string;
@@ -30,16 +45,15 @@ function runCli(args: string[], options?: {
       timeout: options?.timeout ?? 30_000,
       cwd: options?.cwd,
       encoding: "utf-8",
-      env: {
-        ...process.env,
-        CORTEX_PLUGIN_ROOT: PACKAGE_ROOT,
-      },
+      env: cliEnv(),
     }).trim();
   } catch (e) {
     // Never block — log and return empty
     const msg = (e as Error).message ?? "";
     if (msg.includes("TIMEOUT")) {
       process.stderr.write(`[cortex] CLI timeout: ${args.join(" ")}\n`);
+    } else {
+      process.stderr.write(`[cortex] CLI failed (${args.join(" ")}): ${msg}\n`);
     }
     return "";
   }
@@ -70,10 +84,7 @@ function runCliChainDetached(argsList: string[][], cwd: string): void {
         stdio: ["ignore", logFd, logFd],
         detached: true,
         cwd,
-        env: {
-          ...process.env,
-          CORTEX_PLUGIN_ROOT: PACKAGE_ROOT,
-        },
+        env: cliEnv(),
       }
     );
     proc.unref();
@@ -83,9 +94,15 @@ function runCliChainDetached(argsList: string[][], cwd: string): void {
   }
 }
 
-/** Get the surface file path for current project */
+/**
+ * Get the surface file path for the current project.
+ * Replicates engine getSurfaceOutputPath (engine/src/config.ts): pi harness
+ * → .pi/, otherwise .claude/. cliEnv() forces PI_CODING_AGENT for spawned
+ * CLIs, so this and the engine always agree on the same path.
+ */
 function getSurfacePath(cwd: string): string {
-  return join(cwd, ".pi", "cortex-memory.local.md");
+  const isPi = Boolean(cliEnv().PI_CODING_AGENT_DIR || cliEnv().PI_CODING_AGENT);
+  return join(cwd, isPi ? ".pi" : ".claude", "cortex-memory.local.md");
 }
 
 /** Source Gemini API key if available */
@@ -98,7 +115,9 @@ function loadGeminiEnv(): void {
         const match = line.match(/^export\s+(\w+)=["']?(.+?)["']?\s*$/);
         if (match) process.env[match[1]] = match[2];
       }
-    } catch {}
+    } catch (e) {
+      process.stderr.write(`[cortex] failed to load gemini env (${envFile}): ${(e as Error).message}\n`);
+    }
   }
 }
 
@@ -120,7 +139,9 @@ export default function (pi: ExtensionAPI) {
       try {
         const surface = readFileSync(surfacePath, "utf-8").trim();
         if (surface) parts.push(surface);
-      } catch {}
+      } catch (e) {
+        process.stderr.write(`[cortex] failed to read surface (${surfacePath}): ${(e as Error).message}\n`);
+      }
     }
 
     // 3. Prompt recall (keyword search based on user's prompt)
@@ -183,17 +204,19 @@ export default function (pi: ExtensionAPI) {
       runCli(["backfill", cwd], { timeout: 30_000, cwd });
     }
 
-    // Step 3: Generate push surface
-    runCli(["generate", cwd], { timeout: 30_000, cwd });
-
-    // Steps 4-6: maintenance — ONE detached chain, run sequentially.
+    // Steps 3-6: maintenance — ONE detached chain, run sequentially.
     // Spawning these concurrently made them race: SQLite allows a single
     // writer, and lifecycle + ai-prune both read-modify-write telemetry.json.
+    //
+    // ORDER MATTERS: generate runs LAST. Lifecycle and ai-prune archive
+    // memories — generating the surface before them served just-archived
+    // memories for the whole next session.
     runCliChainDetached(
       [
         ["semantic-edges", cwd],
         ["lifecycle", cwd, "--if-needed"],
         ["ai-prune", cwd, "--if-needed"],
+        ["generate", cwd],
       ],
       cwd
     );

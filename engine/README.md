@@ -146,20 +146,20 @@ SessionEnd hook (JSON stdin: {session_id, transcript_path, cwd})
            a. candidateToMemory() [pure] → Memory
            b. insertMemory(db, memory)
            c. computeSimilarityAndCreateEdges():
-              - tokenize both → Jaccard pre-filter
-              - < 0.1: skip
-              - 0.1–0.4: relates_to edge (active)
-              - 0.4–0.5: relates_to edge (suggested)
-              - > 0.6: strong relates_to edge
+              - hybrid similarity (local cosine if both embedded, else Jaccard)
+              - classify with per-space bands (Jaccard: 0.1/0.4/0.5,
+                local cosine: 0.6/0.75/0.82) → active/suggested edges
+              - keep top 3 strongest edges per new memory
         9. saveExtractionCheckpoint(cursor)
        10. runLifecycle(projectDb) — decay/archive/prune
        11. invalidateSurfaceCache(cwd) — delete all .json in surface-cache/
 
     → Step 2: bun cli.ts backfill <cwd>       (embed new memories)
-    → Step 3: bun cli.ts generate <cwd>       (see Surface Generation Pipeline)
-    → Step 4: bun cli.ts semantic-edges <cwd> (typed edge classification)
-    → Step 5: bun cli.ts lifecycle <cwd> --if-needed
-    → Step 6: bun cli.ts ai-prune <cwd> --if-needed
+    → Step 3: bun cli.ts semantic-edges <cwd> (typed edge classification)
+    → Step 4: bun cli.ts lifecycle <cwd> --if-needed
+    → Step 5: bun cli.ts ai-prune <cwd> --if-needed
+    → Step 6: bun cli.ts generate <cwd>       (LAST, after archival — see
+                                               Surface Generation Pipeline)
 ```
 
 All hooks exit 0 unconditionally — never block session. Errors surface only in `/tmp/cortex-*.log`.
@@ -271,23 +271,24 @@ Exemptions:
 
 ## Similarity & Edge Creation
 
-### Jaccard Pre-Filter (at insertion time)
+### Edge classification (at insertion time)
 
 ```
-tokenize(summary + content) for new and existing memory
-jaccardSimilarity(tokensA, tokensB) → score [0, 1]
-jaccardPreFilter(score):
-  < 0.1  → definitely_different → skip
-  0.1–0.6 → maybe → classifySimilarity():
-    0.1–0.4 → relates_to edge (active)
-    0.4–0.5 → relates_to edge (suggested)
-    0.5+    → consolidation candidate (logged)
-  > 0.6  → definitely_similar → strong relates_to edge
+hybridSimilarityScored(tokens, tokens, localEmbA, localEmbB) → {score, method}
+  method = cosine  when both sides have local embeddings (same dims)
+  method = jaccard otherwise (with <0.1 pre-filter → score 0)
+
+classifySimilarity(score, space) — bands calibrated PER SPACE:
+  jaccard / gemini-cosine:  ignore <0.1 | relate <0.4 | suggest ≤0.5 | consolidate >0.5
+  local-cosine (runs hot):  ignore <0.6 | relate <0.75 | suggest <0.82 | consolidate ≥0.82
+
+relate/consolidate → active relates_to edge, suggest → suggested edge.
+Cap: top MAX_EDGES_PER_MEMORY (3) strongest edges per new memory.
 ```
 
 ### Cosine Similarity (at search time)
 
-Used by `/recall` and prompt-recall when embeddings are available, and by `consolidate` via `hybridSimilarity()` (Jaccard + cosine) for duplicate-pair detection.
+Used by `/recall` and prompt-recall when embeddings are available, and by `consolidate` via hybrid similarity for duplicate-pair detection with per-space thresholds (`consolidationThresholdFor`: 0.5 Jaccard/Gemini, 0.8 local cosine).
 
 ### Tokenizer
 
@@ -354,7 +355,7 @@ Archive by ID or fuzzy keyword query. Tries ID lookup in project → global, the
 
 Two modes, project DB only.
 
-**List mode** — `consolidate <cwd> [--threshold=N]` (default threshold 0.5): detects duplicate pairs via `hybridSimilarity()` (Jaccard + cosine when embeddings available) and prints each pair with IDs, similarity %, type, priority, summary, and content for human review.
+**List mode** — `consolidate <cwd> [--threshold=N]`: detects duplicate pairs via hybrid similarity (cosine when both sides share an embedding type, Jaccard otherwise) and prints each pair with IDs, similarity %, type, priority, summary, and content for human review. Default threshold is per similarity space — 0.5 for Jaccard and Gemini-768 cosine, 0.8 for raw local-BGE cosine (which scores same-domain non-duplicates 0.6-0.75); `--threshold=N` overrides uniformly.
 
 **Merge mode** — `consolidate <cwd> --merge --a=<idA> --b=<idB> --summary=<text> --content=<text>`: merges one reviewed pair. The merged memory gets confidence 1.0 (human-approved), the higher priority of the two, combined tags, pinned if either was pinned, and null embeddings (backfill re-embeds the new content). Both originals are marked `superseded` with `supersedes` edges, and the new memory ID is printed. Run `backfill` + `generate` afterwards.
 

@@ -41,12 +41,12 @@ A `SessionEnd` hook detaches a background worker (so nothing blocks the session)
 
 1. **Extract** — Read the session transcript (JSONL), truncate if >100KB (resumable via cursor checkpoints), add git context (branch, commits, changed files), and pipe to a headless coding-agent CLI (`claude -p --model haiku` by default) for memory extraction; global-scoped candidates are routed to the global DB
 2. **Backfill** — Compute embeddings for newly extracted memories (Gemini API, or local HuggingFace fallback)
-3. **Generate** — Rebuild the surface file for the next session
-4. **Semantic Edges** — Classify Jaccard-created `relates_to` edges into typed relationships
-5. **Lifecycle** — Decay confidence, archive stale memories, prune old ones
-6. **AI Prune** — When due, the LLM evaluates active memories and archives low-value ones
+3. **Semantic Edges** — Classify similarity-created `relates_to` edges into typed relationships
+4. **Lifecycle** — Decay confidence, archive stale memories, prune old ones
+5. **AI Prune** — When due, the LLM evaluates active memories and archives low-value ones
+6. **Generate** — Rebuild the surface file LAST, after all archival, so the next session never starts from a surface containing just-archived memories
 
-The maintenance steps (4-6) run sequentially — not as concurrent detached spawns — because SQLite allows one writer and lifecycle + AI prune both read-modify-write telemetry. Each step logs to `/tmp/cortex-*.log` (`cortex-extract.log`, `cortex-backfill.log`, `cortex-generate.log`, `cortex-semantic-edges.log`, `cortex-lifecycle.log`, `cortex-ai-prune.log`).
+The maintenance steps (3-5) run sequentially — not as concurrent detached spawns — because SQLite allows one writer and lifecycle + AI prune both read-modify-write telemetry. Each step logs to a per-process file `/tmp/cortex-<step>.<pid>.log` (extract, backfill, semantic-edges, lifecycle, ai-prune, generate).
 
 All hooks exit 0 unconditionally — errors are logged, never surfaced. A `CORTEX_EXTRACTING=1` environment variable prevents recursive hook storms when `claude -p` is invoked during extraction.
 
@@ -301,20 +301,22 @@ Memories are connected through typed edges, forming a knowledge graph.
 
 ### Two-Tier Approach
 
-**Tier 1: Jaccard Pre-Filter** (at insertion time)
+**Tier 1: Edge classification** (at insertion time)
 
-Cheap token-overlap comparison:
+Hybrid similarity — cosine on local embeddings when both sides have one, Jaccard token overlap otherwise — with bands calibrated per similarity space. Raw 384-dim local cosine runs "hot" (same-domain memories about different aspects routinely score 0.6-0.75), so it uses higher cutoffs:
 
-| Jaccard Score | Classification | Action |
-|---|---|---|
-| < 0.1 | `definitely_different` | Skip |
-| 0.1 - 0.4 | `maybe` | Create `relates_to` edge |
-| 0.4 - 0.5 | `maybe` | Create suggested edge for review |
-| > 0.6 | `definitely_similar` | Create strong `relates_to` edge |
+| Band | Jaccard score | Local cosine score | Action |
+|---|---|---|---|
+| ignore | < 0.1 | < 0.6 | Skip |
+| relate | 0.1 - 0.4 | 0.6 - 0.75 | Create `relates_to` edge |
+| suggest | 0.4 - 0.5 | 0.75 - 0.82 | Create suggested edge for review |
+| consolidate | > 0.5 | ≥ 0.82 | Create strong `relates_to` edge |
+
+Each new memory keeps at most its 3 strongest edges (structural guard against edge explosion).
 
 **Tier 2: Cosine Similarity** (embeddings)
 
-Used by `/recall` for search ranking and by `/consolidate` for duplicate detection (threshold: cosine > 0.5).
+Used by `/recall` for search ranking and by `/consolidate` for duplicate detection. Consolidation thresholds are per-space: Jaccard and Gemini-768 cosine flag pairs above 0.5; raw local-BGE cosine flags pairs above 0.8.
 
 ### Consolidation
 

@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS memories (
   last_accessed_at TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'active'
+  status TEXT NOT NULL DEFAULT 'active',
+  archived_at TEXT
 );
 
 -- Edge table with unique constraint per FR-106
@@ -68,7 +69,8 @@ CREATE TABLE IF NOT EXISTS extraction_checkpoints (
   id TEXT PRIMARY KEY,
   session_id TEXT NOT NULL,
   cursor_position INTEGER NOT NULL,
-  extracted_at TEXT NOT NULL
+  extracted_at TEXT NOT NULL,
+  transcript_length INTEGER
 );
 
 -- FTS5 virtual table for keyword search (FR-101)
@@ -156,26 +158,84 @@ CREATE INDEX IF NOT EXISTS idx_facts_valid ON facts(valid_to);
 `;
 
 /**
+ * Current schema version stamped into PRAGMA user_version.
+ * Bump when the schema changes in a way old code cannot safely handle.
+ */
+export const CURRENT_SCHEMA_VERSION = 1;
+
+/**
  * Initialize database schema and enable optimizations
  * I/O: Creates/modifies database file
+ *
+ * Schema versioning (PRAGMA user_version):
+ * - 0 (fresh or legacy DB): run schema + migrations, stamp current version
+ * - equal to CURRENT_SCHEMA_VERSION: proceed (schema/migrations are idempotent)
+ * - greater than CURRENT_SCHEMA_VERSION: fail fast — old code must not
+ *   touch (and potentially corrupt) a newer database
  */
 function initializeSchema(db: Database): void {
-  // Enable WAL mode for concurrent access (FR-100)
-  db.run('PRAGMA journal_mode = WAL');
-
   // WAL allows only one writer; the SessionEnd pipeline spawns detached
   // workers (semantic-edges, lifecycle, ai-prune) that can collide. Without
   // a busy timeout a collision throws SQLITE_BUSY immediately — and detached
   // workers log to /dev/null, so the write is silently lost.
+  // MUST be set BEFORE the WAL pragma: journal_mode=WAL itself takes a write
+  // lock, so a concurrent writer would otherwise cause an unprotected
+  // SQLITE_BUSY on open.
   db.run('PRAGMA busy_timeout = 5000');
+
+  // Enable WAL mode for concurrent access (FR-100)
+  db.run('PRAGMA journal_mode = WAL');
 
   // Enable foreign key constraints
   db.run('PRAGMA foreign_keys = ON');
 
-  // Execute schema creation
+  // Schema version check BEFORE any schema mutation
+  const versionRow = db.prepare('PRAGMA user_version').get() as { user_version: number };
+  const schemaVersion = versionRow.user_version;
+
+  if (schemaVersion > CURRENT_SCHEMA_VERSION) {
+    throw new Error(
+      `Database schema version ${schemaVersion} is newer than supported version ` +
+        `${CURRENT_SCHEMA_VERSION} — refusing to open (update the cortex plugin)`
+    );
+  }
+
+  // Execute schema creation (idempotent) + migrations
   db.exec(SCHEMA);
 
   migrateCheckpointUniqueness(db);
+  migrateArchivedAt(db);
+  migrateCheckpointTranscriptLength(db);
+
+  if (schemaVersion < CURRENT_SCHEMA_VERSION) {
+    db.run(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
+  }
+}
+
+/**
+ * Idempotent migration: add memories.archived_at for existing databases.
+ * CREATE TABLE IF NOT EXISTS won't alter tables that already exist in the
+ * wild, so the column is added via a guarded ALTER TABLE.
+ *
+ * archived_at records WHEN a memory was archived — prune eligibility uses
+ * it as a grace period anchor (legacy archived rows keep NULL and fall
+ * back to updated_at).
+ */
+function migrateArchivedAt(db: Database): void {
+  const columns = db.prepare(`PRAGMA table_info(memories)`).all() as { name: string }[];
+  if (columns.some((c) => c.name === 'archived_at')) return;
+  db.run(`ALTER TABLE memories ADD COLUMN archived_at TEXT`);
+}
+
+/**
+ * Idempotent migration: add extraction_checkpoints.transcript_length.
+ * Stores the transcript content length at checkpoint time so a rewritten
+ * (shrunken) transcript can be detected and the cursor reset to 0.
+ */
+function migrateCheckpointTranscriptLength(db: Database): void {
+  const columns = db.prepare(`PRAGMA table_info(extraction_checkpoints)`).all() as { name: string }[];
+  if (columns.some((c) => c.name === 'transcript_length')) return;
+  db.run(`ALTER TABLE extraction_checkpoints ADD COLUMN transcript_length INTEGER`);
 }
 
 /**
@@ -209,6 +269,21 @@ export function openDatabase(path: string): Database {
   const db = new Database(path);
   initializeSchema(db);
   return db;
+}
+
+/**
+ * Open an EXISTING database read-only, skipping schema init/migrations.
+ *
+ * For hot read-only paths (the prompt-recall hook runs on EVERY user prompt):
+ * opening read-write + running the full DDL/migration block per prompt is
+ * wasted work and takes the writer lock. Throws if the file doesn't exist —
+ * callers must check first and fall back to openDatabase when creating.
+ *
+ * @param path - Existing database file path
+ * @returns Read-only database instance (writes throw)
+ */
+export function openDatabaseReadOnly(path: string): Database {
+  return new Database(path, { readonly: true });
 }
 
 // ============================================================================
@@ -260,6 +335,7 @@ type MemoryRow = {
   created_at: string;
   updated_at: string;
   status: MemoryStatus;
+  archived_at: string | null;
 };
 
 /**
@@ -287,6 +363,7 @@ function rowToMemory(row: MemoryRow): Memory {
     created_at: row.created_at,
     updated_at: row.updated_at,
     status: row.status,
+    archived_at: row.archived_at ?? null,
   });
 }
 
@@ -306,8 +383,8 @@ export function insertMemory(db: Database, memory: Memory): string {
       confidence, priority, pinned,
       source_type, source_session, source_context,
       tags, access_count, last_accessed_at,
-      created_at, updated_at, status
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      created_at, updated_at, status, archived_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   stmt.run(
@@ -329,7 +406,8 @@ export function insertMemory(db: Database, memory: Memory): string {
     memory.last_accessed_at,
     memory.created_at,
     memory.updated_at,
-    memory.status
+    memory.status,
+    memory.archived_at
   );
 
   return memory.id;
@@ -400,6 +478,10 @@ export function updateMemory(db: Database, id: string, fields: Partial<Memory>):
     updates.push('status = ?');
     values.push(fields.status);
   }
+  if (fields.archived_at !== undefined) {
+    updates.push('archived_at = ?');
+    values.push(fields.archived_at);
+  }
 
   // Always update updated_at timestamp
   updates.push('updated_at = ?');
@@ -443,22 +525,40 @@ export function getMemory(db: Database, id: string): Memory | null {
  * Get multiple memories by IDs in a single query
  * I/O: Reads from database
  *
+ * Defaults to ACTIVE memories only: this function backs recall enrichment
+ * and graph traversal, where archived/superseded memories resurfacing as
+ * "related" leaks retracted knowledge back into context. Pass 'any' to
+ * opt into all statuses explicitly (e.g. traverse --include-archived).
+ *
  * @param db - Database instance
  * @param ids - Array of memory IDs
+ * @param statuses - Statuses to include (default ['active']), or 'any'
  * @returns Readonly array of memories (matching IDs only)
  */
-export function getMemoriesByIds(db: Database, ids: readonly string[]): readonly Memory[] {
+export function getMemoriesByIds(
+  db: Database,
+  ids: readonly string[],
+  statuses: readonly MemoryStatus[] | 'any' = ['active']
+): readonly Memory[] {
   if (ids.length === 0) {
+    return [];
+  }
+  if (statuses !== 'any' && statuses.length === 0) {
     return [];
   }
 
   // Build parameterized query with placeholders
-  const placeholders = ids.map(() => '?').join(',');
+  const idPlaceholders = ids.map(() => '?').join(',');
+  const statusFilter =
+    statuses === 'any'
+      ? ''
+      : ` AND status IN (${statuses.map(() => '?').join(',')})`;
   const stmt = db.prepare(`
-    SELECT * FROM memories WHERE id IN (${placeholders})
+    SELECT * FROM memories WHERE id IN (${idPlaceholders})${statusFilter}
   `);
 
-  const rows = stmt.all(...ids) as any[];
+  const params = statuses === 'any' ? [...ids] : [...ids, ...statuses];
+  const rows = stmt.all(...params) as any[];
 
   return rows.map(rowToMemory);
 }
@@ -914,6 +1014,86 @@ export function deleteEdgesForMemory(db: Database, memoryId: string): number {
 }
 
 /**
+ * Re-point all non-supersedes edges from one memory to another.
+ * Used when merging memories: the merged memory inherits the graph
+ * connections (source_of pairings, typed semantic edges) of its members
+ * instead of starting with zero connections.
+ *
+ * Handles:
+ * - Self-references: edges that would connect toId to itself after
+ *   re-pointing (e.g. an edge between the two merged members) are dropped.
+ * - Unique constraint: edges that would duplicate an existing
+ *   (source, target, relation_type) triple after re-pointing are dropped.
+ * - Supersedes edges are left untouched (they record merge history).
+ *
+ * I/O: Writes to database. Caller should wrap in a transaction.
+ *
+ * @param db - Database instance
+ * @param fromId - Memory ID whose edges to re-point
+ * @param toId - Memory ID that inherits the edges (must exist)
+ * @returns Number of edges re-pointed
+ */
+export function repointEdgesToMemory(db: Database, fromId: string, toId: string): number {
+  // Drop edges that would self-reference after re-pointing
+  db.prepare(`
+    DELETE FROM edges
+    WHERE relation_type != 'supersedes'
+      AND ((source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?))
+  `).run(fromId, toId, toId, fromId);
+
+  // Drop edges that would violate the (source, target, relation) unique
+  // constraint after re-pointing the source side
+  db.prepare(`
+    DELETE FROM edges
+    WHERE relation_type != 'supersedes'
+      AND source_id = ?
+      AND EXISTS (
+        SELECT 1 FROM edges e2
+        WHERE e2.source_id = ?
+          AND e2.target_id = edges.target_id
+          AND e2.relation_type = edges.relation_type
+      )
+  `).run(fromId, toId);
+
+  // Same for the target side
+  db.prepare(`
+    DELETE FROM edges
+    WHERE relation_type != 'supersedes'
+      AND target_id = ?
+      AND EXISTS (
+        SELECT 1 FROM edges e2
+        WHERE e2.target_id = ?
+          AND e2.source_id = edges.source_id
+          AND e2.relation_type = edges.relation_type
+      )
+  `).run(fromId, toId);
+
+  // Re-point surviving edges
+  const r1 = db.prepare(
+    `UPDATE edges SET source_id = ? WHERE source_id = ? AND relation_type != 'supersedes'`
+  ).run(toId, fromId);
+  const r2 = db.prepare(
+    `UPDATE edges SET target_id = ? WHERE target_id = ? AND relation_type != 'supersedes'`
+  ).run(toId, fromId);
+
+  return r1.changes + r2.changes;
+}
+
+/**
+ * Re-point facts sourced from one memory to another.
+ * Used when merging memories so facts don't dangle on superseded members.
+ * I/O: Writes to database
+ *
+ * @returns Number of facts re-pointed
+ */
+export function repointFactSources(db: Database, fromId: string, toId: string): number {
+  const result = db.prepare(
+    `UPDATE facts SET source_memory_id = ? WHERE source_memory_id = ?`
+  ).run(toId, fromId);
+  return result.changes;
+}
+
+/**
  * Hard-delete pruned memories older than retentionDays.
  * Permanently removes data to reclaim space. Run after lifecycle.
  * I/O: Deletes from database
@@ -960,6 +1140,7 @@ export function getExtractionCheckpoint(
     session_id: row.session_id,
     cursor_position: row.cursor_position,
     extracted_at: row.extracted_at,
+    transcript_length: row.transcript_length ?? null,
   });
 }
 
@@ -972,7 +1153,9 @@ export function getExtractionCheckpoint(
  */
 export function saveExtractionCheckpoint(
   db: Database,
-  checkpoint: Omit<ExtractionCheckpoint, 'id'>
+  checkpoint: Omit<ExtractionCheckpoint, 'id' | 'transcript_length'> & {
+    readonly transcript_length?: number | null;
+  }
 ): void {
   // Respect caller's extracted_at if provided, otherwise use current timestamp
   const extracted_at = checkpoint.extracted_at ?? new Date().toISOString();
@@ -982,23 +1165,26 @@ export function saveExtractionCheckpoint(
     session_id: checkpoint.session_id,
     cursor_position: checkpoint.cursor_position,
     extracted_at,
+    transcript_length: checkpoint.transcript_length ?? null,
   });
 
   // Atomic UPSERT — a check-then-insert would let two concurrent workers
   // both observe "no checkpoint" and insert duplicate rows.
   const stmt = db.prepare(`
-    INSERT INTO extraction_checkpoints (id, session_id, cursor_position, extracted_at)
-    VALUES (?, ?, ?, ?)
+    INSERT INTO extraction_checkpoints (id, session_id, cursor_position, extracted_at, transcript_length)
+    VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(session_id) DO UPDATE SET
       cursor_position = excluded.cursor_position,
-      extracted_at = excluded.extracted_at
+      extracted_at = excluded.extracted_at,
+      transcript_length = excluded.transcript_length
   `);
 
   stmt.run(
     validated.id,
     validated.session_id,
     validated.cursor_position,
-    validated.extracted_at
+    validated.extracted_at,
+    validated.transcript_length
   );
 }
 
@@ -1104,6 +1290,12 @@ export function restoreCheckpoint(db: Database, checkpointPath: string): void {
         db.run(`DELETE FROM main."${name}"`);
         db.run(`INSERT INTO main."${name}" SELECT * FROM checkpoint."${name}"`);
       }
+
+      // The insert triggers resync FTS rows for restored ids, but FTS rows
+      // whose ids are ABSENT from the restored tables would linger as
+      // orphans (phantom search hits). Clean them up explicitly.
+      db.run(`DELETE FROM memories_fts WHERE id NOT IN (SELECT id FROM main.memories)`);
+      db.run(`DELETE FROM entities_fts WHERE id NOT IN (SELECT id FROM main.entities)`);
     });
     tx();
   } finally {
@@ -1282,10 +1474,19 @@ export function insertFact(db: Database, fact: Fact): string {
 /**
  * Get current (non-superseded) facts for an entity.
  * I/O: Reads from database
+ *
+ * Defense in depth: facts whose source memory is no longer active are
+ * excluded even if their valid_to was never set (archive paths are supposed
+ * to supersede facts, but a missed path must not keep reporting retracted
+ * knowledge). Facts with no resolvable source memory are kept.
  */
 export function getCurrentFacts(db: Database, entityId: string): readonly Fact[] {
   const rows = db.prepare(
-    `SELECT * FROM facts WHERE entity_id = ? AND valid_to IS NULL ORDER BY created_at DESC`
+    `SELECT f.* FROM facts f
+     LEFT JOIN memories m ON m.id = f.source_memory_id
+     WHERE f.entity_id = ? AND f.valid_to IS NULL
+       AND (m.id IS NULL OR m.status = 'active')
+     ORDER BY f.created_at DESC`
   ).all(entityId) as any[];
 
   return rows.map(row => createFact({
@@ -1331,6 +1532,21 @@ export function supersedeFact(db: Database, factId: string): void {
   db.prepare(
     `UPDATE facts SET valid_to = ? WHERE id = ?`
   ).run(new Date().toISOString(), factId);
+}
+
+/**
+ * Supersede all current facts sourced from a memory (set valid_to = now).
+ * Called when a memory is archived (forget, lifecycle, ai-prune) so
+ * entity-query stops reporting knowledge whose source was retracted.
+ * I/O: Writes to database
+ *
+ * @returns Number of facts superseded
+ */
+export function supersedeFactsForMemory(db: Database, memoryId: string): number {
+  const result = db.prepare(
+    `UPDATE facts SET valid_to = ? WHERE source_memory_id = ? AND valid_to IS NULL`
+  ).run(new Date().toISOString(), memoryId);
+  return result.changes;
 }
 
 /**

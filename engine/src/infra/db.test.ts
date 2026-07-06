@@ -1,5 +1,10 @@
 import { describe, it, expect, beforeEach } from 'vitest';
+import { Database } from 'bun:sqlite';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
+  CURRENT_SCHEMA_VERSION,
   openDatabase,
   insertMemory,
   updateMemory,
@@ -728,6 +733,64 @@ describe('Database Layer', () => {
       db.close();
     });
 
+    it('cleans up FTS rows orphaned by restore (regression)', () => {
+      const db = openDatabase(':memory:');
+
+      // Insert one memory, checkpoint it
+      insertMemory(db, createMemory({
+        id: 'mem-fts-keep',
+        content: 'Memory about zebras and savannas',
+        summary: 'Zebra memory',
+        memory_type: 'context',
+        scope: 'project',
+        confidence: 0.9,
+        priority: 5,
+        source_type: 'extraction',
+        source_session: 'session-fts',
+        source_context: '{}',
+      }));
+
+      const checkpointPath = createCheckpoint(db);
+
+      // Insert a SECOND memory after the checkpoint — its FTS row would
+      // become an orphan on restore without explicit cleanup
+      insertMemory(db, createMemory({
+        id: 'mem-fts-orphan',
+        content: 'Memory about quixotic wombats',
+        summary: 'Wombat memory',
+        memory_type: 'context',
+        scope: 'project',
+        confidence: 0.9,
+        priority: 5,
+        source_type: 'extraction',
+        source_session: 'session-fts',
+        source_context: '{}',
+      }));
+
+      restoreCheckpoint(db, checkpointPath);
+
+      // Base table only has the checkpointed memory
+      expect(getMemory(db, 'mem-fts-orphan')).toBeNull();
+      expect(getMemory(db, 'mem-fts-keep')).not.toBeNull();
+
+      // FTS row count matches memories row count — no orphans
+      const memCount = (db.prepare('SELECT COUNT(*) AS c FROM memories').get() as { c: number }).c;
+      const ftsCount = (db.prepare('SELECT COUNT(*) AS c FROM memories_fts').get() as { c: number }).c;
+      expect(ftsCount).toBe(memCount);
+      expect(ftsCount).toBe(1);
+
+      // The orphaned content is not searchable (no phantom hits)
+      const phantomHits = searchByKeyword(db, 'wombats', 10);
+      expect(phantomHits).toEqual([]);
+
+      // The restored memory remains searchable
+      const realHits = searchByKeyword(db, 'zebras', 10);
+      expect(realHits.map((m) => m.id)).toEqual(['mem-fts-keep']);
+
+      db.close();
+      rmSync(checkpointPath, { force: true });
+    });
+
     it('rejects checkpoint path with single quote (SQL injection prevention)', () => {
       const db = openDatabase(':memory:');
 
@@ -768,5 +831,455 @@ describe('Database Layer', () => {
       projectDb.close();
       globalDb.close();
     });
+  });
+
+  describe('schema migrations (idempotent, tables exist in the wild)', () => {
+    it('adds archived_at and transcript_length to a legacy database', () => {
+      const fs = require('node:fs');
+      const os = require('node:os');
+      const path = require('node:path');
+      const { Database } = require('bun:sqlite');
+
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-migration-'));
+      const dbPath = path.join(dir, 'legacy.db');
+
+      // Simulate a legacy database created before the columns existed
+      const legacy = new Database(dbPath);
+      legacy.run(`
+        CREATE TABLE memories (
+          id TEXT PRIMARY KEY, content TEXT NOT NULL, summary TEXT NOT NULL,
+          memory_type TEXT NOT NULL, scope TEXT NOT NULL,
+          embedding BLOB, local_embedding BLOB,
+          confidence REAL NOT NULL, priority INTEGER NOT NULL,
+          pinned INTEGER NOT NULL DEFAULT 0,
+          source_type TEXT NOT NULL, source_session TEXT NOT NULL, source_context TEXT NOT NULL,
+          tags TEXT NOT NULL, access_count INTEGER NOT NULL DEFAULT 0,
+          last_accessed_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'active'
+        )
+      `);
+      legacy.run(`
+        CREATE TABLE extraction_checkpoints (
+          id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+          cursor_position INTEGER NOT NULL, extracted_at TEXT NOT NULL
+        )
+      `);
+      const now = new Date().toISOString();
+      legacy.run(
+        `INSERT INTO memories (id, content, summary, memory_type, scope, confidence, priority, source_type, source_session, source_context, tags, last_accessed_at, created_at, updated_at)
+         VALUES ('legacy-1', 'c', 's', 'context', 'project', 0.8, 5, 'manual', 'sess', '{}', '[]', ?, ?, ?)`,
+        [now, now, now]
+      );
+      legacy.close();
+
+      // openDatabase must migrate in place without touching existing rows
+      const db = openDatabase(dbPath);
+      const memoryCols = (db.prepare(`PRAGMA table_info(memories)`).all() as { name: string }[]).map(c => c.name);
+      const checkpointCols = (db.prepare(`PRAGMA table_info(extraction_checkpoints)`).all() as { name: string }[]).map(c => c.name);
+      expect(memoryCols).toContain('archived_at');
+      expect(checkpointCols).toContain('transcript_length');
+
+      // Legacy row readable, archived_at defaults to null
+      const legacyMemory = getMemory(db, 'legacy-1');
+      expect(legacyMemory).not.toBeNull();
+      expect(legacyMemory!.archived_at).toBeNull();
+      db.close();
+
+      // Idempotent: re-opening must not throw (duplicate column)
+      const again = openDatabase(dbPath);
+      expect(getMemory(again, 'legacy-1')).not.toBeNull();
+      again.close();
+
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('persists archived_at through insert, update, and read', () => {
+      const db = openDatabase(':memory:');
+      const now = new Date().toISOString();
+      const memory = createMemory({
+        id: 'arch-1',
+        content: 'c', summary: 's', memory_type: 'context', scope: 'project',
+        confidence: 0.8, priority: 5, source_type: 'manual',
+        source_session: 'sess', source_context: '{}',
+      });
+      insertMemory(db, memory);
+
+      expect(getMemory(db, 'arch-1')!.archived_at).toBeNull();
+
+      updateMemory(db, 'arch-1', { status: 'archived', archived_at: now });
+      const updated = getMemory(db, 'arch-1');
+      expect(updated!.status).toBe('archived');
+      expect(updated!.archived_at).toBe(now);
+      db.close();
+    });
+
+    it('persists transcript_length on extraction checkpoints', () => {
+      const db = openDatabase(':memory:');
+
+      saveExtractionCheckpoint(db, {
+        session_id: 'sess-tl',
+        cursor_position: 42,
+        extracted_at: new Date().toISOString(),
+        transcript_length: 1000,
+      });
+      expect(getExtractionCheckpoint(db, 'sess-tl')!.transcript_length).toBe(1000);
+
+      // Omitted → null (legacy callers)
+      saveExtractionCheckpoint(db, {
+        session_id: 'sess-legacy',
+        cursor_position: 7,
+        extracted_at: new Date().toISOString(),
+      });
+      expect(getExtractionCheckpoint(db, 'sess-legacy')!.transcript_length).toBeNull();
+      db.close();
+    });
+  });
+
+  describe('repointEdgesToMemory / repointFactSources', () => {
+    const { repointEdgesToMemory, repointFactSources, upsertEntity, insertFact, getFactsByMemory } = require('./db.js');
+
+    function seedMemory(db: ReturnType<typeof openDatabase>, id: string): void {
+      insertMemory(db, createMemory({
+        id, content: `content ${id}`, summary: `summary ${id}`,
+        memory_type: 'context', scope: 'project', confidence: 0.8, priority: 5,
+        source_type: 'manual', source_session: 'sess', source_context: '{}',
+      }));
+    }
+
+    it('re-points edges, drops self-references and duplicates, keeps supersedes', () => {
+      const db = openDatabase(':memory:');
+      for (const id of ['old', 'merged', 'other', 'shared']) seedMemory(db, id);
+
+      insertEdge(db, { source_id: 'old', target_id: 'other', relation_type: 'source_of', strength: 1.0, bidirectional: false, status: 'active' });
+      insertEdge(db, { source_id: 'old', target_id: 'merged', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active' });
+      insertEdge(db, { source_id: 'old', target_id: 'shared', relation_type: 'refines', strength: 0.5, bidirectional: true, status: 'active' });
+      insertEdge(db, { source_id: 'merged', target_id: 'shared', relation_type: 'refines', strength: 0.5, bidirectional: true, status: 'active' });
+      insertEdge(db, { source_id: 'other', target_id: 'old', relation_type: 'supersedes', strength: 1.0, bidirectional: false, status: 'active' });
+
+      repointEdgesToMemory(db, 'old', 'merged');
+
+      const edges = getAllEdges(db);
+      // source_of re-pointed
+      const sourceOf = edges.filter((e: Edge) => e.relation_type === 'source_of');
+      expect(sourceOf.length).toBe(1);
+      expect(sourceOf[0].source_id).toBe('merged');
+      // old↔merged dropped (would self-reference)
+      expect(edges.some((e: Edge) => e.source_id === e.target_id)).toBe(false);
+      expect(edges.filter((e: Edge) => e.relation_type === 'relates_to').length).toBe(0);
+      // duplicate refines dropped, existing one kept
+      const refines = edges.filter((e: Edge) => e.relation_type === 'refines');
+      expect(refines.length).toBe(1);
+      expect(refines[0].source_id).toBe('merged');
+      // supersedes untouched (history)
+      const supersedes = edges.filter((e: Edge) => e.relation_type === 'supersedes');
+      expect(supersedes.length).toBe(1);
+      expect(supersedes[0].target_id).toBe('old');
+      db.close();
+    });
+
+    it('re-points fact sources', () => {
+      const db = openDatabase(':memory:');
+      seedMemory(db, 'old');
+      seedMemory(db, 'merged');
+
+      const entityId = upsertEntity(db, 'Thing', 'concept');
+      const now = new Date().toISOString();
+      insertFact(db, {
+        id: 'f1', entity_id: entityId, predicate: 'is', object: 'a thing',
+        source_memory_id: 'old', confidence: 0.7, valid_from: now, valid_to: null, created_at: now,
+      });
+
+      const changed = repointFactSources(db, 'old', 'merged');
+      expect(changed).toBe(1);
+      expect(getFactsByMemory(db, 'old').length).toBe(0);
+      expect(getFactsByMemory(db, 'merged').length).toBe(1);
+      db.close();
+    });
+  });
+});
+
+describe('Schema versioning (PRAGMA user_version)', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'cortex-schema-test-'));
+  });
+
+  it('stamps a fresh database with the current schema version', () => {
+    const db = openDatabase(':memory:');
+
+    const row = db.prepare('PRAGMA user_version').get() as { user_version: number };
+    expect(row.user_version).toBe(CURRENT_SCHEMA_VERSION);
+    expect(row.user_version).toBe(1);
+
+    db.close();
+  });
+
+  it('refuses to open a database with a newer schema version', () => {
+    const dbPath = join(tmpDir, 'future.db');
+
+    // Simulate a DB written by a newer plugin version
+    const raw = new Database(dbPath);
+    raw.run('PRAGMA user_version = 99');
+    raw.close();
+
+    expect(() => openDatabase(dbPath)).toThrow(
+      /schema version 99 is newer than supported version 1/
+    );
+
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('reopens an already-stamped database without error', () => {
+    const dbPath = join(tmpDir, 'stamped.db');
+
+    const first = openDatabase(dbPath);
+    first.close();
+
+    const second = openDatabase(dbPath);
+    const row = second.prepare('PRAGMA user_version').get() as { user_version: number };
+    expect(row.user_version).toBe(CURRENT_SCHEMA_VERSION);
+    second.close();
+
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('stamps a legacy (version 0) file database and preserves its data', () => {
+    const dbPath = join(tmpDir, 'legacy.db');
+
+    const db = openDatabase(dbPath);
+    insertMemory(db, createMemory({
+      id: 'mem-schema-1',
+      content: 'legacy content survives version stamping',
+      summary: 'legacy',
+      memory_type: 'context',
+      scope: 'project',
+      confidence: 0.8,
+      priority: 5,
+      source_type: 'extraction',
+      source_session: 'sess-schema',
+      source_context: '{}',
+    }));
+    // Reset to 0 as if written by pre-versioning code
+    db.run('PRAGMA user_version = 0');
+    db.close();
+
+    const reopened = openDatabase(dbPath);
+    const row = reopened.prepare('PRAGMA user_version').get() as { user_version: number };
+    expect(row.user_version).toBe(CURRENT_SCHEMA_VERSION);
+    expect(getMemory(reopened, 'mem-schema-1')).not.toBeNull();
+    reopened.close();
+
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+});
+
+// ============================================================================
+// Regression tests: findings 11 and 12 — status-filtered getMemoriesByIds,
+// fact supersede on archive, active-source filter in getCurrentFacts
+// ============================================================================
+
+import {
+  getMemoriesByIds,
+  upsertEntity,
+  insertFact,
+  getCurrentFacts,
+  supersedeFactsForMemory,
+  getFactsByMemory,
+} from './db.js';
+
+function makeStatusMemory(id: string, status: 'active' | 'archived' | 'superseded'): Memory {
+  const now = new Date().toISOString();
+  return createMemory({
+    id,
+    content: `content ${id}`,
+    summary: `summary ${id}`,
+    memory_type: 'context',
+    scope: 'project',
+    confidence: 0.8,
+    priority: 5,
+    source_type: 'extraction',
+    source_session: 'sess',
+    source_context: '{}',
+    created_at: now,
+    updated_at: now,
+    last_accessed_at: now,
+    status,
+  });
+}
+
+describe('getMemoriesByIds status filter (finding 11)', () => {
+  let db: Database;
+
+  beforeEach(() => {
+    db = openDatabase(':memory:');
+    insertMemory(db, makeStatusMemory('m-active', 'active'));
+    insertMemory(db, makeStatusMemory('m-archived', 'archived'));
+    insertMemory(db, makeStatusMemory('m-superseded', 'superseded'));
+  });
+
+  it('defaults to active-only', () => {
+    const result = getMemoriesByIds(db, ['m-active', 'm-archived', 'm-superseded']);
+    expect(result.map(m => m.id)).toEqual(['m-active']);
+  });
+
+  it("returns all statuses with 'any'", () => {
+    const result = getMemoriesByIds(db, ['m-active', 'm-archived', 'm-superseded'], 'any');
+    expect(result.map(m => m.id).sort()).toEqual(['m-active', 'm-archived', 'm-superseded']);
+  });
+
+  it('supports explicit status lists', () => {
+    const result = getMemoriesByIds(db, ['m-active', 'm-archived'], ['archived']);
+    expect(result.map(m => m.id)).toEqual(['m-archived']);
+  });
+
+  it('returns empty for an empty status list', () => {
+    expect(getMemoriesByIds(db, ['m-active'], [])).toEqual([]);
+  });
+});
+
+describe('fact supersede on archive (finding 12)', () => {
+  let db: Database;
+  let entityId: string;
+
+  beforeEach(() => {
+    db = openDatabase(':memory:');
+    insertMemory(db, makeStatusMemory('fact-src', 'active'));
+    entityId = upsertEntity(db, 'PgBouncer', 'tool');
+    insertFact(db, {
+      id: 'fact-1',
+      entity_id: entityId,
+      predicate: 'used for',
+      object: 'connection pooling',
+      source_memory_id: 'fact-src',
+      confidence: 0.9,
+      valid_from: new Date().toISOString(),
+      valid_to: null,
+      created_at: new Date().toISOString(),
+    });
+  });
+
+  it('supersedeFactsForMemory retracts current facts and reports count', () => {
+    expect(getCurrentFacts(db, entityId)).toHaveLength(1);
+
+    const count = supersedeFactsForMemory(db, 'fact-src');
+    expect(count).toBe(1);
+    expect(getCurrentFacts(db, entityId)).toHaveLength(0);
+
+    // Idempotent: second call supersedes nothing new
+    expect(supersedeFactsForMemory(db, 'fact-src')).toBe(0);
+
+    // History preserved: fact still exists with valid_to set
+    const all = getFactsByMemory(db, 'fact-src');
+    expect(all).toHaveLength(1);
+    expect(all[0].valid_to).not.toBeNull();
+  });
+
+  it('getCurrentFacts excludes facts whose source memory is not active (defense in depth)', () => {
+    // Archive the source WITHOUT superseding the fact (a missed archive path)
+    updateMemory(db, 'fact-src', { status: 'archived' });
+
+    expect(getCurrentFacts(db, entityId)).toHaveLength(0);
+  });
+
+  it('getCurrentFacts keeps facts when the source memory is active', () => {
+    expect(getCurrentFacts(db, entityId)).toHaveLength(1);
+  });
+});
+
+// ============================================================================
+// openDatabaseReadOnly — hot read-only paths (prompt-recall hook)
+// ============================================================================
+
+import { openDatabaseReadOnly, searchByKeywordOr } from './db.js';
+
+describe('openDatabaseReadOnly', () => {
+  function makeRoMemory(id: string): Memory {
+    const now = new Date().toISOString();
+    return createMemory({
+      id,
+      content: 'readonly nixos content',
+      summary: 'readonly nixos summary',
+      memory_type: 'context',
+      scope: 'project',
+      confidence: 0.9,
+      priority: 5,
+      source_type: 'manual',
+      source_session: 's1',
+      source_context: '{}',
+      created_at: now,
+      last_accessed_at: now,
+      updated_at: now,
+    });
+  }
+
+  it('reads an existing database, including FTS search', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cortex-ro-test-'));
+    const dbPath = join(dir, 'cortex.db');
+    try {
+      const rw = openDatabase(dbPath);
+      insertMemory(rw, makeRoMemory('ro-1'));
+      rw.close();
+
+      const ro = openDatabaseReadOnly(dbPath);
+      try {
+        expect(getMemory(ro, 'ro-1')).not.toBeNull();
+        const hits = searchByKeywordOr(ro, ['nixos'], 5);
+        expect(hits.map(m => m.id)).toContain('ro-1');
+      } finally {
+        ro.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects writes (readonly enforced by SQLite)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cortex-ro-test-'));
+    const dbPath = join(dir, 'cortex.db');
+    try {
+      openDatabase(dbPath).close();
+
+      const ro = openDatabaseReadOnly(dbPath);
+      try {
+        expect(() => insertMemory(ro, makeRoMemory('ro-write'))).toThrow();
+      } finally {
+        ro.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not run schema DDL — no tables are created on a database it did not initialize', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cortex-ro-test-'));
+    const dbPath = join(dir, 'bare.db');
+    try {
+      // Create a bare SQLite file WITHOUT cortex schema
+      const bare = new Database(dbPath);
+      bare.run('CREATE TABLE unrelated (x INTEGER)');
+      bare.close();
+
+      const ro = openDatabaseReadOnly(dbPath);
+      try {
+        const tables = ro
+          .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+          .all() as { name: string }[];
+        expect(tables.map(t => t.name)).not.toContain('memories');
+      } finally {
+        ro.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('throws when the file does not exist (callers must check first)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cortex-ro-test-'));
+    try {
+      expect(() => openDatabaseReadOnly(join(dir, 'missing.db'))).toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

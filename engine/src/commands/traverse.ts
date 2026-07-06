@@ -16,6 +16,7 @@ export type TraverseOptions = {
   readonly edgeTypes?: string; // Comma-separated edge types
   readonly direction?: string; // 'outgoing' | 'incoming' | 'both' (default 'both')
   readonly minStrength?: number; // Default 0
+  readonly includeArchived?: boolean; // Default false: only active memories in results
 };
 
 // Command result
@@ -157,9 +158,12 @@ export function executeTraverse(
     }
   }
 
-  // Batch fetch all memories in a single query
+  // Batch fetch all memories in a single query. Default is active-only so
+  // archived/superseded memories don't resurface through the graph;
+  // --include-archived opts into all statuses explicitly.
   if (idsToFetch.size > 0) {
-    const memories = getMemoriesByIds(db, Array.from(idsToFetch));
+    const statuses = options.includeArchived ? ('any' as const) : (['active'] as const);
+    const memories = getMemoriesByIds(db, Array.from(idsToFetch), statuses);
     for (const memory of memories) {
       memoryMap.set(memory.id, memory);
     }

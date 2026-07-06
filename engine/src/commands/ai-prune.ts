@@ -10,15 +10,17 @@
 
 import type { Database } from 'bun:sqlite';
 import * as fs from 'node:fs';
-import { getActiveMemories, updateMemory, archiveEdgesForMemory } from '../infra/db.js';
+import { getActiveMemories, updateMemory, archiveEdgesForMemory, supersedeFactsForMemory } from '../infra/db.js';
 import { isClaudeLlmAvailable, runLlmPrompt } from '../infra/claude-llm.js';
 import { writeTelemetry } from '../infra/filesystem.js';
+import { invalidateSurfaceCache } from './generate.js';
 import {
   AI_PRUNE_SESSION_INTERVAL,
   AI_PRUNE_MEMORY_THRESHOLD,
   AI_PRUNE_TIMEOUT_MS,
   AI_PRUNE_BATCH_SIZE,
   AI_PRUNE_MIN_MEMORIES,
+  AI_PRUNE_MIN_AGE_DAYS,
 } from '../config.js';
 
 // ============================================================================
@@ -188,7 +190,8 @@ async function callClaudePrune(prompt: string): Promise<string> {
 export async function runAiPruneIfNeeded(
   projectDb: Database,
   globalDb: Database,
-  telemetryPath: string
+  telemetryPath: string,
+  cwd?: string
 ): Promise<AiPruneResult> {
   // Always increment session counter
   const sessionCount = incrementSessionCounter(telemetryPath);
@@ -203,7 +206,21 @@ export async function runAiPruneIfNeeded(
     return { archived: 0, reviewed: 0, skipped: true };
   }
 
-  return runAiPrune(projectDb, globalDb, telemetryPath);
+  return runAiPrune(projectDb, globalDb, telemetryPath, cwd);
+}
+
+/**
+ * Check whether a memory is too young to archive (pure).
+ * Enforces the "never archive <AI_PRUNE_MIN_AGE_DAYS days old" rule in code —
+ * the LLM prompt states it, but LLM output must never be trusted to obey it.
+ */
+export function isTooYoungToArchive(
+  createdAt: string,
+  now: Date,
+  minAgeDays: number = AI_PRUNE_MIN_AGE_DAYS
+): boolean {
+  const ageMs = now.getTime() - new Date(createdAt).getTime();
+  return ageMs < minAgeDays * 24 * 60 * 60 * 1000;
 }
 
 /**
@@ -224,7 +241,8 @@ function chunk<T>(arr: readonly T[], size: number): T[][] {
 export async function runAiPrune(
   projectDb: Database,
   globalDb: Database,
-  telemetryPath: string
+  telemetryPath: string,
+  cwd?: string
 ): Promise<AiPruneResult> {
   if (!isClaudeLlmAvailable()) {
     return { archived: 0, reviewed: 0, error: 'Claude CLI not available' };
@@ -262,6 +280,7 @@ export async function runAiPrune(
   const projectIds = new Set(projectMemories.map(m => m.id));
   const globalIds = new Set(globalMemories.map(m => m.id));
   const pinnedIds = new Set(allMemories.filter(m => m.pinned).map(m => m.id));
+  const createdAtById = new Map(allMemories.map(m => [m.id, m.created_at]));
 
   const batches = chunk(memoryData, AI_PRUNE_BATCH_SIZE);
   const totalBatches = batches.length;
@@ -293,20 +312,37 @@ export async function runAiPrune(
         continue;
       }
 
+      // Age guard enforced in code, not just prompt: never archive
+      // memories younger than AI_PRUNE_MIN_AGE_DAYS regardless of LLM output
+      const createdAt = createdAtById.get(candidate.id);
+      if (createdAt && isTooYoungToArchive(createdAt, new Date())) {
+        logInfo(`Skipping too-young memory ${candidate.id.slice(0, 8)} (< ${AI_PRUNE_MIN_AGE_DAYS} days old)`);
+        continue;
+      }
+
+      // archived_at anchors the archive→prune grace period (FR-091)
+      const archivedAt = new Date().toISOString();
       if (projectIds.has(candidate.id)) {
-        updateMemory(projectDb, candidate.id, { status: 'archived' });
+        updateMemory(projectDb, candidate.id, { status: 'archived', archived_at: archivedAt });
         archiveEdgesForMemory(projectDb, candidate.id);
+        supersedeFactsForMemory(projectDb, candidate.id);
         totalArchived++;
         logInfo(`Archived ${candidate.id.slice(0, 8)}: ${candidate.reason}`);
       } else if (globalIds.has(candidate.id)) {
-        updateMemory(globalDb, candidate.id, { status: 'archived' });
+        updateMemory(globalDb, candidate.id, { status: 'archived', archived_at: archivedAt });
         archiveEdgesForMemory(globalDb, candidate.id);
+        supersedeFactsForMemory(globalDb, candidate.id);
         totalArchived++;
         logInfo(`Archived ${candidate.id.slice(0, 8)}: ${candidate.reason}`);
       } else {
         logError(`AI suggested unknown memory ID: ${candidate.id}`);
       }
     }
+  }
+
+  // Invalidate cached surfaces when memories were archived
+  if (cwd !== undefined && totalArchived > 0) {
+    invalidateSurfaceCache(cwd);
   }
 
   resetSessionCounter(telemetryPath, allMemories.length - totalArchived);

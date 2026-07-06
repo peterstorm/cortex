@@ -404,6 +404,27 @@ describe('extractUnigrams', () => {
     const result = extractUnigrams('how does X work in this code');
     expect(result).toEqual(['work', 'code']);
   });
+
+  test('keeps unicode letters as whole words (Danish, regression)', () => {
+    // The old [^a-z0-9_\s.\-] regex shredded non-ASCII words into fragments
+    // ("håndterer" -> "h ndterer"), producing garbage FTS queries.
+    const result = extractUnigrams('hvordan håndterer vi løsningen på café-problemet');
+
+    expect(result).toContain('håndterer');
+    expect(result).toContain('løsningen');
+    // Hyphens are preserved for compound words
+    expect(result).toContain('café-problemet');
+
+    // No mangled fragments
+    expect(result).not.toContain('ndterer');
+    expect(result).not.toContain('sningen');
+    expect(result).not.toContain('caf');
+  });
+
+  test('unicode-aware regex leaves ASCII behavior unchanged', () => {
+    const result = extractUnigrams('debug the extract-and-generate pipeline v1.2');
+    expect(result).toEqual(['debug', 'extract-and-generate', 'pipeline', 'v1.2']);
+  });
 });
 
 describe('executePromptRecallWithFallback — gates', () => {

@@ -19,7 +19,9 @@ CLI_PATH="${PLUGIN_ROOT}/engine/src/cli.ts"
 # without it the semantic fallback in prompt-recall is silently dead.
 GEMINI_ENV="${CORTEX_GEMINI_ENV:-$HOME/.config/sops-nix/secrets/rendered/gemini-env}"
 if [[ -f "$GEMINI_ENV" ]]; then
-  source "$GEMINI_ENV"
+  # Never let a bad env file abort the hook (set -e): silence output and
+  # swallow non-zero exit — successfully exported vars are preserved.
+  source "$GEMINI_ENV" >/dev/null 2>&1 || true
 fi
 
 # Pipe stdin JSON to prompt-recall command, suppress stderr

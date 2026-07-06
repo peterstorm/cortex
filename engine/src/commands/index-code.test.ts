@@ -561,6 +561,46 @@ export function multiply(a: number, b: number): number {
     expect(context.end_line).toBe(3);
   });
 
+  test('CLI contract: handleIndexCode arg shape [filePath, summary, --start, --end, --tags] creates code+prose pair', async () => {
+    // cli.ts handleIndexCode forwards args.slice(1) = [filePath, summary, ...flags]
+    // to executeIndexCode — this exercises exactly that contract end-to-end.
+    const result = await executeIndexCode(
+      [testFilePath, 'Addition helper', '--start=1', '--end=3', '--tags=math,addition'],
+      'session-cli-contract',
+      projectDb,
+      globalDb,
+      undefined,
+      'test-project'
+    );
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+
+    const proseMem = getMemory(projectDb, result.prose_memory_id);
+    const codeMem = getMemory(projectDb, result.code_memory_id);
+
+    // Pair exists with correct types
+    expect(proseMem!.memory_type).toBe('code_description');
+    expect(codeMem!.memory_type).toBe('code');
+    expect(proseMem!.content).toBe('Addition helper');
+
+    // Line range applied to the code memory
+    expect(codeMem!.content).toContain('export function add');
+    expect(codeMem!.content).not.toContain('multiply');
+    const codeContext = JSON.parse(codeMem!.source_context);
+    expect(codeContext.start_line).toBe(1);
+    expect(codeContext.end_line).toBe(3);
+
+    // Tags applied
+    expect(proseMem!.tags).toEqual(['math', 'addition']);
+
+    // Prose links to code via source_of edge
+    const edges = getEdgesForMemory(projectDb, result.prose_memory_id);
+    expect(edges.length).toBe(1);
+    expect(edges[0].relation_type).toBe('source_of');
+    expect(edges[0].target_id).toBe(result.code_memory_id);
+  });
+
   test('routes to global database when scope=global', async () => {
     const result = await executeIndexCode(
       [testFilePath, 'Math functions', '--scope=global'],

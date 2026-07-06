@@ -84,8 +84,14 @@ export function determineLifecycleAction(
 
   // FR-090: Handle archived memories
   if (memory.status === 'archived') {
-    // FR-091: Prune if archived and untouched past threshold
-    if (daysSinceAccess >= PRUNE_THRESHOLD_DAYS) {
+    // FR-091: Prune only after a full grace period FROM ARCHIVAL. Archiving
+    // does not touch last_accessed_at, so gating on access alone would
+    // hard-prune a long-unaccessed memory immediately after it is archived
+    // (sometimes in the same lifecycle run). Legacy archived rows without
+    // archived_at fall back to updated_at (set when the status changed).
+    const archivedAnchor = memory.archived_at ?? memory.updated_at;
+    const daysSinceArchive = computeDaysBetween(archivedAnchor, now);
+    if (daysSinceAccess >= PRUNE_THRESHOLD_DAYS && daysSinceArchive >= PRUNE_THRESHOLD_DAYS) {
       return { action: 'prune', reason: `archived_${PRUNE_THRESHOLD_DAYS}d_no_access` };
     }
     return { action: 'none' };

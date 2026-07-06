@@ -11,6 +11,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { spliceSurfaceContent } from '../core/surface.js';
 
 /**
  * Check if a process with given PID is running.
@@ -120,9 +121,20 @@ export function withPidLock<T>(lockPath: string, fn: () => T): T {
 }
 
 /**
- * Write surface content to file with PID lock protection.
+ * Write a marker-wrapped surface block to file with PID lock protection.
+ *
+ * Implements the replace-between-markers contract (FR-024): when the target
+ * file exists and contains both CORTEX_MEMORY markers, only the block between
+ * (and including) the markers is replaced — user content before/after
+ * survives. See spliceSurfaceContent for the corrupt-marker fallback.
+ *
+ * The final write is atomic (temp + rename) so concurrent readers
+ * (UserPromptSubmit hook, pi extension) never observe a torn surface.
+ *
  * Creates parent directories if needed.
  * Throws if another process holds the lock.
+ *
+ * @param content - Marker-wrapped surface block (output of wrapInMarkers)
  */
 export function writeSurface(
   filePath: string,
@@ -136,8 +148,14 @@ export function writeSurface(
     const dir = path.dirname(filePath);
     fs.mkdirSync(dir, { recursive: true });
 
-    // Write content
-    fs.writeFileSync(filePath, content, 'utf8');
+    // Splice into existing content (pure), preserving user content outside markers
+    const existing = readSurface(filePath);
+    const merged = spliceSurfaceContent(existing, content);
+
+    // Atomic write: temp + rename
+    const tempPath = `${filePath}.tmp-${process.pid}`;
+    fs.writeFileSync(tempPath, merged, 'utf8');
+    fs.renameSync(tempPath, filePath);
   });
 }
 

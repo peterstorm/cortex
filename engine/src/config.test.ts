@@ -17,6 +17,12 @@ import {
   SURFACE_MAX_TOKENS,
   DEFAULT_SEARCH_LIMIT,
   GITIGNORE_PATTERNS,
+  CONSOLIDATION_SIMILARITY_THRESHOLD,
+  CONSOLIDATION_LOCAL_COSINE_THRESHOLD,
+  DEDUP_SIMILARITY_THRESHOLD,
+  MERGE_CEILING_THRESHOLD,
+  MAX_EDGES_PER_MEMORY,
+  consolidationThresholdFor,
 } from './config.js';
 
 describe('config - path resolution', () => {
@@ -99,6 +105,29 @@ describe('config - constants', () => {
 
   it('GITIGNORE_PATTERNS includes cortex-memory.local.md', () => {
     expect(GITIGNORE_PATTERNS).toContain('.claude/cortex-memory.local.md');
+  });
+
+  it('MAX_EDGES_PER_MEMORY is a small positive cap', () => {
+    expect(MAX_EDGES_PER_MEMORY).toBeGreaterThan(0);
+    expect(MAX_EDGES_PER_MEMORY).toBeLessThanOrEqual(10);
+  });
+});
+
+describe('config - consolidationThresholdFor', () => {
+  it('uses the well-separated default for jaccard and gemini-cosine', () => {
+    expect(consolidationThresholdFor('jaccard')).toBe(CONSOLIDATION_SIMILARITY_THRESHOLD);
+    expect(consolidationThresholdFor('gemini-cosine')).toBe(CONSOLIDATION_SIMILARITY_THRESHOLD);
+  });
+
+  it('uses the calibrated hot-space threshold for local-cosine', () => {
+    expect(consolidationThresholdFor('local-cosine')).toBe(CONSOLIDATION_LOCAL_COSINE_THRESHOLD);
+  });
+
+  it('local-cosine threshold sits above the same-domain band (0.6-0.75) and below the true-duplicate band (0.85+)', () => {
+    expect(CONSOLIDATION_LOCAL_COSINE_THRESHOLD).toBeGreaterThan(0.75);
+    expect(CONSOLIDATION_LOCAL_COSINE_THRESHOLD).toBeLessThan(MERGE_CEILING_THRESHOLD);
+    // Consistent with the dedup threshold calibrated for the same space
+    expect(CONSOLIDATION_LOCAL_COSINE_THRESHOLD).toBeGreaterThanOrEqual(DEDUP_SIMILARITY_THRESHOLD);
   });
 });
 

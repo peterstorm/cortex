@@ -26,6 +26,7 @@ function createTestMemory(overrides: Partial<Memory> = {}): Memory {
     created_at: now,
     updated_at: now,
     status: 'active',
+    archived_at: null,
     ...overrides,
   };
 }
@@ -225,6 +226,60 @@ describe('computeRank recency decay', () => {
     const rank14 = computeRank(memory, { maxAccessLog: 1, now, recencyHalfLifeDays: 14 });
 
     expect(rank7).toBeLessThan(rank14);
+  });
+
+  it('produces a finite rank for unparseable last_accessed_at (regression)', () => {
+    // 'garbage' -> new Date(...).getTime() === NaN. Without the isFinite
+    // guard NaN propagated through the multiplier and corrupted ordering.
+    const now = new Date('2024-06-15T00:00:00Z');
+    const garbage = createTestMemory({
+      id: '1',
+      confidence: 0.8,
+      priority: 5,
+      access_count: 0,
+      last_accessed_at: 'garbage',
+    });
+
+    const rank = computeRank(garbage, { maxAccessLog: 1, now });
+
+    expect(Number.isFinite(rank)).toBe(true);
+    expect(Number.isNaN(rank)).toBe(false);
+  });
+
+  it('produces a finite rank for empty-string last_accessed_at', () => {
+    const now = new Date('2024-06-15T00:00:00Z');
+    const empty = createTestMemory({
+      id: '1',
+      confidence: 0.8,
+      priority: 5,
+      access_count: 0,
+      last_accessed_at: '',
+    });
+
+    const rank = computeRank(empty, { maxAccessLog: 1, now });
+
+    expect(Number.isFinite(rank)).toBe(true);
+  });
+
+  it('treats invalid last_accessed_at as fresh (no decay, multiplier 1)', () => {
+    const now = new Date('2024-06-15T00:00:00Z');
+    const base = {
+      confidence: 0.8,
+      priority: 5,
+      access_count: 0,
+      pinned: false,
+    };
+    const invalid = createTestMemory({ ...base, id: '1', last_accessed_at: 'garbage' });
+    const fresh = createTestMemory({
+      ...base,
+      id: '2',
+      last_accessed_at: '2024-06-15T00:00:00Z', // ageDays = 0 -> multiplier 1
+    });
+
+    const invalidRank = computeRank(invalid, { maxAccessLog: 1, now });
+    const freshRank = computeRank(fresh, { maxAccessLog: 1, now });
+
+    expect(invalidRank).toBeCloseTo(freshRank, 10);
   });
 });
 
@@ -563,5 +618,121 @@ describe('mergeResults properties', () => {
         }
       )
     );
+  });
+});
+
+// ============================================================================
+// Regression tests: review findings 3 and 7 (oversized memory must not blank
+// the surface; token accounting includes rendering overhead)
+// ============================================================================
+
+import { estimateRenderTokens } from './ranking.js';
+import { generateSurface, estimateTokens } from './surface.js';
+
+describe('selectForSurface oversized memory (finding 3)', () => {
+  it('skips an over-budget top-ranked memory instead of blanking selection', () => {
+    // Huge summary, top rank — used to `break` and select NOTHING
+    const huge = createTestMemory({
+      id: 'huge',
+      summary: 'x'.repeat(10_000), // ~2500 tokens, exceeds any budget alone
+      memory_type: 'decision',
+      confidence: 1.0,
+      priority: 10,
+      access_count: 1000,
+      pinned: true, // exempt from recency decay: guaranteed top rank
+    });
+    const small = Array.from({ length: 5 }, (_, i) =>
+      createTestMemory({
+        id: `small-${i}`,
+        summary: `small memory ${i}`,
+        memory_type: 'pattern',
+        confidence: 0.5,
+        priority: 3,
+      })
+    );
+
+    const selected = selectForSurface([huge, ...small], {
+      currentBranch: 'main',
+      targetTokens: 300,
+      maxTokens: 400,
+    });
+
+    // Lower-ranked smaller memories are selected; the oversized one is skipped
+    expect(selected.length).toBeGreaterThan(0);
+    expect(selected.some(m => m.id === 'huge')).toBe(false);
+    expect(selected.some(m => m.id.startsWith('small-'))).toBe(true);
+  });
+
+  it('overflow pass also skips (not breaks on) over-budget memories', () => {
+    // First memory over budget in the overflow pass, later ones fit
+    const memories = [
+      createTestMemory({
+        id: 'big-code-desc',
+        summary: 'y'.repeat(4_000),
+        memory_type: 'code_description', // small category budget: lands in overflow
+        confidence: 1.0,
+        priority: 10,
+        access_count: 500,
+        pinned: true,
+      }),
+      ...Array.from({ length: 10 }, (_, i) =>
+        createTestMemory({
+          id: `fit-${i}`,
+          summary: `fits fine ${i}`,
+          memory_type: 'context',
+          confidence: 0.4,
+          priority: 2,
+        })
+      ),
+    ];
+
+    const selected = selectForSurface(memories, {
+      currentBranch: 'main',
+      targetTokens: 200,
+      maxTokens: 250,
+    });
+
+    expect(selected.some(m => m.id === 'big-code-desc')).toBe(false);
+    expect(selected.filter(m => m.id.startsWith('fit-')).length).toBeGreaterThan(1);
+  });
+});
+
+describe('token accounting includes rendering overhead (finding 7)', () => {
+  it('estimateRenderTokens counts prefix and tags line', () => {
+    const noTags = createTestMemory({ summary: 'abcd', tags: [] });
+    const withTags = createTestMemory({
+      summary: 'abcd',
+      tags: ['performance', 'database', 'architecture'],
+    });
+    expect(estimateRenderTokens(noTags)).toBeGreaterThan(estimateTokens('abcd'));
+    expect(estimateRenderTokens(withTags)).toBeGreaterThan(estimateRenderTokens(noTags));
+  });
+
+  it('rendered surface stays within maxTokens * 1.1 even with tag-heavy memories', () => {
+    const heavyTags = Array.from({ length: 40 }, (_, i) =>
+      createTestMemory({
+        id: `tagged-${i}`,
+        summary: `memory number ${i} with a moderately long summary about subsystem behavior`,
+        memory_type: 'decision',
+        tags: [
+          'performance-tuning', 'database-connection-pooling', 'architecture-decisions',
+          'long-tag-number-four', 'and-a-fifth-long-tag',
+        ],
+        confidence: 0.9,
+        priority: 8,
+      })
+    );
+
+    const maxTokens = 500;
+    const selected = selectForSurface(heavyTags, {
+      currentBranch: 'main',
+      targetTokens: maxTokens,
+      maxTokens,
+    });
+
+    const rendered = generateSurface(selected, 'main', null, { maxTokens: maxTokens + 200 });
+    // Selection budget covers memory lines; +200 covers header overhead which
+    // runGenerate reserves separately via SURFACE_OVERHEAD_TOKENS.
+    expect(estimateTokens(rendered)).toBeLessThanOrEqual((maxTokens + 200) * 1.1);
   });
 });

@@ -305,6 +305,22 @@ describe('filesystem', () => {
       expect(parsed).toEqual({ count: 2 });
     });
 
+    it('writes atomically: correct content and no .tmp-* residue', () => {
+      const filePath = path.join(tmpDir, 'telemetry.json');
+      const data = { last_prune_at: '2026-07-06T00:00:00Z', memories_since_prune: 12 };
+
+      writeTelemetry(filePath, data);
+      writeTelemetry(filePath, data); // second write must also clean up
+
+      // Final content is complete, parseable JSON
+      expect(JSON.parse(fs.readFileSync(filePath, 'utf8'))).toEqual(data);
+
+      // temp+rename must leave no intermediate files behind
+      const leftovers = fs.readdirSync(tmpDir).filter((f) => f.includes('.tmp-'));
+      expect(leftovers).toEqual([]);
+      expect(fs.readdirSync(tmpDir)).toEqual(['telemetry.json']);
+    });
+
     it('handles complex nested data structures', () => {
       const filePath = path.join(tmpDir, 'telemetry.json');
       const data = {
@@ -324,5 +340,74 @@ describe('filesystem', () => {
       const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
       expect(parsed).toEqual(data);
     });
+  });
+});
+
+// ============================================================================
+// Regression tests: findings 4 and 5 — atomic surface writes + marker splice
+// ============================================================================
+
+import { SURFACE_START_MARKER, SURFACE_END_MARKER } from '../core/surface.js';
+
+describe('writeSurface atomicity and marker contract (findings 4, 5)', () => {
+  const wrap = (body: string) => `${SURFACE_START_MARKER}\n${body}\n${SURFACE_END_MARKER}`;
+
+  let regressionTmpDir: string;
+  const tmpDirRef = () => regressionTmpDir;
+
+  beforeEach(() => {
+    regressionTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-surface-regress-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(regressionTmpDir, { recursive: true, force: true });
+  });
+
+  it('leaves no temp file residue and produces complete content', () => {
+    const surfacePath = path.join(tmpDirRef(), 'sub', 'surface.md');
+    const lockDir = path.join(tmpDirRef(), 'locks');
+    const content = wrap('complete surface body');
+
+    writeSurface(surfacePath, content, lockDir);
+
+    expect(fs.readFileSync(surfacePath, 'utf8')).toBe(content);
+    const siblings = fs.readdirSync(path.dirname(surfacePath));
+    expect(siblings.filter(f => f.includes('.tmp-'))).toHaveLength(0);
+  });
+
+  it('preserves user content above and below the marker block across regenerations', () => {
+    const surfacePath = path.join(tmpDirRef(), 'surface.md');
+    const lockDir = path.join(tmpDirRef(), 'locks');
+
+    // First generation: cortex owns the file
+    writeSurface(surfacePath, wrap('generation one'), lockDir);
+
+    // User adds notes around the block
+    const withUserContent = `# User notes above\n${fs.readFileSync(surfacePath, 'utf8')}\n\nUser notes below`;
+    fs.writeFileSync(surfacePath, withUserContent, 'utf8');
+
+    // Regeneration replaces only the block
+    writeSurface(surfacePath, wrap('generation two'), lockDir);
+
+    const result = fs.readFileSync(surfacePath, 'utf8');
+    expect(result).toContain('# User notes above');
+    expect(result).toContain('User notes below');
+    expect(result).toContain('generation two');
+    expect(result).not.toContain('generation one');
+  });
+
+  it('corrupt END marker: user content survives (conservative append)', () => {
+    const surfacePath = path.join(tmpDirRef(), 'surface.md');
+    const lockDir = path.join(tmpDirRef(), 'locks');
+
+    const corrupt = `important user notes\n${SURFACE_START_MARKER}\ndangling block without end`;
+    fs.mkdirSync(path.dirname(surfacePath), { recursive: true });
+    fs.writeFileSync(surfacePath, corrupt, 'utf8');
+
+    writeSurface(surfacePath, wrap('fresh block'), lockDir);
+
+    const result = fs.readFileSync(surfacePath, 'utf8');
+    expect(result).toContain('important user notes');
+    expect(result).toContain('fresh block');
   });
 });

@@ -94,6 +94,8 @@ export interface Memory {
   readonly created_at: string; // ISO8601
   readonly updated_at: string; // ISO8601
   readonly status: MemoryStatus;
+  /** When the memory was archived (ISO8601). Null while active; anchors the archive→prune grace period. */
+  readonly archived_at: string | null;
 }
 
 // Edge Relation Type (FR-104)
@@ -137,6 +139,12 @@ export interface ExtractionCheckpoint {
   readonly session_id: string;
   readonly cursor_position: number;
   readonly extracted_at: string; // ISO8601
+  /**
+   * Transcript content length (characters) when the checkpoint was saved.
+   * Null for legacy checkpoints. Used to detect a rewritten/shrunken
+   * transcript so the cursor can be reset instead of pointing past EOF.
+   */
+  readonly transcript_length: number | null;
 }
 
 // Hook Input
@@ -167,6 +175,15 @@ export interface MemoryCandidate {
   readonly priority: number;
   readonly tags: readonly string[];
 }
+
+/**
+ * Similarity space a score was computed in. Scores are NOT comparable across
+ * spaces: raw cosine on 384-dim local BGE embeddings runs "hot" (same-domain
+ * memories about different aspects routinely score 0.6-0.75), while Jaccard
+ * and Gemini-768 cosine are much better separated. Thresholds and
+ * classification bands must be calibrated per space.
+ */
+export type SimilaritySpace = 'jaccard' | 'local-cosine' | 'gemini-cosine';
 
 // Similarity Action (discriminated union)
 export type SimilarityAction =
@@ -208,6 +225,7 @@ export function createMemory(input: {
   created_at?: string;
   updated_at?: string;
   status?: MemoryStatus;
+  archived_at?: string | null;
 }): Memory {
   // Validate non-empty strings
   const trimmedId = input.id.trim();
@@ -273,6 +291,7 @@ export function createMemory(input: {
     created_at: input.created_at ?? now,
     updated_at: input.updated_at ?? now,
     status,
+    archived_at: input.archived_at ?? null,
   };
 }
 
@@ -326,6 +345,7 @@ export function createExtractionCheckpoint(input: {
   session_id: string;
   cursor_position: number;
   extracted_at?: string;
+  transcript_length?: number | null;
 }): ExtractionCheckpoint {
   // Validate cursor_position >= 0
   if (Number.isNaN(input.cursor_position) || input.cursor_position < 0) {
@@ -334,11 +354,20 @@ export function createExtractionCheckpoint(input: {
     );
   }
 
+  // Validate transcript_length >= 0 when provided
+  const transcript_length = input.transcript_length ?? null;
+  if (transcript_length !== null && (Number.isNaN(transcript_length) || transcript_length < 0)) {
+    throw new Error(
+      `transcript_length must be >= 0 or null, got ${transcript_length}`
+    );
+  }
+
   return {
     id: input.id,
     session_id: input.session_id,
     cursor_position: input.cursor_position,
     extracted_at: input.extracted_at ?? new Date().toISOString(),
+    transcript_length,
   };
 }
 

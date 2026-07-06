@@ -47,10 +47,14 @@ export function computeRank(
   if (!memory.pinned) {
     const halfLife = options.recencyHalfLifeDays ?? RECENCY_HALF_LIFE_DAYS;
     const now = options.now ?? new Date();
-    const lastAccessed = new Date(memory.last_accessed_at);
-    const ageDays = (now.getTime() - lastAccessed.getTime()) / (1000 * 60 * 60 * 24);
-    const recencyMultiplier = 1 / (1 + Math.max(0, ageDays) / halfLife);
-    rank *= recencyMultiplier;
+    const lastAccessedMs = new Date(memory.last_accessed_at).getTime();
+    // Guard against unparseable timestamps: NaN would propagate through the
+    // clamp and corrupt surface ordering. Treat invalid as fresh (multiplier 1).
+    if (Number.isFinite(lastAccessedMs)) {
+      const ageDays = (now.getTime() - lastAccessedMs) / (1000 * 60 * 60 * 24);
+      const recencyMultiplier = 1 / (1 + Math.max(0, ageDays) / halfLife);
+      rank *= recencyMultiplier;
+    }
   }
 
   // Ensure rank is in [0, 1] range
@@ -114,10 +118,12 @@ export function selectForSurface(
       continue;
     }
 
-    // Skip if would exceed max tokens
-    const tokens = estimateTokens(memory.summary);
+    // Skip only the over-budget memory (a `break` here let a single oversized
+    // top-ranked memory blank the entire surface — smaller lower-ranked
+    // memories must still get a chance to fill the budget).
+    const tokens = estimateRenderTokens(memory);
     if (totalTokens + tokens > maxTokens) {
-      break;
+      continue;
     }
 
     selected.push({ memory, rank });
@@ -136,9 +142,10 @@ export function selectForSurface(
       const { memory, rank } = item;
       if (selected.some(s => s.memory.id === memory.id)) continue;
 
-      const tokens = estimateTokens(memory.summary);
+      // Same skip-not-break rule as the first pass
+      const tokens = estimateRenderTokens(memory);
       if (totalTokens + tokens > maxTokens) {
-        break;
+        continue;
       }
 
       selected.push({ memory, rank });
@@ -192,4 +199,16 @@ export function mergeResults(
 // Helper: estimate lines (newline count + 1)
 function estimateLines(text: string): number {
   return text.split('\n').length;
+}
+
+/**
+ * Estimate the tokens a memory actually costs when rendered on the surface.
+ * generateSurface renders `- ${summary}` plus an optional `  *Tags: ...*`
+ * line — counting only the raw summary under-budgets tag-heavy memories.
+ * Exported for budget verification in tests.
+ */
+export function estimateRenderTokens(memory: Memory): number {
+  const summaryLine = `- ${memory.summary}`;
+  const tagsLine = memory.tags.length > 0 ? `\n  *Tags: ${memory.tags.join(', ')}*` : '';
+  return estimateTokens(summaryLine + tagsLine);
 }

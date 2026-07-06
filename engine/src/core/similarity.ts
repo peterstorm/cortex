@@ -3,7 +3,7 @@
  * Pure functional implementations with no I/O
  */
 
-import type { SimilarityAction, Memory } from './types.js';
+import type { SimilarityAction, SimilaritySpace, Memory } from './types.js';
 import { KEYWORD_OVERLAP_WEIGHT } from '../config.js';
 
 /**
@@ -60,7 +60,7 @@ export function cosineSimilarity(a: Float64Array | Float32Array, b: Float64Array
 export function tokenize(text: string): ReadonlySet<string> {
   const normalized = text
     .toLowerCase()
-    .replace(/[^\w\s]/g, ' ') // Replace punctuation with spaces
+    .replace(/[^\p{L}\p{N}_\s]/gu, ' ') // Replace punctuation with spaces (unicode-aware)
     .replace(/\s+/g, ' ')      // Collapse multiple spaces
     .trim();
 
@@ -69,6 +69,50 @@ export function tokenize(text: string): ReadonlySet<string> {
   }
 
   return new Set(normalized.split(' '));
+}
+
+/**
+ * Common English stop words + filler words to filter from natural-language
+ * queries and prompts. Shared by recall (tiered keyword search) and
+ * prompt-recall (keyword extraction). Pure data.
+ */
+export const STOP_WORDS: ReadonlySet<string> = new Set([
+  // Articles & determiners
+  'a', 'an', 'the', 'this', 'that', 'these', 'those',
+  // Pronouns
+  'i', 'me', 'my', 'we', 'our', 'you', 'your', 'he', 'she', 'it', 'its', 'they', 'them', 'their',
+  // Prepositions
+  'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'from', 'up', 'about', 'into', 'through', 'during', 'before', 'after', 'above', 'below', 'between', 'under', 'over',
+  // Conjunctions
+  'and', 'but', 'or', 'nor', 'so', 'yet', 'both', 'either', 'neither',
+  // Common verbs
+  'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'shall', 'can',
+  // Filler / instruction words
+  'please', 'help', 'want', 'need', 'like', 'just', 'also', 'very', 'really', 'actually', 'basically',
+  'tell', 'show', 'explain', 'describe', 'give', 'make', 'let', 'get', 'know', 'think', 'see', 'look', 'find', 'use',
+  // Question words
+  'how', 'what', 'where', 'when', 'why', 'which', 'who', 'whom',
+  // Other common words
+  'not', 'no', 'yes', 'all', 'each', 'every', 'any', 'some', 'more', 'most', 'other', 'than',
+  'if', 'then', 'else', 'only', 'own', 'same', 'such', 'too', 'here', 'there', 'now',
+]);
+
+/**
+ * Extract meaningful keywords from a natural-language prompt or query.
+ * Pure function: lowercase, strip punctuation (keeping hyphens/dots for
+ * compound words and versions), tokenize, filter stop words, deduplicate.
+ *
+ * @param prompt - Raw prompt/query text
+ * @returns Array of meaningful keyword tokens
+ */
+export function extractUnigrams(prompt: string): readonly string[] {
+  return prompt
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}_\s.\-]/gu, ' ')  // Strip punctuation, unicode-aware (keep hyphens and dots for compound words / versions)
+    .split(/\s+/)
+    .filter(t => t.length > 1)  // Drop single chars
+    .filter(t => !STOP_WORDS.has(t))
+    .filter((t, i, arr) => arr.indexOf(t) === i);  // Deduplicate
 }
 
 /**
@@ -94,17 +138,49 @@ export function jaccardSimilarity(tokensA: ReadonlySet<string>, tokensB: Readonl
 }
 
 /**
- * Classify similarity score into actionable categories
- * Based on FR-059:
+ * Classify similarity score into actionable categories.
+ *
+ * Bands are calibrated PER SIMILARITY SPACE — a raw local-BGE cosine of 0.65
+ * means "same project domain, different aspect", while a Jaccard of 0.65
+ * means "near-identical text". Applying the Jaccard bands to local cosine
+ * produced O(n²) relates_to edges (nearly every same-project pair landed in
+ * consolidate/suggest).
+ *
+ * Jaccard / Gemini-cosine bands (FR-059, well-separated spaces):
  * - < 0.1: ignore (unrelated)
  * - 0.1-0.4: relate (create relates_to edge)
  * - 0.4-0.5: suggest (create suggested edge for review)
  * - > 0.5: consolidate (flag for merge)
  *
+ * Local-cosine bands (384-dim BGE, runs hot — consistent with the 0.75
+ * dedup threshold and 0.85 merge ceiling in config.ts):
+ * - < 0.6: ignore (same-domain background similarity)
+ * - 0.6-0.75: relate
+ * - 0.75-0.82: suggest
+ * - >= 0.82: consolidate
+ *
  * @param score - Similarity score in range [0, 1]
+ * @param space - Similarity space the score was computed in (default 'jaccard')
  * @returns Similarity action with action type and strength (where applicable)
  */
-export function classifySimilarity(score: number): SimilarityAction {
+export function classifySimilarity(
+  score: number,
+  space: SimilaritySpace = 'jaccard'
+): SimilarityAction {
+  if (space === 'local-cosine') {
+    if (score < 0.6) {
+      return { action: 'ignore' };
+    }
+    if (score < 0.75) {
+      return { action: 'relate', strength: score };
+    }
+    if (score < 0.82) {
+      return { action: 'suggest', strength: score };
+    }
+    return { action: 'consolidate' };
+  }
+
+  // 'jaccard' and 'gemini-cosine': well-separated spaces share the FR-059 bands
   if (score < 0.1) {
     return { action: 'ignore' };
   }
@@ -138,7 +214,19 @@ export function jaccardPreFilter(score: number): JaccardPreFilter {
 }
 
 /**
- * Compute hybrid similarity preferring cosine (semantic) over Jaccard (lexical).
+ * Result of a hybrid similarity computation, tagged with the method that
+ * actually produced the score. Callers that know WHICH embedding space fed
+ * the cosine (local 384-dim vs Gemini 768-dim) combine `method` with that
+ * knowledge to pick calibrated thresholds/bands.
+ */
+export type HybridSimilarityResult = {
+  readonly score: number;
+  readonly method: 'cosine' | 'jaccard';
+};
+
+/**
+ * Compute hybrid similarity preferring cosine (semantic) over Jaccard (lexical),
+ * reporting which method produced the score.
  * Pure function — takes pre-computed tokens and optional embeddings.
  *
  * Algorithm:
@@ -152,19 +240,19 @@ export function jaccardPreFilter(score: number): JaccardPreFilter {
  * @param tokensB - Pre-tokenized second item
  * @param embeddingA - Optional embedding (Float32 or Float64)
  * @param embeddingB - Optional embedding (Float32 or Float64)
- * @returns Similarity score in [0, 1], or 0 if definitely_different (no embeddings)
+ * @returns Score in [0, 1] (0 if definitely_different) + the method used
  */
-export function hybridSimilarity(
+export function hybridSimilarityScored(
   tokensA: ReadonlySet<string>,
   tokensB: ReadonlySet<string>,
   embeddingA: Float64Array | Float32Array | null,
   embeddingB: Float64Array | Float32Array | null
-): number {
+): HybridSimilarityResult {
   // Prefer cosine when embeddings are available — catches semantic duplicates
   // that use different vocabulary but mean the same thing
   if (embeddingA && embeddingB) {
     if (embeddingA.length === embeddingB.length) {
-      return cosineSimilarity(embeddingA, embeddingB);
+      return { score: cosineSimilarity(embeddingA, embeddingB), method: 'cosine' };
     }
     process.stderr.write(
       `[cortex:similarity] WARN: embedding dimension mismatch (${embeddingA.length} vs ${embeddingB.length}), falling back to Jaccard\n`
@@ -176,10 +264,24 @@ export function hybridSimilarity(
   const preFilter = jaccardPreFilter(jaccardScore);
 
   if (preFilter.result === 'definitely_different') {
-    return 0;
+    return { score: 0, method: 'jaccard' };
   }
 
-  return jaccardScore;
+  return { score: jaccardScore, method: 'jaccard' };
+}
+
+/**
+ * Compute hybrid similarity preferring cosine (semantic) over Jaccard (lexical).
+ * Thin wrapper over hybridSimilarityScored for callers that don't need the
+ * method (see that function for the algorithm).
+ */
+export function hybridSimilarity(
+  tokensA: ReadonlySet<string>,
+  tokensB: ReadonlySet<string>,
+  embeddingA: Float64Array | Float32Array | null,
+  embeddingB: Float64Array | Float32Array | null
+): number {
+  return hybridSimilarityScored(tokensA, tokensB, embeddingA, embeddingB).score;
 }
 
 /**
@@ -227,7 +329,8 @@ export function rankBySimilarity(
   limit: number,
   minScore: number = 0
 ): readonly { memory: Memory; score: number }[] {
-  return candidates
+  const matching = filterMatchingDimensions(candidates, queryEmbedding);
+  return matching
     .map(({ memory, embedding }) => ({ memory, score: cosineSimilarity(queryEmbedding, embedding) }))
     .filter(({ score }) => score >= minScore)
     .sort((a, b) => b.score - a.score)
@@ -235,11 +338,57 @@ export function rankBySimilarity(
 }
 
 /**
- * Rank memory candidates by fused cosine + keyword overlap score.
+ * Filter out candidates whose embedding dimension does not match the query.
+ * Emits a single stderr warning with the count skipped (not one per row) so
+ * legacy/corrupt rows degrade recall gracefully instead of killing it.
+ */
+function filterMatchingDimensions(
+  candidates: readonly { memory: Memory; embedding: Float64Array | Float32Array }[],
+  queryEmbedding: Float64Array | Float32Array
+): readonly { memory: Memory; embedding: Float64Array | Float32Array }[] {
+  const matching = candidates.filter(
+    ({ embedding }) => embedding.length === queryEmbedding.length
+  );
+  const skipped = candidates.length - matching.length;
+  if (skipped > 0) {
+    process.stderr.write(
+      `[cortex:similarity] WARN: skipped ${skipped} candidate(s) with embedding dimension != ${queryEmbedding.length}\n`
+    );
+  }
+  return matching;
+}
+
+/**
+ * Fraction of query tokens that appear in the memory's tokens.
+ * 1.0 when every query token is covered, 0 when none are (or query is empty).
+ *
+ * This is deliberately NOT Jaccard: a fully-matching 1-2 token proper-noun
+ * query against a ~30-token summary has Jaccard ≈ 0.03 (intersection/union),
+ * which made the keyword boost a near no-op. Coverage normalizes by query
+ * size only, so an exact proper-noun hit gets the full boost.
+ *
+ * @param queryTokens - Tokenized query
+ * @param memoryTokens - Tokenized memory text
+ * @returns Coverage ratio in [0, 1]
+ */
+export function queryCoverage(
+  queryTokens: ReadonlySet<string>,
+  memoryTokens: ReadonlySet<string>
+): number {
+  if (queryTokens.size === 0) return 0;
+  let covered = 0;
+  for (const token of queryTokens) {
+    if (memoryTokens.has(token)) covered++;
+  }
+  return covered / queryTokens.size;
+}
+
+/**
+ * Rank memory candidates by fused cosine + keyword coverage score.
  * Pure function — takes pre-fetched candidates and returns sorted results.
  *
- * Formula: fused_score = cosine_score * (1 + keywordWeight * overlap_ratio)
- * where overlap_ratio is Jaccard(queryTokens, memoryTokens).
+ * Formula: fused_score = min(1, cosine_score * (1 + keywordWeight * coverage))
+ * where coverage is |queryTokens ∩ memoryTokens| / |queryTokens|.
  *
  * The keyword boost helps proper noun queries ("NixOS", "BullMQ") rank
  * exact lexical matches above semantically similar but different-vocabulary results.
@@ -260,14 +409,15 @@ export function rankByFusedSimilarity(
   minScore: number = 0,
   keywordWeight: number = KEYWORD_OVERLAP_WEIGHT
 ): readonly { memory: Memory; score: number }[] {
-  return candidates
+  const matching = filterMatchingDimensions(candidates, queryEmbedding);
+  return matching
     .map(({ memory, embedding }) => {
       const cosineScore = cosineSimilarity(queryEmbedding, embedding);
       if (cosineScore < minScore) return null;
 
       const memoryTokens = tokenize(`${memory.summary} ${memory.tags.join(' ')}`);
-      const overlapRatio = jaccardSimilarity(queryTokens, memoryTokens);
-      const fusedScore = cosineScore * (1 + keywordWeight * overlapRatio);
+      const coverage = queryCoverage(queryTokens, memoryTokens);
+      const fusedScore = Math.min(1, cosineScore * (1 + keywordWeight * coverage));
 
       return { memory, score: fusedScore };
     })

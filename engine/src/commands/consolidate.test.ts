@@ -230,6 +230,83 @@ describe('findSimilarPairs - embedding type selection', () => {
   });
 });
 
+describe('findSimilarPairs - per-space default thresholds (calibration regression)', () => {
+  // Orthogonal vocabulary: Jaccard ~0, so cosine drives the score
+  const contentA = { content: 'alpha bravo charlie delta', summary: 'alpha bravo' };
+  const contentB = { content: 'echo foxtrot golf hotel', summary: 'echo foxtrot' };
+
+  /** Float32 pair with cosine exactly `c` against [1, 0] */
+  const localPairAt = (c: number): [Memory, Memory] => [
+    createTestMemory({ ...contentA, local_embedding: new Float32Array([1, 0]) }),
+    createTestMemory({ ...contentB, local_embedding: new Float32Array([c, Math.sqrt(1 - c * c)]) }),
+  ];
+
+  test('local-cosine 0.7 (same-domain-different-aspect band) is NOT flagged by default', () => {
+    // Raw 384-dim BGE cosine runs hot: 0.6-0.75 is routine for unrelated
+    // aspects of the same project. Under the old uniform 0.5 threshold this
+    // produced O(n²) false "duplicate" pairs.
+    const pairs = findSimilarPairs(localPairAt(0.7));
+    expect(pairs.length).toBe(0);
+  });
+
+  test('local-cosine 0.85 (true-duplicate band) IS flagged by default', () => {
+    const pairs = findSimilarPairs(localPairAt(0.85));
+    expect(pairs.length).toBe(1);
+    expect(pairs[0].similarity).toBeCloseTo(0.85, 5);
+  });
+
+  test('Jaccard 0.55 is flagged by default (well-separated space keeps 0.5)', () => {
+    // 6 shared tokens, 11-token union → Jaccard = 6/11 ≈ 0.545
+    const sharedWords = 'one two three four five six';
+    const memoryA = createTestMemory({
+      summary: sharedWords, content: `${sharedWords} seven eight`,
+    });
+    const memoryB = createTestMemory({
+      summary: sharedWords, content: `${sharedWords} nine ten eleven`,
+    });
+
+    const pairs = findSimilarPairs([memoryA, memoryB]);
+    expect(pairs.length).toBe(1);
+    expect(pairs[0].similarity).toBeCloseTo(6 / 11, 5);
+  });
+
+  test('Gemini cosine 0.55 is flagged by default (well-separated space keeps 0.5)', () => {
+    const c = 0.55;
+    const memoryA = createTestMemory({ ...contentA, embedding: new Float64Array([1, 0]) });
+    const memoryB = createTestMemory({
+      ...contentB,
+      embedding: new Float64Array([c, Math.sqrt(1 - c * c)]),
+    });
+
+    const pairs = findSimilarPairs([memoryA, memoryB]);
+    expect(pairs.length).toBe(1);
+    expect(pairs[0].similarity).toBeCloseTo(0.55, 5);
+  });
+
+  test('explicit threshold overrides the per-space defaults uniformly', () => {
+    expect(findSimilarPairs(localPairAt(0.7), 0.6).length).toBe(1);
+    expect(findSimilarPairs(localPairAt(0.7), 0.75).length).toBe(0);
+  });
+
+  test('dimension-mismatch fallback uses the jaccard threshold, not the cosine one', () => {
+    // Both sides have local embeddings but with different dims → hybrid
+    // falls back to Jaccard; the pair threshold must follow the METHOD used.
+    const sharedWords = 'one two three four five six';
+    const memoryA = createTestMemory({
+      summary: sharedWords, content: `${sharedWords} seven eight`,
+      local_embedding: new Float32Array([1, 0]),
+    });
+    const memoryB = createTestMemory({
+      summary: sharedWords, content: `${sharedWords} nine ten eleven`,
+      local_embedding: new Float32Array([1, 0, 0]),
+    });
+
+    // Jaccard ≈ 0.545 — above 0.5 (jaccard threshold), below 0.8 (local-cosine)
+    const pairs = findSimilarPairs([memoryA, memoryB]);
+    expect(pairs.length).toBe(1);
+  });
+});
+
 describe('formatPairForReview', () => {
   test('formats pair with all relevant information', () => {
     const memoryA = createTestMemory({
@@ -597,13 +674,17 @@ describe('mergePair', () => {
       similarity: 0.9,
     };
 
-    const mergedId = mergePair(
+    const result = mergePair(
       db,
       pair,
       'Merged summary',
       'Merged content',
       'test-session'
     );
+
+    expect(result.kind).toBe('merged');
+    if (result.kind !== 'merged') throw new Error('expected merged');
+    const mergedId = result.mergedId;
 
     // Check merged memory exists
     const merged = getMemory(db, mergedId);
@@ -665,13 +746,182 @@ describe('mergePair', () => {
 
     const pair: MemoryPair = { memoryA, memoryB, similarity: 0.9 };
 
-    expect(() =>
-      mergePair(db, pair, 'Merged summary', 'Merged content', 'test-session')
-    ).toThrow(/mem-a.*superseded/);
+    const result = mergePair(db, pair, 'Merged summary', 'Merged content', 'test-session');
+    expect(result.kind).toBe('skipped');
+    if (result.kind !== 'skipped') throw new Error('expected skipped');
+    expect(result.reason).toMatch(/mem-a.*superseded/);
 
     // No side effects: B untouched, no supersedes edges created
     expect(getMemory(db, 'mem-b')!.status).toBe('active');
     expect(getAllEdges(db).filter((e) => e.relation_type === 'supersedes').length).toBe(0);
+  });
+
+  test('checks DB status, not the stale pair snapshot (overlapping pairs)', () => {
+    // Library flow: detect pairs (A,B) and (B,C) from one snapshot, merge
+    // (A,B), then attempt (B,C) with the STALE pair objects (status 'active').
+    const memoryA = createTestMemory({ id: 'mem-a', summary: 'shared topic' });
+    const memoryB = createTestMemory({ id: 'mem-b', summary: 'shared topic' });
+    const memoryC = createTestMemory({ id: 'mem-c', summary: 'shared topic' });
+
+    insertMemory(db, memoryA);
+    insertMemory(db, memoryB);
+    insertMemory(db, memoryC);
+
+    const pairAB: MemoryPair = { memoryA, memoryB, similarity: 0.9 };
+    // Stale snapshot: memoryB still says status 'active'
+    const pairBC: MemoryPair = { memoryA: memoryB, memoryB: memoryC, similarity: 0.9 };
+
+    const first = mergePair(db, pairAB, 'Merged AB', 'Merged AB content', 'test-session');
+    expect(first.kind).toBe('merged');
+
+    const second = mergePair(db, pairBC, 'Merged BC', 'Merged BC content', 'test-session');
+    expect(second.kind).toBe('skipped');
+    if (second.kind !== 'skipped') throw new Error('expected skipped');
+    expect(second.reason).toMatch(/mem-b.*superseded/);
+
+    // C untouched, no double-merge of B
+    expect(getMemory(db, 'mem-c')!.status).toBe('active');
+    const supersedesTargetingB = getAllEdges(db).filter(
+      (e) => e.relation_type === 'supersedes' && e.target_id === 'mem-b'
+    );
+    expect(supersedesTargetingB.length).toBe(1);
+  });
+
+  test('re-points non-supersedes edges to the merged memory', () => {
+    // A code_description with a source_of edge to a code memory must keep
+    // its pairing after being merged — the merged memory inherits the edge.
+    const prose = createTestMemory({
+      id: 'mem-prose',
+      memory_type: 'code_description',
+      summary: 'describes the parser',
+    });
+    const code = createTestMemory({
+      id: 'mem-code',
+      memory_type: 'code',
+      summary: 'function parse() {}',
+      content: 'function parse() {}',
+    });
+    const otherProse = createTestMemory({
+      id: 'mem-prose-2',
+      memory_type: 'code_description',
+      summary: 'also describes the parser',
+    });
+    const related = createTestMemory({ id: 'mem-related', summary: 'related note' });
+
+    insertMemory(db, prose);
+    insertMemory(db, code);
+    insertMemory(db, otherProse);
+    insertMemory(db, related);
+
+    const { insertEdge } = require('../infra/db.js');
+    // Prose→code pairing (source_of), typed semantic edge, and an edge
+    // BETWEEN the two members (must be dropped, not self-referenced)
+    insertEdge(db, {
+      source_id: 'mem-prose', target_id: 'mem-code',
+      relation_type: 'source_of', strength: 1.0, bidirectional: false, status: 'active',
+    });
+    insertEdge(db, {
+      source_id: 'mem-prose-2', target_id: 'mem-related',
+      relation_type: 'refines', strength: 0.8, bidirectional: true, status: 'active',
+    });
+    insertEdge(db, {
+      source_id: 'mem-prose', target_id: 'mem-prose-2',
+      relation_type: 'relates_to', strength: 0.7, bidirectional: true, status: 'active',
+    });
+
+    const pair: MemoryPair = { memoryA: prose, memoryB: otherProse, similarity: 0.9 };
+    const result = mergePair(db, pair, 'Merged prose', 'Merged prose content', 'test-session');
+    expect(result.kind).toBe('merged');
+    if (result.kind !== 'merged') throw new Error('expected merged');
+
+    const edges = getAllEdges(db);
+
+    // source_of pairing preserved, re-pointed to merged memory
+    const sourceOf = edges.filter((e) => e.relation_type === 'source_of');
+    expect(sourceOf.length).toBe(1);
+    expect(sourceOf[0].source_id).toBe(result.mergedId);
+    expect(sourceOf[0].target_id).toBe('mem-code');
+
+    // Typed semantic edge preserved
+    const refines = edges.filter((e) => e.relation_type === 'refines');
+    expect(refines.length).toBe(1);
+    expect(refines[0].source_id).toBe(result.mergedId);
+    expect(refines[0].target_id).toBe('mem-related');
+
+    // Edge between the two merged members dropped (no self-reference)
+    const selfRef = edges.filter((e) => e.source_id === e.target_id);
+    expect(selfRef.length).toBe(0);
+    expect(edges.filter((e) => e.relation_type === 'relates_to').length).toBe(0);
+
+    // Supersedes edges still created
+    const supersedes = edges.filter((e) => e.relation_type === 'supersedes');
+    expect(supersedes.length).toBe(2);
+  });
+
+  test('dedupes edges that would collide after re-pointing', () => {
+    const memoryA = createTestMemory({ id: 'mem-a', summary: 'topic' });
+    const memoryB = createTestMemory({ id: 'mem-b', summary: 'topic' });
+    const shared = createTestMemory({ id: 'mem-shared', summary: 'shared target' });
+
+    insertMemory(db, memoryA);
+    insertMemory(db, memoryB);
+    insertMemory(db, shared);
+
+    const { insertEdge } = require('../infra/db.js');
+    // Both members point at the same target with the same relation — after
+    // re-pointing, only one (merged → shared) edge may survive the unique
+    // constraint.
+    insertEdge(db, {
+      source_id: 'mem-a', target_id: 'mem-shared',
+      relation_type: 'relates_to', strength: 0.6, bidirectional: true, status: 'active',
+    });
+    insertEdge(db, {
+      source_id: 'mem-b', target_id: 'mem-shared',
+      relation_type: 'relates_to', strength: 0.6, bidirectional: true, status: 'active',
+    });
+
+    const pair: MemoryPair = { memoryA, memoryB, similarity: 0.9 };
+    const result = mergePair(db, pair, 'Merged', 'Merged content', 'test-session');
+    expect(result.kind).toBe('merged');
+    if (result.kind !== 'merged') throw new Error('expected merged');
+
+    const relates = getAllEdges(db).filter((e) => e.relation_type === 'relates_to');
+    expect(relates.length).toBe(1);
+    expect(relates[0].source_id).toBe(result.mergedId);
+    expect(relates[0].target_id).toBe('mem-shared');
+  });
+
+  test('re-points facts from merged members to the merged memory', () => {
+    const memoryA = createTestMemory({ id: 'mem-a', summary: 'topic' });
+    const memoryB = createTestMemory({ id: 'mem-b', summary: 'topic' });
+
+    insertMemory(db, memoryA);
+    insertMemory(db, memoryB);
+
+    const { upsertEntity, insertFact, getFactsByMemory } = require('../infra/db.js');
+    const entityId = upsertEntity(db, 'TestTool', 'tool');
+    const now = new Date().toISOString();
+    insertFact(db, {
+      id: 'fact-1',
+      entity_id: entityId,
+      predicate: 'used for',
+      object: 'testing',
+      source_memory_id: 'mem-a',
+      confidence: 0.8,
+      valid_from: now,
+      valid_to: null,
+      created_at: now,
+    });
+
+    const pair: MemoryPair = { memoryA, memoryB, similarity: 0.9 };
+    const result = mergePair(db, pair, 'Merged', 'Merged content', 'test-session');
+    expect(result.kind).toBe('merged');
+    if (result.kind !== 'merged') throw new Error('expected merged');
+
+    expect(getFactsByMemory(db, 'mem-a').length).toBe(0);
+    const repointed = getFactsByMemory(db, result.mergedId);
+    expect(repointed.length).toBe(1);
+    expect(repointed[0].id).toBe('fact-1');
   });
 });
 
@@ -852,3 +1102,73 @@ describe('buildMergedMemory - properties', () => {
   });
 });
 
+
+// ============================================================================
+// Regression test: finding 1b — mergePair invalidates the surface cache
+// ============================================================================
+
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as nodePath from 'node:path';
+
+describe('mergePair surface cache invalidation (finding 1b)', () => {
+  test('successful merge with cwd removes cached surfaces', () => {
+    const db = openDatabase(':memory:');
+    const tempDir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'cortex-merge-regress-'));
+    try {
+      const cacheDir = nodePath.join(tempDir, '.memory', 'surface-cache');
+      fs.mkdirSync(cacheDir, { recursive: true });
+      fs.writeFileSync(nodePath.join(cacheDir, 'stale.json'), '{"surface":"stale"}', 'utf8');
+
+      const memoryA = createTestMemory({ id: 'inv-a' });
+      const memoryB = createTestMemory({ id: 'inv-b' });
+      insertMemory(db, memoryA);
+      insertMemory(db, memoryB);
+
+      const result = mergePair(
+        db,
+        { memoryA, memoryB, similarity: 0.9 },
+        'Merged summary',
+        'Merged content',
+        'test-session',
+        tempDir
+      );
+
+      expect(result.kind).toBe('merged');
+      expect(fs.readdirSync(cacheDir).filter(f => f.endsWith('.json'))).toHaveLength(0);
+    } finally {
+      db.close();
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test('skipped merge does NOT invalidate the cache', () => {
+    const db = openDatabase(':memory:');
+    const tempDir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'cortex-merge-regress-'));
+    try {
+      const cacheDir = nodePath.join(tempDir, '.memory', 'surface-cache');
+      fs.mkdirSync(cacheDir, { recursive: true });
+      fs.writeFileSync(nodePath.join(cacheDir, 'valid.json'), '{"surface":"still valid"}', 'utf8');
+
+      const memoryA = createTestMemory({ id: 'skip-a', status: 'superseded' });
+      const memoryB = createTestMemory({ id: 'skip-b' });
+      insertMemory(db, memoryA);
+      insertMemory(db, memoryB);
+
+      const result = mergePair(
+        db,
+        { memoryA, memoryB, similarity: 0.9 },
+        'Merged summary',
+        'Merged content',
+        'test-session',
+        tempDir
+      );
+
+      expect(result.kind).toBe('skipped');
+      expect(fs.readdirSync(cacheDir).filter(f => f.endsWith('.json'))).toHaveLength(1);
+    } finally {
+      db.close();
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+});

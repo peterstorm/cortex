@@ -524,3 +524,184 @@ describe('generate command', () => {
   });
 });
 
+// ============================================================================
+// Regression tests: findings 2 and 9 — DB-fingerprinted cache validity and
+// symlink-normalized cwd comparison
+// ============================================================================
+
+import { computeDbFingerprint } from './generate.js';
+import { updateMemory } from '../infra/db.js';
+
+describe('DB-fingerprinted surface cache (finding 2)', () => {
+  let tempDir: string;
+  let projectDb: Database;
+  let globalDb: Database;
+
+  const initGit = (dir: string) => {
+    const { execSync } = require('node:child_process');
+    execSync('git init', { cwd: dir, stdio: 'ignore' });
+    execSync('git checkout -b main', { cwd: dir, stdio: 'ignore' });
+    execSync('git config user.email "test@test.com"', { cwd: dir, stdio: 'ignore' });
+    execSync('git config user.name "Test"', { cwd: dir, stdio: 'ignore' });
+    fs.writeFileSync(path.join(dir, '.gitignore'), '');
+    execSync('git add .gitignore', { cwd: dir, stdio: 'ignore' });
+    execSync('git commit -m "init"', { cwd: dir, stdio: 'ignore' });
+  };
+
+  const insertTestMemory = (db: Database, id: string, summary: string) => {
+    insertMemory(db, createMemory({
+      id,
+      content: `content: ${summary}`,
+      summary,
+      memory_type: 'decision',
+      scope: 'project',
+      confidence: 0.9,
+      priority: 8,
+      source_type: 'extraction',
+      source_session: 'session-1',
+      source_context: JSON.stringify({ branch: 'main' }),
+    }));
+  };
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-fp-test-'));
+    projectDb = openDatabase(':memory:');
+    globalDb = openDatabase(':memory:');
+    initGit(tempDir);
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  test('cache hit when nothing changed (fingerprint matches)', () => {
+    insertTestMemory(projectDb, randomUUID(), 'Stable memory');
+    runGenerate({ projectDb, globalDb, cwd: tempDir });
+
+    const fingerprint = computeDbFingerprint(projectDb, globalDb);
+    const cached = loadCachedSurface(tempDir, undefined, fingerprint);
+
+    expect(cached).not.toBeNull();
+    expect(cached!.surface).toContain('Stable memory');
+  });
+
+  test('cache miss after archiving a memory (fingerprint changed)', () => {
+    const id = randomUUID();
+    insertTestMemory(projectDb, id, 'Soon archived');
+    runGenerate({ projectDb, globalDb, cwd: tempDir });
+
+    // Archive AFTER caching — the cached surface still contains the memory
+    updateMemory(projectDb, id, { status: 'archived', archived_at: new Date().toISOString() });
+
+    const fingerprint = computeDbFingerprint(projectDb, globalDb);
+    const cached = loadCachedSurface(tempDir, undefined, fingerprint);
+
+    expect(cached).toBeNull();
+  });
+
+  test('cache miss for a legacy cache without a fingerprint when one is expected', () => {
+    insertTestMemory(projectDb, randomUUID(), 'Legacy cached memory');
+    runGenerate({ projectDb, globalDb, cwd: tempDir });
+
+    // Strip the fingerprint to simulate a pre-upgrade cache file
+    const cacheDir = path.join(tempDir, '.memory', 'surface-cache');
+    const cacheFile = path.join(cacheDir, fs.readdirSync(cacheDir)[0]);
+    const data = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+    delete data.db_fingerprint;
+    fs.writeFileSync(cacheFile, JSON.stringify(data), 'utf8');
+
+    const fingerprint = computeDbFingerprint(projectDb, globalDb);
+    expect(loadCachedSurface(tempDir, undefined, fingerprint)).toBeNull();
+    // Without an expected fingerprint (legacy caller), still a hit
+    expect(loadCachedSurface(tempDir)).not.toBeNull();
+  });
+
+  test('symlinked cwd hits the cache written via the real path (finding 9)', () => {
+    insertTestMemory(projectDb, randomUUID(), 'Symlink memory');
+    runGenerate({ projectDb, globalDb, cwd: tempDir });
+
+    const linkPath = path.join(os.tmpdir(), `cortex-fp-link-${randomUUID().slice(0, 8)}`);
+    fs.symlinkSync(tempDir, linkPath);
+    try {
+      const cached = loadCachedSurface(linkPath, path.join(tempDir, '.memory', 'surface-cache'));
+      expect(cached).not.toBeNull();
+      expect(cached!.surface).toContain('Symlink memory');
+    } finally {
+      fs.unlinkSync(linkPath);
+    }
+  });
+});
+
+// ============================================================================
+// Regression test: finding 7 — entity section accounted in token budget
+// ============================================================================
+
+import { upsertEntity, insertFact } from '../infra/db.js';
+import { estimateTokens } from '../core/surface.js';
+
+describe('surface token budget with entities (finding 7)', () => {
+  test('rendered surface stays within 2000 tokens * 1.1 with entities and tag-heavy memories', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-budget-test-'));
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    const { execSync } = require('node:child_process');
+    execSync('git init', { cwd: tempDir, stdio: 'ignore' });
+    execSync('git checkout -b main', { cwd: tempDir, stdio: 'ignore' });
+
+    try {
+      // 5 entities with 3 facts each (max the surface renders)
+      for (let e = 0; e < 5; e++) {
+        const entityId = upsertEntity(projectDb, `Entity-${e}-with-a-long-name`, 'tool');
+        insertMemory(projectDb, createMemory({
+          id: `src-${e}`,
+          content: 'source', summary: `entity source ${e}`,
+          memory_type: 'context', scope: 'project',
+          confidence: 0.5, priority: 3,
+          source_type: 'extraction', source_session: 's', source_context: '{}',
+        }));
+        for (let f = 0; f < 3; f++) {
+          insertFact(projectDb, {
+            id: `fact-${e}-${f}`,
+            entity_id: entityId,
+            predicate: `predicate number ${f} with some length to it`,
+            object: `object value ${f} that is also reasonably descriptive`,
+            source_memory_id: `src-${e}`,
+            confidence: 0.9,
+            valid_from: new Date().toISOString(),
+            valid_to: null,
+            created_at: new Date().toISOString(),
+          });
+        }
+      }
+
+      // Tag-heavy memories, plenty to overfill the budget
+      for (let i = 0; i < 60; i++) {
+        insertMemory(projectDb, createMemory({
+          id: randomUUID(),
+          content: `Detailed content for memory ${i}`,
+          summary: `Memory ${i}: a moderately long summary describing subsystem behavior and decisions`,
+          memory_type: 'decision',
+          scope: 'project',
+          confidence: 0.9,
+          priority: 8,
+          tags: ['performance-tuning', 'database-pooling', 'architecture', 'long-tag-four', 'fifth-tag'],
+          source_type: 'extraction',
+          source_session: 'session-1',
+          source_context: JSON.stringify({ branch: 'main' }),
+        }));
+      }
+
+      runGenerate({ projectDb, globalDb, cwd: tempDir });
+
+      const surfacePath = path.join(tempDir, '.claude', 'cortex-memory.local.md');
+      const content = fs.readFileSync(surfacePath, 'utf8');
+
+      expect(content).toContain('## Entities');
+      expect(estimateTokens(content)).toBeLessThanOrEqual(2000 * 1.1);
+    } finally {
+      projectDb.close();
+      globalDb.close();
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+});

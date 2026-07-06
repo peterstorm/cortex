@@ -8,10 +8,12 @@
 import type { Database } from 'bun:sqlite';
 import * as fs from 'node:fs';
 import type { Memory } from '../core/types.js';
-import { getActiveMemories, getArchivedMemories, getAllEdges, updateMemory, deleteEdgesForMemory, archiveEdgesForMemory, getLatestMemoryTimestamp, vacuumPrunedMemories } from '../infra/db.js';
+import { getActiveMemories, getArchivedMemories, getAllEdges, updateMemory, deleteEdgesForMemory, archiveEdgesForMemory, getLatestMemoryTimestamp, vacuumPrunedMemories, supersedeFactsForMemory } from '../infra/db.js';
 import { computeAllCentrality } from '../core/graph.js';
+import { writeTelemetry } from '../infra/filesystem.js';
 import { decayConfidence, determineLifecycleAction } from '../core/decay.js';
 import { LIFECYCLE_FALLBACK_HOURS, VACUUM_RETENTION_DAYS } from '../config.js';
+import { invalidateSurfaceCache } from './generate.js';
 
 export interface LifecycleResult {
   readonly decayed: number;
@@ -66,6 +68,8 @@ function readLastLifecycleAt(telemetryPath: string): string | null {
 
 /**
  * Write last_lifecycle_at to telemetry file (merge, don't overwrite).
+ * Uses writeTelemetry (temp file + atomic rename) so concurrent readers
+ * never observe torn JSON.
  */
 function writeLastLifecycleAt(telemetryPath: string, timestamp: string): void {
   let data: Record<string, unknown> = {};
@@ -75,7 +79,7 @@ function writeLastLifecycleAt(telemetryPath: string, timestamp: string): void {
     // file doesn't exist or invalid — start fresh
   }
   data.last_lifecycle_at = timestamp;
-  fs.writeFileSync(telemetryPath, JSON.stringify(data, null, 2), 'utf8');
+  writeTelemetry(telemetryPath, data);
 }
 
 /**
@@ -87,7 +91,8 @@ function writeLastLifecycleAt(telemetryPath: string, timestamp: string): void {
 export function runLifecycleIfNeeded(
   projectDb: Database,
   globalDb: Database,
-  telemetryPath: string
+  telemetryPath: string,
+  cwd?: string
 ): LifecycleResult {
   const now = new Date();
   const lastLifecycleAt = readLastLifecycleAt(telemetryPath);
@@ -104,14 +109,36 @@ export function runLifecycleIfNeeded(
     return { decayed: 0, archived: 0, pruned: 0, skipped: true };
   }
 
-  const projectResult = runLifecycle(projectDb);
-  const globalResult = runLifecycle(globalDb);
+  const result = runFullLifecycle(projectDb, globalDb, cwd);
+
+  writeLastLifecycleAt(telemetryPath, now.toISOString());
+
+  return result;
+}
+
+/**
+ * Run lifecycle on both databases AND vacuum expired pruned rows.
+ * Shared by the smart-trigger path (runLifecycleIfNeeded) and the plain
+ * `lifecycle <cwd>` CLI path — previously vacuum only ran on the
+ * `--if-needed` path, so a manual lifecycle never hard-deleted pruned
+ * memories past the retention period.
+ *
+ * @param projectDb - Project database
+ * @param globalDb - Global database
+ * @param cwd - Project root; when provided, surface cache is invalidated on changes
+ * @returns Combined lifecycle counts across both databases
+ */
+export function runFullLifecycle(
+  projectDb: Database,
+  globalDb: Database,
+  cwd?: string
+): LifecycleResult {
+  const projectResult = runLifecycle(projectDb, cwd);
+  const globalResult = runLifecycle(globalDb, cwd);
 
   // Hard-delete pruned memories past retention period
   vacuumPrunedMemories(projectDb, VACUUM_RETENTION_DAYS);
   vacuumPrunedMemories(globalDb, VACUUM_RETENTION_DAYS);
-
-  writeLastLifecycleAt(telemetryPath, now.toISOString());
 
   return {
     decayed: projectResult.decayed + globalResult.decayed,
@@ -134,7 +161,7 @@ export function runLifecycleIfNeeded(
  * The spec says "14 consecutive days" but tracking daily state is complex;
  * we use last_accessed_at as proxy.
  */
-export function runLifecycle(db: Database): LifecycleResult {
+export function runLifecycle(db: Database, cwd?: string): LifecycleResult {
   const now = new Date();
 
   // I/O: Fetch all active memories
@@ -177,23 +204,27 @@ export function runLifecycle(db: Database): LifecycleResult {
 
     // I/O: Only write to DB on status transitions
     if (action.action === 'archive') {
-      updateMemory(db, memory.id, { status: 'archived' });
+      // archived_at anchors the archive→prune grace period (FR-091)
+      updateMemory(db, memory.id, { status: 'archived', archived_at: now.toISOString() });
       archiveEdgesForMemory(db, memory.id);
+      // Retract entity facts sourced from the archived memory
+      supersedeFactsForMemory(db, memory.id);
       archivedCount++;
     } else if (action.action === 'prune') {
       updateMemory(db, memory.id, { status: 'pruned' });
       deleteEdgesForMemory(db, memory.id);
+      supersedeFactsForMemory(db, memory.id);
       prunedCount++;
     }
     // exempt and none: no DB write needed
   }
 
-  // Also process archived memories for pruning
-  // Note: A memory can be archived AND pruned in the same runLifecycle call.
-  // This is intentional - the prune loop re-reads archived memories after the
-  // archive loop writes, so a very old memory (e.g., 100 days unaccessed with
-  // confidence < 0.3) will be archived in the first loop, then pruned in this
-  // second loop if it also meets the 30-day archived threshold.
+  // Also process archived memories for pruning.
+  // Note: A memory archived in the loop above will NOT be pruned in the same
+  // call — prune eligibility is anchored at archived_at, giving every
+  // archived memory a full PRUNE_THRESHOLD_DAYS grace period before its
+  // edges are hard-deleted (legacy rows without archived_at fall back to
+  // updated_at, which the archive write also refreshes).
   // I/O: Fetch archived memories
   const archivedMemories = getArchivedMemories(db);
   for (const memory of archivedMemories) {
@@ -208,8 +239,14 @@ export function runLifecycle(db: Database): LifecycleResult {
         status: 'pruned',
       });
       deleteEdgesForMemory(db, memory.id);
+      supersedeFactsForMemory(db, memory.id);
       prunedCount++;
     }
+  }
+
+  // Invalidate cached surfaces when the visible memory set changed
+  if (cwd !== undefined && (archivedCount > 0 || prunedCount > 0)) {
+    invalidateSurfaceCache(cwd);
   }
 
   return {

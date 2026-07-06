@@ -7,7 +7,9 @@
 # - FR-046: Backfill missing embeddings after extraction
 #
 # Architecture:
-# Thin shell orchestrator - reads stdin JSON, pipes to extract CLI, then backfills embeddings, then generates surface.
+# Thin shell orchestrator - reads stdin JSON, pipes to extract CLI, backfills
+# embeddings, runs maintenance (semantic-edges, lifecycle, ai-prune), and
+# generates the surface LAST so it reflects post-archival state.
 # ALL errors caught and logged, NEVER block session (exit 0 always).
 #
 # Usage (invoked by Stop hook):
@@ -43,6 +45,15 @@ log_info() {
   echo "[cortex-hook] INFO: $*" >&2
 }
 
+# Per-process log files: fixed /tmp paths clobber each other when multiple
+# detached workers run concurrently (one per session Stop). Include the PID.
+EXTRACT_LOG="/tmp/cortex-extract.$$.log"
+BACKFILL_LOG="/tmp/cortex-backfill.$$.log"
+GENERATE_LOG="/tmp/cortex-generate.$$.log"
+SEMANTIC_EDGES_LOG="/tmp/cortex-semantic-edges.$$.log"
+LIFECYCLE_LOG="/tmp/cortex-lifecycle.$$.log"
+AI_PRUNE_LOG="/tmp/cortex-ai-prune.$$.log"
+
 # Main execution wrapped in error handler
 main() {
   # Read stdin JSON (Stop hook input)
@@ -62,58 +73,63 @@ main() {
 
   # Step 1: Extract (pipe stdin JSON to CLI)
   local extract_ok=true
-  if ! echo "$stdin_json" | bun "$CLI_PATH" extract 2>&1 | tee /tmp/cortex-extract.log; then
-    log_error "Extract failed (see /tmp/cortex-extract.log)"
+  if ! echo "$stdin_json" | bun "$CLI_PATH" extract 2>&1 | tee "$EXTRACT_LOG"; then
+    log_error "Extract failed (see $EXTRACT_LOG)"
     extract_ok=false
   fi
 
   # Step 2: Backfill embeddings only if extraction succeeded (FR-046)
   if [[ "$extract_ok" == true ]] && [[ -n "$cwd" ]]; then
     log_info "Backfilling embeddings for cwd: $cwd"
-    if ! bun "$CLI_PATH" backfill "$cwd" 2>&1 | tee /tmp/cortex-backfill.log; then
-      log_error "Backfill failed (see /tmp/cortex-backfill.log)"
+    if ! bun "$CLI_PATH" backfill "$cwd" 2>&1 | tee "$BACKFILL_LOG"; then
+      log_error "Backfill failed (see $BACKFILL_LOG)"
     fi
   fi
 
-  # Step 3: Generate push surface (always — stale memories still need fresh surface)
-  if [[ -n "$cwd" ]]; then
-    log_info "Generating push surface for cwd: $cwd"
-    if ! bun "$CLI_PATH" generate "$cwd" 2>&1 | tee /tmp/cortex-generate.log; then
-      log_error "Generate failed (see /tmp/cortex-generate.log)"
-    fi
-  else
-    log_error "Could not parse cwd from stdin JSON, skipping generate"
-  fi
-
-  # Steps 4-6: maintenance, run SEQUENTIALLY. This whole worker is already
+  # Steps 3-5: maintenance, run SEQUENTIALLY. This whole worker is already
   # detached from the session, so nothing here blocks the user — and running
   # these concurrently made them race each other: SQLite allows one writer
   # (collisions were silently lost in /dev/null), and lifecycle + ai-prune
   # both read-modify-write telemetry.json. Logs go to /tmp for debuggability.
+  #
+  # ORDER MATTERS: generate must run LAST. Lifecycle and ai-prune archive
+  # memories — generating the surface before them served just-archived
+  # memories for the whole next session.
 
-  # Step 4: Semantic edge classification (claude -p) — upgrades Jaccard
+  # Step 3: Semantic edge classification (claude -p) — upgrades Jaccard
   # 'relates_to' edges to typed relationships
   if [[ "$extract_ok" == true ]] && [[ -n "$cwd" ]]; then
     log_info "Running semantic edge classification"
-    if ! bun "$CLI_PATH" semantic-edges "$cwd" >/tmp/cortex-semantic-edges.log 2>&1; then
-      log_error "Semantic edges failed (see /tmp/cortex-semantic-edges.log)"
+    if ! bun "$CLI_PATH" semantic-edges "$cwd" >"$SEMANTIC_EDGES_LOG" 2>&1; then
+      log_error "Semantic edges failed (see $SEMANTIC_EDGES_LOG)"
     fi
   fi
 
-  # Step 5: Lifecycle prune — skips if no new memories and last run <2h ago
+  # Step 4: Lifecycle prune — skips if no new memories and last run <2h ago
   if [[ -n "$cwd" ]]; then
     log_info "Running lifecycle prune"
-    if ! bun "$CLI_PATH" lifecycle "$cwd" --if-needed >/tmp/cortex-lifecycle.log 2>&1; then
-      log_error "Lifecycle failed (see /tmp/cortex-lifecycle.log)"
+    if ! bun "$CLI_PATH" lifecycle "$cwd" --if-needed >"$LIFECYCLE_LOG" 2>&1; then
+      log_error "Lifecycle failed (see $LIFECYCLE_LOG)"
     fi
   fi
 
-  # Step 6: AI prune — smart trigger decides whether a prune is due
+  # Step 5: AI prune — smart trigger decides whether a prune is due
   if [[ -n "$cwd" ]]; then
     log_info "Running AI prune"
-    if ! bun "$CLI_PATH" ai-prune "$cwd" --if-needed >/tmp/cortex-ai-prune.log 2>&1; then
-      log_error "AI prune failed (see /tmp/cortex-ai-prune.log)"
+    if ! bun "$CLI_PATH" ai-prune "$cwd" --if-needed >"$AI_PRUNE_LOG" 2>&1; then
+      log_error "AI prune failed (see $AI_PRUNE_LOG)"
     fi
+  fi
+
+  # Step 6: Generate push surface LAST, after all archival is done, so the
+  # surface never contains memories archived earlier in this pipeline
+  if [[ -n "$cwd" ]]; then
+    log_info "Generating push surface for cwd: $cwd"
+    if ! bun "$CLI_PATH" generate "$cwd" 2>&1 | tee "$GENERATE_LOG"; then
+      log_error "Generate failed (see $GENERATE_LOG)"
+    fi
+  else
+    log_error "Could not parse cwd from stdin JSON, skipping generate"
   fi
 
   log_info "Stop hook complete"

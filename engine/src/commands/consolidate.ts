@@ -16,11 +16,15 @@ import {
   insertMemory,
   insertEdge,
   updateMemory,
-  deleteEdgesForMemory,
+  getMemory,
+  repointEdgesToMemory,
+  repointFactSources,
 } from '../infra/db.js';
-import { tokenize, hybridSimilarity } from '../core/similarity.js';
+import { tokenize, hybridSimilarityScored } from '../core/similarity.js';
 import { createMemory } from '../core/types.js';
-import { CONSOLIDATION_SIMILARITY_THRESHOLD } from '../config.js';
+import type { SimilaritySpace } from '../core/types.js';
+import { consolidationThresholdFor } from '../config.js';
+import { invalidateSurfaceCache } from './generate.js';
 
 // ============================================================================
 // FUNCTIONAL CORE - PURE FUNCTIONS
@@ -43,13 +47,19 @@ export interface MemoryPair {
  * Uses Jaccard pre-filter to avoid unnecessary cosine computations.
  * Only compares memories with embeddings of the same type (gemini vs local).
  *
+ * The duplicate threshold is calibrated PER SIMILARITY SPACE: raw local-BGE
+ * cosine runs hot (same-domain pairs score 0.6-0.75), so it uses
+ * CONSOLIDATION_LOCAL_COSINE_THRESHOLD (0.8) while Jaccard and Gemini cosine
+ * use CONSOLIDATION_SIMILARITY_THRESHOLD (0.5). An explicit `threshold`
+ * argument overrides the per-space defaults uniformly.
+ *
  * @param memories - Active memories to compare
- * @param threshold - Similarity threshold (default 0.5)
+ * @param threshold - Optional uniform threshold override (default: per-space)
  * @returns Array of similar pairs sorted by similarity (descending)
  */
 export function findSimilarPairs(
   memories: readonly Memory[],
-  threshold: number = CONSOLIDATION_SIMILARITY_THRESHOLD
+  threshold?: number
 ): readonly MemoryPair[] {
   const pairs: MemoryPair[] = [];
 
@@ -63,20 +73,32 @@ export function findSimilarPairs(
   const commonEmbeddings = (
     a: Memory,
     b: Memory
-  ): [Float64Array | Float32Array | null, Float64Array | Float32Array | null] => {
-    if (a.embedding && b.embedding) return [a.embedding, b.embedding];
-    if (a.local_embedding && b.local_embedding) return [a.local_embedding, b.local_embedding];
-    return [null, null];
+  ): {
+    embA: Float64Array | Float32Array | null;
+    embB: Float64Array | Float32Array | null;
+    cosineSpace: SimilaritySpace;
+  } => {
+    if (a.embedding && b.embedding) {
+      return { embA: a.embedding, embB: b.embedding, cosineSpace: 'gemini-cosine' };
+    }
+    if (a.local_embedding && b.local_embedding) {
+      return { embA: a.local_embedding, embB: b.local_embedding, cosineSpace: 'local-cosine' };
+    }
+    return { embA: null, embB: null, cosineSpace: 'jaccard' };
   };
 
   // Compare each pair exactly once (i < j ensures no duplicates)
   for (let i = 0; i < memories.length; i++) {
     for (let j = i + 1; j < memories.length; j++) {
-      const [embA, embB] = commonEmbeddings(memories[i], memories[j]);
-      const similarity = hybridSimilarity(tokenSets[i], tokenSets[j], embA, embB);
+      const { embA, embB, cosineSpace } = commonEmbeddings(memories[i], memories[j]);
+      const { score, method } = hybridSimilarityScored(tokenSets[i], tokenSets[j], embA, embB);
+      // Dimension mismatch inside hybridSimilarityScored falls back to
+      // Jaccard even when embeddings were provided — trust `method`.
+      const space: SimilaritySpace = method === 'cosine' ? cosineSpace : 'jaccard';
+      const pairThreshold = threshold ?? consolidationThresholdFor(space);
 
-      if (similarity >= threshold) {
-        pairs.push({ memoryA: memories[i], memoryB: memories[j], similarity });
+      if (score >= pairThreshold) {
+        pairs.push({ memoryA: memories[i], memoryB: memories[j], similarity: score });
       }
     }
   }
@@ -204,7 +226,7 @@ export interface ConsolidateResult {
  * Options for consolidate command
  */
 export interface ConsolidateOptions {
-  readonly threshold?: number; // Default 0.5
+  readonly threshold?: number; // Default: per-space (consolidationThresholdFor)
   readonly maxPasses?: number; // Default 3 (FR-081)
   readonly sessionId?: string; // For source tracking
 }
@@ -225,16 +247,23 @@ export function detectDuplicates(
   db: Database,
   options: ConsolidateOptions = {}
 ): readonly MemoryPair[] {
-  const threshold = options.threshold ?? CONSOLIDATION_SIMILARITY_THRESHOLD;
-
   // I/O: Fetch all active memories
   const activeMemories = getActiveMemories(db);
 
-  // Pure: Find similar pairs
-  const pairs = findSimilarPairs(activeMemories, threshold);
+  // Pure: Find similar pairs (per-space threshold unless overridden)
+  const pairs = findSimilarPairs(activeMemories, options.threshold);
 
   return pairs;
 }
+
+/**
+ * Result of a mergePair attempt (discriminated union).
+ * 'skipped' means no DB mutation happened — e.g. a member of the pair
+ * was already superseded by an earlier merge in the same review session.
+ */
+export type MergePairResult =
+  | { readonly kind: 'merged'; readonly mergedId: string }
+  | { readonly kind: 'skipped'; readonly reason: string };
 
 /**
  * Merge a single memory pair
@@ -243,6 +272,10 @@ export function detectDuplicates(
  * FR-077: Mark old memories as superseded
  * FR-082: Human-only operation (not automatic)
  *
+ * The merged memory inherits all non-supersedes edges of both members
+ * (source_of pairings, typed semantic edges) and the members' entity facts
+ * are re-pointed to it — merging must not orphan the graph.
+ *
  * I/O boundary - performs database operations
  *
  * @param db - Database instance
@@ -250,39 +283,56 @@ export function detectDuplicates(
  * @param mergedSummary - Human-provided merged summary
  * @param mergedContent - Human-provided merged content
  * @param sessionId - Current session ID
- * @returns ID of newly created merged memory
+ * @param cwd - Project root; when provided, the surface cache is invalidated
+ *              after a successful merge (superseded members must not be
+ *              served from a stale cached surface)
+ * @returns MergePairResult — merged with new ID, or skipped with reason
  */
 export function mergePair(
   db: Database,
   pair: MemoryPair,
   mergedSummary: string,
   mergedContent: string,
-  sessionId: string
-): string {
-  // Guard: pair members must still be active. Pairs come from a snapshot;
-  // a memory already superseded by an earlier merge in the same review
-  // session must not be merged again.
-  for (const member of [pair.memoryA, pair.memoryB]) {
-    if (member.status !== 'active') {
-      throw new Error(
-        `Cannot merge: memory ${member.id} has status '${member.status}' (expected 'active')`
-      );
-    }
-  }
-
+  sessionId: string,
+  cwd?: string
+): MergePairResult {
   // Pure: Build merged memory (id + timestamp from I/O boundary)
   const mergedMemory = buildMergedMemory(
     pair, mergedSummary, mergedContent, sessionId,
     randomUUID(), new Date().toISOString()
   );
 
+  let skipped: MergePairResult | null = null;
+
   // I/O: All DB writes in a single transaction for atomicity
   const tx = db.transaction(() => {
+    // Guard: pair members must still be active IN THE DATABASE. Pairs come
+    // from a snapshot; with overlapping pairs (A,B),(B,C) a member already
+    // superseded by an earlier merge must not be merged again. Checking the
+    // in-memory snapshot is not enough — re-fetch by ID inside the tx.
+    for (const member of [pair.memoryA, pair.memoryB]) {
+      const fresh = getMemory(db, member.id);
+      if (!fresh) {
+        skipped = { kind: 'skipped', reason: `memory ${member.id} no longer exists` };
+        return;
+      }
+      if (fresh.status !== 'active') {
+        skipped = {
+          kind: 'skipped',
+          reason: `memory ${member.id} has status '${fresh.status}' (expected 'active')`,
+        };
+        return;
+      }
+    }
+
     insertMemory(db, mergedMemory);
 
-    // Clean up old edges before superseding (must precede new edge insertion)
-    deleteEdgesForMemory(db, pair.memoryA.id);
-    deleteEdgesForMemory(db, pair.memoryB.id);
+    // Re-point graph edges and facts from old members to the merged memory
+    // (must precede superseding; deleting them would orphan code pairings)
+    repointEdgesToMemory(db, pair.memoryA.id, mergedMemory.id);
+    repointEdgesToMemory(db, pair.memoryB.id, mergedMemory.id);
+    repointFactSources(db, pair.memoryA.id, mergedMemory.id);
+    repointFactSources(db, pair.memoryB.id, mergedMemory.id);
 
     // Mark old memories as superseded (FR-077)
     updateMemory(db, pair.memoryA.id, { status: 'superseded' });
@@ -310,7 +360,15 @@ export function mergePair(
 
   tx();
 
-  return mergedMemory.id;
+  if (skipped) return skipped;
+
+  // Invalidate cached surfaces: two members were superseded and a merged
+  // memory was inserted — any cached surface is stale.
+  if (cwd !== undefined) {
+    invalidateSurfaceCache(cwd);
+  }
+
+  return { kind: 'merged', mergedId: mergedMemory.id };
 }
 
 /**
@@ -335,7 +393,7 @@ export function executeConsolidate(
   db: Database,
   options: ConsolidateOptions = {}
 ): ConsolidateResult {
-  const threshold = options.threshold ?? CONSOLIDATION_SIMILARITY_THRESHOLD;
+  const threshold = options.threshold; // undefined → per-space defaults
   const maxPasses = options.maxPasses ?? 3; // FR-081: default 3, enforced below
   const sessionId = options.sessionId ?? 'consolidate-session';
 

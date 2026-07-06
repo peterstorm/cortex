@@ -45,7 +45,7 @@ describe('Cortex E2E Integration Tests', () => {
 
   test('full pipeline: remember -> recall -> forget -> verify archived', async () => {
     // Step 1: Remember - Create explicit memory
-    const rememberResult = executeRemember(
+    const rememberResult = await executeRemember(
       ['Test architecture decision about database choice', '--type=decision', '--priority=8'],
       sessionId,
       projectDb,
@@ -96,12 +96,12 @@ describe('Cortex E2E Integration Tests', () => {
     expect(foundAfterArchive).toBeUndefined();
   });
 
-  test('lifecycle: decay -> archive -> prune', () => {
+  test('lifecycle: decay -> archive -> prune', async () => {
     // Create a progress memory with low confidence, old timestamp
     const hundredDaysAgo = new Date(Date.now() - 100 * 24 * 60 * 60 * 1000).toISOString();
 
     // Use executeRemember but then manually update timestamps for testing
-    const rememberResult = executeRemember(
+    const rememberResult = await executeRemember(
       ['Old progress note', '--type=progress', '--priority=5'],
       sessionId,
       projectDb,
@@ -123,23 +123,36 @@ describe('Cortex E2E Integration Tests', () => {
     `);
     updateStmt.run(hundredDaysAgo, hundredDaysAgo, memoryId);
 
-    // Run lifecycle - should decay and potentially archive/prune
+    // Run lifecycle - should decay and archive, but NOT prune yet:
+    // archived_at anchors a 30-day grace period from archival.
     const lifecycleResult = runLifecycle(projectDb);
 
     // With very old progress memory (100d) at 0.1 confidence:
     // - Will decay further
     // - Should be archived (confidence < 0.3 for 14+ days)
-    // - Should be pruned (unaccessed 30+ days while archived)
+    // - Must NOT be pruned in the same run (fresh archived_at)
     expect(lifecycleResult.archived).toBeGreaterThan(0);
-    expect(lifecycleResult.pruned).toBeGreaterThan(0);
+    expect(lifecycleResult.pruned).toBe(0);
 
-    // Verify final status
+    const archivedMemory = getMemory(projectDb, memoryId);
+    expect(archivedMemory).not.toBeNull();
+    expect(archivedMemory!.status).toBe('archived');
+    expect(archivedMemory!.archived_at).not.toBeNull();
+
+    // Simulate the grace period elapsing, then the next run prunes
+    projectDb.prepare(`UPDATE memories SET archived_at = ? WHERE id = ?`).run(
+      new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString(),
+      memoryId
+    );
+    const secondRun = runLifecycle(projectDb);
+    expect(secondRun.pruned).toBeGreaterThan(0);
+
     const finalMemory = getMemory(projectDb, memoryId);
     expect(finalMemory).not.toBeNull();
     expect(finalMemory!.status).toBe('pruned');
   });
 
-  test('generate: create push surface from memories', () => {
+  test('generate: create push surface from memories', async () => {
     // Create multiple memories with different types
     const memories = [
       ['Core architecture uses functional programming', '--type=architecture', '--priority=9'],
@@ -149,7 +162,7 @@ describe('Cortex E2E Integration Tests', () => {
     ];
 
     for (const args of memories) {
-      const result = executeRemember(args, sessionId, projectDb, globalDb);
+      const result = await executeRemember(args, sessionId, projectDb, globalDb);
       expect(result.success).toBe(true);
     }
 
@@ -186,7 +199,7 @@ describe('Cortex E2E Integration Tests', () => {
 
   test('project vs global scope isolation', async () => {
     // Create project-scoped memory
-    const projectResult = executeRemember(
+    const projectResult = await executeRemember(
       ['Project-specific database configuration', '--type=context', '--scope=project'],
       sessionId,
       projectDb,
@@ -197,7 +210,7 @@ describe('Cortex E2E Integration Tests', () => {
     if (!projectResult.success) return;
 
     // Create global-scoped memory
-    const globalResult = executeRemember(
+    const globalResult = await executeRemember(
       ['Global design pattern for all projects', '--type=pattern', '--scope=global'],
       sessionId,
       projectDb,
@@ -266,7 +279,7 @@ describe('Cortex E2E Integration Tests', () => {
     ];
 
     for (const { content, type } of types) {
-      const result = executeRemember(
+      const result = await executeRemember(
         [content, `--type=${type}`, '--priority=7'],
         sessionId,
         projectDb,
@@ -295,11 +308,11 @@ describe('Cortex E2E Integration Tests', () => {
     expect(patternMemory?.memory.memory_type).toBe('pattern');
   });
 
-  test('pinned memories survive lifecycle decay', () => {
+  test('pinned memories survive lifecycle decay', async () => {
     // Create pinned and non-pinned progress memories (fast decay type)
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
 
-    const pinnedResult = executeRemember(
+    const pinnedResult = await executeRemember(
       ['Important milestone - pinned', '--type=progress', '--priority=9', '--pinned'],
       sessionId,
       projectDb,
@@ -309,7 +322,7 @@ describe('Cortex E2E Integration Tests', () => {
     expect(pinnedResult.success).toBe(true);
     if (!pinnedResult.success) return;
 
-    const normalResult = executeRemember(
+    const normalResult = await executeRemember(
       ['Regular progress note', '--type=progress', '--priority=5'],
       sessionId,
       projectDb,
@@ -385,7 +398,7 @@ describe('Cortex E2E Integration Tests', () => {
 
   test('tags are stored and searchable', async () => {
     // Create memory with tags
-    const result = executeRemember(
+    const result = await executeRemember(
       [
         'API versioning strategy',
         '--type=decision',
@@ -420,9 +433,9 @@ describe('Cortex E2E Integration Tests', () => {
     expect(foundMemory).toBeDefined();
   });
 
-  test('idempotent forget - archiving twice succeeds', () => {
+  test('idempotent forget - archiving twice succeeds', async () => {
     // Create memory
-    const result = executeRemember(
+    const result = await executeRemember(
       ['Memory to forget', '--type=context'],
       sessionId,
       projectDb,
@@ -446,9 +459,9 @@ describe('Cortex E2E Integration Tests', () => {
     expect(memory!.status).toBe('archived');
   });
 
-  test('priority affects memory persistence', () => {
+  test('priority affects memory persistence', async () => {
     // Create high and low priority memories
-    const highPriorityResult = executeRemember(
+    const highPriorityResult = await executeRemember(
       ['Critical decision', '--type=decision', '--priority=10'],
       sessionId,
       projectDb,
@@ -458,7 +471,7 @@ describe('Cortex E2E Integration Tests', () => {
     expect(highPriorityResult.success).toBe(true);
     if (!highPriorityResult.success) return;
 
-    const lowPriorityResult = executeRemember(
+    const lowPriorityResult = await executeRemember(
       ['Minor note', '--type=context', '--priority=1'],
       sessionId,
       projectDb,

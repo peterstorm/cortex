@@ -5,6 +5,7 @@
 
 import type { MemoryType, MemoryScope, MemoryCandidate, GitContext } from './types.js';
 import { MEMORY_TYPES, isMemoryType } from './types.js';
+import { SUMMARY_MAX_CHARS } from '../config.js';
 import type { EntityFactCandidate, EntityProfile } from './entities.js';
 import { isValidEntityFactCandidate } from './entities.js';
 
@@ -13,6 +14,16 @@ export interface ParsedExtractionResult {
   readonly memories: readonly MemoryCandidate[];
   readonly entities: readonly EntityFactCandidate[];
 }
+
+/**
+ * Discriminated parse outcome. A parse_error (malformed JSON, unexpected
+ * shape) must be distinguishable from a genuinely-empty extraction —
+ * otherwise the caller saves the checkpoint and the transcript chunk is
+ * permanently consumed with zero extraction.
+ */
+export type ExtractionParseOutcome =
+  | ({ readonly kind: 'ok' } & ParsedExtractionResult)
+  | { readonly kind: 'parse_error'; readonly raw: string };
 
 export interface TruncationResult {
   readonly truncated: string;
@@ -231,11 +242,11 @@ If no significant memories or entities, return empty arrays.`;
  * FR-007: Validate priority range
  *
  * @param response - Raw LLM response text
- * @returns Parsed memories and entity-fact candidates
+ * @returns Discriminated outcome: ok (memories + entities) or parse_error
  */
 export function parseExtractionResponse(
   response: string
-): ParsedExtractionResult {
+): ExtractionParseOutcome {
   try {
     // Extract JSON from response (handle markdown code blocks)
     const jsonMatch = response.match(/```json\s*([\s\S]*?)\s*```/) || [
@@ -259,8 +270,8 @@ export function parseExtractionResponse(
       rawMemories = parsed.memories;
       rawEntities = Array.isArray(parsed.entities) ? parsed.entities : [];
     } else {
-      process.stderr.write(`[cortex:extraction] WARN: Expected array or {memories:[]}, got ${typeof parsed}. Returning empty.\n`);
-      return { memories: [], entities: [] };
+      process.stderr.write(`[cortex:extraction] WARN: Expected array or {memories:[]}, got ${typeof parsed}. Treating as parse error.\n`);
+      return { kind: 'parse_error', raw: response };
     }
 
     // Validate and filter memory candidates
@@ -271,7 +282,7 @@ export function parseExtractionResponse(
 
     const memories: readonly MemoryCandidate[] = validMemories.map((c) => ({
       content: String(c.content),
-      summary: String(c.summary),
+      summary: truncateSummary(String(c.summary)),
       memory_type: isMemoryType(c.memory_type) ? c.memory_type : 'context',
       scope: c.scope === 'global' ? 'global' as const : 'project' as const,
       confidence: Number(c.confidence),
@@ -289,12 +300,36 @@ export function parseExtractionResponse(
         object: String((c as any).object).trim(),
       }));
 
-    return { memories, entities };
+    return { kind: 'ok', memories, entities };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     process.stderr.write(`[cortex:extraction] WARN: Parse failure: ${message}. Response (truncated): ${response.slice(0, 200)}\n`);
-    return { memories: [], entities: [] };
+    return { kind: 'parse_error', raw: response };
   }
+}
+
+/**
+ * Cap a summary at SUMMARY_MAX_CHARS, truncating at a word boundary with an
+ * ellipsis. Pure function. An unbounded LLM summary can single-handedly blow
+ * the surface token budget (and, before selectForSurface skipped oversized
+ * memories, could blank the surface entirely).
+ */
+export function truncateSummary(
+  summary: string,
+  maxChars: number = SUMMARY_MAX_CHARS
+): string {
+  if (summary.length <= maxChars) {
+    return summary;
+  }
+
+  // Reserve one char for the ellipsis
+  const window = summary.slice(0, maxChars - 1);
+  const lastSpace = window.lastIndexOf(' ');
+  // Cut at the last word boundary unless it would discard more than half the
+  // window (e.g. one giant unbroken token) — then hard-cut.
+  const cut = lastSpace > maxChars / 2 ? window.slice(0, lastSpace) : window;
+
+  return cut.trimEnd() + '…';
 }
 
 /**

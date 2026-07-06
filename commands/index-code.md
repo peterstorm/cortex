@@ -14,59 +14,59 @@ description: "Index important code blocks with prose descriptions. USE when user
 
 ## Description
 
-Creates a prose-code memory pair: embeds the prose description for semantic search, stores raw code separately, links via `source_of` edge. Enables finding code via natural language queries.
+Creates a prose-code memory pair in ONE command: embeds the prose summary for semantic search, stores raw code separately (never embedded), and links them via a `source_of` edge. Enables finding code via natural language queries.
 
 ## CLI Command
 
 ```bash
-bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts index-code <cwd> <proseId> <codePath>
+bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts index-code <cwd> <filePath> <summary> [--start=N] [--end=N] [--scope=project|global] [--tags=tag1,tag2] [--session=ID]
 ```
 
 ## Arguments
 
 **Required:**
-- `<cwd>` - Project working directory
-- `<proseId>` - Memory ID of prose description (from `/remember` or existing memory)
-- `<codePath>` - File path to code file
+- `<cwd>` - Project working directory (absolute path)
+- `<filePath>` - Path to the code file to index
+- `<summary>` - Prose description of the code (this is what gets embedded and searched)
 
-## Usage Flow
+**Optional flags:**
+- `--start=N` - First line of the code block (1-based, inclusive)
+- `--end=N` - Last line of the code block (1-based, inclusive; must be >= start)
+- `--scope=project|global` - Memory scope (default: `project`)
+- `--tags=tag1,tag2` - Comma-separated tags applied to both memories
+- `--session=ID` - Session ID recorded on the memories (default: `manual-index`)
 
-1. First, create prose description:
-   ```
-   /remember "Pure ranking function computing composite score from confidence, priority, centrality, and access" --type=code_description
-   ```
-   Returns: `memory-abc123`
+## Usage
 
-2. Then, index the code:
-   ```
-   /index-code memory-abc123 ./engine/src/core/ranking.ts
-   ```
+Single command — no separate `/remember` step needed:
+
+```bash
+bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts index-code /path/to/project ./engine/src/core/ranking.ts "Pure ranking function computing composite score from confidence, priority, centrality, and access" --start=40 --end=95 --tags=ranking,core
+```
 
 ## What Gets Stored
 
-- **Prose memory:** Embedded for semantic search, appears in push surface
-- **Code memory:** Raw code content, NOT embedded (security + cost)
+- **Prose memory** (`code_description`): the summary, embedded for semantic search, appears in push surface
+- **Code memory** (`code`): raw code content (whole file, or the `--start`/`--end` line range), NOT embedded (security + cost)
 - **Edge:** `source_of` relation linking prose → code
-- **Retrieval:** `/recall` returns prose, prose's edges surface the code
+- **Re-indexing:** existing code/prose memories for the same file path are superseded automatically
+- **Retrieval:** `/recall` returns prose; the prose memory's edges surface the code
 
 ## Use Cases
 
 ### Index key functions
-```
-/remember "Decay confidence using exponential half-life formula, with pinned/centrality modifiers" --type=code_description
-/index-code {memoryId} ./engine/src/core/decay.ts
-```
-
-### Index architectural patterns
-```
-/remember "Functional core: pure similarity classification returning discriminated union action" --type=architecture
-/index-code {memoryId} ./engine/src/core/similarity.ts
+```bash
+... index-code <cwd> ./engine/src/core/decay.ts "Decay confidence using exponential half-life formula, with pinned/centrality modifiers"
 ```
 
-### Index domain types
+### Index a specific block with tags
+```bash
+... index-code <cwd> ./engine/src/core/similarity.ts "Pure similarity classification returning discriminated union action" --start=96 --end=118 --tags=similarity,architecture
 ```
-/remember "Memory type as discriminated union with 8 variants, immutable fields" --type=pattern
-/index-code {memoryId} ./engine/src/core/types.ts
+
+### Index globally-relevant patterns
+```bash
+... index-code <cwd> ./engine/src/core/types.ts "Memory type as discriminated union with 8 variants, immutable fields" --scope=global
 ```
 
 ## Why Not Embed Code Directly?
@@ -84,7 +84,7 @@ bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts index-code <cwd> <proseId> <codePath
 
 ## Output
 
-Returns code memory ID and confirms prose-code link. Code becomes discoverable via `/recall` on prose description.
+Returns the code memory ID and confirms the prose-code link (plus how many old versions were superseded). Code becomes discoverable via `/recall` on the prose description.
 
 ## Integration with Other Skills
 

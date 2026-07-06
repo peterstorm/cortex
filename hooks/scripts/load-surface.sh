@@ -21,6 +21,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CLI_PATH="${PLUGIN_ROOT}/engine/src/cli.ts"
 
+# Per-process log file: a fixed /tmp path clobbers across concurrent sessions.
+LOAD_SURFACE_LOG="/tmp/cortex-load-surface.$$.log"
+
 # Logging helper
 log_error() {
   echo "[cortex-hook] ERROR: $*" >&2
@@ -51,8 +54,8 @@ main() {
   log_info "Loading cached surface for cwd: $cwd"
 
   # Load cached surface (writes to .claude/cortex-memory.local.md if available)
-  if ! bun "$CLI_PATH" load-surface "$cwd" 2>&1 | tee /tmp/cortex-load-surface.log; then
-    log_error "Load-surface failed (see /tmp/cortex-load-surface.log)"
+  if ! bun "$CLI_PATH" load-surface "$cwd" 2>&1 | tee "$LOAD_SURFACE_LOG"; then
+    log_error "Load-surface failed (see $LOAD_SURFACE_LOG)"
   fi
 
   log_info "SessionStart hook complete"

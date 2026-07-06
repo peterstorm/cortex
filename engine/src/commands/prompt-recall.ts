@@ -16,34 +16,17 @@ import type { Database } from 'bun:sqlite';
 import type { Memory } from '../core/types.js';
 import { searchByKeywordOr, searchByKeywordAnd, getMemoriesWithEmbedding } from '../infra/db.js';
 import { embedTexts, isGeminiAvailable } from '../infra/gemini-embed.ts';
-import { rankBySimilarity } from '../core/similarity.js';
+import { rankBySimilarity, STOP_WORDS, extractUnigrams } from '../core/similarity.js';
 import { buildQueryEmbeddingText } from './recall.js';
 
 // ============================================================================
 // CONSTANTS
 // ============================================================================
 
-/** Common English stop words + filler words to filter from prompts */
-export const STOP_WORDS = new Set([
-  // Articles & determiners
-  'a', 'an', 'the', 'this', 'that', 'these', 'those',
-  // Pronouns
-  'i', 'me', 'my', 'we', 'our', 'you', 'your', 'he', 'she', 'it', 'its', 'they', 'them', 'their',
-  // Prepositions
-  'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'from', 'up', 'about', 'into', 'through', 'during', 'before', 'after', 'above', 'below', 'between', 'under', 'over',
-  // Conjunctions
-  'and', 'but', 'or', 'nor', 'so', 'yet', 'both', 'either', 'neither',
-  // Common verbs
-  'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'shall', 'can',
-  // Filler / instruction words
-  'please', 'help', 'want', 'need', 'like', 'just', 'also', 'very', 'really', 'actually', 'basically',
-  'tell', 'show', 'explain', 'describe', 'give', 'make', 'let', 'get', 'know', 'think', 'see', 'look', 'find', 'use',
-  // Question words
-  'how', 'what', 'where', 'when', 'why', 'which', 'who', 'whom',
-  // Other common words
-  'not', 'no', 'yes', 'all', 'each', 'every', 'any', 'some', 'more', 'most', 'other', 'than',
-  'if', 'then', 'else', 'only', 'own', 'same', 'such', 'too', 'here', 'there', 'now',
-]);
+// STOP_WORDS and extractUnigrams moved to core/similarity.ts so recall.ts can
+// use them without a command→command import cycle. Re-exported for
+// backwards-compatible imports.
+export { STOP_WORDS, extractUnigrams };
 
 /** Minimum meaningful tokens required to run search */
 export const MIN_MEANINGFUL_TOKENS = 2;
@@ -69,23 +52,6 @@ export const AND_FIRST_MAX_UNIGRAMS = 6;
 // ============================================================================
 // PURE FUNCTIONS
 // ============================================================================
-
-/**
- * Extract meaningful keywords from a user prompt
- * Pure function: lowercase, strip punctuation, tokenize, filter stop words
- *
- * @param prompt - Raw user prompt text
- * @returns Array of meaningful keyword tokens
- */
-export function extractUnigrams(prompt: string): readonly string[] {
-  return prompt
-    .toLowerCase()
-    .replace(/[^\w\s.\-]/g, ' ')  // Strip punctuation (keep hyphens and dots for compound words / versions)
-    .split(/\s+/)
-    .filter(t => t.length > 1)  // Drop single chars
-    .filter(t => !STOP_WORDS.has(t))
-    .filter((t, i, arr) => arr.indexOf(t) === i);  // Deduplicate
-}
 
 export function extractKeywords(prompt: string): readonly string[] {
   const unigrams = extractUnigrams(prompt);

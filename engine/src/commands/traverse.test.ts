@@ -868,3 +868,70 @@ describe('traverse command', () => {
     });
   });
 });
+
+// ============================================================================
+// Regression tests: finding 11 — traverse excludes archived by default,
+// includes them with includeArchived
+// ============================================================================
+
+describe('traverse archived filtering (finding 11)', () => {
+  let db: Database;
+
+  const mkMem = (id: string, status: 'active' | 'archived') => createMemory({
+    id,
+    content: `content ${id}`,
+    summary: `summary ${id}`,
+    memory_type: 'context',
+    scope: 'project',
+    confidence: 0.8,
+    priority: 5,
+    source_type: 'extraction',
+    source_session: 's',
+    source_context: '{}',
+    status,
+  });
+
+  beforeEach(() => {
+    db = openDatabase(':memory:');
+    insertMemory(db, mkMem('start', 'active'));
+    insertMemory(db, mkMem('active-neighbor', 'active'));
+    insertMemory(db, mkMem('archived-neighbor', 'archived'));
+
+    insertEdge(db, {
+      source_id: 'start',
+      target_id: 'active-neighbor',
+      relation_type: 'relates_to',
+      strength: 0.8,
+      bidirectional: false,
+      status: 'active',
+    });
+    insertEdge(db, {
+      source_id: 'start',
+      target_id: 'archived-neighbor',
+      relation_type: 'relates_to',
+      strength: 0.8,
+      bidirectional: false,
+      status: 'active',
+    });
+  });
+
+  it('excludes archived memories by default', () => {
+    const result = executeTraverse(db, { id: 'start', depth: 1 });
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    const depth1Ids = (result.result.results[1] ?? []).map(m => m.id);
+    expect(depth1Ids).toContain('active-neighbor');
+    expect(depth1Ids).not.toContain('archived-neighbor');
+  });
+
+  it('includes archived memories with includeArchived', () => {
+    const result = executeTraverse(db, { id: 'start', depth: 1, includeArchived: true });
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    const depth1Ids = (result.result.results[1] ?? []).map(m => m.id);
+    expect(depth1Ids).toContain('active-neighbor');
+    expect(depth1Ids).toContain('archived-neighbor');
+  });
+});

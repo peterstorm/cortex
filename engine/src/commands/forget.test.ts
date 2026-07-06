@@ -3,7 +3,7 @@
  * Uses in-memory SQLite for integration testing
  */
 
-import { describe, test, expect, beforeEach } from 'vitest';
+import { describe, test, expect, beforeEach, afterEach } from 'vitest';
 import { Database } from 'bun:sqlite';
 import { openDatabase, insertMemory } from '../infra/db.js';
 import { createMemory } from '../core/types.js';
@@ -414,5 +414,80 @@ describe('forget command', () => {
         }
       }
     });
+  });
+});
+
+// ============================================================================
+// Regression tests: findings 1b and 12 — forget invalidates the surface
+// cache and supersedes facts sourced from the archived memory
+// ============================================================================
+
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { upsertEntity, insertFact, getCurrentFacts } from '../infra/db.js';
+
+describe('forget side effects (findings 1b, 12)', () => {
+  let db: Database;
+  let tempDir: string;
+
+  beforeEach(() => {
+    db = openDatabase(':memory:');
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-forget-regress-'));
+
+    insertMemory(db, createMemory({
+      id: 'mem-f1',
+      content: 'PgBouncer handles pooling',
+      summary: 'PgBouncer handles pooling',
+      memory_type: 'decision',
+      scope: 'project',
+      confidence: 0.9,
+      priority: 7,
+      source_type: 'extraction',
+      source_session: 's',
+      source_context: '{}',
+      status: 'active',
+    }));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  test('forgetById with cwd invalidates the surface cache', () => {
+    // Simulate a cached surface
+    const cacheDir = path.join(tempDir, '.memory', 'surface-cache');
+    fs.mkdirSync(cacheDir, { recursive: true });
+    fs.writeFileSync(path.join(cacheDir, 'abc.json'), '{"surface":"stale"}', 'utf8');
+
+    const result = forgetById(db, 'mem-f1', tempDir);
+
+    expect(result.status).toBe('archived');
+    expect(fs.readdirSync(cacheDir).filter(f => f.endsWith('.json'))).toHaveLength(0);
+  });
+
+  test('forgetById without cwd still archives (no cache to invalidate)', () => {
+    expect(forgetById(db, 'mem-f1').status).toBe('archived');
+  });
+
+  test('forgetById supersedes facts sourced from the archived memory', () => {
+    const entityId = upsertEntity(db, 'PgBouncer', 'tool');
+    insertFact(db, {
+      id: 'fact-f1',
+      entity_id: entityId,
+      predicate: 'used for',
+      object: 'connection pooling',
+      source_memory_id: 'mem-f1',
+      confidence: 0.9,
+      valid_from: new Date().toISOString(),
+      valid_to: null,
+      created_at: new Date().toISOString(),
+    });
+    expect(getCurrentFacts(db, entityId)).toHaveLength(1);
+
+    forgetById(db, 'mem-f1');
+
+    // Entity-query path (getCurrentFacts) no longer reports the retracted fact
+    expect(getCurrentFacts(db, entityId)).toHaveLength(0);
   });
 });

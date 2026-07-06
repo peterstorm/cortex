@@ -455,3 +455,144 @@ describe('recall command', () => {
     }
   });
 });
+// ============================================================================
+// Regression tests: findings 10, 11, 13 — tiered keyword search,
+// active-only enrichment, top-3 access-stat updates
+// ============================================================================
+
+import { getMemory as getMemoryById } from '../infra/db.js';
+
+describe('tiered keyword search (finding 10)', () => {
+  test('stopword-heavy natural-language query finds the memory via OR fallback', async () => {
+    const { projectDb, globalDb } = setupTestDbs();
+
+    insertMemory(projectDb, createTestMemory({
+      id: 'pool-mem',
+      content: 'We use pgbouncer for connection pooling in production',
+      summary: 'pgbouncer connection pooling',
+      embedding: null,
+    }));
+
+    // Raw implicit-AND over all tokens ("how" AND "should" AND ... AND
+    // "pooling") returned 0 results before the tiered fix.
+    const result = await executeRecall(projectDb, globalDb, {
+      query: 'how should we be handling the connection pooling here',
+      keyword: true,
+    });
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.result.method).toBe('keyword');
+    expect(result.result.results.some(r => r.memory.id === 'pool-mem')).toBe(true);
+  });
+
+  test('precision preserved: AND hits rank ahead of OR-only hits', async () => {
+    const { projectDb, globalDb } = setupTestDbs();
+
+    insertMemory(projectDb, createTestMemory({
+      id: 'both-tokens',
+      content: 'embedding backfill strategy for the queue',
+      summary: 'embedding backfill strategy',
+      embedding: null,
+    }));
+    insertMemory(projectDb, createTestMemory({
+      id: 'one-token',
+      content: 'embedding dimensions mismatch bug',
+      summary: 'embedding dimensions',
+      embedding: null,
+    }));
+
+    const result = await executeRecall(projectDb, globalDb, {
+      query: 'embedding backfill',
+      keyword: true,
+    });
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    // AND match (contains both tokens) comes first
+    expect(result.result.results[0].memory.id).toBe('both-tokens');
+  });
+});
+
+describe('active-only related enrichment (finding 11)', () => {
+  test('superseded memories no longer resurface under Related', async () => {
+    const { projectDb, globalDb } = setupTestDbs();
+
+    const merged = createTestMemory({
+      id: 'merged-mem',
+      content: 'merged knowledge about caching layers',
+      summary: 'merged caching knowledge',
+      embedding: null,
+    });
+    const ancestor = createTestMemory({
+      id: 'ancestor-mem',
+      content: 'old superseded caching memory',
+      summary: 'old caching memory',
+      status: 'superseded',
+      embedding: null,
+    });
+    insertMemory(projectDb, merged);
+    insertMemory(projectDb, ancestor);
+    insertEdge(projectDb, {
+      source_id: 'merged-mem',
+      target_id: 'ancestor-mem',
+      relation_type: 'supersedes',
+      strength: 1.0,
+      bidirectional: false,
+      status: 'active',
+    });
+
+    const result = await executeRecall(projectDb, globalDb, {
+      query: 'caching layers',
+      keyword: true,
+    });
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    const hit = result.result.results.find(r => r.memory.id === 'merged-mem');
+    expect(hit).toBeDefined();
+    expect(hit!.related.some(m => m.id === 'ancestor-mem')).toBe(false);
+  });
+});
+
+describe('access stats limited to top results (finding 13)', () => {
+  test('4th+ results keep their access stats untouched', async () => {
+    const { projectDb, globalDb } = setupTestDbs();
+
+    const oldTimestamp = '2020-01-01T00:00:00.000Z';
+    for (let i = 0; i < 5; i++) {
+      insertMemory(projectDb, createTestMemory({
+        id: `hit-${i}`,
+        content: `frobnicator subsystem detail number ${i}`,
+        summary: `frobnicator detail ${i}`,
+        embedding: null,
+        access_count: 0,
+        last_accessed_at: oldTimestamp,
+      }));
+    }
+
+    const result = await executeRecall(projectDb, globalDb, {
+      query: 'frobnicator',
+      keyword: true,
+    });
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.result.results.length).toBe(5);
+
+    // Exactly the top 3 got their stats bumped
+    const topIds = result.result.results.slice(0, 3).map(r => r.memory.id);
+    const tailIds = result.result.results.slice(3).map(r => r.memory.id);
+
+    for (const id of topIds) {
+      const mem = getMemoryById(projectDb, id)!;
+      expect(mem.access_count).toBe(1);
+      expect(mem.last_accessed_at).not.toBe(oldTimestamp);
+    }
+    for (const id of tailIds) {
+      const mem = getMemoryById(projectDb, id)!;
+      expect(mem.access_count).toBe(0);
+      expect(mem.last_accessed_at).toBe(oldTimestamp);
+    }
+  });
+});
