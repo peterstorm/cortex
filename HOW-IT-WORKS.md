@@ -22,7 +22,7 @@ Cortex maintains **two** SQLite databases:
 | **Project** | `<project>/.memory/cortex.db` | Project-specific memories (default) |
 | **Global** | `~/.claude/memory/cortex-global.db` | Cross-project knowledge |
 
-A memory is stored in **global** only if the LLM assigns it confidence > 0.8 AND classifies its scope as "global" (e.g., "TypeScript generics work like this" vs "our API uses X pattern").
+During extraction, candidates the LLM classifies as scope "global" (e.g., "TypeScript generics work like this" vs "our API uses X pattern") are routed to the **global** database; everything else lands in the project database.
 
 ---
 
@@ -34,36 +34,41 @@ When you start Claude Code:
 
 1. Check for a **cached surface** file (keyed by `sha256(branch:cwd)`)
 2. If cache exists and is < 24h old → serve from cache
-3. If stale or missing → regenerate from DB (explained in "Surface Generation" below)
+3. If stale or missing → regenerate from DB (explained in "Surface Generation" below) — but only if the project already has a `.memory/cortex.db`; the hook never creates databases in untouched projects
 4. Write result to `.claude/cortex-memory.local.md`
 
-Claude Code loads this file as context. The surface is ~300-500 tokens — enough for relevant memories without bloating the context window.
+Claude Code loads this file as context. The surface targets ~1500 tokens (hard max 2000) — enough for relevant memories without bloating the context window.
 
-### 2. During Session (Manual Commands)
+### 2. During Session
 
-You can interact with cortex manually:
+**Every prompt** triggers two `UserPromptSubmit` hooks: one pipes the surface file into context, and one (`prompt-recall.sh`) runs keyword recall against your prompt — strict AND search over the prompt's keywords first, then an OR fallback, plus a conservative semantic fallback (cosine floor 0.65) when the keyword path returns nothing. Results already in the surface are deduplicated away.
+
+You can also interact with cortex manually:
 
 | Command | What it does |
 |---|---|
 | `/remember` | Manually store a specific memory |
 | `/recall <query>` | Search memories by semantic similarity or keywords |
 | `/forget <id>` | Mark a memory as archived |
-| `/index-code <path>` | Index source files as code memories |
+| `/index-code` | Index source files as code memories (CLI: `index-code <cwd> <proseId> <codePath>`) |
 | `/consolidate` | Merge duplicate/overlapping memories |
 | `/inspect` | View memory stats, recent extractions, DB health |
+| `/prune` | AI-assisted pruning pass over active memories |
 
-### 3. Session End (`Stop` hook → `extract-and-generate.sh`)
+There's also an `entity-query` CLI command for entity-first temporal retrieval (`entity-query <cwd> <query> [--history] [--limit=N]`).
 
-When your session ends:
+### 3. Session End (`SessionEnd` hook → `extract-and-generate.sh`)
+
+When your session ends, the hook detaches a background worker (so nothing blocks the session) that runs the pipeline sequentially:
 
 1. **Read transcript** — the JSONL file Claude Code writes during the session
 2. **Resume from checkpoint** — if transcript > 100KB, extraction is resumable; picks up where it left off
-3. **Send to Claude CLI** — pipes extraction prompt to `claude -p` (uses your Anthropic subscription)
-4. **Parse response** — validate each memory candidate (type, confidence, priority)
+3. **Send to the LLM CLI** — pipes extraction prompt to `claude -p --model haiku` (uses your Anthropic subscription), or `pi -p` when running under the pi agent
+4. **Parse response** — validate each memory candidate (type, confidence, priority); global-scoped candidates go to the global DB
 5. **Store in DB** — insert memories, compute similarity edges to existing memories
-6. **Run lifecycle** — decay old memories, archive stale ones, prune ancient ones
-7. **Invalidate surface cache** — new memories mean cached surfaces are stale
-8. **Regenerate surface** — immediately rebuild so next session starts fresh
+6. **Backfill embeddings** — embed newly stored memories (Gemini, or local fallback)
+7. **Regenerate surface** — rebuild so the next session starts fresh
+8. **Maintenance (sequential)** — semantic edge classification, then lifecycle (decay/archive/prune), then AI prune. These used to be concurrent detached spawns, but SQLite allows one writer and lifecycle + AI prune both read-modify-write telemetry — so they now run one after another. Logs go to `/tmp/cortex-semantic-edges.log`, `/tmp/cortex-lifecycle.log`, `/tmp/cortex-ai-prune.log` (extract/backfill/generate log to `/tmp/cortex-*.log` too).
 
 ---
 
@@ -131,7 +136,7 @@ The "push surface" is the markdown file Claude reads at session start. It's gene
 | Code | 0 (excluded — too large) |
 
 5. Allow high-value memories to overflow into unused budget from other categories
-6. Target 300-500 tokens total
+6. Target ~1500 tokens total, hard max 2000 (including ~200 tokens of markdown overhead)
 7. Wrap in `<!-- CORTEX_MEMORY_START -->` / `<!-- CORTEX_MEMORY_END -->` markers
 8. Cache the result keyed by `sha256(branch:cwd)`
 
@@ -139,9 +144,9 @@ The "push surface" is the markdown file Claude reads at session start. It's gene
 
 ## Memory Graph (Similarity Edges)
 
-When new memories are inserted, they're compared to all existing active memories. The system uses a **two-tier similarity** approach, though currently only Jaccard is wired up at insertion time:
+When new memories are inserted, they're compared to all existing active memories. The system uses a **two-tier similarity** approach:
 
-### Tier 1: Jaccard Pre-Filter (active)
+### Tier 1: Jaccard Pre-Filter (at insertion time)
 
 Cheap token-overlap comparison used for edge creation during extraction:
 
@@ -153,9 +158,13 @@ Cheap token-overlap comparison used for edge creation during extraction:
 | 0.5+ | `maybe` | Flag for consolidation (logged, not auto-merged in v1) |
 | 0.6+ | `definitely_similar` | Create strong `relates_to` edge (strength = 0.9) |
 
-### Tier 2: Cosine Similarity on Embeddings (plumbed but not yet wired)
+### Tier 2: Cosine Similarity on Embeddings (wired)
 
-`cosineSimilarity()` exists in `core/similarity.ts` and is used by `/recall` for search ranking. The plan is to use it during edge creation for the "maybe" range (0.1-0.6 Jaccard) once embeddings are backfilled — giving much more accurate similarity than token overlap. Currently, the "maybe" range falls through to Jaccard-only classification.
+`cosineSimilarity()` in `core/similarity.ts` is used throughout: `/recall` and the prompt-recall hook rank results by cosine similarity, and `/consolidate` detects duplicate pairs via `hybridSimilarity()` (Jaccard + cosine combined).
+
+### Semantic Edge Classification
+
+Jaccard-created `relates_to` edges are upgraded to typed relationships by the `semantic-edges` pipeline, which runs in the SessionEnd worker: it batches edge pairs to the headless LLM CLI (`claude -p --model haiku` by default), which classifies each pair into a typed relation with a strength score.
 
 ### Edge Types
 
@@ -177,10 +186,13 @@ Memories aren't permanent. After every extraction, the lifecycle runs:
 Confidence decays over time based on age and access patterns. Highly connected memories (high centrality) decay slower. Pinned memories are exempt.
 
 ### Archive
-If confidence drops below 0.3 AND the memory hasn't been accessed in 14+ days → status changes to `archived`. Archived memories don't appear in the surface.
+If decayed confidence drops below 0.3 AND the memory hasn't been accessed in 14+ days → status changes to `archived`. Archived memories don't appear in the surface.
 
 ### Prune
-If a memory has been archived for 90+ days → status changes to `pruned`. Pruned memories are effectively deleted (still in DB but invisible to all queries).
+If a memory has been archived for 30+ days with no access → status changes to `pruned`. Pruned memories are effectively deleted (still in DB but invisible to all queries).
+
+### AI Prune
+On top of decay, an AI prune pass has the LLM review active memories in batches and archive stale, redundant, or low-value ones. It runs in the SessionEnd worker when 5+ sessions have passed since the last prune, or when the active count reaches max(50, 1.25 × the count at the last prune) — the growth backoff stops it firing every session.
 
 **Escape hatch**: Accessing a memory (via `/recall`) resets its access timestamp and boosts it back above the threshold.
 
@@ -194,7 +206,7 @@ If a memory has been archived for 90+ days → status changes to `pruned`. Prune
 1. Embed the query via Gemini Embedding API (`gemini-embedding-001`)
 2. Query is prefixed: `[query] [project:name] <your query>`
 3. Memories are prefixed: `[memory_type] [project:name] <summary>`
-4. Cosine similarity search against stored embeddings in both DBs
+4. Cosine similarity search against stored embeddings in both DBs (archived and superseded memories are excluded)
 5. Results merged (project first), enriched with graph-traversed related memories
 
 ### Keyword (fallback, or `--keyword` flag)
@@ -229,8 +241,9 @@ Memories are inserted without embeddings (to avoid blocking extraction). A backg
       hooks/
         hooks.json         # Hook registrations
         scripts/
-          extract-and-generate.sh  # Stop hook
+          extract-and-generate.sh  # SessionEnd hook
           load-surface.sh          # SessionStart hook
+          prompt-recall.sh         # UserPromptSubmit hook (keyword recall)
       engine/src/          # TypeScript source
       commands/            # Skill markdown files
 ```
@@ -241,9 +254,12 @@ Memories are inserted without embeddings (to avoid blocking extraction). A backg
 
 | Variable | Purpose | Required |
 |---|---|---|
-| `GEMINI_API_KEY` | Embedding backfill + semantic search | Yes (for embeddings + semantic recall) |
+| `GEMINI_API_KEY` | Embedding backfill + semantic search (embeddings only — never used for extraction) | Yes (for embeddings + semantic recall) |
+| `CORTEX_GEMINI_ENV` | Path to a file the hooks source to get `GEMINI_API_KEY` (defaults to the sops-nix path `~/.config/sops-nix/secrets/rendered/gemini-env`) | No |
+| `CORTEX_LLM_BINARY` | Force the headless LLM binary (`claude` or `pi`) | No (auto-detected) |
+| `CORTEX_LLM_MODEL` | Override the model passed to the LLM binary | No |
 | `CLAUDE_PLUGIN_ROOT` | Plugin directory (set by Claude Code) | Auto |
 
-Extraction uses `claude -p` (Claude CLI) — no API key needed, uses your Anthropic subscription. The `claude` binary must be on PATH (it is when running inside Claude Code hooks).
+Extraction, AI pruning, and edge classification shell out to a headless coding-agent CLI: `claude -p --model haiku` by default (must be on PATH — it is when running inside Claude Code hooks), or `pi -p` when running under the pi agent (no `--model` flag, so pi's configured provider default is used). No API key needed — it uses your Anthropic subscription.
 
-Without `GEMINI_API_KEY`, embeddings are skipped and recall falls back to keyword search. Extraction still works via Claude CLI.
+Without `GEMINI_API_KEY`, Gemini embeddings are skipped (the bundled local BGE model still embeds) and recall falls back accordingly. Extraction still works via the LLM CLI. Because hooks don't inherit your shell profile, they source the key from the `CORTEX_GEMINI_ENV` file.

@@ -17,6 +17,7 @@ import type { Memory } from '../core/types.js';
 import { searchByKeywordOr, searchByKeywordAnd, getMemoriesWithEmbedding } from '../infra/db.js';
 import { embedTexts, isGeminiAvailable } from '../infra/gemini-embed.ts';
 import { rankBySimilarity } from '../core/similarity.js';
+import { buildQueryEmbeddingText } from './recall.js';
 
 // ============================================================================
 // CONSTANTS
@@ -143,6 +144,8 @@ export type PromptRecallOptions = {
   readonly prompt: string;
   readonly surfaceContent: string;
   readonly limit?: number;
+  /** Project name for the [query] [project:name] embedding prefix (FR-039) */
+  readonly projectName?: string;
 };
 
 /**
@@ -244,8 +247,11 @@ export async function executePromptRecallWithFallback(
   }
 
   try {
+    // Same [query] [project:name] prefix as recall.ts — memories were
+    // embedded with a metadata prefix, so an unprefixed query lands in a
+    // slightly different embedding space and degrades ranking.
     const embeddings = await embedTexts(
-      [options.prompt.trim()],
+      [buildQueryEmbeddingText(options.prompt, options.projectName)],
       options.geminiApiKey!,
     );
     const queryEmbedding = embeddings[0];

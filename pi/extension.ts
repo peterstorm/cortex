@@ -8,8 +8,8 @@
 
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { existsSync, readFileSync } from "node:fs";
-import { execSync, spawn } from "node:child_process";
+import { existsSync, readFileSync, openSync, closeSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -23,7 +23,9 @@ function runCli(args: string[], options?: {
 }): string {
   try {
     const input = options?.stdin ?? "";
-    return execSync(`bun "${CLI_PATH}" ${args.join(" ")}`, {
+    // execFileSync with an argv array — no shell, so cwd/args containing
+    // spaces or metacharacters can't break (or inject into) the command.
+    return execFileSync("bun", [CLI_PATH, ...args], {
       input,
       timeout: options?.timeout ?? 30_000,
       cwd: options?.cwd,
@@ -43,27 +45,42 @@ function runCli(args: string[], options?: {
   }
 }
 
-/** Run a bun CLI command detached (fire-and-forget). */
-function runCliDetached(args: string[], options?: {
-  stdin?: string;
-  cwd?: string;
-}): void {
+/**
+ * Run several bun CLI commands sequentially in ONE detached child.
+ * Used for post-session maintenance: sequential execution prevents the
+ * SQLite single-writer and telemetry read-modify-write races that
+ * concurrent detached spawns caused. Logs go to /tmp/cortex-maintenance.log.
+ */
+function runCliChainDetached(argsList: string[][], cwd: string): void {
   try {
-    const proc = spawn("bun", [CLI_PATH, ...args], {
-      stdio: options?.stdin ? ["pipe", "ignore", "ignore"] : ["ignore", "ignore", "ignore"],
-      detached: true,
-      cwd: options?.cwd,
-      env: {
-        ...process.env,
-        CORTEX_PLUGIN_ROOT: PACKAGE_ROOT,
-      },
-    });
-    if (options?.stdin && proc.stdin) {
-      proc.stdin.write(options.stdin);
-      proc.stdin.end();
-    }
+    const script = [
+      `const { execFileSync } = require("node:child_process");`,
+      `const chains = JSON.parse(process.argv[2]);`,
+      `for (const args of chains) {`,
+      `  try { execFileSync("bun", [process.argv[1], ...args], { stdio: "inherit", cwd: process.argv[3] }); }`,
+      `  catch (e) { console.error("[cortex-maintenance] step failed:", args[0], e?.message); }`,
+      `}`,
+    ].join("\n");
+
+    const logFd = openSync("/tmp/cortex-maintenance.log", "a");
+    const proc = spawn(
+      "bun",
+      ["-e", script, CLI_PATH, JSON.stringify(argsList), cwd],
+      {
+        stdio: ["ignore", logFd, logFd],
+        detached: true,
+        cwd,
+        env: {
+          ...process.env,
+          CORTEX_PLUGIN_ROOT: PACKAGE_ROOT,
+        },
+      }
+    );
     proc.unref();
-  } catch {}
+    closeSync(logFd);
+  } catch (e) {
+    process.stderr.write(`[cortex] failed to spawn maintenance chain: ${(e as Error).message}\n`);
+  }
 }
 
 /** Get the surface file path for current project */
@@ -151,10 +168,13 @@ export default function (pi: ExtensionAPI) {
       cwd,
     });
 
-    // Step 1: Extract memories from session transcript
+    // Step 1: Extract memories from session transcript.
+    // Timeout must exceed the engine's inner LLM timeout (90s in
+    // claude-llm.ts) — a shorter outer timeout SIGTERMs mid-extraction,
+    // losing the chunk without saving a checkpoint.
     const extractResult = runCli(["extract"], {
       stdin: hookInput,
-      timeout: 60_000,
+      timeout: 120_000,
       cwd,
     });
 
@@ -163,17 +183,20 @@ export default function (pi: ExtensionAPI) {
       runCli(["backfill", cwd], { timeout: 30_000, cwd });
     }
 
-    // Step 3: Semantic edges (fire-and-forget)
-    runCliDetached(["semantic-edges", cwd], { cwd });
-
-    // Step 4: Generate push surface
+    // Step 3: Generate push surface
     runCli(["generate", cwd], { timeout: 30_000, cwd });
 
-    // Step 5: Lifecycle prune (fire-and-forget)
-    runCliDetached(["lifecycle", cwd, "--if-needed"], { cwd });
-
-    // Step 6: AI prune (fire-and-forget)
-    runCliDetached(["ai-prune", cwd, "--if-needed"], { cwd });
+    // Steps 4-6: maintenance — ONE detached chain, run sequentially.
+    // Spawning these concurrently made them race: SQLite allows a single
+    // writer, and lifecycle + ai-prune both read-modify-write telemetry.json.
+    runCliChainDetached(
+      [
+        ["semantic-edges", cwd],
+        ["lifecycle", cwd, "--if-needed"],
+        ["ai-prune", cwd, "--if-needed"],
+      ],
+      cwd
+    );
   });
 
   // ─── Commands ─────────────────────────────────────────────────────────

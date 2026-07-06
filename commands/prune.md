@@ -14,7 +14,9 @@ description: "AI-powered memory pruning. Reviews all active memories and archive
 
 ## Description
 
-You (Claude) act as the pruner. Fetch all active memories, evaluate each for relevance, and archive the ones that are stale, redundant, or too granular. No Gemini involved — this uses your judgment.
+You (Claude) act as the pruner. Fetch all active memories, evaluate each for relevance, and archive the ones that are stale, redundant, or too granular. This uses your judgment directly.
+
+Note: an automated `ai-prune` also runs in the SessionEnd pipeline (via the headless LLM CLI) when 5+ sessions have passed since the last prune, or when the active count reaches max(50, 1.25 × the count at the last prune). This skill is the interactive, user-confirmed version.
 
 ## Procedure
 

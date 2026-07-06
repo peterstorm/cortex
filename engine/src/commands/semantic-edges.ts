@@ -15,7 +15,7 @@
  * Designed to run as fire-and-forget step in extract-and-generate hook.
  */
 
-import { existsSync, unlinkSync, writeFileSync, readFileSync, mkdirSync } from 'fs';
+import { unlinkSync, writeFileSync, readFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import type { Database } from 'bun:sqlite';
 import type { Memory } from '../core/types.js';
@@ -26,28 +26,23 @@ import { getRelatesToEdges, getMemory, deleteEdge, insertEdge } from '../infra/d
 /** Max pairs per LLM call to stay within 90s timeout */
 const BATCH_SIZE = 10;
 
-/** Lock file directory (inside cortex memory dir) */
-const LOCK_DIR = join(
-  process.env.HOME ?? '/tmp',
-  '.claude/plugins/cache/local/cortex/0.1.0/.memory'
-);
-const LOCK_FILE = join(LOCK_DIR, 'semantic-edges.lock');
-
 /**
  * Acquire a lock file with PID. Returns true if acquired.
  * Stale locks (PID no longer running) are automatically reclaimed.
+ * The lock lives in the project's .memory/locks dir — a global lock would
+ * make semantic-edges runs for unrelated projects silently skip each other.
  */
-function acquireLock(): boolean {
+function acquireLock(lockFile: string): boolean {
   try {
-    mkdirSync(LOCK_DIR, { recursive: true });
+    mkdirSync(join(lockFile, '..'), { recursive: true });
     // O_EXCL: atomic create-if-not-exists — eliminates TOCTOU race
-    writeFileSync(LOCK_FILE, String(process.pid), { flag: 'wx' });
+    writeFileSync(lockFile, String(process.pid), { flag: 'wx' });
     return true;
-  } catch (err: any) {
-    if (err?.code !== 'EEXIST') return false;
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') return false;
     // Lock file exists — check if holder is still alive
     try {
-      const existingPid = parseInt(readFileSync(LOCK_FILE, 'utf-8').trim(), 10);
+      const existingPid = parseInt(readFileSync(lockFile, 'utf-8').trim(), 10);
       if (!isNaN(existingPid)) {
         try {
           process.kill(existingPid, 0);
@@ -55,9 +50,9 @@ function acquireLock(): boolean {
         } catch {
           // Process gone, stale lock — reclaim it
           logInfo(`Reclaiming stale lock from PID ${existingPid}`);
-          unlinkSync(LOCK_FILE);
+          unlinkSync(lockFile);
           try {
-            writeFileSync(LOCK_FILE, String(process.pid), { flag: 'wx' });
+            writeFileSync(lockFile, String(process.pid), { flag: 'wx' });
             return true;
           } catch {
             return false; // Another process beat us to reclaim
@@ -71,9 +66,9 @@ function acquireLock(): boolean {
   }
 }
 
-function releaseLock(): void {
+function releaseLock(lockFile: string): void {
   try {
-    unlinkSync(LOCK_FILE);
+    unlinkSync(lockFile);
   } catch {
     // Ignore — lock already removed
   }
@@ -82,6 +77,8 @@ function releaseLock(): void {
 export interface SemanticEdgesOptions {
   /** Max edges to process (0 = all) */
   readonly limit: number;
+  /** Directory for the per-project lock file (from getLockDir(cwd)) */
+  readonly lockDir?: string;
 }
 
 export type SemanticEdgesResult =
@@ -131,7 +128,8 @@ export async function executeSemanticEdges(
   db: Database,
   options: SemanticEdgesOptions = { limit: 0 }
 ): Promise<SemanticEdgesResult> {
-  if (!acquireLock()) {
+  const lockFile = join(options.lockDir ?? '/tmp/cortex-locks', 'semantic-edges.lock');
+  if (!acquireLock(lockFile)) {
     logInfo('Another semantic-edges instance is already running, skipping');
     return { ok: true, classified: 0, failed: 0, skipped: 0 };
   }
@@ -237,7 +235,7 @@ export async function executeSemanticEdges(
     const message = err instanceof Error ? err.message : String(err);
     return { ok: false, error: `Semantic edges failed: ${message}` };
   } finally {
-    releaseLock();
+    releaseLock(lockFile);
   }
 }
 

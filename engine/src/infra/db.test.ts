@@ -5,6 +5,7 @@ import {
   updateMemory,
   getMemory,
   getMemoriesWithEmbedding,
+  getMemoriesWithEmbeddingByIds,
   searchByKeyword,
   getActiveMemories,
   insertEdge,
@@ -290,6 +291,13 @@ describe('Database Layer', () => {
 
       db.close();
     });
+
+    it('returns empty for empty or whitespace-only query instead of FTS5 syntax error', () => {
+      expect(searchByKeyword(db, '', 10)).toEqual([]);
+      expect(searchByKeyword(db, '   ', 10)).toEqual([]);
+
+      db.close();
+    });
   });
 
   describe('getMemoriesWithEmbedding + rankBySimilarity', () => {
@@ -344,6 +352,24 @@ describe('Database Layer', () => {
       insertMemory(db, mem1);
       insertMemory(db, mem2);
       insertMemory(db, mem3);
+    });
+
+    it('excludes non-active memories from embedding candidates', () => {
+      // Archival keeps the embedding — without a status filter, /forget-ed
+      // memories would resurface in semantic recall.
+      updateMemory(db, 'mem-emb-2', { status: 'archived' });
+
+      const candidates = getMemoriesWithEmbedding(db, 'gemini');
+      expect(candidates.map((c) => c.memory.id).sort()).toEqual(['mem-emb-1', 'mem-emb-3']);
+
+      const byIds = getMemoriesWithEmbeddingByIds(
+        db,
+        ['mem-emb-1', 'mem-emb-2', 'mem-emb-3'],
+        'gemini'
+      );
+      expect(byIds.map((c) => c.memory.id).sort()).toEqual(['mem-emb-1', 'mem-emb-3']);
+
+      db.close();
     });
 
     it('fetches and ranks by gemini embedding similarity', () => {

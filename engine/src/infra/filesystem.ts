@@ -67,9 +67,9 @@ function acquirePidLock(lockPath: string): void {
   try {
     fs.writeFileSync(lockPath, String(process.pid), { flag: 'wx' });
     return; // Lock acquired successfully
-  } catch (e: any) {
+  } catch (e: unknown) {
     // If error is not EEXIST, propagate it
-    if (e.code !== 'EEXIST') {
+    if ((e as NodeJS.ErrnoException).code !== 'EEXIST') {
       throw e;
     }
   }
@@ -82,8 +82,15 @@ function acquirePidLock(lockPath: string): void {
     );
   }
 
-  // Stale lock - override it
-  fs.writeFileSync(lockPath, String(process.pid), 'utf8');
+  // Stale lock — remove it, then retry the ATOMIC create. A plain overwrite
+  // here would let two processes both observe the stale PID and both
+  // "acquire" the lock (the TOCTOU the wx flag exists to prevent).
+  try {
+    fs.unlinkSync(lockPath);
+  } catch {
+    // Already removed by a competing process
+  }
+  fs.writeFileSync(lockPath, String(process.pid), { flag: 'wx' });
 }
 
 /**
@@ -199,5 +206,10 @@ export function writeTelemetry(
   fs.mkdirSync(dir, { recursive: true });
 
   const json = JSON.stringify(data, null, 2);
-  fs.writeFileSync(filePath, json, 'utf8');
+
+  // Atomic write (temp + rename): concurrent readers must never observe
+  // torn JSON — a torn telemetry file resets all maintenance counters.
+  const tempPath = `${filePath}.tmp-${process.pid}`;
+  fs.writeFileSync(tempPath, json, 'utf8');
+  fs.renameSync(tempPath, filePath);
 }

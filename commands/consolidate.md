@@ -15,66 +15,71 @@ description: "Find and merge duplicate memories. RUN periodically (every 10-20 e
 
 ## Description
 
-Detects similar memory pairs using embedding cosine similarity and Jaccard pre-filtering. Reports candidates for consolidation. Currently detection-only (manual merge in v1, auto-merge in future).
+Detects similar memory pairs using hybrid similarity (Jaccard token overlap + embedding cosine) and prints each pair in full for review. You then merge approved pairs one at a time with the `--merge` flag — the merged memory supersedes both originals.
 
-## CLI Command
+## CLI Commands
+
+**List similar pairs:**
 
 ```bash
-bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts consolidate <cwd>
+bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts consolidate <cwd> [--threshold=N]
+```
+
+**Merge one reviewed pair:**
+
+```bash
+bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts consolidate <cwd> --merge \
+  --a=<idA> --b=<idB> \
+  --summary="<merged summary>" --content="<merged content>"
 ```
 
 ## Arguments
 
 **Required:**
-- `<cwd>` - Project working directory
+- `<cwd>` - Project working directory (consolidate operates on the project DB only)
 
-**Optional:**
-- None (operates on all active memories in project DB)
+**Optional (list mode):**
+- `--threshold=N` - Similarity threshold in (0, 1] (default: 0.5)
 
-## Usage Example
+**Required (merge mode):**
+- `--merge` - Switch to merge mode
+- `--a=<idA>`, `--b=<idB>` - IDs of the pair to merge
+- `--summary=<text>` - Summary for the merged memory
+- `--content=<text>` - Content for the merged memory
 
-```
-/consolidate
-```
+## Workflow
 
-Returns: `Found 3 similar pairs`
+1. **List pairs:** Run list mode. Each similar pair is printed with IDs, similarity %, type, priority, summary, and full content.
 
-## How It Works
+2. **Review each pair** with the user:
+   - Truly duplicate → write a merged summary + content that preserves the best of both
+   - Related but distinct → skip (keep both)
+   - One is outdated → use `/forget` on the stale one instead of merging
 
-1. **Jaccard pre-filter:** Tokenizes memory content, computes Jaccard similarity
-   - Score >0.6 = definitely similar
-   - Score <0.1 = definitely different
-   - Score 0.1-0.6 = maybe (proceed to embedding check)
+3. **Merge each approved pair** with a `--merge` call. This creates the new merged memory (embeddings start null so backfill re-embeds the new text), marks both originals as `superseded` with `supersedes` edges, and prints the new memory ID.
 
-2. **Embedding similarity:** Computes cosine similarity on embeddings
-   - Score >0.5 = consolidation candidate
+4. **Refresh embeddings + surface** after all merges:
+   ```bash
+   bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts backfill <cwd>
+   bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts generate <cwd>
+   ```
 
-3. **Classification:**
-   - 0.5-0.7: Similar, should review for merge
-   - 0.7-0.9: Very similar, likely duplicates
-   - >0.9: Near-identical, definitely merge
+## How Detection Works
 
-4. **Output:** List of memory pairs with similarity scores
+1. **Jaccard pre-filter:** Tokenizes memory content, computes token-overlap similarity
+2. **Embedding similarity:** Cosine similarity on stored embeddings (when available)
+3. **Hybrid score:** Combined Jaccard + cosine; pairs scoring above the threshold are reported
 
-## Consolidation Strategy (Manual v1)
+Rough interpretation of scores:
+- 0.5-0.7: Similar, review carefully before merging
+- 0.7-0.9: Very similar, likely duplicates
+- \>0.9: Near-identical, almost always merge
 
-When consolidation reports similar pairs:
+## Merge Semantics
 
-1. **Review both memories** to understand differences
-2. **Choose merge approach:**
-   - Keep higher-priority memory, archive the other
-   - Create new combined memory with `/remember`, archive both originals
-   - Keep both if subtle differences matter
-
-3. **Archive duplicates** with `/forget`
-
-## Future: Auto-Merge (v2)
-
-Planned features:
-- Automatic merge when >0.9 similarity
-- Interactive prompt for 0.5-0.9 range
-- Merge preview with combined content
-- Rollback via checkpoint/restore
+- Merged memory: confidence 1.0 (human-approved), higher priority of the two, combined tags, pinned if either was pinned, global scope if either was global
+- Originals: status set to `superseded` (hidden from search/surface), linked via `supersedes` edges
+- Embeddings: nulled on the merged memory — `backfill` re-embeds the new content
 
 ## When to Run
 
@@ -91,17 +96,13 @@ Planned features:
 
 ## Safety
 
-- **Read-only in v1:** Only reports duplicates, doesn't modify
-- **Checkpoint:** Future merge will checkpoint DB before changes
-- **Rollback:** Can restore from checkpoint if merge goes wrong
-
-## Output
-
-Returns count of similar pairs found. Detailed pair list written to telemetry logs.
+- **List mode is read-only** — nothing changes until you call `--merge`
+- **Merge is human-approved** — you write the merged summary/content per pair
+- **Originals aren't deleted** — superseded memories stay in the DB
 
 ## Integration with Other Skills
 
 - Run `/consolidate` before `/recall` if memory feels cluttered
-- Use `/forget` to manually archive duplicates after review
+- Use `/forget` to archive one-sided duplicates instead of merging
 - Check `/inspect` for memory count trends
 - Lifecycle decay reduces duplicates naturally over time

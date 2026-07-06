@@ -11,6 +11,9 @@ import type {
   Edge,
   ExtractionCheckpoint,
   MemoryScope,
+  MemoryType,
+  MemoryStatus,
+  SourceType,
   EdgeRelation,
 } from '../core/types.js';
 import { createMemory, createEdge, createExtractionCheckpoint, isEdgeRelation, isMemoryType } from '../core/types.js';
@@ -160,11 +163,39 @@ function initializeSchema(db: Database): void {
   // Enable WAL mode for concurrent access (FR-100)
   db.run('PRAGMA journal_mode = WAL');
 
+  // WAL allows only one writer; the SessionEnd pipeline spawns detached
+  // workers (semantic-edges, lifecycle, ai-prune) that can collide. Without
+  // a busy timeout a collision throws SQLITE_BUSY immediately — and detached
+  // workers log to /dev/null, so the write is silently lost.
+  db.run('PRAGMA busy_timeout = 5000');
+
   // Enable foreign key constraints
   db.run('PRAGMA foreign_keys = ON');
 
   // Execute schema creation
   db.exec(SCHEMA);
+
+  migrateCheckpointUniqueness(db);
+}
+
+/**
+ * One-time migration: extraction_checkpoints.session_id must be unique so
+ * saveExtractionCheckpoint can UPSERT. Older databases may hold duplicate
+ * rows from concurrent writers — keep the newest per session, then index.
+ */
+function migrateCheckpointUniqueness(db: Database): void {
+  const existing = db
+    .prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_checkpoints_session_unique'`)
+    .get();
+  if (existing) return;
+
+  db.run(`
+    DELETE FROM extraction_checkpoints
+    WHERE rowid NOT IN (
+      SELECT MAX(rowid) FROM extraction_checkpoints GROUP BY session_id
+    )
+  `);
+  db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoints_session_unique ON extraction_checkpoints(session_id)`);
 }
 
 /**
@@ -206,10 +237,36 @@ function deserializeFloat32Array(buffer: Buffer): Float32Array {
 }
 
 /**
+ * Raw memories-table row shape. Enum-valued columns are typed with the domain
+ * unions — the schema CHECK constraints enforce them at write time.
+ */
+type MemoryRow = {
+  id: string;
+  content: string;
+  summary: string;
+  memory_type: MemoryType;
+  scope: MemoryScope;
+  embedding: Buffer | null;
+  local_embedding: Buffer | null;
+  confidence: number;
+  priority: number;
+  pinned: number;
+  source_type: SourceType;
+  source_session: string;
+  source_context: string;
+  tags: string;
+  access_count: number;
+  last_accessed_at: string;
+  created_at: string;
+  updated_at: string;
+  status: MemoryStatus;
+};
+
+/**
  * Convert a raw database row to a Memory domain object.
  * Pure helper — centralizes the row-to-Memory mapping used by all query functions.
  */
-function rowToMemory(row: any): Memory {
+function rowToMemory(row: MemoryRow): Memory {
   return createMemory({
     id: row.id,
     content: row.content,
@@ -288,7 +345,7 @@ export function insertMemory(db: Database, memory: Memory): string {
  */
 export function updateMemory(db: Database, id: string, fields: Partial<Memory>): void {
   const updates: string[] = [];
-  const values: any[] = [];
+  const values: (string | number | Uint8Array | null)[] = [];
 
   // Build dynamic UPDATE statement based on provided fields
   if (fields.content !== undefined) {
@@ -497,7 +554,7 @@ export function getMemoriesWithEmbedding(
 ): readonly { memory: Memory; embedding: Float64Array | Float32Array }[] {
   const column = type === 'gemini' ? 'embedding' : 'local_embedding';
   const stmt = db.prepare(`
-    SELECT * FROM memories WHERE ${column} IS NOT NULL
+    SELECT * FROM memories WHERE ${column} IS NOT NULL AND status = 'active'
   `);
 
   const rows = stmt.all() as any[];
@@ -550,6 +607,10 @@ export function searchByKeyword(
     .filter(t => t.length > 0)
     .map(t => '"' + t.replace(/"/g, '""') + '"')
     .join(' ');
+
+  // MATCH '' is an FTS5 syntax error — empty/whitespace query means no results
+  if (safeQuery.length === 0) return [];
+
   const rows = stmt.all(safeQuery, limit) as any[];
 
   return rows.map(rowToMemory);
@@ -635,7 +696,7 @@ export function getMemoriesWithEmbeddingByIds(
   const column = type === 'gemini' ? 'embedding' : 'local_embedding';
   const placeholders = ids.map(() => '?').join(',');
   const stmt = db.prepare(`
-    SELECT * FROM memories WHERE id IN (${placeholders}) AND ${column} IS NOT NULL
+    SELECT * FROM memories WHERE id IN (${placeholders}) AND ${column} IS NOT NULL AND status = 'active'
   `);
 
   const rows = stmt.all(...ids) as any[];
@@ -916,40 +977,29 @@ export function saveExtractionCheckpoint(
   // Respect caller's extracted_at if provided, otherwise use current timestamp
   const extracted_at = checkpoint.extracted_at ?? new Date().toISOString();
 
-  // Check if checkpoint exists for this session
-  const existing = getExtractionCheckpoint(db, checkpoint.session_id);
+  const validated = createExtractionCheckpoint({
+    id: randomUUID(),
+    session_id: checkpoint.session_id,
+    cursor_position: checkpoint.cursor_position,
+    extracted_at,
+  });
 
-  if (existing) {
-    // Update existing checkpoint
-    const stmt = db.prepare(`
-      UPDATE extraction_checkpoints
-      SET cursor_position = ?, extracted_at = ?
-      WHERE session_id = ?
-    `);
+  // Atomic UPSERT — a check-then-insert would let two concurrent workers
+  // both observe "no checkpoint" and insert duplicate rows.
+  const stmt = db.prepare(`
+    INSERT INTO extraction_checkpoints (id, session_id, cursor_position, extracted_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(session_id) DO UPDATE SET
+      cursor_position = excluded.cursor_position,
+      extracted_at = excluded.extracted_at
+  `);
 
-    stmt.run(checkpoint.cursor_position, extracted_at, checkpoint.session_id);
-  } else {
-    // Insert new checkpoint
-    const id = randomUUID();
-    const validated = createExtractionCheckpoint({
-      id,
-      session_id: checkpoint.session_id,
-      cursor_position: checkpoint.cursor_position,
-      extracted_at,
-    });
-
-    const stmt = db.prepare(`
-      INSERT INTO extraction_checkpoints (id, session_id, cursor_position, extracted_at)
-      VALUES (?, ?, ?, ?)
-    `);
-
-    stmt.run(
-      validated.id,
-      validated.session_id,
-      validated.cursor_position,
-      validated.extracted_at
-    );
-  }
+  stmt.run(
+    validated.id,
+    validated.session_id,
+    validated.cursor_position,
+    validated.extracted_at
+  );
 }
 
 // ============================================================================
@@ -1032,25 +1082,35 @@ export function restoreCheckpoint(db: Database, checkpointPath: string): void {
   // Attach the checkpoint database and copy all data
   db.run(`ATTACH DATABASE '${checkpointPath}' AS checkpoint`);
 
-  // Get all regular table names from checkpoint (exclude FTS tables)
-  const tables = db.query(`
-    SELECT name FROM checkpoint.sqlite_master
-    WHERE type='table'
-      AND name NOT LIKE 'sqlite_%'
-      AND name NOT LIKE '%_fts%'
-  `).all() as { name: string }[];
+  try {
+    // Get all regular table names from checkpoint (exclude FTS tables)
+    const tables = db.query(`
+      SELECT name FROM checkpoint.sqlite_master
+      WHERE type='table'
+        AND name NOT LIKE 'sqlite_%'
+        AND name NOT LIKE '%_fts%'
+    `).all() as { name: string }[];
 
-  // Clear current tables and copy from checkpoint
-  for (const { name } of tables) {
-    // Validate table name against allowlist
-    validateTableName(name);
+    // Validate every table name BEFORE mutating anything — a mid-loop
+    // failure would otherwise leave the database half-restored.
+    for (const { name } of tables) {
+      validateTableName(name);
+    }
 
-    // Use double quotes for table identifiers (SQL standard)
-    db.run(`DELETE FROM main."${name}"`);
-    db.run(`INSERT INTO main."${name}" SELECT * FROM checkpoint."${name}"`);
+    // All-or-nothing restore: a partial restore is worse than no restore.
+    const tx = db.transaction(() => {
+      for (const { name } of tables) {
+        // Use double quotes for table identifiers (SQL standard)
+        db.run(`DELETE FROM main."${name}"`);
+        db.run(`INSERT INTO main."${name}" SELECT * FROM checkpoint."${name}"`);
+      }
+    });
+    tx();
+  } finally {
+    // Always detach — a stuck ATTACH makes every retry fail with
+    // "database checkpoint is already in use".
+    db.run('DETACH DATABASE checkpoint');
   }
-
-  db.run('DETACH DATABASE checkpoint');
 }
 
 // ============================================================================

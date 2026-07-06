@@ -29,7 +29,7 @@ Claude Code reads `.claude/cortex-memory.local.md` as context, giving it "memory
 
 ### Session Start
 
-A `SessionStart` hook loads a cached "surface" — a compact markdown summary of the most relevant memories. The cache is keyed by `sha256(branch:cwd)` and valid for 24 hours. If stale or missing, it regenerates from the database. Additionally, a `UserPromptSubmit` hook pipes the surface file contents on every prompt, ensuring Claude always has memory context.
+A `SessionStart` hook loads a cached "surface" — a compact markdown summary of the most relevant memories. The cache is keyed by `sha256(branch:cwd)` and valid for 24 hours. If stale or missing, it regenerates from the database — but only for projects that already have a `.memory/cortex.db` (the hook never creates databases in untouched projects). Additionally, a `UserPromptSubmit` hook pipes the surface file contents on every prompt, and a second `UserPromptSubmit` hook (`prompt-recall.sh`) runs keyword recall against your prompt — strict AND search over prompt keywords first, OR fallback, plus a conservative semantic fallback (0.65 cosine floor) when keywords find nothing.
 
 ### During a Session
 
@@ -37,14 +37,16 @@ Seven slash commands let you interact with memory directly: `/remember`, `/recal
 
 ### Session End
 
-A `SessionEnd` hook orchestrates a multi-step pipeline:
+A `SessionEnd` hook detaches a background worker (so nothing blocks the session) that runs the pipeline sequentially:
 
-1. **Extract** — Read the session transcript (JSONL), truncate if >100KB (resumable via cursor checkpoints), add git context (branch, commits, changed files), and pipe to Claude CLI (`claude -p --model haiku`) for memory extraction
+1. **Extract** — Read the session transcript (JSONL), truncate if >100KB (resumable via cursor checkpoints), add git context (branch, commits, changed files), and pipe to a headless coding-agent CLI (`claude -p --model haiku` by default) for memory extraction; global-scoped candidates are routed to the global DB
 2. **Backfill** — Compute embeddings for newly extracted memories (Gemini API, or local HuggingFace fallback)
-3. **Semantic Edges** — Fire-and-forget: classify Jaccard-created `relates_to` edges into typed relationships
-4. **Generate** — Rebuild the surface file for the next session
-5. **Lifecycle** — Fire-and-forget: decay confidence, archive stale memories, prune old ones
-6. **AI Prune** — Fire-and-forget: Claude evaluates active memories and suggests archives
+3. **Generate** — Rebuild the surface file for the next session
+4. **Semantic Edges** — Classify Jaccard-created `relates_to` edges into typed relationships
+5. **Lifecycle** — Decay confidence, archive stale memories, prune old ones
+6. **AI Prune** — When due, the LLM evaluates active memories and archives low-value ones
+
+The maintenance steps (4-6) run sequentially — not as concurrent detached spawns — because SQLite allows one writer and lifecycle + AI prune both read-modify-write telemetry. Each step logs to `/tmp/cortex-*.log` (`cortex-extract.log`, `cortex-backfill.log`, `cortex-generate.log`, `cortex-semantic-edges.log`, `cortex-lifecycle.log`, `cortex-ai-prune.log`).
 
 All hooks exit 0 unconditionally — errors are logged, never surfaced. A `CORTEX_EXTRACTING=1` environment variable prevents recursive hook storms when `claude -p` is invoked during extraction.
 
@@ -56,7 +58,18 @@ All hooks exit 0 unconditionally — errors are logged, never surfaced. A `CORTE
 - Claude Code CLI (provides `claude` binary on PATH)
 - `GEMINI_API_KEY` environment variable (for embeddings + semantic search; without it, recall falls back to keyword search)
 
-### Setup
+### Setup (marketplace install)
+
+The repo ships a self-marketplace manifest (`.claude-plugin/marketplace.json`), so you can install straight from git:
+
+```
+/plugin marketplace add <repo-url>
+/plugin install cortex@cortex
+```
+
+Then install engine dependencies inside the installed plugin's `engine/` directory (`bun install`).
+
+### Setup (manual clone)
 
 1. Clone this repo into your Claude Code plugins directory:
    ```bash
@@ -75,6 +88,8 @@ All hooks exit 0 unconditionally — errors are logged, never surfaced. A `CORTE
    export GEMINI_API_KEY="your-key-here"
    ```
 
+   Hooks don't inherit your shell profile — they source the key from a file instead. By default they look at the sops-nix path (`~/.config/sops-nix/secrets/rendered/gemini-env`); set `CORTEX_GEMINI_ENV` to point at any file that exports `GEMINI_API_KEY`.
+
 4. Restart Claude Code — the plugin registers automatically via `plugin.json` and `hooks.json`.
 
 ## Commands
@@ -84,7 +99,7 @@ All hooks exit 0 unconditionally — errors are logged, never surfaced. A `CORTE
 | `/remember` | Store an explicit memory | Architectural decisions, gotchas, patterns, insights |
 | `/recall <query>` | Semantic or keyword search | Before starting tasks, encountering unfamiliar code, making decisions |
 | `/forget <id\|query>` | Archive a memory | When information is outdated, incorrect, or contradictory |
-| `/consolidate` | Detect duplicate memories | Periodically (every 10-20 extractions) or when memory feels cluttered |
+| `/consolidate` | Detect and merge duplicate memories | Periodically (every 10-20 extractions) or when memory feels cluttered |
 | `/inspect` | View memory health & stats | Diagnostics — counts, queue sizes, extraction stats, graph metrics |
 | `/prune` | AI-powered pruning pass | Periodically to keep memory lean and high-signal |
 | `/index-code` | Pair prose with source code | When important code is written — creates a searchable code memory |
@@ -150,8 +165,7 @@ Cortex follows a **Functional Core / Imperative Shell** design:
 │  db.ts           SQLite CRUD, schema, FTS5            │
 │  filesystem.ts   PID locking, surface write           │
 │  git-context.ts  Branch, commits, changed files       │
-│  claude-llm.ts   Claude CLI client                    │
-│  gemini-llm.ts   Gemini API client                    │
+│  claude-llm.ts   Headless LLM CLI client (claude/pi)  │
 │  gemini-embed.ts Gemini embedding API                 │
 │  local-embed.ts  HuggingFace transformers fallback    │
 └───────────────────────────────────────────────────────┘
@@ -175,15 +189,14 @@ Cortex follows a **Functional Core / Imperative Shell** design:
 | **Project** | `<project>/.memory/cortex.db` | Project-specific memories (default) |
 | **Global** | `~/.claude/memory/cortex-global.db` | Cross-project knowledge |
 
-A memory is stored globally only if the LLM assigns confidence > 0.8 AND scope = `"global"`.
+During extraction, candidates the LLM classifies as scope `"global"` are routed to the global database; everything else lands in the project database.
 
 ### External Services
 
 | Service | Purpose | Required |
 |---|---|---|
-| Claude CLI (`claude -p`) | Memory extraction, AI pruning, edge classification | Yes (uses your Anthropic subscription) |
-| Gemini Embedding-001 | Semantic embeddings (768-dim) | No (falls back to local) |
-| Gemini 2.5 Flash | Edge type classification | No (edges stay as `relates_to`) |
+| Headless agent CLI (`claude -p --model haiku`, or `pi -p` under the pi agent) | Memory extraction, AI pruning, edge classification | Yes (uses your Anthropic subscription; override with `CORTEX_LLM_BINARY`/`CORTEX_LLM_MODEL`) |
+| Gemini Embedding-001 | Semantic embeddings (768-dim) — the only thing `GEMINI_API_KEY` is used for | No (falls back to local) |
 | HuggingFace Transformers | Local embedding fallback (BGE-small-en-v1.5, 384-dim) | Bundled |
 
 ## Memory Model
@@ -258,7 +271,7 @@ The surface is the markdown file Claude reads at session start. Generation:
 | Code | 0 (excluded) |
 
 5. High-value memories overflow into unused budget from under-populated categories
-6. Target ~400 tokens, hard max 550
+6. Target ~1500 tokens, hard max 2000 (including ~200 tokens of markdown overhead)
 7. Wrap in `<!-- CORTEX_MEMORY_START/END -->` markers
 8. Cache keyed by `sha256(branch:cwd)`
 
@@ -305,7 +318,7 @@ Used by `/recall` for search ranking and by `/consolidate` for duplicate detecti
 
 ### Consolidation
 
-`/consolidate` scans all active memory pairs using the hybrid Jaccard + cosine approach and reports candidates. In v1, consolidation is read-only — users manually archive duplicates with `/forget`.
+`/consolidate` scans all active memory pairs using the hybrid Jaccard + cosine approach and prints each candidate pair (IDs, similarity %, type, priority, summary, content) for review. Approved pairs are merged one at a time via `consolidate <cwd> --merge --a=<idA> --b=<idB> --summary=<text> --content=<text>` — the merged memory supersedes both originals, and its embeddings start null so backfill re-embeds the new content.
 
 ## Semantic Search
 
@@ -314,8 +327,8 @@ Used by `/recall` for search ranking and by `/consolidate` for duplicate detecti
 ### Semantic (default, requires `GEMINI_API_KEY`)
 
 1. Embed query via Gemini: `[query] [project:name] <user query>`
-2. Cosine similarity against stored embeddings in both databases
-3. Merge results (project-scoped first)
+2. Cosine similarity against stored embeddings in both databases (archived and superseded memories are excluded)
+3. Merge results (project-scoped first); with `--branch`, the filter is applied before the result limit so branch matches aren't cut off
 4. Enrich with depth-2 graph traversal
 5. Update access count (boosts ranking, delays archival)
 
@@ -358,17 +371,17 @@ Pinned memories and those with centrality > 0.5 are exempt.
 
 ### Archive
 
-If confidence drops below 0.3 for 14+ consecutive days (and not pinned, centrality <= 0.5) → status changes to `archived`. Archived memories don't appear in the surface or search results.
+If decayed confidence is below 0.3 and the memory hasn't been accessed in 14+ days (and not pinned, centrality <= 0.5) → status changes to `archived`. Archived memories don't appear in the surface or search results.
 
 **Escape hatch:** Accessing a memory via `/recall` resets its `last_accessed_at`, delaying archival.
 
 ### Prune
 
-Archived memories with no access for 90+ days → status changes to `pruned` (effectively deleted, still in DB but invisible).
+Archived memories with no access for 30+ days → status changes to `pruned` (effectively deleted, still in DB but invisible).
 
 ### AI Prune
 
-Periodically (every 5 sessions or when memory count exceeds 50), Claude evaluates active memories in batches and suggests which to archive. Runs as a fire-and-forget detached process.
+The LLM evaluates active memories in batches and archives low-value ones. Triggered when 5+ sessions have passed since the last prune, or when the active memory count reaches max(50, 1.25 × the count at the last prune) — the growth backoff prevents a full prune from firing every session once the store stays above the base threshold. Runs as part of the detached SessionEnd worker.
 
 ## Configuration
 
@@ -376,21 +389,23 @@ Periodically (every 5 sessions or when memory count exceeds 50), Claude evaluate
 
 | Variable | Purpose | Required |
 |---|---|---|
-| `GEMINI_API_KEY` | Embeddings + semantic search | No (falls back to keyword search + local embeddings) |
+| `GEMINI_API_KEY` | Embeddings + semantic search (embeddings only — never used for extraction) | No (falls back to keyword search + local embeddings) |
+| `CORTEX_GEMINI_ENV` | Path to a file hooks source to get `GEMINI_API_KEY` (default: sops-nix path) | No |
+| `CORTEX_LLM_BINARY` | Force the headless LLM binary (`claude` or `pi`) | No (auto-detected) |
+| `CORTEX_LLM_MODEL` | Override the model passed to the LLM binary | No (`haiku` for claude; none for pi) |
 | `CLAUDE_PLUGIN_ROOT` | Plugin directory | Auto-set by Claude Code |
 
-Extraction uses `claude -p` (Claude CLI) — no separate API key needed, uses your Anthropic subscription.
+Extraction, AI pruning, and edge classification shell out to a headless coding-agent CLI: `claude -p --model haiku` by default, or `pi -p` when running under the pi agent (no `--model` flag, so pi's configured provider default is used). No separate API key needed — it uses your Anthropic subscription.
 
 ### Key Constants
 
 | Constant | Value | Purpose |
 |---|---|---|
 | `MAX_TRANSCRIPT_BYTES` | 100 KB | Trigger resumable extraction |
-| `EXTRACTION_TIMEOUT_MS` | 30s | Extraction time budget |
+| LLM call timeout | 90s | Extraction / edge-classification time budget |
 | `SURFACE_STALE_HOURS` | 24h | Cache expiry |
 | `RECENCY_HALF_LIFE_DAYS` | 14 | Ranking decay half-life |
-| `ARCHIVE_THRESHOLD_DAYS` | 7 | Low-confidence → archive transition |
-| `PRUNE_THRESHOLD_DAYS` | 90 | Archived → pruned transition |
+| `PRUNE_THRESHOLD_DAYS` | 30 | Archived → pruned transition |
 | `AI_PRUNE_SESSION_INTERVAL` | 5 | Run AI prune every N sessions |
 | `AI_PRUNE_MEMORY_THRESHOLD` | 50 | AI prune trigger count |
 | `DEFAULT_SEARCH_LIMIT` | 10 | Results per `/recall` |
@@ -420,6 +435,7 @@ Extraction uses `claude -p` (Claude CLI) — no separate API key needed, uses yo
         scripts/
           extract-and-generate.sh   # SessionEnd hook
           load-surface.sh           # SessionStart hook
+          prompt-recall.sh          # UserPromptSubmit hook (keyword recall)
       engine/src/               # TypeScript source
       commands/                 # Skill markdown files
 ```
@@ -457,10 +473,11 @@ bun engine/src/cli.ts semantic-edges <cwd>
 bun engine/src/cli.ts remember <cwd> "content" --type=pattern
 bun engine/src/cli.ts recall <cwd> "query"
 bun engine/src/cli.ts forget <cwd> "id-or-query"
-bun engine/src/cli.ts consolidate <cwd>
+bun engine/src/cli.ts consolidate <cwd> [--threshold=N]
+bun engine/src/cli.ts consolidate <cwd> --merge --a=<idA> --b=<idB> --summary=<text> --content=<text>
 bun engine/src/cli.ts inspect <cwd>
 bun engine/src/cli.ts index-code <cwd> <proseId> <codePath>
-bun engine/src/cli.ts traverse <cwd> <memoryId> --depth=2
+bun engine/src/cli.ts traverse <cwd> <memoryId> [maxDepth]
 ```
 
 ### Testing Strategy
@@ -472,7 +489,7 @@ bun engine/src/cli.ts traverse <cwd> <memoryId> --depth=2
 
 | Package | Purpose |
 |---|---|
-| `better-sqlite3` | SQLite bindings (WAL mode, FTS5) |
+| `bun:sqlite` | SQLite (WAL mode, FTS5) — built into Bun, no install needed |
 | `@huggingface/transformers` | Local embedding model fallback |
 | `ts-pattern` | Exhaustive pattern matching |
 | `vitest` | Test framework |

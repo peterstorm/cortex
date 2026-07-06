@@ -33,7 +33,7 @@ bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts generate <cwd>
 - `<content>` - Memory content (quote if contains spaces)
 
 **Optional:**
-- `--type=TYPE` - Memory type: architecture, decision, pattern, gotcha, context, progress, code_description (default: decision)
+- `--type=TYPE` - Memory type: architecture, decision, pattern, gotcha, context, progress, code_description (default: context)
 - `--priority=N` - Priority 1-10 (default: 5)
 - `--scope=SCOPE` - 'project' or 'global' (default: project)
 - `--pinned` - Pin memory (prevents decay/archival)
@@ -58,7 +58,7 @@ bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts generate <cwd>
 
 ### Store global knowledge
 ```
-/remember "Voyage embeddings are 1024d, local are 384d - never mix" --type=gotcha --scope=global --priority=10 --pinned
+/remember "Gemini embeddings are 768d, local BGE embeddings are 384d - never compare across models" --type=gotcha --scope=global --priority=10 --pinned
 ```
 
 ## Memory Types
