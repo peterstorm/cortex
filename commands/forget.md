@@ -36,7 +36,7 @@ bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts forget <cwd> <idOrQuery>
 /forget memory-abc123
 ```
 
-### Forget by query (finds first match)
+### Forget by query (archives if exactly one match)
 ```
 /forget "old authentication approach"
 ```
@@ -52,7 +52,8 @@ bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts forget <cwd> <idOrQuery>
 2. If not found, tries global DB
 3. If still not found, does fuzzy text search in project DB
 4. If not found, tries fuzzy search in global DB
-5. Archives first match found
+5. If the query matches **exactly one** memory, it is archived automatically
+6. If the query matches **multiple** memories, nothing is archived — the candidates (ID + summary) are listed so you can review and `/forget <id>` the right one
 
 ## Archival vs. Deletion
 
@@ -76,7 +77,7 @@ bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts forget <cwd> <idOrQuery>
 
 ## Output
 
-Returns confirmation with memory ID that was archived, or "Memory not found" if no match.
+Returns confirmation with memory ID that was archived, a candidate list when multiple memories match (nothing archived), or "Memory not found" if no match.
 
 ## Integration with Other Skills
 

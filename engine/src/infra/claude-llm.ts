@@ -43,12 +43,34 @@ export interface EdgeClassification {
 
 /**
  * Detect which CLI binary to use for headless LLM calls.
- * Prefers pi (if PI_CODING_AGENT_DIR is set), falls back to claude.
+ *
+ * Priority:
+ * 1. CORTEX_LLM_BINARY env override
+ * 2. claude — when this process was launched from a Claude Code session
+ *    (CLAUDECODE set); a user with both tools installed should not be
+ *    silently routed to pi just because PI_CODING_AGENT_DIR is exported
+ * 3. pi — when the pi agent env is present
+ * 4. claude — default
  */
 function getLlmBinary(): string {
   const env = typeof Bun !== 'undefined' ? Bun.env : process.env;
+  if (env.CORTEX_LLM_BINARY) return env.CORTEX_LLM_BINARY;
+  if (env.CLAUDECODE) return 'claude';
   if (env.PI_CODING_AGENT_DIR || env.PI_CODING_AGENT) return 'pi';
   return 'claude';
+}
+
+/**
+ * Model for headless LLM calls.
+ * For claude: defaults to haiku (cheap, fast).
+ * For pi: NO default — pi may be configured with any provider (OpenAI,
+ * Gemini, ...) where 'haiku' is not a valid model name; omitting --model
+ * lets pi use its own configured default for the provider.
+ */
+function getLlmModel(binary: string): string | undefined {
+  const env = typeof Bun !== 'undefined' ? Bun.env : process.env;
+  if (env.CORTEX_LLM_MODEL) return env.CORTEX_LLM_MODEL;
+  return binary === 'claude' ? 'haiku' : undefined;
 }
 
 /**
@@ -88,16 +110,18 @@ export function isClaudeLlmAvailable(): boolean {
  * @returns Raw Claude response text
  * @throws Error if binary not found, non-zero exit, or timeout
  */
-async function runClaudePrompt(prompt: string, timeoutMs: number): Promise<string> {
+export async function runLlmPrompt(prompt: string, timeoutMs: number): Promise<string> {
   const binary = getLlmBinary();
+  const model = getLlmModel(binary);
+  const modelArgs = model ? ['--model', model] : [];
+
   let args: string[];
   if (binary === 'pi') {
     const provider = getDefaultProvider();
-    args = provider
-      ? [binary, '-p', '--model', 'haiku', '--provider', provider, '--no-session']
-      : [binary, '-p', '--model', 'haiku', '--no-session'];
+    const providerArgs = provider ? ['--provider', provider] : [];
+    args = [binary, '-p', ...modelArgs, ...providerArgs, '--no-session'];
   } else {
-    args = [binary, '-p', '--model', 'haiku', '--output-format', 'text'];
+    args = [binary, '-p', ...modelArgs, '--output-format', 'text'];
   }
 
   if (!isClaudeLlmAvailable()) {
@@ -169,7 +193,7 @@ async function runClaudePrompt(prompt: string, timeoutMs: number): Promise<strin
  * @throws Error if binary not found, non-zero exit, or timeout
  */
 export async function extractMemories(prompt: string): Promise<string> {
-  return runClaudePrompt(prompt, EXTRACTION_TIMEOUT_MS);
+  return runLlmPrompt(prompt, EXTRACTION_TIMEOUT_MS);
 }
 
 /**
@@ -186,7 +210,7 @@ export async function classifyEdges(
   if (pairs.length === 0) return [];
 
   const prompt = buildEdgeClassificationPrompt(pairs);
-  const response = await runClaudePrompt(prompt, EDGE_CLASSIFICATION_TIMEOUT_MS);
+  const response = await runLlmPrompt(prompt, EDGE_CLASSIFICATION_TIMEOUT_MS);
   return parseEdgeClassificationResponse(response);
 }
 

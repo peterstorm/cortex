@@ -83,6 +83,44 @@ describe("truncateTranscript", () => {
     expect(result.newCursor).toBe(content.length);
   });
 
+  it("resumes without skipping content when truncated chunk contains multi-byte UTF-8", () => {
+    // Each line is 5 chars but 7 bytes ("🎉" = 2 chars / 4 bytes).
+    // A byte-based cursor would overshoot on resume, skipping content
+    // and landing mid-line.
+    const line = "a🎉b\n"; // 5 chars, 7 bytes
+    const content = line.repeat(10); // 50 chars, 70 bytes
+
+    // Budget of 20 bytes fits 2 complete lines (14 bytes)
+    const first = truncateTranscript(content, 20, 0);
+    expect(first.truncated).toBe(line.repeat(2));
+    expect(first.newCursor).toBe(10); // 2 lines * 5 CHARS — not 14 bytes
+
+    // Resume must continue exactly where the first chunk ended
+    const second = truncateTranscript(content, 20, first.newCursor);
+    expect(second.truncated).toBe(line.repeat(2));
+    expect(second.newCursor).toBe(20);
+
+    // Walking the whole transcript reassembles it exactly, no gaps
+    let cursor = 0;
+    let reassembled = "";
+    while (cursor < content.length) {
+      const step = truncateTranscript(content, 20, cursor);
+      reassembled += step.truncated;
+      cursor = step.newCursor;
+    }
+    expect(reassembled).toBe(content);
+  });
+
+  it("never splits a surrogate pair at the byte budget boundary", () => {
+    // One giant line of emoji (no newlines) forces the raw-window branch.
+    const content = "🎉".repeat(100); // 200 chars, 400 bytes
+    // Budget 10 bytes = 2.5 emoji — must stop at 2 (8 bytes), not split the 3rd
+    const result = truncateTranscript(content, 10, 0);
+    expect(result.truncated).toBe("🎉🎉");
+    expect(result.newCursor).toBe(4);
+    expect(result.truncated.includes("�")).toBe(false);
+  });
+
   it("preserves JSONL boundary with cursor and maxBytes", () => {
     const content = "line1\nline2\nline3\nline4\n";
     const result = truncateTranscript(content, 12, 6); // From "line2", max 12 bytes

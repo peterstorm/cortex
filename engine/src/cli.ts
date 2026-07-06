@@ -40,7 +40,7 @@ import {
   DEFAULT_SEARCH_LIMIT,
   GITIGNORE_PATTERNS,
 } from './config.js';
-import { openDatabase, getActiveMemories } from './infra/db.js';
+import { openDatabase, getActiveMemories, getMemoriesByIds } from './infra/db.js';
 import { ensureGitignored } from './infra/filesystem.js';
 
 // Command imports
@@ -52,7 +52,7 @@ import type { RecallOptions } from './commands/recall.js';
 import { executeRemember } from './commands/remember.js';
 import { executeIndexCode } from './commands/index-code.js';
 import { forgetById, forgetByQuery } from './commands/forget.js';
-import { findSimilarPairs } from './commands/consolidate.js';
+import { findSimilarPairs, formatPairForReview, mergePair } from './commands/consolidate.js';
 import { runLifecycle, runLifecycleIfNeeded } from './commands/lifecycle.js';
 import { runAiPrune, runAiPruneIfNeeded } from './commands/ai-prune.js';
 import { executeTraverse } from './commands/traverse.js';
@@ -209,23 +209,19 @@ async function handleExtract(): Promise<CommandResult> {
     };
   }
 
-  // Only open project DB - extract doesn't use global DB
-  const projectDbPath = getProjectDbPath(input.cwd);
-  const projectDbDir = dirname(projectDbPath);
-  if (!existsSync(projectDbDir)) {
-    mkdirSync(projectDbDir, { recursive: true });
-  }
-
   try {
     ensureGitignored(input.cwd, GITIGNORE_PATTERNS);
   } catch (err) {
     logError(`Failed to update .gitignore: ${err}`);
   }
 
-  const projectDb = openDatabase(projectDbPath);
+  // Both DBs: extraction classifies candidate scope (FR-008), and
+  // global-scoped candidates must land in the global DB to be visible
+  // from other projects.
+  const [projectDb, globalDb] = initDatabases(input.cwd);
 
   try {
-    const result = await executeExtract(input, projectDb);
+    const result = await executeExtract(input, projectDb, globalDb);
     return {
       success: result.success,
       output: JSON.stringify(result),
@@ -238,6 +234,7 @@ async function handleExtract(): Promise<CommandResult> {
     };
   } finally {
     projectDb.close();
+    globalDb.close();
   }
 }
 
@@ -530,14 +527,17 @@ async function handleForget(args: string[]): Promise<CommandResult> {
 
 /**
  * Handle 'consolidate' subcommand
- * Find and report similar memory pairs
+ *
+ * List mode:  consolidate <cwd> [--threshold=N]
+ *   Prints each similar pair with IDs, similarity, and content for review.
+ * Merge mode: consolidate <cwd> --merge --a=<idA> --b=<idB> --summary=<text> --content=<text>
+ *   Merges one reviewed pair (FR-075..077); human approval happens in the skill.
  */
 async function handleConsolidate(args: string[]): Promise<CommandResult> {
-  // Args: [cwd]
   if (args.length < 1) {
     return {
       success: false,
-      error: 'Usage: consolidate <cwd>',
+      error: 'Usage: consolidate <cwd> [--threshold=N] | consolidate <cwd> --merge --a=<idA> --b=<idB> --summary=<text> --content=<text>',
     };
   }
 
@@ -558,11 +558,61 @@ async function handleConsolidate(args: string[]): Promise<CommandResult> {
   const projectDb = openDatabase(projectDbPath);
 
   try {
+    if (args.includes('--merge')) {
+      const flagValue = (name: string): string | undefined => {
+        const arg = args.find(a => a.startsWith(`--${name}=`));
+        return arg?.slice(name.length + 3);
+      };
+      const idA = flagValue('a');
+      const idB = flagValue('b');
+      const summary = flagValue('summary');
+      const content = flagValue('content');
+      if (!idA || !idB || !summary || !content) {
+        return {
+          success: false,
+          error: 'Usage: consolidate <cwd> --merge --a=<idA> --b=<idB> --summary=<text> --content=<text>',
+        };
+      }
+
+      const found = getMemoriesByIds(projectDb, [idA, idB]);
+      const memoryA = found.find(m => m.id === idA);
+      const memoryB = found.find(m => m.id === idB);
+      if (!memoryA || !memoryB) {
+        const missing = [!memoryA && idA, !memoryB && idB].filter(Boolean).join(', ');
+        return { success: false, error: `Memory not found: ${missing}` };
+      }
+
+      const mergedId = mergePair(
+        projectDb,
+        { memoryA, memoryB, similarity: 1.0 },
+        summary,
+        content,
+        'consolidate-session'
+      );
+      return {
+        success: true,
+        output: `Merged ${idA} + ${idB} -> ${mergedId} (both originals superseded). Run backfill + generate to refresh embeddings and surface.`,
+      };
+    }
+
+    const thresholdArg = args.find(a => a.startsWith('--threshold='));
+    const threshold = thresholdArg ? Number.parseFloat(thresholdArg.slice('--threshold='.length)) : undefined;
+    if (threshold !== undefined && (Number.isNaN(threshold) || threshold <= 0 || threshold > 1)) {
+      return { success: false, error: '--threshold must be a number in (0, 1]' };
+    }
+
     const memories = getActiveMemories(projectDb);
-    const pairs = findSimilarPairs(memories);
+    const pairs = findSimilarPairs(memories, threshold);
+
+    if (pairs.length === 0) {
+      return { success: true, output: 'Found 0 similar pairs' };
+    }
+
+    const sections = pairs.map(formatPairForReview);
+    const header = `Found ${pairs.length} similar pair(s). To merge one:\n  consolidate <cwd> --merge --a=<idA> --b=<idB> --summary=<merged summary> --content=<merged content>\n`;
     return {
       success: true,
-      output: `Found ${pairs.length} similar pairs`,
+      output: [header, ...sections].join('\n'),
     };
   } catch (err) {
     return {
@@ -809,7 +859,7 @@ async function handleSemanticEdges(args: string[]): Promise<CommandResult> {
   })();
 
   try {
-    const result = await executeSemanticEdges(projectDb, { limit });
+    const result = await executeSemanticEdges(projectDb, { limit, lockDir: getLockDir(cwd) });
 
     if (!result.ok) {
       return { success: false, error: result.error };
@@ -848,17 +898,41 @@ async function handleLoadSurface(args: string[]): Promise<CommandResult> {
   try {
     const result = loadCachedSurface(cwd, getSurfaceCacheDir(cwd));
 
-    if (result !== null) {
+    if (result !== null && !result.staleness.stale) {
       // Write cached surface to .claude/cortex-memory.local.md
       const outputPath = getSurfaceOutputPath(cwd);
       mkdirSync(dirname(outputPath), { recursive: true });
       writeFileSync(outputPath, wrapInMarkers(result.surface), 'utf8');
+      return { success: true, output: 'Loaded cached surface' };
     }
 
-    return {
-      success: true,
-      output: result !== null ? 'Loaded cached surface' : 'No cached surface available',
-    };
+    // Cache miss or stale: regenerate from the database — but only for
+    // projects that already use cortex. This hook runs at SessionStart in
+    // EVERY project; creating .memory/DBs in untouched projects is not ok.
+    if (!existsSync(getProjectDbPath(cwd))) {
+      return { success: true, output: 'No cached surface available' };
+    }
+
+    const [projectDb, globalDb] = initDatabases(cwd);
+    try {
+      runGenerate({
+        projectDb,
+        globalDb,
+        cwd,
+        surfacePath: getSurfaceOutputPath(cwd),
+        cachePath: getSurfaceCacheDir(cwd),
+        lockDir: getLockDir(cwd),
+      });
+      return {
+        success: true,
+        output: result === null
+          ? 'Regenerated surface (cache miss)'
+          : `Regenerated surface (cache stale: ${result.staleness.age_hours.toFixed(1)}h old)`,
+      };
+    } finally {
+      projectDb.close();
+      globalDb.close();
+    }
   } catch (err) {
     return {
       success: false,
@@ -976,6 +1050,7 @@ async function handlePromptRecall(): Promise<CommandResult> {
         prompt,
         surfaceContent,
         geminiApiKey: getGeminiApiKey(),
+        projectName: getProjectName(cwd),
       });
       const output = formatPromptRecall(memories);
 
@@ -1078,15 +1153,9 @@ async function main() {
     };
   }
 
-  // Safety: close DBs on uncaught exceptions to prevent WAL corruption
-  process.on('uncaughtException', (err) => {
-    logError(`Uncaught exception: ${err}`);
-    process.exit(1);
-  });
-
   // Output result
   if (result.output) {
-    console.log(result.output);
+    process.stdout.write(result.output + '\n');
   }
 
   // Dispose ONNX model resources before exit

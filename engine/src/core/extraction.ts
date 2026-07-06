@@ -23,13 +23,18 @@ export interface TruncationResult {
  * Truncates transcript to maxBytes while preserving JSONL line boundaries.
  * Returns truncated content and new cursor position for resumable extraction.
  *
+ * The cursor is a CHARACTER offset into `content` (it is consumed via
+ * `content.slice(cursor)`). All branches must advance it in characters —
+ * mixing in byte counts overshoots on multi-byte UTF-8 transcripts,
+ * silently skipping content and resuming mid-JSONL-line.
+ *
  * FR-004: Track cursor position for resumable extraction
  * FR-012: Transcript size threshold 100KB for resumable extraction
  *
  * @param content - JSONL transcript content
  * @param maxBytes - Maximum size in bytes (default 100KB per FR-012)
- * @param cursor - Optional starting position for resuming extraction
- * @returns Truncated content and new cursor position
+ * @param cursor - Optional starting position for resuming extraction (characters)
+ * @returns Truncated content and new cursor position (characters)
  */
 export function truncateTranscript(
   content: string,
@@ -48,36 +53,47 @@ export function truncateTranscript(
     };
   }
 
-  // Find the last complete line within maxBytes
-  // Truncate to maxBytes first, then find last newline
-  const truncatedBuffer = Buffer.from(remainingContent, "utf8").slice(
-    0,
-    maxBytes
-  );
-  const truncatedStr = truncatedBuffer.toString("utf8");
+  // Binary search the largest CHARACTER prefix whose UTF-8 size fits maxBytes.
+  let lo = 0;
+  let hi = remainingContent.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (Buffer.byteLength(remainingContent.slice(0, mid), "utf8") <= maxBytes) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  // Never split a surrogate pair (a lone high surrogate would encode as U+FFFD)
+  let charLimit = lo;
+  const lastCode = remainingContent.charCodeAt(charLimit - 1);
+  if (charLimit > 0 && lastCode >= 0xd800 && lastCode <= 0xdbff) {
+    charLimit--;
+  }
+
+  const window = remainingContent.slice(0, charLimit);
 
   // Find last newline to preserve JSONL boundary
-  const lastNewline = truncatedStr.lastIndexOf("\n");
+  const lastNewline = window.lastIndexOf("\n");
 
   if (lastNewline === -1) {
     // Single JSONL line exceeds maxBytes (common with large tool outputs).
     // Returning empty + unchanged cursor causes a permanent silent skip:
     // every subsequent run finds the same oversized first line and bails.
-    // Fall back to the raw byte slice — Claude tolerates partial JSONL —
-    // and advance cursor by the bytes consumed so progress is guaranteed.
+    // Fall back to the raw window — Claude tolerates partial JSONL —
+    // and advance cursor by the characters consumed so progress is guaranteed.
     return {
-      truncated: truncatedStr,
-      newCursor: cursor + truncatedBuffer.length,
+      truncated: window,
+      newCursor: cursor + window.length,
     };
   }
 
   // Include the newline character
-  const result = truncatedStr.slice(0, lastNewline + 1);
-  const bytesConsumed = Buffer.byteLength(result, "utf8");
+  const result = window.slice(0, lastNewline + 1);
 
   return {
     truncated: result,
-    newCursor: cursor + bytesConsumed,
+    newCursor: cursor + result.length,
   };
 }
 

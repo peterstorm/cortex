@@ -37,88 +37,61 @@ bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts inspect <cwd>
 /inspect
 ```
 
-## Output Sections
+## Output
 
-### Memory Counts
-- **Active:** Memories in search/surface rotation
-- **Archived:** Memories hidden from search (via `/forget` or lifecycle)
-- **Pruned:** Deleted memories (lifecycle cleanup)
-- **Total:** Sum of all statuses
+JSON printed to stdout with these fields (combined across project + global DBs):
 
-Breakdown by:
-- Scope (project vs. global)
-- Type (architecture, decision, pattern, gotcha, etc.)
-- Pinned (decay-immune memories)
+### `memory_counts`
+- **total:** Number of *active* memories across both databases
+- **by_type:** Active count per memory type (architecture, decision, pattern, gotcha, context, progress, code_description, code)
+- **by_scope:** Active count per scope (project vs. global)
 
-### Embedding Status
-- **With voyage embeddings:** Memories embedded by Voyage AI
-- **With local embeddings:** Memories with fallback embeddings
-- **Pending queue:** Memories awaiting embedding
-- **No embeddings:** Memories skipped (code type, or embedding failed)
+### `edge_count`
+Total number of edges across both databases.
 
-### Extraction Stats
-- **Extraction count:** Total extraction sessions
-- **Last extraction:** Timestamp of most recent extraction
-- **Cursor position:** Progress through last transcript
-- **Avg memories per extraction:** Trend over time
+### `embedding_queue_size`
+Active memories with no embedding yet (neither Gemini nor local) — the backfill queue.
 
-### Graph Metrics
-- **Total edges:** Count of memory relationships
-- **Edge types:** Breakdown (relates_to, derived_from, contradicts, etc.)
-- **Suggested edges:** Auto-detected but unconfirmed
-- **Avg centrality:** Mean in-degree across memories
+### `cache_staleness`
+- **exists:** Whether the surface cache directory exists
+- **age_hours:** Age of the most recent cache file (>24h means the surface will regenerate at next session start)
 
-### Surface Cache
-- **Cached branches:** List of branches with cached surfaces
-- **Cache age:** Time since last generation
-- **Staleness warnings:** Caches >24h old
-
-### Lifecycle Health
-- **Last lifecycle run:** When decay/archival last executed
-- **Archived this run:** Count from last lifecycle
-- **Pruned this run:** Count from last lifecycle
-- **Avg confidence:** Mean confidence score (indicates decay health)
+### `last_extraction` (if present)
+Status (`success`/`failure`), timestamp, and error message of the last recorded extraction, read from `.memory/telemetry.json`.
 
 ## Interpreting Results
 
 ### Healthy System
 - Active memories: 20-80 (not too sparse, not too cluttered)
-- Pending embeddings: <10 (queue processing keeps up)
-- Avg confidence: >0.6 (memories are fresh and useful)
+- Embedding queue: <10 (backfill keeps up)
 - Cache age: <24h (surfaces stay current)
+- Edge count growing over time (graph is forming)
 
 ### Warning Signs
-- Active memories: >100 (run `/consolidate` to merge duplicates)
-- Pending embeddings: >50 (run `/backfill` to process queue)
-- Avg confidence: <0.4 (memories decaying, may need archival)
-- No edges: Graph isn't forming (extraction may be failing)
+- Active memories: >100 (run `/consolidate` or `/prune`)
+- Embedding queue: >50 (run `backfill` to process queue)
+- Edge count 0 with many memories (extraction/edge creation may be failing)
 
 ### Critical Issues
 - Active memories: 0 (extraction pipeline broken)
-- All memories: 0 (database corrupted or wrong path)
-- Avg confidence: 0 (lifecycle misconfigured)
+- Cache doesn't exist after sessions ended (generate step failing — check `/tmp/cortex-generate.log`)
 
 ## When to Use
 
 **Diagnostic scenarios:**
 - `/recall` returns nothing → check active memory count
 - Push surface empty → check cache age, memory counts
-- Slow searches → check pending embedding queue
-- Duplicate results → check consolidation metrics
+- Slow searches → check embedding queue size
+- Duplicate results → check total count, then run `/consolidate`
 
 **Verification scenarios:**
-- After `/consolidate` → verify similar pairs reduced
-- After `/forget` → verify archived count increased
-- After extraction → verify extraction count incremented
-- After backfill → verify pending queue cleared
-
-## Output Format
-
-Human-readable formatted text with sections, counts, and timestamps. Also writes detailed JSON to telemetry log file for programmatic analysis.
+- After `/consolidate` → verify active count dropped (merged pairs superseded)
+- After extraction → verify counts grew / `last_extraction` updated
+- After backfill → verify embedding queue cleared
 
 ## Integration with Other Skills
 
 - Before `/recall`, check active count to estimate result quality
 - After `/consolidate`, verify duplicate reduction
 - Before `/remember`, check if memory already exists
-- After lifecycle, verify archival/prune counts are reasonable
+- After lifecycle, verify counts moved in the expected direction

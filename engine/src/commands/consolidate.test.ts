@@ -185,6 +185,51 @@ describe('findSimilarPairs', () => {
   });
 });
 
+describe('findSimilarPairs - embedding type selection', () => {
+  // Two orthogonal-vocabulary memories: Jaccard ~0, so any similarity above
+  // threshold must come from a cosine comparison.
+  const contentA = { content: 'alpha bravo charlie delta', summary: 'alpha bravo' };
+  const contentB = { content: 'echo foxtrot golf hotel', summary: 'echo foxtrot' };
+
+  test('falls back to local-local when gemini embeddings are not on both sides', () => {
+    // A has gemini + local; B has local only. Naive per-memory selection
+    // would pair 3d-gemini vs 3d-local... use different dims to be strict:
+    const memoryA = createTestMemory({
+      ...contentA,
+      embedding: new Float64Array([1, 0, 0, 0]),          // 4d gemini
+      local_embedding: new Float32Array([1, 0, 0]),       // 3d local
+    });
+    const memoryB = createTestMemory({
+      ...contentB,
+      embedding: null,
+      local_embedding: new Float32Array([1, 0, 0]),       // identical local vector
+    });
+
+    const pairs = findSimilarPairs([memoryA, memoryB], 0.9);
+    // Identical local vectors → cosine 1.0. Cross-type selection would have
+    // hit a dimension mismatch and fallen back to Jaccard (~0, no pair).
+    expect(pairs.length).toBe(1);
+    expect(pairs[0].similarity).toBeCloseTo(1.0);
+  });
+
+  test('uses gemini-gemini when both sides have gemini embeddings', () => {
+    const memoryA = createTestMemory({
+      ...contentA,
+      embedding: new Float64Array([0, 1, 0]),
+      local_embedding: new Float32Array([1, 0, 0]),
+    });
+    const memoryB = createTestMemory({
+      ...contentB,
+      embedding: new Float64Array([0, 1, 0]),
+      local_embedding: new Float32Array([0, 1, 0]), // orthogonal local — must not be used
+    });
+
+    const pairs = findSimilarPairs([memoryA, memoryB], 0.9);
+    expect(pairs.length).toBe(1);
+    expect(pairs[0].similarity).toBeCloseTo(1.0);
+  });
+});
+
 describe('formatPairForReview', () => {
   test('formats pair with all relevant information', () => {
     const memoryA = createTestMemory({
@@ -339,7 +384,9 @@ describe('buildMergedMemory', () => {
     expect(merged.scope).toBe('project');
   });
 
-  test('prefers gemini embedding over local', () => {
+  test('nulls embeddings so backfill re-embeds the merged content', () => {
+    // Merged content is new text — carrying over either source embedding
+    // would leave a stale vector that backfill (null-only) never repairs.
     const geminiEmbedding = new Float64Array([0.1, 0.2, 0.3]);
     const localEmbedding = new Float32Array([0.4, 0.5, 0.6]);
 
@@ -368,8 +415,8 @@ describe('buildMergedMemory', () => {
       '2026-01-01T00:00:00.000Z'
     );
 
-    expect(merged.embedding).toEqual(geminiEmbedding);
-    expect(merged.local_embedding).toEqual(localEmbedding);
+    expect(merged.embedding).toBeNull();
+    expect(merged.local_embedding).toBeNull();
   });
 
   test('sets confidence to 1.0 for human-approved merge', () => {
@@ -605,6 +652,26 @@ describe('mergePair', () => {
 
     expect(updatedA!.status).toBe('superseded');
     expect(updatedB!.status).toBe('superseded');
+  });
+
+  test('rejects merging a pair whose member is no longer active', () => {
+    // Pairs come from a snapshot — a member superseded by an earlier merge
+    // in the same review session must not be merged again.
+    const memoryA = createTestMemory({ id: 'mem-a', status: 'superseded' });
+    const memoryB = createTestMemory({ id: 'mem-b' });
+
+    insertMemory(db, memoryA);
+    insertMemory(db, memoryB);
+
+    const pair: MemoryPair = { memoryA, memoryB, similarity: 0.9 };
+
+    expect(() =>
+      mergePair(db, pair, 'Merged summary', 'Merged content', 'test-session')
+    ).toThrow(/mem-a.*superseded/);
+
+    // No side effects: B untouched, no supersedes edges created
+    expect(getMemory(db, 'mem-b')!.status).toBe('active');
+    expect(getAllEdges(db).filter((e) => e.relation_type === 'supersedes').length).toBe(0);
   });
 });
 

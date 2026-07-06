@@ -55,12 +55,25 @@ export function findSimilarPairs(
 
   // Pre-tokenize all memories once (summary+content) to avoid O(n^2) re-tokenization
   const tokenSets = memories.map(m => tokenize(`${m.summary} ${m.content}`));
-  const embeddings = memories.map(m => m.embedding ?? m.local_embedding);
+
+  // Per pair, compare within a common embedding space: gemini-gemini if both
+  // have one, else local-local, else no embeddings (Jaccard fallback).
+  // Picking `embedding ?? local_embedding` per memory independently would
+  // produce cross-type pairs (768d vs 384d) that always fall back to Jaccard.
+  const commonEmbeddings = (
+    a: Memory,
+    b: Memory
+  ): [Float64Array | Float32Array | null, Float64Array | Float32Array | null] => {
+    if (a.embedding && b.embedding) return [a.embedding, b.embedding];
+    if (a.local_embedding && b.local_embedding) return [a.local_embedding, b.local_embedding];
+    return [null, null];
+  };
 
   // Compare each pair exactly once (i < j ensures no duplicates)
   for (let i = 0; i < memories.length; i++) {
     for (let j = i + 1; j < memories.length; j++) {
-      const similarity = hybridSimilarity(tokenSets[i], tokenSets[j], embeddings[i], embeddings[j]);
+      const [embA, embB] = commonEmbeddings(memories[i], memories[j]);
+      const similarity = hybridSimilarity(tokenSets[i], tokenSets[j], embA, embB);
 
       if (similarity >= threshold) {
         pairs.push({ memoryA: memories[i], memoryB: memories[j], similarity });
@@ -110,7 +123,9 @@ Memory B (ID: ${pair.memoryB.id})
  * - Use higher priority of the two
  * - Preserve pinned flag if either is pinned
  * - Combine tags (deduplicated)
- * - Prefer voyage embedding over local if available
+ * - Embeddings start null: merged content is new text, so carrying over an
+ *   old embedding would make future recall/dedup rank against stale vectors.
+ *   Backfill (which fills null embeddings) re-embeds at next opportunity.
  * - Use provided merged summary and content
  * - Set scope to 'global' if either is global, else 'project'
  *
@@ -138,10 +153,6 @@ export function buildMergedMemory(
   // Combine and deduplicate tags
   const combinedTags = Array.from(new Set([...memoryA.tags, ...memoryB.tags]));
 
-  // Prefer gemini embedding from either memory
-  const embedding = memoryA.embedding ?? memoryB.embedding ?? null;
-  const local_embedding = memoryA.local_embedding ?? memoryB.local_embedding ?? null;
-
   // Use memory type from higher-priority memory
   const memory_type = memoryA.priority >= memoryB.priority ? memoryA.memory_type : memoryB.memory_type;
 
@@ -158,8 +169,8 @@ export function buildMergedMemory(
     summary: mergedSummary,
     memory_type,
     scope,
-    embedding,
-    local_embedding,
+    embedding: null,
+    local_embedding: null,
     confidence: 1.0, // Merged memories have full confidence (human-approved)
     priority,
     pinned,
@@ -248,6 +259,17 @@ export function mergePair(
   mergedContent: string,
   sessionId: string
 ): string {
+  // Guard: pair members must still be active. Pairs come from a snapshot;
+  // a memory already superseded by an earlier merge in the same review
+  // session must not be merged again.
+  for (const member of [pair.memoryA, pair.memoryB]) {
+    if (member.status !== 'active') {
+      throw new Error(
+        `Cannot merge: memory ${member.id} has status '${member.status}' (expected 'active')`
+      );
+    }
+  }
+
   // Pure: Build merged memory (id + timestamp from I/O boundary)
   const mergedMemory = buildMergedMemory(
     pair, mergedSummary, mergedContent, sessionId,

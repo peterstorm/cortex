@@ -89,5 +89,5 @@ Returns code memory ID and confirms prose-code link. Code becomes discoverable v
 ## Integration with Other Skills
 
 - Use `/recall` to find prose descriptions of code
-- Use `/traverse` to explore code relationships via edges
+- Use the traverse CLI to explore code relationships via edges: `bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts traverse <cwd> <memoryId> [maxDepth]`
 - Use `/forget` to archive if code is refactored away

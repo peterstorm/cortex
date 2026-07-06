@@ -101,7 +101,8 @@ export interface ExtractionResult {
  */
 export async function executeExtract(
   input: HookInput,
-  projectDb: Database
+  projectDb: Database,
+  globalDb: Database | null = null
 ): Promise<ExtractionResult> {
   try {
     // Validate Claude CLI availability
@@ -176,17 +177,14 @@ export async function executeExtract(
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logError(`Claude extraction failed: ${message}`);
-      // Save checkpoint at newCursor to advance past failed chunk (no retry)
-      saveExtractionCheckpoint(projectDb, {
-        session_id: input.session_id,
-        cursor_position: newCursor,
-        extracted_at: new Date().toISOString(),
-      });
+      // Leave the cursor where it was: a transient LLM failure (timeout,
+      // rate limit) must not permanently discard up to 100KB of transcript.
+      // The next extract run for this session retries the same chunk.
       return {
         success: false,
         extracted_count: 0,
         edge_count: 0,
-        cursor_position: newCursor,
+        cursor_position: cursorStart,
         error: `Claude extraction failed: ${message}`,
       };
     }
@@ -219,23 +217,44 @@ export async function executeExtract(
     // Non-fatal: if embedding fails, dedup falls back to Jaccard-only
     const candidateEmbeddings = await generateCandidateEmbeddings(candidates, projectName);
 
-    // Pure: Dedup candidates against existing memories (hybrid Jaccard + cosine)
-    const { kept: dedupedCandidates, skipped: dedupSkipped, merges: dedupMerges } =
-      deduplicateCandidates(candidates, existingMemories, DEDUP_SIMILARITY_THRESHOLD, candidateEmbeddings, MERGE_CEILING_THRESHOLD);
+    // Route by scope (FR-008): global-scoped candidates go to the global DB
+    // so they're visible from other projects; without this the scope
+    // classification is dead weight. Falls back to project when no global
+    // DB was provided (tests, legacy callers).
+    const projectCandidates: MemoryCandidate[] = [];
+    const projectEmbeddings = new Map<number, Float32Array>();
+    const globalCandidates: MemoryCandidate[] = [];
+    const globalEmbeddings = new Map<number, Float32Array>();
 
-    if (dedupSkipped > 0) {
-      logInfo(`Dedup: skipped ${dedupSkipped} near-duplicate candidates (hybrid)`);
-    }
+    candidates.forEach((candidate, i) => {
+      const embedding = candidateEmbeddings.get(i);
+      if (globalDb && candidate.scope === 'global') {
+        if (embedding) globalEmbeddings.set(globalCandidates.length, embedding);
+        globalCandidates.push(candidate);
+      } else {
+        if (embedding) projectEmbeddings.set(projectCandidates.length, embedding);
+        projectCandidates.push(candidate);
+      }
+    });
 
-    // Process merges: append new content to existing memories
-    if (dedupMerges.length > 0) {
-      logInfo(`Dedup: merging ${dedupMerges.length} candidates into existing memories`);
-      for (const merge of dedupMerges) {
+    // Dedup + merge + insert one scope's candidates against one DB
+    const processScope = (
+      db: Database,
+      scopedCandidates: readonly MemoryCandidate[],
+      scopedEmbeddings: Map<number, Float32Array>,
+      existing: readonly Memory[]
+    ): { inserted: Memory[]; skipped: number; merged: number } => {
+      const { kept, skipped, merges } = deduplicateCandidates(
+        scopedCandidates, existing, DEDUP_SIMILARITY_THRESHOLD, scopedEmbeddings, MERGE_CEILING_THRESHOLD
+      );
+
+      // Process merges: append new content to existing memories
+      for (const merge of merges) {
         try {
-          const existing = getMemory(projectDb, merge.existingMemoryId);
-          if (!existing) continue;
-          updateMemory(projectDb, merge.existingMemoryId, {
-            content: `${existing.content}\n---\n${merge.candidate.content}`,
+          const existingMem = getMemory(db, merge.existingMemoryId);
+          if (!existingMem) continue;
+          updateMemory(db, merge.existingMemoryId, {
+            content: `${existingMem.content}\n---\n${merge.candidate.content}`,
             // Null out embeddings so backfill regenerates with updated content
             embedding: null,
             local_embedding: null,
@@ -245,24 +264,48 @@ export async function executeExtract(
           logError(`Failed to merge into ${merge.existingMemoryId}: ${message}`);
         }
       }
+
+      // Process each candidate — individual insert failures are non-fatal.
+      // Intentional: we continue inserting remaining candidates even if one
+      // fails, because partial extraction is better than none (FR-010).
+      const inserted: Memory[] = [];
+      for (const candidate of kept) {
+        try {
+          const candidateIndex = scopedCandidates.indexOf(candidate);
+          const localEmbedding = scopedEmbeddings.get(candidateIndex) ?? null;
+          const memory = candidateToMemory(candidate, input.session_id, gitContext, localEmbedding);
+          insertMemory(db, memory);
+          inserted.push(memory);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          logError(`Failed to insert memory: ${message}`);
+        }
+      }
+
+      return { inserted, skipped, merged: merges.length };
+    };
+
+    const projectResult = processScope(projectDb, projectCandidates, projectEmbeddings, existingMemories);
+    const globalResult = globalDb && globalCandidates.length > 0
+      ? processScope(globalDb, globalCandidates, globalEmbeddings, getActiveMemories(globalDb))
+      : { inserted: [] as Memory[], skipped: 0, merged: 0 };
+
+    if (globalResult.inserted.length > 0) {
+      logInfo(`Routed ${globalResult.inserted.length} global-scoped memories to global DB`);
     }
 
-    // Process each candidate — individual insert failures are non-fatal.
-    // Intentional: we continue inserting remaining candidates even if one fails,
-    // because partial extraction is better than none (FR-010).
-    const insertedMemories: Memory[] = [];
-    for (const candidate of dedupedCandidates) {
-      try {
-        const candidateIndex = candidates.indexOf(candidate);
-        const localEmbedding = candidateEmbeddings.get(candidateIndex) ?? null;
-        const memory = candidateToMemory(candidate, input.session_id, gitContext, localEmbedding);
-        insertMemory(projectDb, memory);
-        insertedMemories.push(memory);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        logError(`Failed to insert memory: ${message}`);
-      }
+    const dedupSkipped = projectResult.skipped + globalResult.skipped;
+    const dedupMergedCount = projectResult.merged + globalResult.merged;
+    if (dedupSkipped > 0) {
+      logInfo(`Dedup: skipped ${dedupSkipped} near-duplicate candidates (hybrid)`);
     }
+    if (dedupMergedCount > 0) {
+      logInfo(`Dedup: merged ${dedupMergedCount} candidates into existing memories`);
+    }
+
+    // Edges and entity facts stay project-DB-only: edges/facts have FK
+    // constraints into the same database, so cross-DB links are impossible.
+    const insertedMemories: Memory[] = projectResult.inserted;
 
     // Compute similarity and create edges (FR-061)
     let edgeCount = 0;
@@ -317,7 +360,8 @@ export async function executeExtract(
     }
 
     // I/O: Invalidate surface cache since new memories were extracted (FR-022)
-    if (insertedMemories.length > 0) {
+    const totalInserted = projectResult.inserted.length + globalResult.inserted.length;
+    if (totalInserted > 0) {
       try {
         invalidateSurfaceCache(input.cwd);
       } catch (err) {
@@ -329,11 +373,11 @@ export async function executeExtract(
 
     return {
       success: true,
-      extracted_count: insertedMemories.length,
+      extracted_count: totalInserted,
       edge_count: edgeCount,
       cursor_position: newCursor,
       dedup_skipped: dedupSkipped > 0 ? dedupSkipped : undefined,
-      dedup_merged: dedupMerges.length > 0 ? dedupMerges.length : undefined,
+      dedup_merged: dedupMergedCount > 0 ? dedupMergedCount : undefined,
       entity_conflicts: entityConflicts.length > 0 ? entityConflicts : undefined,
     };
   } catch (err) {
