@@ -104,15 +104,15 @@ export async function executeExtract(
   projectDb: Database
 ): Promise<ExtractionResult> {
   try {
-    // Validate Claude CLI availability
+    // Validate extraction LLM CLI availability
     if (!isClaudeLlmAvailable()) {
-      logInfo('Claude CLI not found on PATH — extraction skipped');
+      logInfo('Extraction LLM CLI not found on PATH — extraction skipped');
       return {
         success: false,
         extracted_count: 0,
         edge_count: 0,
         cursor_position: 0,
-        error: 'Claude CLI not available',
+        error: 'Extraction LLM CLI not available',
       };
     }
 
@@ -168,14 +168,14 @@ export async function executeExtract(
     // Pure: Build extraction prompt (with entity context)
     const prompt = buildExtractionPrompt(truncated, gitContext, projectName, knownEntityProfiles);
 
-    // I/O: Call Claude CLI for extraction (async)
-    logInfo('Using Claude for memory extraction');
+    // I/O: Call the configured LLM CLI for extraction (async)
+    logInfo('Using configured LLM for memory extraction');
     let response: string;
     try {
       response = await extractMemories(prompt);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      logError(`Claude extraction failed: ${message}`);
+      logError(`Memory extraction failed: ${message}`);
       // Save checkpoint at newCursor to advance past failed chunk (no retry)
       saveExtractionCheckpoint(projectDb, {
         session_id: input.session_id,
@@ -187,7 +187,7 @@ export async function executeExtract(
         extracted_count: 0,
         edge_count: 0,
         cursor_position: newCursor,
-        error: `Claude extraction failed: ${message}`,
+        error: `Memory extraction failed: ${message}`,
       };
     }
 

@@ -5,9 +5,67 @@
 import { describe, it, expect } from 'vitest';
 import {
   buildEdgeClassificationPrompt,
+  buildLlmInvocation,
   parseEdgeClassificationResponse,
   type MemoryPair,
 } from './claude-llm.js';
+
+describe('buildLlmInvocation', () => {
+  it('uses the cheap supported Codex model for an active Codex session', () => {
+    const invocation = buildLlmInvocation({
+      PI_CODING_AGENT: 'true',
+      CORTEX_PI_PROVIDER: 'openai-codex',
+      CORTEX_PI_MODEL: 'gpt-5.6-terra',
+    });
+
+    expect(invocation).toEqual({
+      binary: 'pi',
+      args: ['pi', '-p', '--provider', 'openai-codex', '--model', 'gpt-5.4-mini', '--no-session'],
+      provider: 'openai-codex',
+      model: 'gpt-5.4-mini',
+    });
+  });
+
+  it('lets explicit extraction settings override automatic Pi selection', () => {
+    const invocation = buildLlmInvocation({
+      PI_CODING_AGENT: 'true',
+      CORTEX_PI_PROVIDER: 'openai-codex',
+      CORTEX_LLM_PROVIDER: 'google',
+      CORTEX_LLM_MODEL: 'gemini-2.5-flash-lite',
+    });
+
+    expect(invocation).toEqual({
+      binary: 'pi',
+      args: ['pi', '-p', '--provider', 'google', '--model', 'gemini-2.5-flash-lite', '--no-session'],
+      provider: 'google',
+      model: 'gemini-2.5-flash-lite',
+    });
+  });
+
+  it('reuses the active model for a custom provider rather than guessing an invalid model', () => {
+    const invocation = buildLlmInvocation({
+      PI_CODING_AGENT: 'true',
+      CORTEX_PI_PROVIDER: 'company-proxy',
+      CORTEX_PI_MODEL: 'memory-fast-v2',
+    });
+
+    expect(invocation).toEqual({
+      binary: 'pi',
+      args: ['pi', '-p', '--provider', 'company-proxy', '--model', 'memory-fast-v2', '--no-session'],
+      provider: 'company-proxy',
+      model: 'memory-fast-v2',
+    });
+  });
+
+  it('retains Haiku extraction for Claude Code', () => {
+    const invocation = buildLlmInvocation({});
+
+    expect(invocation).toEqual({
+      binary: 'claude',
+      args: ['claude', '-p', '--model', 'haiku', '--output-format', 'text'],
+    });
+  });
+});
 
 describe('buildEdgeClassificationPrompt', () => {
   it('builds prompt with pair descriptions', () => {

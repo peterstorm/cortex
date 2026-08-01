@@ -20,6 +20,7 @@ function runCli(args: string[], options?: {
   stdin?: string;
   timeout?: number;
   cwd?: string;
+  env?: NodeJS.ProcessEnv;
 }): string {
   try {
     const input = options?.stdin ?? "";
@@ -31,6 +32,7 @@ function runCli(args: string[], options?: {
       env: {
         ...process.env,
         CORTEX_PLUGIN_ROOT: PACKAGE_ROOT,
+        ...options?.env,
       },
     }).trim();
   } catch (e) {
@@ -47,6 +49,7 @@ function runCli(args: string[], options?: {
 function runCliDetached(args: string[], options?: {
   stdin?: string;
   cwd?: string;
+  env?: NodeJS.ProcessEnv;
 }): void {
   try {
     const proc = spawn("bun", [CLI_PATH, ...args], {
@@ -56,6 +59,7 @@ function runCliDetached(args: string[], options?: {
       env: {
         ...process.env,
         CORTEX_PLUGIN_ROOT: PACKAGE_ROOT,
+        ...options?.env,
       },
     });
     if (options?.stdin && proc.stdin) {
@@ -69,6 +73,21 @@ function runCliDetached(args: string[], options?: {
 /** Get the surface file path for current project */
 function getSurfacePath(cwd: string): string {
   return join(cwd, ".pi", "cortex-memory.local.md");
+}
+
+type PiModelSelection = Readonly<{
+  provider: string;
+  id: string;
+}>;
+
+/** Pass the active Pi model to engine subprocesses without mutating global env. */
+function getCortexLlmEnvironment(model: PiModelSelection | undefined): NodeJS.ProcessEnv {
+  return model
+    ? {
+      CORTEX_PI_PROVIDER: model.provider,
+      CORTEX_PI_MODEL: model.id,
+    }
+    : {};
 }
 
 /** Source Gemini API key if available */
@@ -87,6 +106,12 @@ function loadGeminiEnv(): void {
 
 export default function (pi: ExtensionAPI) {
   loadGeminiEnv();
+
+  // Session shutdown can invalidate SessionManager's file reference. Retain
+  // immutable session metadata from session_start for transcript extraction.
+  let sessionFile: string | undefined;
+  let sessionId: string | undefined;
+  let activeModel: PiModelSelection | undefined;
 
   // ─── Before Agent Start: Resolve paths + inject memory surface + prompt recall
   pi.on("before_agent_start", async (event, ctx) => {
@@ -132,31 +157,52 @@ export default function (pi: ExtensionAPI) {
 
   // ─── Session Start: Load cached surface ─────────────────────────────
   pi.on("session_start", async (_event, ctx) => {
+    sessionFile = ctx.sessionManager.getSessionFile();
+    sessionId = ctx.sessionManager.getSessionId();
+    activeModel = ctx.model
+      ? { provider: ctx.model.provider, id: ctx.model.id }
+      : undefined;
+
     const cwd = ctx.cwd;
     runCli(["load-surface", cwd], { timeout: 10_000, cwd });
   });
 
+  pi.on("model_select", async (event) => {
+    activeModel = { provider: event.model.provider, id: event.model.id };
+  });
+
   // ─── Session End: Extract + generate + lifecycle ────────────────────
   pi.on("session_shutdown", async (event, ctx) => {
-    // Guard: don't extract on reload
-    if (event.reason === "reload") return;
+    // A nested `pi -p` extraction inherits this marker. Never let that child
+    // invoke Cortex's shutdown pipeline again (or emit a second empty-path error).
+    if (event.reason === "reload" || process.env.CORTEX_EXTRACTING === "1") return;
 
     const cwd = ctx.cwd;
-    const sessionFile = ctx.sessionManager.getSessionFile();
+    const transcriptPath = ctx.sessionManager.getSessionFile() ?? sessionFile;
+    const extractionSessionId = ctx.sessionManager.getSessionId() ?? sessionId ?? "unknown";
+    const llmEnv = getCortexLlmEnvironment(
+      ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : activeModel,
+    );
 
-    // Build stdin JSON matching what the Claude Code hook expects
-    const hookInput = JSON.stringify({
-      session_id: ctx.sessionManager.getSessionId() ?? "unknown",
-      transcript_path: sessionFile ?? "",
-      cwd,
-    });
-
-    // Step 1: Extract memories from session transcript
-    const extractResult = runCli(["extract"], {
-      stdin: hookInput,
-      timeout: 60_000,
-      cwd,
-    });
+    // Persistent sessions have a JSONL transcript. In-memory/ephemeral Pi
+    // sessions do not, so skip only extraction rather than passing an empty
+    // path through to the engine and producing an ENOENT error.
+    let extractResult = "";
+    if (transcriptPath && existsSync(transcriptPath)) {
+      const hookInput = JSON.stringify({
+        session_id: extractionSessionId,
+        transcript_path: transcriptPath,
+        cwd,
+      });
+      extractResult = runCli(["extract"], {
+        stdin: hookInput,
+        timeout: 60_000,
+        cwd,
+        env: llmEnv,
+      });
+    } else {
+      process.stderr.write("[cortex] No persisted Pi session transcript; extraction skipped\n");
+    }
 
     // Step 2: Backfill embeddings
     if (extractResult) {
@@ -164,7 +210,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Step 3: Semantic edges (fire-and-forget)
-    runCliDetached(["semantic-edges", cwd], { cwd });
+    runCliDetached(["semantic-edges", cwd], { cwd, env: llmEnv });
 
     // Step 4: Generate push surface
     runCli(["generate", cwd], { timeout: 30_000, cwd });

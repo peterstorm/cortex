@@ -138,7 +138,7 @@ export async function executeSemanticEdges(
 
   try {
     if (!isClaudeLlmAvailable()) {
-      return { ok: false, error: 'Claude CLI not found on PATH' };
+      return { ok: false, error: 'Extraction LLM CLI not found on PATH' };
     }
 
     // Step 1: Get relates_to edges (optionally limited)

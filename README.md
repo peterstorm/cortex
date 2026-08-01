@@ -39,7 +39,7 @@ Seven slash commands let you interact with memory directly: `/remember`, `/recal
 
 A `SessionEnd` hook orchestrates a multi-step pipeline:
 
-1. **Extract** — Read the session transcript (JSONL), truncate if >100KB (resumable via cursor checkpoints), add git context (branch, commits, changed files), and pipe to Claude CLI (`claude -p --model haiku`) for memory extraction
+1. **Extract** — Read the session transcript (JSONL), truncate if >100KB (resumable via cursor checkpoints), add git context (branch, commits, changed files), and invoke the configured extraction LLM. Claude Code uses Claude Haiku; Pi uses an inexpensive model authenticated for the active provider (for Codex: `openai-codex/gpt-5.4-mini`).
 2. **Backfill** — Compute embeddings for newly extracted memories (Gemini API, or local HuggingFace fallback)
 3. **Semantic Edges** — Fire-and-forget: classify Jaccard-created `relates_to` edges into typed relationships
 4. **Generate** — Rebuild the surface file for the next session
@@ -181,7 +181,7 @@ A memory is stored globally only if the LLM assigns confidence > 0.8 AND scope =
 
 | Service | Purpose | Required |
 |---|---|---|
-| Claude CLI (`claude -p`) | Memory extraction, AI pruning, edge classification | Yes (uses your Anthropic subscription) |
+| Extraction LLM CLI (`claude -p` or `pi -p`) | Memory extraction and edge classification | Yes (uses the active Claude or Pi provider authentication) |
 | Gemini Embedding-001 | Semantic embeddings (768-dim) | No (falls back to local) |
 | Gemini 2.5 Flash | Edge type classification | No (edges stay as `relates_to`) |
 | HuggingFace Transformers | Local embedding fallback (BGE-small-en-v1.5, 384-dim) | Bundled |
@@ -378,8 +378,10 @@ Periodically (every 5 sessions or when memory count exceeds 50), Claude evaluate
 |---|---|---|
 | `GEMINI_API_KEY` | Embeddings + semantic search | No (falls back to keyword search + local embeddings) |
 | `CLAUDE_PLUGIN_ROOT` | Plugin directory | Auto-set by Claude Code |
+| `CORTEX_LLM_PROVIDER` | Override the extraction provider in Pi | No |
+| `CORTEX_LLM_MODEL` | Override the extraction model in Pi | No |
 
-Extraction uses `claude -p` (Claude CLI) — no separate API key needed, uses your Anthropic subscription.
+Claude Code extraction uses `claude -p --model haiku`. In Pi, Cortex receives the active session's provider and automatically chooses a low-cost compatible extraction model — `openai-codex/gpt-5.4-mini` for Codex. Custom or unrecognised Pi providers reuse the active model rather than guessing an unsupported ID. Set both `CORTEX_LLM_PROVIDER` and `CORTEX_LLM_MODEL` to override this selection.
 
 ### Key Constants
 
