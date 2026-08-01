@@ -41,12 +41,11 @@ A `SessionEnd` hook orchestrates a multi-step pipeline:
 
 1. **Extract** — Read the session transcript (JSONL), truncate if >100KB (resumable via cursor checkpoints), add git context (branch, commits, changed files), and invoke the configured extraction LLM. Claude Code uses Claude Haiku; Pi uses an inexpensive model authenticated for the active provider (for Codex: `openai-codex/gpt-5.4-mini`).
 2. **Backfill** — Compute embeddings for newly extracted memories (Gemini API, or local HuggingFace fallback)
-3. **Semantic Edges** — Fire-and-forget: classify Jaccard-created `relates_to` edges into typed relationships
-4. **Generate** — Rebuild the surface file for the next session
-5. **Lifecycle** — Fire-and-forget: decay confidence, archive stale memories, prune old ones
-6. **AI Prune** — Fire-and-forget: Claude evaluates active memories and suggests archives
+3. **Maintenance worker** — Start one detached worker that runs semantic edges, lifecycle, AI prune, and surface generation sequentially
 
-All hooks exit 0 unconditionally — errors are logged, never surfaced. A `CORTEX_EXTRACTING=1` environment variable prevents recursive hook storms when `claude -p` is invoked during extraction.
+The worker holds a per-project PID lock, so simultaneous session shutdowns cannot multiply expensive LLM jobs. AI prune has its own lock for manual invocations and only retriggers above the memory threshold after at least 25% growth. Nested extraction LLMs inherit `CORTEX_EXTRACTING=1`; the Pi and Claude Code shutdown hooks treat that marker as a terminal no-op to prevent recursive maintenance storms.
+
+All hooks exit 0 unconditionally — errors are logged, never surfaced.
 
 ## Installation
 
@@ -368,7 +367,7 @@ Archived memories with no access for 90+ days → status changes to `pruned` (ef
 
 ### AI Prune
 
-Periodically (every 5 sessions or when memory count exceeds 50), Claude evaluates active memories in batches and suggests which to archive. Runs as a fire-and-forget detached process.
+Periodically (every 5 sessions, or when memory first exceeds 50 and subsequently grows by at least 25%), the configured extraction LLM evaluates active memories in batches and suggests which to archive. It runs inside the detached, per-project-locked maintenance worker; an additional AI-prune lock protects manual invocations.
 
 ## Configuration
 
@@ -454,6 +453,7 @@ bun engine/src/cli.ts backfill <cwd>
 bun engine/src/cli.ts lifecycle <cwd> --if-needed
 bun engine/src/cli.ts ai-prune <cwd> --if-needed
 bun engine/src/cli.ts semantic-edges <cwd>
+bun engine/src/cli.ts maintenance <cwd>
 
 # Manual commands
 bun engine/src/cli.ts remember <cwd> "content" --type=pattern

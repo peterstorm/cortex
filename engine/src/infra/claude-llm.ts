@@ -124,7 +124,7 @@ export function isClaudeLlmAvailable(): boolean {
  * @returns Raw Claude response text
  * @throws Error if binary not found, non-zero exit, or timeout
  */
-async function runClaudePrompt(prompt: string, timeoutMs: number): Promise<string> {
+export async function runLlmPrompt(prompt: string, timeoutMs: number): Promise<string> {
   const env = typeof Bun !== 'undefined' ? Bun.env : process.env;
   const { binary, args, provider, model } = buildLlmInvocation(env);
 
@@ -201,7 +201,7 @@ async function runClaudePrompt(prompt: string, timeoutMs: number): Promise<strin
  * @throws Error if binary not found, non-zero exit, or timeout
  */
 export async function extractMemories(prompt: string): Promise<string> {
-  return runClaudePrompt(prompt, EXTRACTION_TIMEOUT_MS);
+  return runLlmPrompt(prompt, EXTRACTION_TIMEOUT_MS);
 }
 
 /**
@@ -218,7 +218,7 @@ export async function classifyEdges(
   if (pairs.length === 0) return [];
 
   const prompt = buildEdgeClassificationPrompt(pairs);
-  const response = await runClaudePrompt(prompt, EDGE_CLASSIFICATION_TIMEOUT_MS);
+  const response = await runLlmPrompt(prompt, EDGE_CLASSIFICATION_TIMEOUT_MS);
   return parseEdgeClassificationResponse(response);
 }
 

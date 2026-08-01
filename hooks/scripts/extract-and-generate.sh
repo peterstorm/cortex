@@ -73,52 +73,16 @@ main() {
     fi
   fi
 
-  # Step 2b: Semantic edge classification (fire-and-forget, uses claude -p --model haiku)
-  # Upgrades Jaccard-created 'relates_to' edges to typed relationships
-  if [[ "$extract_ok" == true ]] && [[ -n "$cwd" ]]; then
-    log_info "Spawning detached semantic edge classification"
-    if command -v setsid >/dev/null 2>&1; then
-      setsid bun "$CLI_PATH" semantic-edges "$cwd" >/dev/null 2>&1 &
-    else
-      nohup bun "$CLI_PATH" semantic-edges "$cwd" >/dev/null 2>&1 &
-      disown
-    fi
-  fi
-
-  # Step 3: Generate push surface (always — stale memories still need fresh surface)
+  # Step 3: Run all expensive post-extraction work in one per-project-locked
+  # worker. This script is already detached, so another layer of background
+  # processes would only make shutdown storms harder to bound and observe.
   if [[ -n "$cwd" ]]; then
-    log_info "Generating push surface for cwd: $cwd"
-    if ! bun "$CLI_PATH" generate "$cwd" 2>&1 | tee /tmp/cortex-generate.log; then
-      log_error "Generate failed (see /tmp/cortex-generate.log)"
+    log_info "Running locked maintenance pipeline for cwd: $cwd"
+    if ! bun "$CLI_PATH" maintenance "$cwd" 2>&1 | tee /tmp/cortex-maintenance.log; then
+      log_error "Maintenance failed (see /tmp/cortex-maintenance.log)"
     fi
   else
-    log_error "Could not parse cwd from stdin JSON, skipping generate"
-  fi
-
-  # Step 4: Fire-and-forget lifecycle prune (detached, cross-platform)
-  # Smart trigger: skips if no new memories and last run <2h ago
-  if [[ -n "$cwd" ]]; then
-    log_info "Spawning detached lifecycle prune"
-    if command -v setsid >/dev/null 2>&1; then
-      # Linux: setsid detaches from session process group
-      setsid bun "$CLI_PATH" lifecycle "$cwd" --if-needed >/dev/null 2>&1 &
-    else
-      # macOS: nohup + disown achieves same detachment
-      nohup bun "$CLI_PATH" lifecycle "$cwd" --if-needed >/dev/null 2>&1 &
-      disown
-    fi
-  fi
-
-  # Step 5: Fire-and-forget AI prune (detached, cross-platform)
-  # Smart trigger: skips if session count < 5 AND memory count < 50
-  if [[ -n "$cwd" ]]; then
-    log_info "Spawning detached AI prune"
-    if command -v setsid >/dev/null 2>&1; then
-      setsid bun "$CLI_PATH" ai-prune "$cwd" --if-needed >/dev/null 2>&1 &
-    else
-      nohup bun "$CLI_PATH" ai-prune "$cwd" --if-needed >/dev/null 2>&1 &
-      disown
-    fi
+    log_error "Could not parse cwd from stdin JSON, skipping maintenance"
   fi
 
   log_info "Stop hook complete"

@@ -9,8 +9,9 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync, readFileSync } from "node:fs";
-import { execSync, spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { shouldRunShutdownPipeline, type CortexShutdownReason } from "./shutdown-policy.js";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const CLI_PATH = join(PACKAGE_ROOT, "engine", "src", "cli.ts");
@@ -24,7 +25,7 @@ function runCli(args: string[], options?: {
 }): string {
   try {
     const input = options?.stdin ?? "";
-    return execSync(`bun "${CLI_PATH}" ${args.join(" ")}`, {
+    return execFileSync("bun", [CLI_PATH, ...args], {
       input,
       timeout: options?.timeout ?? 30_000,
       cwd: options?.cwd,
@@ -174,8 +175,12 @@ export default function (pi: ExtensionAPI) {
   // ─── Session End: Extract + generate + lifecycle ────────────────────
   pi.on("session_shutdown", async (event, ctx) => {
     // A nested `pi -p` extraction inherits this marker. Never let that child
-    // invoke Cortex's shutdown pipeline again (or emit a second empty-path error).
-    if (event.reason === "reload" || process.env.CORTEX_EXTRACTING === "1") return;
+    // invoke Cortex's shutdown pipeline again: doing so recursively forks one
+    // maintenance worker per extraction LLM call.
+    if (!shouldRunShutdownPipeline(
+      event.reason as CortexShutdownReason,
+      process.env.CORTEX_EXTRACTING,
+    )) return;
 
     const cwd = ctx.cwd;
     const transcriptPath = ctx.sessionManager.getSessionFile() ?? sessionFile;
@@ -209,17 +214,10 @@ export default function (pi: ExtensionAPI) {
       runCli(["backfill", cwd], { timeout: 30_000, cwd });
     }
 
-    // Step 3: Semantic edges (fire-and-forget)
-    runCliDetached(["semantic-edges", cwd], { cwd, env: llmEnv });
-
-    // Step 4: Generate push surface
-    runCli(["generate", cwd], { timeout: 30_000, cwd });
-
-    // Step 5: Lifecycle prune (fire-and-forget)
-    runCliDetached(["lifecycle", cwd, "--if-needed"], { cwd });
-
-    // Step 6: AI prune (fire-and-forget)
-    runCliDetached(["ai-prune", cwd, "--if-needed"], { cwd });
+    // Steps 3-6 run in one detached, per-project locked worker. This prevents
+    // simultaneous session shutdowns from multiplying semantic-edge and AI
+    // prune LLM calls while keeping shutdown latency independent of maintenance.
+    runCliDetached(["maintenance", cwd], { cwd, env: llmEnv });
   });
 
   // ─── Commands ─────────────────────────────────────────────────────────

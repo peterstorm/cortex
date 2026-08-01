@@ -11,7 +11,7 @@
 import type { Database } from 'bun:sqlite';
 import * as fs from 'node:fs';
 import { getActiveMemories, updateMemory, archiveEdgesForMemory } from '../infra/db.js';
-import { isClaudeLlmAvailable } from '../infra/claude-llm.js';
+import { isClaudeLlmAvailable, runLlmPrompt } from '../infra/claude-llm.js';
 import {
   AI_PRUNE_SESSION_INTERVAL,
   AI_PRUNE_MEMORY_THRESHOLD,
@@ -45,15 +45,20 @@ interface PruneCandidate {
  *
  * Triggers if EITHER:
  * - sessions_since_ai_prune >= sessionInterval
- * - activeMemoryCount >= memoryThreshold
+ * - active memory crossed the threshold and grew at least 25% since the last
+ *   completed prune. A raw threshold would run on every shutdown forever once
+ *   a store remained above the threshold.
  */
 export function shouldRunAiPrune(
   sessionsSinceAiPrune: number,
   activeMemoryCount: number,
   sessionInterval: number,
-  memoryThreshold: number
+  memoryThreshold: number,
+  activeCountAtLastPrune: number = 0,
 ): boolean {
-  return sessionsSinceAiPrune >= sessionInterval || activeMemoryCount >= memoryThreshold;
+  if (sessionsSinceAiPrune >= sessionInterval) return true;
+  const growthFloor = Math.max(memoryThreshold, Math.ceil(activeCountAtLastPrune * 1.25));
+  return activeMemoryCount >= growthFloor;
 }
 
 /**
@@ -137,10 +142,10 @@ function writeTelemetryData(path: string, data: Record<string, unknown>): void {
   fs.writeFileSync(path, JSON.stringify(data, null, 2), 'utf8');
 }
 
-function getSessionsSinceAiPrune(telemetryPath: string): number {
+function getActiveCountAtLastPrune(telemetryPath: string): number {
   const data = readTelemetry(telemetryPath);
-  const val = data.sessions_since_ai_prune;
-  return typeof val === 'number' ? val : 0;
+  const value = data.active_count_at_last_ai_prune;
+  return typeof value === 'number' ? value : 0;
 }
 
 function incrementSessionCounter(telemetryPath: string): number {
@@ -152,10 +157,11 @@ function incrementSessionCounter(telemetryPath: string): number {
   return next;
 }
 
-function resetSessionCounter(telemetryPath: string): void {
+function resetSessionCounter(telemetryPath: string, activeCount: number): void {
   const data = readTelemetry(telemetryPath);
   data.sessions_since_ai_prune = 0;
   data.last_ai_prune_at = new Date().toISOString();
+  data.active_count_at_last_ai_prune = activeCount;
   writeTelemetryData(telemetryPath, data);
 }
 
@@ -163,57 +169,9 @@ function resetSessionCounter(telemetryPath: string): void {
 // LLM CALL
 // ============================================================================
 
-/**
- * Call claude -p with the prune prompt.
- * Same pattern as extractMemories in claude-llm.ts.
- */
+/** Use the same provider-compatible, recursion-guarded LLM path as extraction. */
 async function callClaudePrune(prompt: string): Promise<string> {
-  const proc = Bun.spawn(
-    ['claude', '-p', '--model', 'haiku', '--output-format', 'text', '--allowedTools', ''],
-    {
-      stdin: 'pipe',
-      stdout: 'pipe',
-      stderr: 'pipe',
-      env: (() => {
-        const env = { ...process.env, CORTEX_EXTRACTING: '1' };
-        delete env.CLAUDECODE;
-        return env;
-      })(),
-    }
-  );
-
-  proc.stdin.write(prompt);
-  proc.stdin.end();
-
-  const stdoutPromise = new Response(proc.stdout).text();
-  const stderrPromise = new Response(proc.stderr).text();
-
-  let timer: ReturnType<typeof setTimeout>;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      proc.kill('SIGKILL');
-      reject(new Error(`AI prune timed out after ${AI_PRUNE_TIMEOUT_MS}ms`));
-    }, AI_PRUNE_TIMEOUT_MS);
-  });
-
-  let exitCode: number;
-  try {
-    exitCode = await Promise.race([proc.exited, timeout]);
-  } finally {
-    clearTimeout(timer!);
-  }
-
-  if (exitCode !== 0) {
-    const stderr = await stderrPromise;
-    throw new Error(`Claude CLI exited with code ${exitCode}: ${stderr.slice(0, 500)}`);
-  }
-
-  const stdout = await stdoutPromise;
-  if (!stdout.trim()) {
-    throw new Error('Empty response from Claude CLI');
-  }
-
-  return stdout;
+  return runLlmPrompt(prompt, AI_PRUNE_TIMEOUT_MS);
 }
 
 // ============================================================================
@@ -237,7 +195,13 @@ export async function runAiPruneIfNeeded(
   const globalMemories = getActiveMemories(globalDb);
   const totalActive = projectMemories.length + globalMemories.length;
 
-  if (!shouldRunAiPrune(sessionCount, totalActive, AI_PRUNE_SESSION_INTERVAL, AI_PRUNE_MEMORY_THRESHOLD)) {
+  if (!shouldRunAiPrune(
+    sessionCount,
+    totalActive,
+    AI_PRUNE_SESSION_INTERVAL,
+    AI_PRUNE_MEMORY_THRESHOLD,
+    getActiveCountAtLastPrune(telemetryPath),
+  )) {
     return { archived: 0, reviewed: 0, skipped: true };
   }
 
@@ -273,7 +237,7 @@ export async function runAiPrune(
   const allMemories = [...projectMemories, ...globalMemories];
 
   if (allMemories.length === 0) {
-    resetSessionCounter(telemetryPath);
+    resetSessionCounter(telemetryPath, 0);
     return { archived: 0, reviewed: 0 };
   }
 
@@ -281,7 +245,7 @@ export async function runAiPrune(
   // With few memories, aggressive pruning wipes out ALL context.
   if (allMemories.length < AI_PRUNE_MIN_MEMORIES) {
     logInfo(`Skipping AI prune: only ${allMemories.length} active memories (min: ${AI_PRUNE_MIN_MEMORIES})`);
-    resetSessionCounter(telemetryPath);
+    resetSessionCounter(telemetryPath, allMemories.length);
     return { archived: 0, reviewed: allMemories.length, skipped: true };
   }
 
@@ -307,6 +271,7 @@ export async function runAiPrune(
   logInfo(`AI pruning ${allMemories.length} memories in ${totalBatches} batch(es)...`);
 
   let totalArchived = 0;
+  let successfulBatches = 0;
 
   for (let i = 0; i < batches.length; i++) {
     const batch = batches[i];
@@ -323,6 +288,7 @@ export async function runAiPrune(
       continue; // skip failed batch, try next
     }
 
+    successfulBatches++;
     const candidates = parsePruneResponse(response);
 
     for (const candidate of candidates) {
@@ -347,7 +313,15 @@ export async function runAiPrune(
     }
   }
 
-  resetSessionCounter(telemetryPath);
+  if (successfulBatches === 0) {
+    return {
+      archived: 0,
+      reviewed: allMemories.length,
+      error: `All ${batches.length} AI prune batches failed`,
+    };
+  }
+
+  resetSessionCounter(telemetryPath, allMemories.length - totalArchived);
 
   logInfo(`AI prune complete: ${totalArchived} archived out of ${allMemories.length} reviewed`);
 
