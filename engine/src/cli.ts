@@ -26,7 +26,7 @@
 
 import { Database } from 'bun:sqlite';
 import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
-import { dirname, isAbsolute } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import type { HookInput } from './core/types.js';
 import {
   getGeminiApiKey,
@@ -42,6 +42,7 @@ import {
 } from './config.js';
 import { openDatabase, openDatabaseReadOnly, getActiveMemories, getMemoriesByIds } from './infra/db.js';
 import { ensureGitignored, writeSurface } from './infra/filesystem.js';
+import { acquireLock, releaseLock } from './infra/lock.js';
 
 // Command imports
 import { executeExtract } from './commands/extract.js';
@@ -742,31 +743,42 @@ async function handleAiPrune(args: string[]): Promise<CommandResult> {
 
   const cwd = args[0];
   const ifNeeded = args.includes('--if-needed');
-  const [projectDb, globalDb] = initDatabases(cwd);
+  const lockFile = join(getLockDir(cwd), 'ai-prune.lock');
+  const lock = acquireLock(lockFile);
+  if (!lock.acquired) {
+    return lock.reason === 'held'
+      ? { success: true, output: 'AI prune skipped (another run is active)' }
+      : { success: false, error: 'AI prune failed: could not acquire lock' };
+  }
 
   try {
-    const result = ifNeeded
-      ? await runAiPruneIfNeeded(projectDb, globalDb, getTelemetryPath(cwd), cwd)
-      : await runAiPrune(projectDb, globalDb, getTelemetryPath(cwd), cwd);
+    const [projectDb, globalDb] = initDatabases(cwd);
+    try {
+      const result = ifNeeded
+        ? await runAiPruneIfNeeded(projectDb, globalDb, getTelemetryPath(cwd), cwd)
+        : await runAiPrune(projectDb, globalDb, getTelemetryPath(cwd), cwd);
 
-    if (result.skipped) {
-      return { success: true, output: 'AI prune skipped (thresholds not met)' };
+      if (result.skipped) {
+        return { success: true, output: 'AI prune skipped (thresholds not met)' };
+      }
+      if (result.error) {
+        return { success: false, error: `AI prune failed: ${result.error}` };
+      }
+      return {
+        success: true,
+        output: `AI prune complete: archived ${result.archived} of ${result.reviewed} reviewed`,
+      };
+    } catch (err) {
+      return {
+        success: false,
+        error: `AI prune failed: ${err}`,
+      };
+    } finally {
+      projectDb.close();
+      globalDb.close();
     }
-    if (result.error) {
-      return { success: false, error: `AI prune failed: ${result.error}` };
-    }
-    return {
-      success: true,
-      output: `AI prune complete: archived ${result.archived} of ${result.reviewed} reviewed`,
-    };
-  } catch (err) {
-    return {
-      success: false,
-      error: `AI prune failed: ${err}`,
-    };
   } finally {
-    projectDb.close();
-    globalDb.close();
+    releaseLock(lockFile);
   }
 }
 
@@ -1190,6 +1202,52 @@ async function handlePromptRecall(): Promise<CommandResult> {
   }
 }
 
+/**
+ * Run expensive post-session work sequentially behind one per-project lock.
+ * Duplicate shutdowns skip rather than multiplying LLM workers.
+ */
+async function handleMaintenance(args: string[]): Promise<CommandResult> {
+  if (args.length < 1) {
+    return { success: false, error: 'Usage: maintenance <cwd>' };
+  }
+
+  const cwd = args[0];
+  const lockFile = join(getLockDir(cwd), 'maintenance.lock');
+  const lock = acquireLock(lockFile);
+  if (!lock.acquired) {
+    return lock.reason === 'held'
+      ? { success: true, output: 'Maintenance skipped (another run is active)' }
+      : { success: false, error: 'Maintenance failed: could not acquire lock' };
+  }
+
+  try {
+    const steps: readonly (() => Promise<CommandResult>)[] = [
+      () => handleSemanticEdges([cwd]),
+      () => handleLifecycle([cwd, '--if-needed']),
+      () => handleAiPrune([cwd, '--if-needed']),
+      () => handleGenerate([cwd]),
+    ];
+    const results: CommandResult[] = [];
+    for (const runStep of steps) results.push(await runStep());
+
+    const output = results
+      .map((result) => result.output ?? result.error)
+      .filter((line): line is string => Boolean(line))
+      .join('\n');
+    const failures = results.filter((result) => !result.success);
+
+    return failures.length === 0
+      ? { success: true, output }
+      : {
+          success: false,
+          output,
+          error: `Maintenance completed with ${failures.length} failed step(s)`,
+        };
+  } finally {
+    releaseLock(lockFile);
+  }
+}
+
 // ============================================================================
 // MAIN DISPATCH
 // ============================================================================
@@ -1203,7 +1261,7 @@ async function main() {
 
   if (args.length === 0) {
     logError('Usage: cli.ts <subcommand> [args...]');
-    logError('Subcommands: extract, generate, recall, remember, index-code, forget, consolidate, lifecycle, ai-prune, traverse, inspect, backfill, semantic-edges, load-surface, prompt-recall, entity-query');
+    logError('Subcommands: extract, generate, recall, remember, index-code, forget, consolidate, lifecycle, ai-prune, maintenance, traverse, inspect, backfill, semantic-edges, load-surface, prompt-recall, entity-query');
     process.exit(1);
   }
 
@@ -1240,6 +1298,9 @@ async function main() {
         break;
       case 'ai-prune':
         result = await handleAiPrune(subcommandArgs);
+        break;
+      case 'maintenance':
+        result = await handleMaintenance(subcommandArgs);
         break;
       case 'traverse':
         result = await handleTraverse(subcommandArgs);

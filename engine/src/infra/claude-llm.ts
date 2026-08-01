@@ -41,64 +41,78 @@ export interface EdgeClassification {
   readonly strength: number;
 }
 
-/**
- * Detect which CLI binary to use for headless LLM calls.
- *
- * Priority:
- * 1. CORTEX_LLM_BINARY env override
- * 2. claude — when this process was launched from a Claude Code session
- *    (CLAUDECODE set); a user with both tools installed should not be
- *    silently routed to pi just because PI_CODING_AGENT_DIR is exported
- * 3. pi — when the pi agent env is present
- * 4. claude — default
- */
-function getLlmBinary(): string {
-  const env = typeof Bun !== 'undefined' ? Bun.env : process.env;
-  if (env.CORTEX_LLM_BINARY) return env.CORTEX_LLM_BINARY;
-  if (env.CLAUDECODE) return 'claude';
-  if (env.PI_CODING_AGENT_DIR || env.PI_CODING_AGENT) return 'pi';
-  return 'claude';
+/** Pi's inexpensive, capable models for structured memory extraction. */
+const PI_EXTRACTION_MODELS: Readonly<Record<string, string>> = {
+  anthropic: 'claude-haiku-4-5',
+  google: 'gemini-3.1-flash-lite',
+  'google-vertex': 'gemini-3.1-flash-lite',
+  openai: 'gpt-5.4-mini',
+  'openai-codex': 'gpt-5.4-mini',
+};
+
+export interface LlmInvocation {
+  readonly binary: 'claude' | 'pi';
+  readonly args: readonly string[];
+  readonly provider?: string;
+  readonly model?: string;
 }
 
-/**
- * Model for headless LLM calls.
- * For claude: defaults to haiku (cheap, fast).
- * For pi: NO default — pi may be configured with any provider (OpenAI,
- * Gemini, ...) where 'haiku' is not a valid model name; omitting --model
- * lets pi use its own configured default for the provider.
- */
-function getLlmModel(binary: string): string | undefined {
-  const env = typeof Bun !== 'undefined' ? Bun.env : process.env;
-  if (env.CORTEX_LLM_MODEL) return env.CORTEX_LLM_MODEL;
-  return binary === 'claude' ? 'haiku' : undefined;
+/** Detect which CLI binary to use for headless LLM calls. */
+function getLlmBinary(env: NodeJS.ProcessEnv): 'claude' | 'pi' {
+  return env.PI_CODING_AGENT_DIR || env.PI_CODING_AGENT ? 'pi' : 'claude';
 }
 
-/**
- * Read the user's default provider from pi agent settings.
- * Returns undefined if not configured or unreadable.
- */
-function getDefaultProvider(): string | undefined {
-  const env = typeof Bun !== 'undefined' ? Bun.env : process.env;
-  const override = env.CORTEX_LLM_PROVIDER;
-  if (override) return override;
-
+/** Read the Pi default provider only when no active-session provider is known. */
+function getDefaultProvider(env: NodeJS.ProcessEnv): string | undefined {
   try {
     const home = env.HOME || env.USERPROFILE || '';
     const settingsPath = `${home}/.pi/agent/settings.json`;
     const content = require('fs').readFileSync(settingsPath, 'utf-8');
-    const settings = JSON.parse(content);
-    return settings.defaultProvider || undefined;
+    const settings = JSON.parse(content) as { defaultProvider?: unknown };
+    return typeof settings.defaultProvider === 'string' ? settings.defaultProvider : undefined;
   } catch {
     return undefined;
   }
 }
 
 /**
+ * Resolve a headless extraction invocation.
+ *
+ * Pi does not expose an Anthropic Haiku model through every provider. Prefer
+ * the active Pi session's provider, then select its cheap extraction model.
+ * Explicit CORTEX_LLM_* values always win; unknown/custom providers reuse the
+ * active model instead of sending an unsupported guessed model ID.
+ */
+export function buildLlmInvocation(env: NodeJS.ProcessEnv): LlmInvocation {
+  const binary = getLlmBinary(env);
+  if (binary === 'claude') {
+    return {
+      binary,
+      args: [binary, '-p', '--model', 'haiku', '--output-format', 'text'],
+    };
+  }
+
+  const activeProvider = env.CORTEX_PI_PROVIDER || env.PI_PROVIDER;
+  const activeModel = env.CORTEX_PI_MODEL || env.PI_MODEL;
+  const provider = env.CORTEX_LLM_PROVIDER || activeProvider || getDefaultProvider(env);
+  const model = env.CORTEX_LLM_MODEL
+    || (provider ? PI_EXTRACTION_MODELS[provider] : undefined)
+    || (provider === activeProvider ? activeModel : undefined);
+  const args = [binary, '-p'];
+
+  if (provider) args.push('--provider', provider);
+  if (model) args.push('--model', model);
+  args.push('--no-session');
+
+  return { binary, args, provider, model };
+}
+
+/**
  * Check if the LLM binary is available on PATH.
  */
 export function isClaudeLlmAvailable(): boolean {
-  const binary = getLlmBinary();
-  return Bun.which(binary) !== null;
+  const env = typeof Bun !== 'undefined' ? Bun.env : process.env;
+  return Bun.which(getLlmBinary(env)) !== null;
 }
 
 /**
@@ -111,21 +125,15 @@ export function isClaudeLlmAvailable(): boolean {
  * @throws Error if binary not found, non-zero exit, or timeout
  */
 export async function runLlmPrompt(prompt: string, timeoutMs: number): Promise<string> {
-  const binary = getLlmBinary();
-  const model = getLlmModel(binary);
-  const modelArgs = model ? ['--model', model] : [];
-
-  let args: string[];
-  if (binary === 'pi') {
-    const provider = getDefaultProvider();
-    const providerArgs = provider ? ['--provider', provider] : [];
-    args = [binary, '-p', ...modelArgs, ...providerArgs, '--no-session'];
-  } else {
-    args = [binary, '-p', ...modelArgs, '--output-format', 'text'];
-  }
+  const env = typeof Bun !== 'undefined' ? Bun.env : process.env;
+  const { binary, args, provider, model } = buildLlmInvocation(env);
 
   if (!isClaudeLlmAvailable()) {
     throw new Error(`${binary} CLI not found on PATH`);
+  }
+
+  if (binary === 'pi') {
+    process.stderr.write(`[cortex:llm] INFO: Pi extraction model: ${provider ?? 'default'}/${model ?? 'default'}\n`);
   }
 
   const proc = Bun.spawn(
@@ -158,7 +166,7 @@ export async function runLlmPrompt(prompt: string, timeoutMs: number): Promise<s
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       proc.kill('SIGKILL');
-      reject(new Error(`Claude CLI timed out after ${timeoutMs}ms`));
+      reject(new Error(`Extraction LLM CLI timed out after ${timeoutMs}ms`));
     }, timeoutMs);
   });
 
@@ -171,7 +179,7 @@ export async function runLlmPrompt(prompt: string, timeoutMs: number): Promise<s
 
   if (result !== 0) {
     const stderr = await stderrPromise;
-    throw new Error(`Claude CLI exited with code ${result}: ${stderr.slice(0, 500)}`);
+    throw new Error(`Extraction LLM CLI exited with code ${result}: ${stderr.slice(0, 500)}`);
   }
 
   const stdout = await stdoutPromise;

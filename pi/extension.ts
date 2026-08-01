@@ -8,101 +8,87 @@
 
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { existsSync, readFileSync, openSync, closeSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { shouldRunShutdownPipeline, type CortexShutdownReason } from "./shutdown-policy.js";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const CLI_PATH = join(PACKAGE_ROOT, "engine", "src", "cli.ts");
-
-/**
- * Env for spawned engine CLIs. The engine decides harness-specific paths
- * (surface file, global DB) by sniffing PI_CODING_AGENT* env vars
- * (engine/src/config.ts detectHarness/getSurfaceOutputPath). If pi's own
- * process doesn't carry that var, the spawned CLI would silently write the
- * surface to .claude/ while this extension reads .pi/ — so force the marker.
- */
-function cliEnv(): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    CORTEX_PLUGIN_ROOT: PACKAGE_ROOT,
-    PI_CODING_AGENT: process.env.PI_CODING_AGENT ?? "1",
-  };
-}
 
 /** Run a bun CLI command, returning stdout. Never throws. */
 function runCli(args: string[], options?: {
   stdin?: string;
   timeout?: number;
   cwd?: string;
+  env?: NodeJS.ProcessEnv;
 }): string {
   try {
     const input = options?.stdin ?? "";
-    // execFileSync with an argv array — no shell, so cwd/args containing
-    // spaces or metacharacters can't break (or inject into) the command.
     return execFileSync("bun", [CLI_PATH, ...args], {
       input,
       timeout: options?.timeout ?? 30_000,
       cwd: options?.cwd,
       encoding: "utf-8",
-      env: cliEnv(),
+      env: {
+        ...process.env,
+        CORTEX_PLUGIN_ROOT: PACKAGE_ROOT,
+        ...options?.env,
+      },
     }).trim();
   } catch (e) {
     // Never block — log and return empty
     const msg = (e as Error).message ?? "";
     if (msg.includes("TIMEOUT")) {
       process.stderr.write(`[cortex] CLI timeout: ${args.join(" ")}\n`);
-    } else {
-      process.stderr.write(`[cortex] CLI failed (${args.join(" ")}): ${msg}\n`);
     }
     return "";
   }
 }
 
-/**
- * Run several bun CLI commands sequentially in ONE detached child.
- * Used for post-session maintenance: sequential execution prevents the
- * SQLite single-writer and telemetry read-modify-write races that
- * concurrent detached spawns caused. Logs go to /tmp/cortex-maintenance.log.
- */
-function runCliChainDetached(argsList: string[][], cwd: string): void {
+/** Run a bun CLI command detached (fire-and-forget). */
+function runCliDetached(args: string[], options?: {
+  stdin?: string;
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+}): void {
   try {
-    const script = [
-      `const { execFileSync } = require("node:child_process");`,
-      `const chains = JSON.parse(process.argv[2]);`,
-      `for (const args of chains) {`,
-      `  try { execFileSync("bun", [process.argv[1], ...args], { stdio: "inherit", cwd: process.argv[3] }); }`,
-      `  catch (e) { console.error("[cortex-maintenance] step failed:", args[0], e?.message); }`,
-      `}`,
-    ].join("\n");
-
-    const logFd = openSync("/tmp/cortex-maintenance.log", "a");
-    const proc = spawn(
-      "bun",
-      ["-e", script, CLI_PATH, JSON.stringify(argsList), cwd],
-      {
-        stdio: ["ignore", logFd, logFd],
-        detached: true,
-        cwd,
-        env: cliEnv(),
-      }
-    );
+    const proc = spawn("bun", [CLI_PATH, ...args], {
+      stdio: options?.stdin ? ["pipe", "ignore", "ignore"] : ["ignore", "ignore", "ignore"],
+      detached: true,
+      cwd: options?.cwd,
+      env: {
+        ...process.env,
+        CORTEX_PLUGIN_ROOT: PACKAGE_ROOT,
+        ...options?.env,
+      },
+    });
+    if (options?.stdin && proc.stdin) {
+      proc.stdin.write(options.stdin);
+      proc.stdin.end();
+    }
     proc.unref();
-    closeSync(logFd);
-  } catch (e) {
-    process.stderr.write(`[cortex] failed to spawn maintenance chain: ${(e as Error).message}\n`);
-  }
+  } catch {}
 }
 
-/**
- * Get the surface file path for the current project.
- * Replicates engine getSurfaceOutputPath (engine/src/config.ts): pi harness
- * → .pi/, otherwise .claude/. cliEnv() forces PI_CODING_AGENT for spawned
- * CLIs, so this and the engine always agree on the same path.
- */
+/** Get the surface file path for current project */
 function getSurfacePath(cwd: string): string {
-  const isPi = Boolean(cliEnv().PI_CODING_AGENT_DIR || cliEnv().PI_CODING_AGENT);
-  return join(cwd, isPi ? ".pi" : ".claude", "cortex-memory.local.md");
+  return join(cwd, ".pi", "cortex-memory.local.md");
+}
+
+type PiModelSelection = Readonly<{
+  provider: string;
+  id: string;
+}>;
+
+/** Pass the active Pi model to engine subprocesses without mutating global env. */
+function getCortexLlmEnvironment(model: PiModelSelection | undefined): NodeJS.ProcessEnv {
+  return model
+    ? {
+      CORTEX_PI_PROVIDER: model.provider,
+      CORTEX_PI_MODEL: model.id,
+    }
+    : {};
 }
 
 /** Source Gemini API key if available */
@@ -115,14 +101,18 @@ function loadGeminiEnv(): void {
         const match = line.match(/^export\s+(\w+)=["']?(.+?)["']?\s*$/);
         if (match) process.env[match[1]] = match[2];
       }
-    } catch (e) {
-      process.stderr.write(`[cortex] failed to load gemini env (${envFile}): ${(e as Error).message}\n`);
-    }
+    } catch {}
   }
 }
 
 export default function (pi: ExtensionAPI) {
   loadGeminiEnv();
+
+  // Session shutdown can invalidate SessionManager's file reference. Retain
+  // immutable session metadata from session_start for transcript extraction.
+  let sessionFile: string | undefined;
+  let sessionId: string | undefined;
+  let activeModel: PiModelSelection | undefined;
 
   // ─── Before Agent Start: Resolve paths + inject memory surface + prompt recall
   pi.on("before_agent_start", async (event, ctx) => {
@@ -139,9 +129,7 @@ export default function (pi: ExtensionAPI) {
       try {
         const surface = readFileSync(surfacePath, "utf-8").trim();
         if (surface) parts.push(surface);
-      } catch (e) {
-        process.stderr.write(`[cortex] failed to read surface (${surfacePath}): ${(e as Error).message}\n`);
-      }
+      } catch {}
     }
 
     // 3. Prompt recall (keyword search based on user's prompt)
@@ -170,56 +158,66 @@ export default function (pi: ExtensionAPI) {
 
   // ─── Session Start: Load cached surface ─────────────────────────────
   pi.on("session_start", async (_event, ctx) => {
+    sessionFile = ctx.sessionManager.getSessionFile();
+    sessionId = ctx.sessionManager.getSessionId();
+    activeModel = ctx.model
+      ? { provider: ctx.model.provider, id: ctx.model.id }
+      : undefined;
+
     const cwd = ctx.cwd;
     runCli(["load-surface", cwd], { timeout: 10_000, cwd });
   });
 
+  pi.on("model_select", async (event) => {
+    activeModel = { provider: event.model.provider, id: event.model.id };
+  });
+
   // ─── Session End: Extract + generate + lifecycle ────────────────────
   pi.on("session_shutdown", async (event, ctx) => {
-    // Guard: don't extract on reload
-    if (event.reason === "reload") return;
+    // A nested `pi -p` extraction inherits this marker. Never let that child
+    // invoke Cortex's shutdown pipeline again: doing so recursively forks one
+    // maintenance worker per extraction LLM call.
+    if (!shouldRunShutdownPipeline(
+      event.reason as CortexShutdownReason,
+      process.env.CORTEX_EXTRACTING,
+    )) return;
 
     const cwd = ctx.cwd;
-    const sessionFile = ctx.sessionManager.getSessionFile();
+    const transcriptPath = ctx.sessionManager.getSessionFile() ?? sessionFile;
+    const extractionSessionId = ctx.sessionManager.getSessionId() ?? sessionId ?? "unknown";
+    const llmEnv = getCortexLlmEnvironment(
+      ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : activeModel,
+    );
 
-    // Build stdin JSON matching what the Claude Code hook expects
-    const hookInput = JSON.stringify({
-      session_id: ctx.sessionManager.getSessionId() ?? "unknown",
-      transcript_path: sessionFile ?? "",
-      cwd,
-    });
-
-    // Step 1: Extract memories from session transcript.
-    // Timeout must exceed the engine's inner LLM timeout (90s in
-    // claude-llm.ts) — a shorter outer timeout SIGTERMs mid-extraction,
-    // losing the chunk without saving a checkpoint.
-    const extractResult = runCli(["extract"], {
-      stdin: hookInput,
-      timeout: 120_000,
-      cwd,
-    });
+    // Persistent sessions have a JSONL transcript. In-memory/ephemeral Pi
+    // sessions do not, so skip only extraction rather than passing an empty
+    // path through to the engine and producing an ENOENT error.
+    let extractResult = "";
+    if (transcriptPath && existsSync(transcriptPath)) {
+      const hookInput = JSON.stringify({
+        session_id: extractionSessionId,
+        transcript_path: transcriptPath,
+        cwd,
+      });
+      extractResult = runCli(["extract"], {
+        stdin: hookInput,
+        timeout: 60_000,
+        cwd,
+        env: llmEnv,
+      });
+    } else {
+      process.stderr.write("[cortex] No persisted Pi session transcript; extraction skipped\n");
+    }
 
     // Step 2: Backfill embeddings
     if (extractResult) {
       runCli(["backfill", cwd], { timeout: 30_000, cwd });
     }
 
-    // Steps 3-6: maintenance — ONE detached chain, run sequentially.
-    // Spawning these concurrently made them race: SQLite allows a single
-    // writer, and lifecycle + ai-prune both read-modify-write telemetry.json.
-    //
-    // ORDER MATTERS: generate runs LAST. Lifecycle and ai-prune archive
-    // memories — generating the surface before them served just-archived
-    // memories for the whole next session.
-    runCliChainDetached(
-      [
-        ["semantic-edges", cwd],
-        ["lifecycle", cwd, "--if-needed"],
-        ["ai-prune", cwd, "--if-needed"],
-        ["generate", cwd],
-      ],
-      cwd
-    );
+    // Steps 3-6 run in one detached, per-project locked worker. This prevents
+    // simultaneous session shutdowns from multiplying semantic-edge and AI
+    // prune LLM calls while keeping shutdown latency independent of maintenance.
+    runCliDetached(["maintenance", cwd], { cwd, env: llmEnv });
   });
 
   // ─── Commands ─────────────────────────────────────────────────────────

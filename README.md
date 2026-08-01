@@ -46,9 +46,9 @@ A `SessionEnd` hook detaches a background worker (so nothing blocks the session)
 5. **AI Prune** — When due, the LLM evaluates active memories and archives low-value ones
 6. **Generate** — Rebuild the surface file LAST, after all archival, so the next session never starts from a surface containing just-archived memories
 
-The maintenance steps (3-5) run sequentially — not as concurrent detached spawns — because SQLite allows one writer and lifecycle + AI prune both read-modify-write telemetry. Each step logs to a per-process file `/tmp/cortex-<step>.<pid>.log` (extract, backfill, semantic-edges, lifecycle, ai-prune, generate).
+Steps 3-6 run through one per-project-locked `maintenance` command. Simultaneous session shutdowns therefore cannot multiply expensive LLM workers, and a separate AI-prune lock protects manual invocations. Each detached session worker writes PID-scoped extraction, backfill, and maintenance logs under `/tmp`.
 
-All hooks exit 0 unconditionally — errors are logged, never surfaced. A `CORTEX_EXTRACTING=1` environment variable prevents recursive hook storms when `claude -p` is invoked during extraction.
+Nested extraction LLMs inherit `CORTEX_EXTRACTING=1`; both Pi and Claude Code shutdown handlers treat that marker as a terminal no-op. This invariant prevents a headless extraction process from recursively spawning another maintenance pipeline. All hooks remain non-blocking and never fail the parent session.
 
 ## Installation
 
@@ -383,7 +383,7 @@ Archived memories with no access for 30+ days → status changes to `pruned` (ef
 
 ### AI Prune
 
-The LLM evaluates active memories in batches and archives low-value ones. Triggered when 5+ sessions have passed since the last prune, or when the active memory count reaches max(50, 1.25 × the count at the last prune) — the growth backoff prevents a full prune from firing every session once the store stays above the base threshold. Runs as part of the detached SessionEnd worker.
+The LLM evaluates active memories in batches and archives low-value ones. Triggered when 5+ sessions have passed since the last prune, or when the active memory count reaches max(50, 1.25 × the count at the last prune) — the growth backoff prevents a full prune from firing every session once the store stays above the base threshold. It runs inside the per-project-locked maintenance pipeline and also holds an AI-prune-specific lock.
 
 ## Configuration
 
@@ -470,6 +470,7 @@ bun engine/src/cli.ts backfill <cwd>
 bun engine/src/cli.ts lifecycle <cwd> --if-needed
 bun engine/src/cli.ts ai-prune <cwd> --if-needed
 bun engine/src/cli.ts semantic-edges <cwd>
+bun engine/src/cli.ts maintenance <cwd>
 
 # Manual commands
 bun engine/src/cli.ts remember <cwd> "content" --type=pattern

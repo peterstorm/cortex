@@ -15,7 +15,7 @@
  * Designed to run as fire-and-forget step in extract-and-generate hook.
  */
 
-import { join } from 'path';
+import { join } from 'node:path';
 import type { Database } from 'bun:sqlite';
 import type { Memory } from '../core/types.js';
 import type { MemoryPair, EdgeClassification } from '../infra/claude-llm.js';
@@ -29,7 +29,7 @@ const BATCH_SIZE = 10;
 export interface SemanticEdgesOptions {
   /** Max edges to process (0 = all) */
   readonly limit: number;
-  /** Directory for the per-project lock file (from getLockDir(cwd)) */
+  /** Per-project lock directory. */
   readonly lockDir?: string;
 }
 
@@ -81,14 +81,15 @@ export async function executeSemanticEdges(
   options: SemanticEdgesOptions = { limit: 0 }
 ): Promise<SemanticEdgesResult> {
   const lockFile = join(options.lockDir ?? '/tmp/cortex-locks', 'semantic-edges.lock');
-  if (!acquireLock(lockFile)) {
-    logInfo('Another semantic-edges instance is already running, skipping');
+  const lock = acquireLock(lockFile);
+  if (!lock.acquired) {
+    logInfo(`Semantic edges skipped: lock ${lock.reason}`);
     return { ok: true, classified: 0, failed: 0, skipped: 0 };
   }
 
   try {
     if (!isClaudeLlmAvailable()) {
-      return { ok: false, error: 'Claude CLI not found on PATH' };
+      return { ok: false, error: 'Extraction LLM CLI not found on PATH' };
     }
 
     // Step 1: Get relates_to edges (optionally limited)

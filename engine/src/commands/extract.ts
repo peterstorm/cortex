@@ -120,8 +120,9 @@ export async function executeExtract(
   // the same time and double-insert candidates. Same per-project PID-lock
   // pattern as semantic-edges.
   const lockFile = join(getLockDir(input.cwd), 'extract.lock');
-  if (!acquireLock(lockFile)) {
-    logInfo('Another extraction is already running for this project — skipping');
+  const lock = acquireLock(lockFile);
+  if (!lock.acquired) {
+    logInfo(`Extraction skipped: lock ${lock.reason}`);
     return {
       success: true,
       extracted_count: 0,

@@ -288,6 +288,7 @@ export async function runAiPrune(
   logInfo(`AI pruning ${allMemories.length} memories in ${totalBatches} batch(es)...`);
 
   let totalArchived = 0;
+  let successfulBatches = 0;
 
   for (let i = 0; i < batches.length; i++) {
     const batch = batches[i];
@@ -304,6 +305,7 @@ export async function runAiPrune(
       continue; // skip failed batch, try next
     }
 
+    successfulBatches++;
     const candidates = parsePruneResponse(response);
 
     for (const candidate of candidates) {
@@ -338,6 +340,14 @@ export async function runAiPrune(
         logError(`AI suggested unknown memory ID: ${candidate.id}`);
       }
     }
+  }
+
+  if (successfulBatches === 0) {
+    return {
+      archived: 0,
+      reviewed: allMemories.length,
+      error: `All ${batches.length} AI prune batches failed`,
+    };
   }
 
   // Invalidate cached surfaces when memories were archived

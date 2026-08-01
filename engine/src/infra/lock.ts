@@ -1,65 +1,62 @@
 /**
- * PID-based file locking for detached workers.
+ * PID-based file locking for detached Cortex workers.
  *
- * SessionEnd spawns detached processes (extract, semantic-edges) that can
- * overlap with each other across sessions. A per-project lock file with the
- * holder's PID prevents concurrent runs; stale locks (holder no longer
- * running) are reclaimed automatically.
- *
- * I/O boundary — all functions perform filesystem side effects.
+ * Lock files contain the holder PID. Creation is atomic and stale locks are
+ * reclaimed when the recorded process no longer exists.
  */
 
-import { unlinkSync, writeFileSync, readFileSync, mkdirSync } from 'fs';
-import { dirname } from 'path';
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 
-/**
- * Acquire a lock file with PID. Returns true if acquired.
- * Stale locks (PID no longer running) are automatically reclaimed.
- * The lock should live in the project's .memory/locks dir — a global lock
- * would make runs for unrelated projects silently skip each other.
- */
-export function acquireLock(lockFile: string): boolean {
+export type LockAcquisition =
+  | Readonly<{ acquired: true }>
+  | Readonly<{ acquired: false; reason: 'held' | 'io-error' }>;
+
+/** Acquire an exclusive PID lock without waiting. */
+export function acquireLock(lockFile: string): LockAcquisition {
   try {
     mkdirSync(dirname(lockFile), { recursive: true });
-    // O_EXCL: atomic create-if-not-exists — eliminates TOCTOU race
     writeFileSync(lockFile, String(process.pid), { flag: 'wx' });
-    return true;
-  } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') return false;
-    // Lock file exists — check if holder is still alive
-    try {
-      const existingPid = parseInt(readFileSync(lockFile, 'utf-8').trim(), 10);
-      if (!isNaN(existingPid)) {
-        try {
-          process.kill(existingPid, 0);
-          return false; // Process still alive, lock is held
-        } catch {
-          // Process gone, stale lock — reclaim it
-          process.stderr.write(`[cortex:lock] INFO: Reclaiming stale lock from PID ${existingPid}\n`);
-          unlinkSync(lockFile);
-          try {
-            writeFileSync(lockFile, String(process.pid), { flag: 'wx' });
-            return true;
-          } catch {
-            return false; // Another process beat us to reclaim
-          }
-        }
-      }
-    } catch {
-      return false;
+    return { acquired: true };
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') {
+      return { acquired: false, reason: 'io-error' };
     }
-    return false;
+  }
+
+  try {
+    const holder = Number.parseInt(readFileSync(lockFile, 'utf8').trim(), 10);
+    if (!Number.isInteger(holder) || holder <= 0) {
+      return { acquired: false, reason: 'io-error' };
+    }
+
+    try {
+      process.kill(holder, 0);
+      return { acquired: false, reason: 'held' };
+    } catch {
+      unlinkSync(lockFile);
+      try {
+        writeFileSync(lockFile, String(process.pid), { flag: 'wx' });
+        process.stderr.write(`[cortex:lock] INFO: Reclaimed stale lock from PID ${holder}\n`);
+        return { acquired: true };
+      } catch (error: unknown) {
+        return {
+          acquired: false,
+          reason: (error as NodeJS.ErrnoException)?.code === 'EEXIST' ? 'held' : 'io-error',
+        };
+      }
+    }
+  } catch {
+    return { acquired: false, reason: 'io-error' };
   }
 }
 
-/**
- * Release a previously acquired lock file.
- * Idempotent — a missing lock file is ignored.
- */
+/** Release a lock owned by the current process. */
 export function releaseLock(lockFile: string): void {
   try {
-    unlinkSync(lockFile);
+    const holder = Number.parseInt(readFileSync(lockFile, 'utf8').trim(), 10);
+    if (holder === process.pid) unlinkSync(lockFile);
   } catch {
-    // Ignore — lock already removed
+    // Idempotent cleanup: missing/unreadable locks require no action.
   }
 }

@@ -49,10 +49,7 @@ log_info() {
 # detached workers run concurrently (one per session Stop). Include the PID.
 EXTRACT_LOG="/tmp/cortex-extract.$$.log"
 BACKFILL_LOG="/tmp/cortex-backfill.$$.log"
-GENERATE_LOG="/tmp/cortex-generate.$$.log"
-SEMANTIC_EDGES_LOG="/tmp/cortex-semantic-edges.$$.log"
-LIFECYCLE_LOG="/tmp/cortex-lifecycle.$$.log"
-AI_PRUNE_LOG="/tmp/cortex-ai-prune.$$.log"
+MAINTENANCE_LOG="/tmp/cortex-maintenance.$$.log"
 
 # Main execution wrapped in error handler
 main() {
@@ -86,50 +83,16 @@ main() {
     fi
   fi
 
-  # Steps 3-5: maintenance, run SEQUENTIALLY. This whole worker is already
-  # detached from the session, so nothing here blocks the user — and running
-  # these concurrently made them race each other: SQLite allows one writer
-  # (collisions were silently lost in /dev/null), and lifecycle + ai-prune
-  # both read-modify-write telemetry.json. Logs go to /tmp for debuggability.
-  #
-  # ORDER MATTERS: generate must run LAST. Lifecycle and ai-prune archive
-  # memories — generating the surface before them served just-archived
-  # memories for the whole next session.
-
-  # Step 3: Semantic edge classification (claude -p) — upgrades Jaccard
-  # 'relates_to' edges to typed relationships
-  if [[ "$extract_ok" == true ]] && [[ -n "$cwd" ]]; then
-    log_info "Running semantic edge classification"
-    if ! bun "$CLI_PATH" semantic-edges "$cwd" >"$SEMANTIC_EDGES_LOG" 2>&1; then
-      log_error "Semantic edges failed (see $SEMANTIC_EDGES_LOG)"
-    fi
-  fi
-
-  # Step 4: Lifecycle prune — skips if no new memories and last run <2h ago
+  # Step 3: The worker is already detached. Run one per-project-locked
+  # maintenance command instead of spawning independent semantic-edge,
+  # lifecycle, AI-prune, and generate processes.
   if [[ -n "$cwd" ]]; then
-    log_info "Running lifecycle prune"
-    if ! bun "$CLI_PATH" lifecycle "$cwd" --if-needed >"$LIFECYCLE_LOG" 2>&1; then
-      log_error "Lifecycle failed (see $LIFECYCLE_LOG)"
-    fi
-  fi
-
-  # Step 5: AI prune — smart trigger decides whether a prune is due
-  if [[ -n "$cwd" ]]; then
-    log_info "Running AI prune"
-    if ! bun "$CLI_PATH" ai-prune "$cwd" --if-needed >"$AI_PRUNE_LOG" 2>&1; then
-      log_error "AI prune failed (see $AI_PRUNE_LOG)"
-    fi
-  fi
-
-  # Step 6: Generate push surface LAST, after all archival is done, so the
-  # surface never contains memories archived earlier in this pipeline
-  if [[ -n "$cwd" ]]; then
-    log_info "Generating push surface for cwd: $cwd"
-    if ! bun "$CLI_PATH" generate "$cwd" 2>&1 | tee "$GENERATE_LOG"; then
-      log_error "Generate failed (see $GENERATE_LOG)"
+    log_info "Running locked maintenance pipeline for cwd: $cwd"
+    if ! bun "$CLI_PATH" maintenance "$cwd" >"$MAINTENANCE_LOG" 2>&1; then
+      log_error "Maintenance failed (see $MAINTENANCE_LOG)"
     fi
   else
-    log_error "Could not parse cwd from stdin JSON, skipping generate"
+    log_error "Could not parse cwd from stdin JSON, skipping maintenance"
   fi
 
   log_info "Stop hook complete"

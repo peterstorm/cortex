@@ -152,6 +152,38 @@ describe('parsePruneResponse / shouldRunAiPrune (sanity)', () => {
     expect(shouldRunAiPrune(5, 0, 5, 50)).toBe(true);
     expect(shouldRunAiPrune(1, 0, 5, 50)).toBe(false);
   });
+
+  it('does not rerun every session merely because the store remains large', () => {
+    expect(shouldRunAiPrune(1, 276, 5, 50, 276)).toBe(false);
+  });
+
+  it('retriggers after 25 percent memory growth', () => {
+    expect(shouldRunAiPrune(1, 124, 5, 50, 100)).toBe(false);
+    expect(shouldRunAiPrune(1, 125, 5, 50, 100)).toBe(true);
+  });
+});
+
+describe('AI prune failure telemetry', () => {
+  beforeEach(() => {
+    mockRunLlmPrompt.mockReset();
+  });
+
+  it('does not mark a prune complete when every LLM batch fails', async () => {
+    mockRunLlmPrompt.mockRejectedValue(new Error('provider unavailable'));
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    const telemetryPath = makeTelemetryPath();
+    for (let index = 0; index < 20; index++) {
+      insertMemory(projectDb, makeMemory(`failure-${index}`, 10));
+    }
+
+    const result = await runAiPrune(projectDb, globalDb, telemetryPath);
+
+    expect(result.error).toContain('All 1 AI prune batches failed');
+    expect(fs.existsSync(telemetryPath)).toBe(false);
+    projectDb.close();
+    globalDb.close();
+  });
 });
 
 // ============================================================================
