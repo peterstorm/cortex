@@ -132,10 +132,15 @@ export function truncateTranscript(
  * ever land. Strip the marker-bracketed blocks before building the prompt.
  */
 export function stripInjectedMemorySurface(content: string): string {
-  return content.replace(
-    /<!-- CORTEX_MEMORY_START -->[\s\S]*?<!-- CORTEX_MEMORY_END -->/g,
-    ""
-  );
+  return content
+    .replace(
+      /<!-- CORTEX_MEMORY_START -->[\s\S]*?<!-- CORTEX_MEMORY_END -->/g,
+      ""
+    )
+    .replace(
+      /<!-- CORTEX_RECALL_START -->[\s\S]*?<!-- CORTEX_RECALL_END -->/g,
+      ""
+    );
 }
 
 export function buildExtractionPrompt(

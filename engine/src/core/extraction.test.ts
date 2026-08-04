@@ -240,6 +240,15 @@ describe("stripInjectedMemorySurface", () => {
     expect(result).not.toContain("DAG framework");
   });
 
+  it("removes prompt-recall blocks as injected memory context", () => {
+    const input =
+      "before <!-- CORTEX_RECALL_START -->\n## Prompt-Relevant Memories\n- [gotcha] stale recall noise\n<!-- CORTEX_RECALL_END --> after";
+    const result = stripInjectedMemorySurface(input);
+    expect(result).toBe("before  after");
+    expect(result).not.toContain("CORTEX_RECALL");
+    expect(result).not.toContain("stale recall noise");
+  });
+
   it("uses non-greedy matching across multiple blocks", () => {
     const input =
       "<!-- CORTEX_MEMORY_START -->A<!-- CORTEX_MEMORY_END -->mid<!-- CORTEX_MEMORY_START -->B<!-- CORTEX_MEMORY_END -->";
@@ -261,7 +270,7 @@ describe("stripInjectedMemorySurface", () => {
 describe("buildExtractionPrompt", () => {
   it("strips injected cortex memory blocks from the embedded transcript", () => {
     const transcript =
-      'turn1\n<!-- CORTEX_MEMORY_START -->\n- DAG framework noise\n<!-- CORTEX_MEMORY_END -->\nturn2';
+      'turn1\n<!-- CORTEX_MEMORY_START -->\n- DAG framework noise\n<!-- CORTEX_MEMORY_END -->\n<!-- CORTEX_RECALL_START -->\n- [gotcha] prompt recall noise\n<!-- CORTEX_RECALL_END -->\nturn2';
     const prompt = buildExtractionPrompt(
       transcript,
       { branch: "main", recent_commits: [], changed_files: [] },
@@ -270,7 +279,9 @@ describe("buildExtractionPrompt", () => {
     expect(prompt).toContain("turn1");
     expect(prompt).toContain("turn2");
     expect(prompt).not.toContain("CORTEX_MEMORY");
+    expect(prompt).not.toContain("CORTEX_RECALL");
     expect(prompt).not.toContain("DAG framework noise");
+    expect(prompt).not.toContain("prompt recall noise");
   });
 
   it("includes project name and branch", () => {

@@ -18,6 +18,7 @@ import { searchByKeywordOr, searchByKeywordAnd, getMemoriesWithEmbedding } from 
 import { embedTexts, isGeminiAvailable } from '../infra/gemini-embed.ts';
 import { rankBySimilarity, STOP_WORDS, extractUnigrams } from '../core/similarity.js';
 import { buildQueryEmbeddingText } from './recall.js';
+import { sanitizeSurfaceText } from '../core/surface.js';
 
 // ============================================================================
 // CONSTANTS
@@ -91,7 +92,7 @@ export function isTagOnlyMatch(memory: Memory, tokens: readonly string[]): boole
 export function formatPromptRecall(memories: readonly Memory[]): string {
   if (memories.length === 0) return '';
 
-  const lines = memories.map(m => `- [${m.memory_type}] ${m.summary}`);
+  const lines = memories.map(m => `- [${m.memory_type}] ${sanitizeSurfaceText(m.summary)}`);
 
   return [
     '<!-- CORTEX_RECALL_START -->',
