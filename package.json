@@ -6,7 +6,7 @@
   "type": "module",
   "author": { "name": "peterstorm" },
   "pi": {
-    "extensions": ["./pi"],
+    "extensions": ["./pi/extension.ts"],
     "prompts": ["./commands"]
   },
   "peerDependencies": {
