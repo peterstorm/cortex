@@ -25,8 +25,8 @@
  */
 
 import { Database } from 'bun:sqlite';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { dirname, isAbsolute, join } from 'node:path';
 import type { HookInput } from './core/types.js';
 import {
   getGeminiApiKey,
@@ -40,29 +40,30 @@ import {
   DEFAULT_SEARCH_LIMIT,
   GITIGNORE_PATTERNS,
 } from './config.js';
-import { openDatabase, getActiveMemories } from './infra/db.js';
-import { ensureGitignored } from './infra/filesystem.js';
+import { openDatabase, openDatabaseReadOnly, getActiveMemories, getMemoriesByIds } from './infra/db.js';
+import { ensureGitignored, writeSurface } from './infra/filesystem.js';
 import { acquireLock, releaseLock } from './infra/lock.js';
 
 // Command imports
 import { executeExtract } from './commands/extract.js';
-import { runGenerate, loadCachedSurface } from './commands/generate.js';
+import { runGenerate, loadCachedSurface, computeDbFingerprint } from './commands/generate.js';
 import { wrapInMarkers } from './core/surface.js';
 import { executeRecall, formatRecallResult, formatRecallError } from './commands/recall.js';
 import type { RecallOptions } from './commands/recall.js';
 import { executeRemember } from './commands/remember.js';
 import { executeIndexCode } from './commands/index-code.js';
 import { forgetById, forgetByQuery } from './commands/forget.js';
-import { findSimilarPairs } from './commands/consolidate.js';
-import { runLifecycle, runLifecycleIfNeeded } from './commands/lifecycle.js';
+import { findSimilarPairs, formatPairForReview, mergePair } from './commands/consolidate.js';
+import { runFullLifecycle, runLifecycleIfNeeded } from './commands/lifecycle.js';
 import { runAiPrune, runAiPruneIfNeeded } from './commands/ai-prune.js';
 import { executeTraverse } from './commands/traverse.js';
 import { runInspect } from './commands/inspect.js';
 import { backfill } from './commands/backfill.js';
+import type { BackfillResult } from './commands/backfill.js';
 import { executeSemanticEdges } from './commands/semantic-edges.js';
 import { executePromptRecallWithFallback, formatPromptRecall } from './commands/prompt-recall.js';
 import { executeEntityQuery, formatEntityQueryResult } from './commands/entity-query.js';
-import { disposeLocalModel } from './infra/local-embed.js';
+import { disposeLocalModel, embedLocal } from './infra/local-embed.js';
 
 // ============================================================================
 // TYPES
@@ -158,13 +159,51 @@ async function readStdinJson(): Promise<HookInput | null> {
 // ============================================================================
 
 /**
+ * Validate a cwd argument before any filesystem side effects.
+ * Pure predicate over the argument string + a single existsSync/statSync probe.
+ *
+ * Rejects:
+ * - Strings starting with '-' (flags mistaken for cwd, e.g. '--session')
+ * - Relative paths (must be absolute)
+ * - Paths that do not exist as directories
+ *
+ * @param cwd - Candidate project root directory
+ * @returns Error message if invalid, null if valid
+ */
+export function validateCwd(cwd: string): string | null {
+  if (cwd.startsWith('-')) {
+    return `Invalid cwd '${cwd}': looks like a flag, expected an absolute directory path`;
+  }
+  if (!isAbsolute(cwd)) {
+    return `Invalid cwd '${cwd}': must be an absolute path`;
+  }
+  try {
+    if (!statSync(cwd).isDirectory()) {
+      return `Invalid cwd '${cwd}': not a directory`;
+    }
+  } catch {
+    return `Invalid cwd '${cwd}': directory does not exist`;
+  }
+  return null;
+}
+
+/**
  * Open or create project and global databases
  * Ensures .memory/ directory exists and is gitignored
+ *
+ * Validates cwd first (single choke point) — exits 1 with a usage error
+ * on invalid cwd so no phantom directories are ever created.
  *
  * @param cwd - Project root directory
  * @returns Tuple of [projectDb, globalDb]
  */
 function initDatabases(cwd: string): [Database, Database] {
+  const cwdError = validateCwd(cwd);
+  if (cwdError !== null) {
+    logError(cwdError);
+    process.exit(1);
+  }
+
   const projectDbPath = getProjectDbPath(cwd);
   const globalDbPath = getGlobalDbPath();
 
@@ -210,23 +249,19 @@ async function handleExtract(): Promise<CommandResult> {
     };
   }
 
-  // Only open project DB - extract doesn't use global DB
-  const projectDbPath = getProjectDbPath(input.cwd);
-  const projectDbDir = dirname(projectDbPath);
-  if (!existsSync(projectDbDir)) {
-    mkdirSync(projectDbDir, { recursive: true });
-  }
-
   try {
     ensureGitignored(input.cwd, GITIGNORE_PATTERNS);
   } catch (err) {
     logError(`Failed to update .gitignore: ${err}`);
   }
 
-  const projectDb = openDatabase(projectDbPath);
+  // Both DBs: extraction classifies candidate scope (FR-008), and
+  // global-scoped candidates must land in the global DB to be visible
+  // from other projects.
+  const [projectDb, globalDb] = initDatabases(input.cwd);
 
   try {
-    const result = await executeExtract(input, projectDb);
+    const result = await executeExtract(input, projectDb, globalDb);
     return {
       success: result.success,
       output: JSON.stringify(result),
@@ -239,6 +274,7 @@ async function handleExtract(): Promise<CommandResult> {
     };
   } finally {
     projectDb.close();
+    globalDb.close();
   }
 }
 
@@ -388,11 +424,12 @@ async function handleRemember(args: string[]): Promise<CommandResult> {
   const rememberArgs = args.slice(1);
 
   try {
-    const result = executeRemember(
+    const result = await executeRemember(
       rememberArgs,
       'manual-session', // Session ID for manual memories
       projectDb,
-      globalDb
+      globalDb,
+      { embedFn: embedLocal, projectName: getProjectName(cwd), cwd }
     );
 
     return {
@@ -416,22 +453,21 @@ async function handleRemember(args: string[]): Promise<CommandResult> {
  * Index code blocks with prose descriptions
  */
 async function handleIndexCode(args: string[]): Promise<CommandResult> {
-  // Args: [cwd, proseId, codePath]
+  // Args: [cwd, filePath, summary, ...flags]
   if (args.length < 3) {
     return {
       success: false,
-      error: 'Usage: index-code <cwd> <proseId> <codePath>',
+      error: 'Usage: index-code <cwd> <filePath> <summary> [--start=N] [--end=N] [--scope=project|global] [--tags=tag1,tag2] [--session=ID]',
     };
   }
 
   const cwd = args[0];
-  const proseId = args[1];
-  const codePath = args[2];
   const [projectDb, globalDb] = initDatabases(cwd);
 
   try {
+    // Forward everything after cwd: filePath, summary, and all flags
     const result = await executeIndexCode(
-      [proseId, codePath],
+      args.slice(1),
       'manual-index',
       projectDb,
       globalDb,
@@ -474,9 +510,9 @@ async function handleForget(args: string[]): Promise<CommandResult> {
 
   try {
     // Try as ID first (both DBs)
-    let result = forgetById(projectDb, idOrQuery);
+    let result = forgetById(projectDb, idOrQuery, cwd);
     if (result.status === 'not_found') {
-      result = forgetById(globalDb, idOrQuery);
+      result = forgetById(globalDb, idOrQuery, cwd);
     }
 
     // If still not found, try as keyword query
@@ -498,6 +534,7 @@ async function handleForget(args: string[]): Promise<CommandResult> {
       const archiveResult = forgetById(
         candidate.scope === 'global' ? globalDb : projectDb,
         candidate.id,
+        cwd,
       );
       if (archiveResult.status === 'archived') {
         return {
@@ -531,18 +568,25 @@ async function handleForget(args: string[]): Promise<CommandResult> {
 
 /**
  * Handle 'consolidate' subcommand
- * Find and report similar memory pairs
+ *
+ * List mode:  consolidate <cwd> [--threshold=N]
+ *   Prints each similar pair with IDs, similarity, and content for review.
+ * Merge mode: consolidate <cwd> --merge --a=<idA> --b=<idB> --summary=<text> --content=<text>
+ *   Merges one reviewed pair (FR-075..077); human approval happens in the skill.
  */
 async function handleConsolidate(args: string[]): Promise<CommandResult> {
-  // Args: [cwd]
   if (args.length < 1) {
     return {
       success: false,
-      error: 'Usage: consolidate <cwd>',
+      error: 'Usage: consolidate <cwd> [--threshold=N] | consolidate <cwd> --merge --a=<idA> --b=<idB> --summary=<text> --content=<text>',
     };
   }
 
   const cwd = args[0];
+  const cwdError = validateCwd(cwd);
+  if (cwdError !== null) {
+    return { success: false, error: cwdError };
+  }
   // Only open project DB - consolidate operates on project scope only
   const projectDbPath = getProjectDbPath(cwd);
   const projectDbDir = dirname(projectDbPath);
@@ -559,11 +603,70 @@ async function handleConsolidate(args: string[]): Promise<CommandResult> {
   const projectDb = openDatabase(projectDbPath);
 
   try {
+    if (args.includes('--merge')) {
+      const flagValue = (name: string): string | undefined => {
+        const arg = args.find(a => a.startsWith(`--${name}=`));
+        return arg?.slice(name.length + 3);
+      };
+      const idA = flagValue('a');
+      const idB = flagValue('b');
+      const summary = flagValue('summary');
+      const content = flagValue('content');
+      if (!idA || !idB || !summary || !content) {
+        return {
+          success: false,
+          error: 'Usage: consolidate <cwd> --merge --a=<idA> --b=<idB> --summary=<text> --content=<text>',
+        };
+      }
+
+      // 'any' status: mergePair re-checks status inside its transaction and
+      // returns a more informative skip reason than "not found"
+      const found = getMemoriesByIds(projectDb, [idA, idB], 'any');
+      const memoryA = found.find(m => m.id === idA);
+      const memoryB = found.find(m => m.id === idB);
+      if (!memoryA || !memoryB) {
+        const missing = [!memoryA && idA, !memoryB && idB].filter(Boolean).join(', ');
+        return { success: false, error: `Memory not found: ${missing}` };
+      }
+
+      const mergeResult = mergePair(
+        projectDb,
+        { memoryA, memoryB, similarity: 1.0 },
+        summary,
+        content,
+        'consolidate-session',
+        cwd
+      );
+      if (mergeResult.kind === 'skipped') {
+        return {
+          success: false,
+          error: `Merge skipped: ${mergeResult.reason}`,
+        };
+      }
+      return {
+        success: true,
+        output: `Merged ${idA} + ${idB} -> ${mergeResult.mergedId} (both originals superseded). Run backfill + generate to refresh embeddings and surface.`,
+      };
+    }
+
+    const thresholdArg = args.find(a => a.startsWith('--threshold='));
+    const threshold = thresholdArg ? Number.parseFloat(thresholdArg.slice('--threshold='.length)) : undefined;
+    if (threshold !== undefined && (Number.isNaN(threshold) || threshold <= 0 || threshold > 1)) {
+      return { success: false, error: '--threshold must be a number in (0, 1]' };
+    }
+
     const memories = getActiveMemories(projectDb);
-    const pairs = findSimilarPairs(memories);
+    const pairs = findSimilarPairs(memories, threshold);
+
+    if (pairs.length === 0) {
+      return { success: true, output: 'Found 0 similar pairs' };
+    }
+
+    const sections = pairs.map(formatPairForReview);
+    const header = `Found ${pairs.length} similar pair(s). To merge one:\n  consolidate <cwd> --merge --a=<idA> --b=<idB> --summary=<merged summary> --content=<merged content>\n`;
     return {
       success: true,
-      output: `Found ${pairs.length} similar pairs`,
+      output: [header, ...sections].join('\n'),
     };
   } catch (err) {
     return {
@@ -595,7 +698,7 @@ async function handleLifecycle(args: string[]): Promise<CommandResult> {
 
   try {
     if (ifNeeded) {
-      const result = runLifecycleIfNeeded(projectDb, globalDb, getTelemetryPath(cwd));
+      const result = runLifecycleIfNeeded(projectDb, globalDb, getTelemetryPath(cwd), cwd);
       if (result.skipped) {
         return { success: true, output: 'Lifecycle skipped (no changes needed)' };
       }
@@ -605,12 +708,14 @@ async function handleLifecycle(args: string[]): Promise<CommandResult> {
       };
     }
 
-    const projectResult = runLifecycle(projectDb);
-    const globalResult = runLifecycle(globalDb);
+    // Same lifecycle+vacuum sequence as the --if-needed path (minus the
+    // skip heuristics) — a manual run must also hard-delete expired
+    // pruned rows.
+    const result = runFullLifecycle(projectDb, globalDb, cwd);
 
     return {
       success: true,
-      output: `Lifecycle complete: archived ${projectResult.archived + globalResult.archived}, pruned ${projectResult.pruned + globalResult.pruned}`,
+      output: `Lifecycle complete: archived ${result.archived}, pruned ${result.pruned}`,
     };
   } catch (err) {
     return {
@@ -646,30 +751,33 @@ async function handleAiPrune(args: string[]): Promise<CommandResult> {
       : { success: false, error: 'AI prune failed: could not acquire lock' };
   }
 
-  const [projectDb, globalDb] = initDatabases(cwd);
   try {
-    const result = ifNeeded
-      ? await runAiPruneIfNeeded(projectDb, globalDb, getTelemetryPath(cwd))
-      : await runAiPrune(projectDb, globalDb, getTelemetryPath(cwd));
+    const [projectDb, globalDb] = initDatabases(cwd);
+    try {
+      const result = ifNeeded
+        ? await runAiPruneIfNeeded(projectDb, globalDb, getTelemetryPath(cwd), cwd)
+        : await runAiPrune(projectDb, globalDb, getTelemetryPath(cwd), cwd);
 
-    if (result.skipped) {
-      return { success: true, output: 'AI prune skipped (thresholds not met)' };
+      if (result.skipped) {
+        return { success: true, output: 'AI prune skipped (thresholds not met)' };
+      }
+      if (result.error) {
+        return { success: false, error: `AI prune failed: ${result.error}` };
+      }
+      return {
+        success: true,
+        output: `AI prune complete: archived ${result.archived} of ${result.reviewed} reviewed`,
+      };
+    } catch (err) {
+      return {
+        success: false,
+        error: `AI prune failed: ${err}`,
+      };
+    } finally {
+      projectDb.close();
+      globalDb.close();
     }
-    if (result.error) {
-      return { success: false, error: `AI prune failed: ${result.error}` };
-    }
-    return {
-      success: true,
-      output: `AI prune complete: archived ${result.archived} of ${result.reviewed} reviewed`,
-    };
-  } catch (err) {
-    return {
-      success: false,
-      error: `AI prune failed: ${err}`,
-    };
   } finally {
-    projectDb.close();
-    globalDb.close();
     releaseLock(lockFile);
   }
 }
@@ -679,25 +787,28 @@ async function handleAiPrune(args: string[]): Promise<CommandResult> {
  * BFS graph traversal from memory ID
  */
 async function handleTraverse(args: string[]): Promise<CommandResult> {
-  // Args: [cwd, memoryId, maxDepth]
-  if (args.length < 2) {
+  // Args: [cwd, memoryId, maxDepth] [--include-archived]
+  const includeArchived = args.includes('--include-archived');
+  const positional = args.filter(a => !a.startsWith('--'));
+
+  if (positional.length < 2) {
     return {
       success: false,
-      error: 'Usage: traverse <cwd> <memoryId> [maxDepth]',
+      error: 'Usage: traverse <cwd> <memoryId> [maxDepth] [--include-archived]',
     };
   }
 
-  const cwd = args[0];
-  const memoryId = args[1];
-  const maxDepth = args.length > 2 ? parseInt(args[2], 10) : 2;
+  const cwd = positional[0];
+  const memoryId = positional[1];
+  const maxDepth = positional.length > 2 ? parseInt(positional[2], 10) : 2;
   const [projectDb, globalDb] = initDatabases(cwd);
 
   try {
     // Try project DB first
-    let result = executeTraverse(projectDb, { id: memoryId, depth: maxDepth });
+    let result = executeTraverse(projectDb, { id: memoryId, depth: maxDepth, includeArchived });
     if (!result.success) {
       // Try global DB
-      result = executeTraverse(globalDb, { id: memoryId, depth: maxDepth });
+      result = executeTraverse(globalDb, { id: memoryId, depth: maxDepth, includeArchived });
     }
 
     if (!result.success) {
@@ -761,6 +872,49 @@ async function handleInspect(args: string[]): Promise<CommandResult> {
 }
 
 /**
+ * Summarize project + global backfill results into a CommandResult.
+ * Pure function — no I/O, testable.
+ *
+ * - Any `ok: false` result → failure with the error(s)
+ * - `failed > 0` → per-memory errors surfaced in `warnings` (caller prints
+ *   to stderr), failed count included in output
+ * - Everything failed (`failed > 0 && processed === 0`) → failure
+ */
+export function summarizeBackfillResults(
+  projectResult: BackfillResult,
+  globalResult: BackfillResult
+): CommandResult & { readonly warnings: readonly string[] } {
+  const results = [projectResult, globalResult];
+  const hardErrors = results.flatMap((r) => (r.ok ? [] : [r.error]));
+
+  if (hardErrors.length > 0) {
+    return { success: false, error: hardErrors.join('; '), warnings: [] };
+  }
+
+  const okResults = results.filter((r): r is Extract<BackfillResult, { ok: true }> => r.ok);
+  const processed = okResults.reduce((sum, r) => sum + r.processed, 0);
+  const failed = okResults.reduce((sum, r) => sum + r.failed, 0);
+  const warnings = okResults.flatMap((r) => [...r.errors]);
+
+  if (failed > 0 && processed === 0) {
+    return {
+      success: false,
+      error: `Backfill failed: all ${failed} embedding(s) failed`,
+      warnings,
+    };
+  }
+
+  return {
+    success: true,
+    output:
+      failed > 0
+        ? `Backfill complete: processed ${processed} memories, ${failed} failed`
+        : `Backfill complete: processed ${processed} memories`,
+    warnings,
+  };
+}
+
+/**
  * Handle 'backfill' subcommand
  * Process pending embedding queue
  */
@@ -781,11 +935,11 @@ async function handleBackfill(args: string[]): Promise<CommandResult> {
     const projectResult = await backfill(projectDb, getProjectName(cwd), apiKey);
     const globalResult = await backfill(globalDb, 'global', apiKey);
 
-    const processed = (projectResult.ok ? projectResult.processed : 0) + (globalResult.ok ? globalResult.processed : 0);
-    return {
-      success: true,
-      output: `Backfill complete: processed ${processed} memories`,
-    };
+    const { warnings, ...result } = summarizeBackfillResults(projectResult, globalResult);
+    for (const warning of warnings) {
+      logError(warning);
+    }
+    return result;
   } catch (err) {
     return {
       success: false,
@@ -818,10 +972,7 @@ async function handleSemanticEdges(args: string[]): Promise<CommandResult> {
   })();
 
   try {
-    const result = await executeSemanticEdges(projectDb, {
-      limit,
-      lockDir: getLockDir(cwd),
-    });
+    const result = await executeSemanticEdges(projectDb, { limit, lockDir: getLockDir(cwd) });
 
     if (!result.ok) {
       return { success: false, error: result.error };
@@ -858,19 +1009,48 @@ async function handleLoadSurface(args: string[]): Promise<CommandResult> {
   const cwd = args[0];
 
   try {
-    const result = loadCachedSurface(cwd, getSurfaceCacheDir(cwd));
-
-    if (result !== null) {
-      // Write cached surface to .claude/cortex-memory.local.md
-      const outputPath = getSurfaceOutputPath(cwd);
-      mkdirSync(dirname(outputPath), { recursive: true });
-      writeFileSync(outputPath, wrapInMarkers(result.surface), 'utf8');
+    // Only act for projects that already use cortex. This hook runs at
+    // SessionStart in EVERY project; creating .memory/DBs in untouched
+    // projects is not ok — and without a project DB the cache fingerprint
+    // can't be validated anyway.
+    if (!existsSync(getProjectDbPath(cwd))) {
+      return { success: true, output: 'No cached surface available' };
     }
 
-    return {
-      success: true,
-      output: result !== null ? 'Loaded cached surface' : 'No cached surface available',
-    };
+    const [projectDb, globalDb] = initDatabases(cwd);
+    try {
+      // Fingerprint the current DBs so a cache written against a different
+      // memory set (archives, merges, inserts) is a miss, not a hit.
+      const fingerprint = computeDbFingerprint(projectDb, globalDb);
+      const result = loadCachedSurface(cwd, getSurfaceCacheDir(cwd), fingerprint);
+
+      if (result !== null && !result.staleness.stale) {
+        // Write cached surface through the same locked, atomic,
+        // marker-splicing path as generation — a bare writeFileSync here
+        // bypassed the surface lock and clobbered user content.
+        writeSurface(getSurfaceOutputPath(cwd), wrapInMarkers(result.surface), getLockDir(cwd));
+        return { success: true, output: 'Loaded cached surface' };
+      }
+
+      // Cache miss or stale: regenerate from the database
+      runGenerate({
+        projectDb,
+        globalDb,
+        cwd,
+        surfacePath: getSurfaceOutputPath(cwd),
+        cachePath: getSurfaceCacheDir(cwd),
+        lockDir: getLockDir(cwd),
+      });
+      return {
+        success: true,
+        output: result === null
+          ? 'Regenerated surface (cache miss)'
+          : `Regenerated surface (cache stale: ${result.staleness.age_hours.toFixed(1)}h old)`,
+      };
+    } finally {
+      projectDb.close();
+      globalDb.close();
+    }
   } catch (err) {
     return {
       success: false,
@@ -980,14 +1160,31 @@ async function handlePromptRecall(): Promise<CommandResult> {
       // Ignore read errors
     }
 
-    const projectDb = hasProjectDb ? openDatabase(projectDbPath) : null;
-    const globalDb = hasGlobalDb ? openDatabase(globalDbPath) : null;
+    // Read-only open: this hook fires on EVERY user prompt and only reads.
+    // Skips schema DDL/migrations and never takes the writer lock. Falls
+    // back to the normal read-write open if the read-only open fails
+    // (e.g. odd filesystem semantics) — best-effort, like the rest of
+    // this handler.
+    const openReadOnly = (path: string): Database | null => {
+      try {
+        return openDatabaseReadOnly(path);
+      } catch {
+        try {
+          return openDatabase(path);
+        } catch {
+          return null;
+        }
+      }
+    };
+    const projectDb = hasProjectDb ? openReadOnly(projectDbPath) : null;
+    const globalDb = hasGlobalDb ? openReadOnly(globalDbPath) : null;
 
     try {
       const memories = await executePromptRecallWithFallback(projectDb, globalDb, {
         prompt,
         surfaceContent,
         geminiApiKey: getGeminiApiKey(),
+        projectName: getProjectName(cwd),
       });
       const output = formatPromptRecall(memories);
 
@@ -1139,15 +1336,9 @@ async function main() {
     };
   }
 
-  // Safety: close DBs on uncaught exceptions to prevent WAL corruption
-  process.on('uncaughtException', (err) => {
-    logError(`Uncaught exception: ${err}`);
-    process.exit(1);
-  });
-
   // Output result
   if (result.output) {
-    process.stdout.write(`${result.output}\n`);
+    process.stdout.write(result.output + '\n');
   }
 
   // Dispose ONNX model resources before exit

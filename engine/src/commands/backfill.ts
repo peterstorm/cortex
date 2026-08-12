@@ -25,16 +25,21 @@ export type BackfillResult =
 
 /**
  * Functional Core: filter memories missing Gemini embedding
+ *
+ * FR-053: `code` memories are created with embedding:null BY DESIGN
+ * (raw source code is retrieved via its paired code_description, and its
+ * summary is just the first 200 chars of raw code) — never embed them.
  */
 function filterGeminiUnembedded(memories: readonly Memory[]): readonly Memory[] {
-  return memories.filter((m) => m.embedding === null);
+  return memories.filter((m) => m.embedding === null && m.memory_type !== 'code');
 }
 
 /**
  * Functional Core: filter memories missing local embedding
+ * FR-053: `code` memories are never embedded (see filterGeminiUnembedded).
  */
 function filterLocalUnembedded(memories: readonly Memory[]): readonly Memory[] {
-  return memories.filter((m) => m.local_embedding === null);
+  return memories.filter((m) => m.local_embedding === null && m.memory_type !== 'code');
 }
 
 /**

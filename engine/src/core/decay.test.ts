@@ -35,6 +35,7 @@ function createMemory(overrides: Partial<Memory> = {}): Memory {
     created_at: now.toISOString(),
     updated_at: now.toISOString(),
     status: 'active',
+    archived_at: null,
     ...overrides,
   };
 }
@@ -391,9 +392,63 @@ describe('decay engine', () => {
       const memory = createMemory({
         status: 'archived',
         last_accessed_at: oldAccess.toISOString(),
+        archived_at: oldAccess.toISOString(),
       });
       const action = determineLifecycleAction(memory, 0.1, 30, 0.2, now);
       expect(action).toEqual({ action: 'prune', reason: 'archived_30d_no_access' });
+    });
+
+    it('does not prune a freshly archived memory even if long unaccessed', () => {
+      // Regression: archiving never touches last_accessed_at, so a memory
+      // unaccessed for months would previously be hard-pruned right after
+      // archival. archived_at anchors a full 30-day grace period.
+      const oldAccess = new Date(now);
+      oldAccess.setDate(oldAccess.getDate() - 100);
+
+      const memory = createMemory({
+        status: 'archived',
+        last_accessed_at: oldAccess.toISOString(),
+        archived_at: now.toISOString(), // archived just now
+      });
+      const action = determineLifecycleAction(memory, 0.1, 30, 0.2, now);
+      expect(action).toEqual({ action: 'none' });
+    });
+
+    it('prunes a memory archived 31 days ago and long unaccessed', () => {
+      const thirtyOneDaysAgo = new Date(now);
+      thirtyOneDaysAgo.setDate(thirtyOneDaysAgo.getDate() - 31);
+
+      const memory = createMemory({
+        status: 'archived',
+        last_accessed_at: thirtyOneDaysAgo.toISOString(),
+        archived_at: thirtyOneDaysAgo.toISOString(),
+      });
+      const action = determineLifecycleAction(memory, 0.1, 30, 0.2, now);
+      expect(action).toEqual({ action: 'prune', reason: 'archived_30d_no_access' });
+    });
+
+    it('legacy archived rows (NULL archived_at) fall back to updated_at', () => {
+      const oldDate = new Date(now);
+      oldDate.setDate(oldDate.getDate() - 40);
+
+      // Legacy row: no archived_at, but updated_at (set at the status
+      // change) is 40 days old — prunable
+      const legacyOld = createMemory({
+        status: 'archived',
+        last_accessed_at: oldDate.toISOString(),
+        updated_at: oldDate.toISOString(),
+        archived_at: null,
+      });
+      expect(determineLifecycleAction(legacyOld, 0.1, 30, 0.2, now).action).toBe('prune');
+
+      // Legacy row updated recently — grace period still applies
+      const legacyFresh = createMemory({
+        status: 'archived',
+        last_accessed_at: oldDate.toISOString(),
+        updated_at: now.toISOString(),
+        archived_at: null,
+      });
+      expect(determineLifecycleAction(legacyFresh, 0.1, 30, 0.2, now).action).toBe('none');
     });
 
     it('keeps pruned memories (terminal state)', () => {

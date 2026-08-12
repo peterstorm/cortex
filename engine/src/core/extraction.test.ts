@@ -83,6 +83,44 @@ describe("truncateTranscript", () => {
     expect(result.newCursor).toBe(content.length);
   });
 
+  it("resumes without skipping content when truncated chunk contains multi-byte UTF-8", () => {
+    // Each line is 5 chars but 7 bytes ("🎉" = 2 chars / 4 bytes).
+    // A byte-based cursor would overshoot on resume, skipping content
+    // and landing mid-line.
+    const line = "a🎉b\n"; // 5 chars, 7 bytes
+    const content = line.repeat(10); // 50 chars, 70 bytes
+
+    // Budget of 20 bytes fits 2 complete lines (14 bytes)
+    const first = truncateTranscript(content, 20, 0);
+    expect(first.truncated).toBe(line.repeat(2));
+    expect(first.newCursor).toBe(10); // 2 lines * 5 CHARS — not 14 bytes
+
+    // Resume must continue exactly where the first chunk ended
+    const second = truncateTranscript(content, 20, first.newCursor);
+    expect(second.truncated).toBe(line.repeat(2));
+    expect(second.newCursor).toBe(20);
+
+    // Walking the whole transcript reassembles it exactly, no gaps
+    let cursor = 0;
+    let reassembled = "";
+    while (cursor < content.length) {
+      const step = truncateTranscript(content, 20, cursor);
+      reassembled += step.truncated;
+      cursor = step.newCursor;
+    }
+    expect(reassembled).toBe(content);
+  });
+
+  it("never splits a surrogate pair at the byte budget boundary", () => {
+    // One giant line of emoji (no newlines) forces the raw-window branch.
+    const content = "🎉".repeat(100); // 200 chars, 400 bytes
+    // Budget 10 bytes = 2.5 emoji — must stop at 2 (8 bytes), not split the 3rd
+    const result = truncateTranscript(content, 10, 0);
+    expect(result.truncated).toBe("🎉🎉");
+    expect(result.newCursor).toBe(4);
+    expect(result.truncated.includes("�")).toBe(false);
+  });
+
   it("preserves JSONL boundary with cursor and maxBytes", () => {
     const content = "line1\nline2\nline3\nline4\n";
     const result = truncateTranscript(content, 12, 6); // From "line2", max 12 bytes
@@ -202,6 +240,15 @@ describe("stripInjectedMemorySurface", () => {
     expect(result).not.toContain("DAG framework");
   });
 
+  it("removes prompt-recall blocks as injected memory context", () => {
+    const input =
+      "before <!-- CORTEX_RECALL_START -->\n## Prompt-Relevant Memories\n- [gotcha] stale recall noise\n<!-- CORTEX_RECALL_END --> after";
+    const result = stripInjectedMemorySurface(input);
+    expect(result).toBe("before  after");
+    expect(result).not.toContain("CORTEX_RECALL");
+    expect(result).not.toContain("stale recall noise");
+  });
+
   it("uses non-greedy matching across multiple blocks", () => {
     const input =
       "<!-- CORTEX_MEMORY_START -->A<!-- CORTEX_MEMORY_END -->mid<!-- CORTEX_MEMORY_START -->B<!-- CORTEX_MEMORY_END -->";
@@ -223,7 +270,7 @@ describe("stripInjectedMemorySurface", () => {
 describe("buildExtractionPrompt", () => {
   it("strips injected cortex memory blocks from the embedded transcript", () => {
     const transcript =
-      'turn1\n<!-- CORTEX_MEMORY_START -->\n- DAG framework noise\n<!-- CORTEX_MEMORY_END -->\nturn2';
+      'turn1\n<!-- CORTEX_MEMORY_START -->\n- DAG framework noise\n<!-- CORTEX_MEMORY_END -->\n<!-- CORTEX_RECALL_START -->\n- [gotcha] prompt recall noise\n<!-- CORTEX_RECALL_END -->\nturn2';
     const prompt = buildExtractionPrompt(
       transcript,
       { branch: "main", recent_commits: [], changed_files: [] },
@@ -232,7 +279,9 @@ describe("buildExtractionPrompt", () => {
     expect(prompt).toContain("turn1");
     expect(prompt).toContain("turn2");
     expect(prompt).not.toContain("CORTEX_MEMORY");
+    expect(prompt).not.toContain("CORTEX_RECALL");
     expect(prompt).not.toContain("DAG framework noise");
+    expect(prompt).not.toContain("prompt recall noise");
   });
 
   it("includes project name and branch", () => {
@@ -324,6 +373,14 @@ describe("buildExtractionPrompt", () => {
   });
 });
 
+/** Narrow a parse outcome to the ok variant — throws if it was a parse_error */
+function okParse(outcome: ReturnType<typeof parseExtractionResponse>) {
+  if (outcome.kind !== "ok") {
+    throw new Error(`expected ok parse outcome, got ${outcome.kind}`);
+  }
+  return outcome;
+}
+
 describe("parseExtractionResponse", () => {
   it("parses valid JSON array of memories", () => {
     const response = JSON.stringify([
@@ -338,7 +395,7 @@ describe("parseExtractionResponse", () => {
       },
     ]);
 
-    const result = parseExtractionResponse(response);
+    const result = okParse(parseExtractionResponse(response));
 
     expect(result.memories).toHaveLength(1);
     expect(result.memories[0]).toEqual({
@@ -368,24 +425,35 @@ describe("parseExtractionResponse", () => {
 ]
 \`\`\``;
 
-    const result = parseExtractionResponse(response);
+    const result = okParse(parseExtractionResponse(response));
 
     expect(result.memories).toHaveLength(1);
     expect(result.memories[0].memory_type).toBe("pattern");
   });
 
-  it("returns empty for invalid JSON", () => {
+  it("returns parse_error for invalid JSON (not indistinguishable from empty)", () => {
     const response = "not valid json";
     const result = parseExtractionResponse(response);
 
-    expect(result.memories).toEqual([]);
-    expect(result.entities).toEqual([]);
+    expect(result.kind).toBe("parse_error");
+    if (result.kind !== "parse_error") throw new Error("expected parse_error");
+    expect(result.raw).toBe(response);
   });
 
-  it("returns empty for non-array JSON without memories key", () => {
+  it("returns parse_error for non-array JSON without memories key", () => {
     const response = JSON.stringify({ notAnArray: true });
     const result = parseExtractionResponse(response);
 
+    expect(result.kind).toBe("parse_error");
+    if (result.kind !== "parse_error") throw new Error("expected parse_error");
+    expect(result.raw).toBe(response);
+  });
+
+  it("returns ok with empty arrays for a genuinely-empty extraction", () => {
+    const result = parseExtractionResponse(JSON.stringify({ memories: [], entities: [] }));
+
+    expect(result.kind).toBe("ok");
+    if (result.kind !== "ok") throw new Error("expected ok");
     expect(result.memories).toEqual([]);
     expect(result.entities).toEqual([]);
   });
@@ -412,7 +480,7 @@ describe("parseExtractionResponse", () => {
       },
     ]);
 
-    const result = parseExtractionResponse(response);
+    const result = okParse(parseExtractionResponse(response));
 
     expect(result.memories).toHaveLength(1);
     expect(result.memories[0].memory_type).toBe("decision");
@@ -449,7 +517,7 @@ describe("parseExtractionResponse", () => {
       },
     ]);
 
-    const result = parseExtractionResponse(response);
+    const result = okParse(parseExtractionResponse(response));
 
     expect(result.memories).toHaveLength(1);
     expect(result.memories[0].confidence).toBe(0.5);
@@ -495,7 +563,7 @@ describe("parseExtractionResponse", () => {
       },
     ]);
 
-    const result = parseExtractionResponse(response);
+    const result = okParse(parseExtractionResponse(response));
 
     expect(result.memories).toHaveLength(1);
     expect(result.memories[0].priority).toBe(5);
@@ -526,7 +594,7 @@ describe("parseExtractionResponse", () => {
         },
       ]);
 
-      const result = parseExtractionResponse(response);
+      const result = okParse(parseExtractionResponse(response));
       expect(result.memories).toHaveLength(1);
       expect(result.memories[0].memory_type).toBe(type);
     });
@@ -545,7 +613,7 @@ describe("parseExtractionResponse", () => {
       },
     ]);
 
-    const result = parseExtractionResponse(response);
+    const result = okParse(parseExtractionResponse(response));
     expect(result.memories).toHaveLength(1);
     expect(result.memories[0].tags).toEqual(["api", "performance", "security"]);
   });
@@ -562,7 +630,7 @@ describe("parseExtractionResponse", () => {
       },
     ]);
 
-    const result = parseExtractionResponse(response);
+    const result = okParse(parseExtractionResponse(response));
     expect(result.memories).toHaveLength(1);
     expect(result.memories[0].tags).toEqual([]);
   });
@@ -583,7 +651,7 @@ describe("parseExtractionResponse", () => {
       },
     ]);
 
-    const result = parseExtractionResponse(response);
+    const result = okParse(parseExtractionResponse(response));
     expect(result.memories).toEqual([]);
   });
 
@@ -619,7 +687,7 @@ describe("parseExtractionResponse", () => {
       fc.assert(
         fc.property(fc.array(validMemoryArb), (memories) => {
           const response = JSON.stringify(memories);
-          const result = parseExtractionResponse(response);
+          const result = okParse(parseExtractionResponse(response));
           expect(Array.isArray(result.memories)).toBe(true);
         })
       );
@@ -629,7 +697,7 @@ describe("parseExtractionResponse", () => {
       fc.assert(
         fc.property(fc.array(validMemoryArb), (memories) => {
           const response = JSON.stringify(memories);
-          const result = parseExtractionResponse(response);
+          const result = okParse(parseExtractionResponse(response));
 
           result.memories.forEach((memory) => {
             expect(memory.memory_type).toMatch(
@@ -644,7 +712,7 @@ describe("parseExtractionResponse", () => {
       fc.assert(
         fc.property(fc.array(validMemoryArb), (memories) => {
           const response = JSON.stringify(memories);
-          const result = parseExtractionResponse(response);
+          const result = okParse(parseExtractionResponse(response));
 
           result.memories.forEach((memory) => {
             expect(memory.confidence).toBeGreaterThanOrEqual(0);
@@ -658,7 +726,7 @@ describe("parseExtractionResponse", () => {
       fc.assert(
         fc.property(fc.array(validMemoryArb), (memories) => {
           const response = JSON.stringify(memories);
-          const result = parseExtractionResponse(response);
+          const result = okParse(parseExtractionResponse(response));
 
           result.memories.forEach((memory) => {
             expect(memory.priority).toBeGreaterThanOrEqual(1);
@@ -673,7 +741,7 @@ describe("parseExtractionResponse", () => {
       fc.assert(
         fc.property(fc.array(validMemoryArb), (memories) => {
           const response = JSON.stringify(memories);
-          const result = parseExtractionResponse(response);
+          const result = okParse(parseExtractionResponse(response));
 
           result.memories.forEach((memory) => {
             expect(Array.isArray(memory.tags)).toBe(true);
@@ -812,5 +880,68 @@ describe("buildEmbeddingText", () => {
         })
       );
     });
+  });
+});
+
+// ============================================================================
+// Regression tests: finding 3b — summaries capped at parse time
+// ============================================================================
+
+import { truncateSummary } from './extraction.js';
+import { SUMMARY_MAX_CHARS } from '../config.js';
+
+describe('truncateSummary (finding 3b)', () => {
+  it('returns short summaries unchanged', () => {
+    expect(truncateSummary('short summary')).toBe('short summary');
+  });
+
+  it('returns a summary exactly at the limit unchanged', () => {
+    const exact = 'a'.repeat(SUMMARY_MAX_CHARS);
+    expect(truncateSummary(exact)).toBe(exact);
+  });
+
+  it('truncates at a word boundary with an ellipsis', () => {
+    const words = ('lorem ipsum dolor sit amet '.repeat(40)).trim(); // > 500 chars
+    const out = truncateSummary(words);
+    expect(out.length).toBeLessThanOrEqual(SUMMARY_MAX_CHARS);
+    expect(out.endsWith('…')).toBe(true);
+    // Word boundary: char before ellipsis is not a space and the cut point
+    // was a full word (no partial 'lore' fragment at the end)
+    const body = out.slice(0, -1);
+    expect(body.endsWith(' ')).toBe(false);
+    expect(['lorem', 'ipsum', 'dolor', 'sit', 'amet'].some(w => body.endsWith(w))).toBe(true);
+  });
+
+  it('hard-cuts a single giant unbroken token', () => {
+    const giant = 'x'.repeat(2000);
+    const out = truncateSummary(giant);
+    expect(out.length).toBeLessThanOrEqual(SUMMARY_MAX_CHARS);
+    expect(out.endsWith('…')).toBe(true);
+  });
+
+  it('parseExtractionResponse caps oversized summaries', () => {
+    const oversized = 'word '.repeat(300).trim(); // 1499 chars
+    const response = JSON.stringify({
+      memories: [
+        {
+          content: 'full content',
+          summary: oversized,
+          memory_type: 'decision',
+          scope: 'project',
+          confidence: 0.9,
+          priority: 8,
+          tags: [],
+        },
+      ],
+      entities: [],
+    });
+
+    const outcome = parseExtractionResponse(response);
+    expect(outcome.kind).toBe('ok');
+    if (outcome.kind === 'ok') {
+      expect(outcome.memories).toHaveLength(1);
+      expect(outcome.memories[0].summary.length).toBeLessThanOrEqual(SUMMARY_MAX_CHARS);
+      expect(outcome.memories[0].summary.endsWith('…')).toBe(true);
+    }
   });
 });

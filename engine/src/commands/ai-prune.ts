@@ -10,14 +10,17 @@
 
 import type { Database } from 'bun:sqlite';
 import * as fs from 'node:fs';
-import { getActiveMemories, updateMemory, archiveEdgesForMemory } from '../infra/db.js';
+import { getActiveMemories, updateMemory, archiveEdgesForMemory, supersedeFactsForMemory } from '../infra/db.js';
 import { isClaudeLlmAvailable, runLlmPrompt } from '../infra/claude-llm.js';
+import { writeTelemetry } from '../infra/filesystem.js';
+import { invalidateSurfaceCache } from './generate.js';
 import {
   AI_PRUNE_SESSION_INTERVAL,
   AI_PRUNE_MEMORY_THRESHOLD,
   AI_PRUNE_TIMEOUT_MS,
   AI_PRUNE_BATCH_SIZE,
   AI_PRUNE_MIN_MEMORIES,
+  AI_PRUNE_MIN_AGE_DAYS,
 } from '../config.js';
 
 // ============================================================================
@@ -44,19 +47,21 @@ interface PruneCandidate {
  * Check whether AI prune should run (pure).
  *
  * Triggers if EITHER:
- * - sessions_since_ai_prune >= sessionInterval
- * - active memory crossed the threshold and grew at least 25% since the last
- *   completed prune. A raw threshold would run on every shutdown forever once
- *   a store remained above the threshold.
+ * - sessions_since_ai_prune >= sessionInterval (regular cadence)
+ * - active memory count crossed the threshold AND grew >= 25% since the
+ *   last prune. A raw count check would fire a full multi-batch LLM prune
+ *   on EVERY session once the store stays above the threshold — pruning is
+ *   selective, so the count rarely drops back below it.
  */
 export function shouldRunAiPrune(
   sessionsSinceAiPrune: number,
   activeMemoryCount: number,
   sessionInterval: number,
   memoryThreshold: number,
-  activeCountAtLastPrune: number = 0,
+  activeCountAtLastPrune: number = 0
 ): boolean {
   if (sessionsSinceAiPrune >= sessionInterval) return true;
+
   const growthFloor = Math.max(memoryThreshold, Math.ceil(activeCountAtLastPrune * 1.25));
   return activeMemoryCount >= growthFloor;
 }
@@ -138,14 +143,10 @@ function readTelemetry(path: string): Record<string, unknown> {
   }
 }
 
-function writeTelemetryData(path: string, data: Record<string, unknown>): void {
-  fs.writeFileSync(path, JSON.stringify(data, null, 2), 'utf8');
-}
-
 function getActiveCountAtLastPrune(telemetryPath: string): number {
   const data = readTelemetry(telemetryPath);
-  const value = data.active_count_at_last_ai_prune;
-  return typeof value === 'number' ? value : 0;
+  const val = data.active_count_at_last_ai_prune;
+  return typeof val === 'number' ? val : 0;
 }
 
 function incrementSessionCounter(telemetryPath: string): number {
@@ -153,7 +154,7 @@ function incrementSessionCounter(telemetryPath: string): number {
   const current = typeof data.sessions_since_ai_prune === 'number' ? data.sessions_since_ai_prune : 0;
   const next = current + 1;
   data.sessions_since_ai_prune = next;
-  writeTelemetryData(telemetryPath, data);
+  writeTelemetry(telemetryPath, data);
   return next;
 }
 
@@ -162,14 +163,18 @@ function resetSessionCounter(telemetryPath: string, activeCount: number): void {
   data.sessions_since_ai_prune = 0;
   data.last_ai_prune_at = new Date().toISOString();
   data.active_count_at_last_ai_prune = activeCount;
-  writeTelemetryData(telemetryPath, data);
+  writeTelemetry(telemetryPath, data);
 }
 
 // ============================================================================
 // LLM CALL
 // ============================================================================
 
-/** Use the same provider-compatible, recursion-guarded LLM path as extraction. */
+/**
+ * Call the headless LLM CLI with the prune prompt.
+ * Delegates to runLlmPrompt, which handles binary detection (claude vs pi),
+ * model/provider selection, pipe draining, and timeout.
+ */
 async function callClaudePrune(prompt: string): Promise<string> {
   return runLlmPrompt(prompt, AI_PRUNE_TIMEOUT_MS);
 }
@@ -185,7 +190,8 @@ async function callClaudePrune(prompt: string): Promise<string> {
 export async function runAiPruneIfNeeded(
   projectDb: Database,
   globalDb: Database,
-  telemetryPath: string
+  telemetryPath: string,
+  cwd?: string
 ): Promise<AiPruneResult> {
   // Always increment session counter
   const sessionCount = incrementSessionCounter(telemetryPath);
@@ -195,17 +201,26 @@ export async function runAiPruneIfNeeded(
   const globalMemories = getActiveMemories(globalDb);
   const totalActive = projectMemories.length + globalMemories.length;
 
-  if (!shouldRunAiPrune(
-    sessionCount,
-    totalActive,
-    AI_PRUNE_SESSION_INTERVAL,
-    AI_PRUNE_MEMORY_THRESHOLD,
-    getActiveCountAtLastPrune(telemetryPath),
-  )) {
+  const lastPruneCount = getActiveCountAtLastPrune(telemetryPath);
+  if (!shouldRunAiPrune(sessionCount, totalActive, AI_PRUNE_SESSION_INTERVAL, AI_PRUNE_MEMORY_THRESHOLD, lastPruneCount)) {
     return { archived: 0, reviewed: 0, skipped: true };
   }
 
-  return runAiPrune(projectDb, globalDb, telemetryPath);
+  return runAiPrune(projectDb, globalDb, telemetryPath, cwd);
+}
+
+/**
+ * Check whether a memory is too young to archive (pure).
+ * Enforces the "never archive <AI_PRUNE_MIN_AGE_DAYS days old" rule in code —
+ * the LLM prompt states it, but LLM output must never be trusted to obey it.
+ */
+export function isTooYoungToArchive(
+  createdAt: string,
+  now: Date,
+  minAgeDays: number = AI_PRUNE_MIN_AGE_DAYS
+): boolean {
+  const ageMs = now.getTime() - new Date(createdAt).getTime();
+  return ageMs < minAgeDays * 24 * 60 * 60 * 1000;
 }
 
 /**
@@ -226,7 +241,8 @@ function chunk<T>(arr: readonly T[], size: number): T[][] {
 export async function runAiPrune(
   projectDb: Database,
   globalDb: Database,
-  telemetryPath: string
+  telemetryPath: string,
+  cwd?: string
 ): Promise<AiPruneResult> {
   if (!isClaudeLlmAvailable()) {
     return { archived: 0, reviewed: 0, error: 'Claude CLI not available' };
@@ -264,6 +280,7 @@ export async function runAiPrune(
   const projectIds = new Set(projectMemories.map(m => m.id));
   const globalIds = new Set(globalMemories.map(m => m.id));
   const pinnedIds = new Set(allMemories.filter(m => m.pinned).map(m => m.id));
+  const createdAtById = new Map(allMemories.map(m => [m.id, m.created_at]));
 
   const batches = chunk(memoryData, AI_PRUNE_BATCH_SIZE);
   const totalBatches = batches.length;
@@ -297,14 +314,26 @@ export async function runAiPrune(
         continue;
       }
 
+      // Age guard enforced in code, not just prompt: never archive
+      // memories younger than AI_PRUNE_MIN_AGE_DAYS regardless of LLM output
+      const createdAt = createdAtById.get(candidate.id);
+      if (createdAt && isTooYoungToArchive(createdAt, new Date())) {
+        logInfo(`Skipping too-young memory ${candidate.id.slice(0, 8)} (< ${AI_PRUNE_MIN_AGE_DAYS} days old)`);
+        continue;
+      }
+
+      // archived_at anchors the archive→prune grace period (FR-091)
+      const archivedAt = new Date().toISOString();
       if (projectIds.has(candidate.id)) {
-        updateMemory(projectDb, candidate.id, { status: 'archived' });
+        updateMemory(projectDb, candidate.id, { status: 'archived', archived_at: archivedAt });
         archiveEdgesForMemory(projectDb, candidate.id);
+        supersedeFactsForMemory(projectDb, candidate.id);
         totalArchived++;
         logInfo(`Archived ${candidate.id.slice(0, 8)}: ${candidate.reason}`);
       } else if (globalIds.has(candidate.id)) {
-        updateMemory(globalDb, candidate.id, { status: 'archived' });
+        updateMemory(globalDb, candidate.id, { status: 'archived', archived_at: archivedAt });
         archiveEdgesForMemory(globalDb, candidate.id);
+        supersedeFactsForMemory(globalDb, candidate.id);
         totalArchived++;
         logInfo(`Archived ${candidate.id.slice(0, 8)}: ${candidate.reason}`);
       } else {
@@ -319,6 +348,11 @@ export async function runAiPrune(
       reviewed: allMemories.length,
       error: `All ${batches.length} AI prune batches failed`,
     };
+  }
+
+  // Invalidate cached surfaces when memories were archived
+  if (cwd !== undefined && totalArchived > 0) {
+    invalidateSurfaceCache(cwd);
   }
 
   resetSessionCounter(telemetryPath, allMemories.length - totalArchived);

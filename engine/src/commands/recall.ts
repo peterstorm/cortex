@@ -9,17 +9,20 @@ import { isGeminiAvailable, embedTexts } from '../infra/gemini-embed.ts';
 import {
   getMemoriesWithEmbedding,
   getMemoriesWithEmbeddingByIds,
-  searchByKeyword,
+  searchByKeywordAnd,
   searchByKeywordOr,
   getEdgesForMemory,
   getMemoriesByIds,
   getAllEdges,
   updateMemory,
 } from '../infra/db.js';
-import { rankByFusedSimilarity, tokenize } from '../core/similarity.js';
+import { rankByFusedSimilarity, tokenize, extractUnigrams } from '../core/similarity.js';
 import { mergeResults } from '../core/ranking.js';
 import { MIN_COSINE_SCORE, SEMANTIC_PRE_FILTER_LIMIT } from '../config.js';
 import { traverseGraph } from '../core/graph.js';
+
+/** Only the top N recall results get their access stats bumped (FR-037). */
+export const ACCESS_STATS_TOP_N = 3;
 
 // Command options (validated externally)
 export type RecallOptions = {
@@ -47,8 +50,9 @@ export type RecallError =
  * Build query embedding text with project prefix for aligned search (FR-039)
  * Pure function — prefixes query with [query] [project:name] to align with memory
  * embeddings that use [memory_type] [project:name] prefix.
+ * Exported for prompt-recall's semantic fallback (same embedding space).
  */
-function buildQueryEmbeddingText(query: string, projectName?: string): string {
+export function buildQueryEmbeddingText(query: string, projectName?: string): string {
   const trimmed = query.trim();
   if (projectName) {
     return `[query] [project:${projectName}] ${trimmed}`;
@@ -124,6 +128,47 @@ function getRelatedMemories(
 }
 
 /**
+ * Tiered keyword search: strict AND first (precision), OR fallback (recall).
+ *
+ * A plain implicit-AND FTS5 query returns 0 results for natural-language
+ * queries ("how do we handle connection pooling here") because every token —
+ * including stopwords — must match. Mirror prompt-recall's tiers:
+ * stopword-filter tokens, try AND, then top up with OR results (deduped,
+ * AND hits first) when AND alone can't fill the limit.
+ *
+ * I/O: Reads from database
+ */
+function tieredKeywordSearch(
+  db: Database,
+  query: string,
+  limit: number
+): readonly Memory[] {
+  const unigrams = extractUnigrams(query);
+  // Stopword filtering can consume the whole query ("what is this?") —
+  // fall back to the raw tokens so short queries still search.
+  const tokens = unigrams.length > 0
+    ? unigrams
+    : query.split(/\s+/).filter(t => t.length > 0);
+
+  const andResults = searchByKeywordAnd(db, tokens, limit);
+  if (andResults.length >= limit) {
+    return andResults;
+  }
+
+  const orResults = searchByKeywordOr(db, tokens, limit);
+
+  const seen = new Set(andResults.map(m => m.id));
+  const merged: Memory[] = [...andResults];
+  for (const mem of orResults) {
+    if (merged.length >= limit) break;
+    if (seen.has(mem.id)) continue;
+    seen.add(mem.id);
+    merged.push(mem);
+  }
+  return merged;
+}
+
+/**
  * Update access statistics for retrieved memories (FR-037)
  * I/O: Writes to database
  */
@@ -172,6 +217,9 @@ export async function executeRecall(
   const query = options.query.trim();
   const limit = options.limit ?? 10;
   const forceKeyword = options.keyword ?? false;
+  // When a branch filter will discard results post-ranking, over-fetch so
+  // the filtered pool can still fill `limit`.
+  const fetchLimit = options.branch ? limit * 5 : limit;
 
   // Validate query
   if (query === '') {
@@ -221,17 +269,26 @@ export async function executeRecall(
         ? searchByKeywordOr(globalDb, queryTokens, SEMANTIC_PRE_FILTER_LIMIT)
         : [];
 
-      // If FTS returns candidates, rank only those; otherwise fall back to full scan
-      const projectCandidates = projectFts.length > 0
-        ? getMemoriesWithEmbeddingByIds(projectDb, projectFts.map(m => m.id), embType)
-        : getMemoriesWithEmbedding(projectDb, embType);
-      const globalCandidates = globalFts.length > 0
-        ? getMemoriesWithEmbeddingByIds(globalDb, globalFts.map(m => m.id), embType)
-        : getMemoriesWithEmbedding(globalDb, embType);
+      // If FTS returns candidates WITH embeddings, rank only those; otherwise
+      // fall back to a full scan. The empty-after-join check matters: FTS can
+      // return hits whose embeddings haven't been backfilled yet, and ranking
+      // an empty candidate set would silently return zero results.
+      const candidatesFor = (
+        db: Database,
+        ftsHits: readonly { id: string }[]
+      ): readonly { memory: Memory; embedding: Float64Array | Float32Array }[] => {
+        if (ftsHits.length > 0) {
+          const byIds = getMemoriesWithEmbeddingByIds(db, ftsHits.map(m => m.id), embType);
+          if (byIds.length > 0) return byIds;
+        }
+        return getMemoriesWithEmbedding(db, embType);
+      };
+      const projectCandidates = candidatesFor(projectDb, projectFts);
+      const globalCandidates = candidatesFor(globalDb, globalFts);
 
       const fusedQueryTokens = tokenize(query);
-      const projectEmbedResults = rankByFusedSimilarity(projectCandidates, queryEmbedding, fusedQueryTokens, limit, MIN_COSINE_SCORE);
-      const globalEmbedResults = rankByFusedSimilarity(globalCandidates, queryEmbedding, fusedQueryTokens, limit, MIN_COSINE_SCORE);
+      const projectEmbedResults = rankByFusedSimilarity(projectCandidates, queryEmbedding, fusedQueryTokens, fetchLimit, MIN_COSINE_SCORE);
+      const globalEmbedResults = rankByFusedSimilarity(globalCandidates, queryEmbedding, fusedQueryTokens, fetchLimit, MIN_COSINE_SCORE);
 
       projectSearchResults = projectEmbedResults.map(({ memory, score }) => ({
         memory,
@@ -253,8 +310,8 @@ export async function executeRecall(
       const message = error instanceof Error ? error.message : 'Unknown error';
       process.stderr.write(`[cortex:recall] WARN: Semantic search failed (${message}) — falling back to keyword\n`);
       try {
-        const projectKw = searchByKeyword(projectDb, query, limit);
-        const globalKw = searchByKeyword(globalDb, query, limit);
+        const projectKw = tieredKeywordSearch(projectDb, query, fetchLimit);
+        const globalKw = tieredKeywordSearch(globalDb, query, fetchLimit);
         projectSearchResults = assignPositionScores(projectKw, 'project');
         globalSearchResults = assignPositionScores(globalKw, 'global');
         searchMethod = 'keyword';
@@ -268,8 +325,8 @@ export async function executeRecall(
     const reason = forceKeyword ? 'forced via --keyword flag' : 'Gemini unavailable';
     process.stderr.write(`[cortex:recall] INFO: Using keyword search (${reason})\n`);
     try {
-      const projectKw = searchByKeyword(projectDb, query, limit);
-      const globalKw = searchByKeyword(globalDb, query, limit);
+      const projectKw = tieredKeywordSearch(projectDb, query, fetchLimit);
+      const globalKw = tieredKeywordSearch(globalDb, query, fetchLimit);
       projectSearchResults = assignPositionScores(projectKw, 'project');
       globalSearchResults = assignPositionScores(globalKw, 'global');
       searchMethod = 'keyword';
@@ -283,16 +340,19 @@ export async function executeRecall(
     }
   }
 
-  let mergedResults = mergeResults(
+  // Branch filter BEFORE merging/truncating to limit — filtering after the
+  // cut would drop branch matches that ranked just below it and return
+  // fewer than `limit` results even when more matches existed.
+  if (options.branch) {
+    projectSearchResults = [...filterByBranch(projectSearchResults, options.branch)];
+    globalSearchResults = [...filterByBranch(globalSearchResults, options.branch)];
+  }
+
+  const mergedResults = mergeResults(
     projectSearchResults,
     globalSearchResults,
     limit
   );
-
-  // Optional branch filter
-  if (options.branch) {
-    mergedResults = filterByBranch(mergedResults, options.branch);
-  }
 
   // Pre-fetch all edges once per DB (avoid per-result queries).
   // NOTE: Loads entire edge table into memory — acceptable for current scale,
@@ -325,11 +385,15 @@ export async function executeRecall(
     });
   }
 
-  // Update access statistics for retrieved memories (FR-037)
-  const projectMemories = enrichedResults
+  // Update access statistics for retrieved memories (FR-037).
+  // Only the top results count as "accessed" — bumping every keyword match
+  // resets last_accessed_at across the board, so anything matching frequent
+  // query words would never decay (access-stat feedback loop).
+  const statsEligible = enrichedResults.slice(0, ACCESS_STATS_TOP_N);
+  const projectMemories = statsEligible
     .filter((r) => r.source === 'project')
     .map((r) => r.memory);
-  const globalMemories = enrichedResults
+  const globalMemories = statsEligible
     .filter((r) => r.source === 'global')
     .map((r) => r.memory);
 

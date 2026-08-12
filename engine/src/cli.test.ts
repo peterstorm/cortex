@@ -5,7 +5,10 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Database } from 'bun:sqlite';
-import { parseHookInput, parseRecallArgs } from './cli.js';
+import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { parseHookInput, parseRecallArgs, validateCwd, summarizeBackfillResults } from './cli.js';
 import { openDatabase, insertMemory } from './infra/db.js';
 import { createMemory } from './core/types.js';
 import { getProjectName } from './config.js';
@@ -510,5 +513,112 @@ describe('cli - integration flows', () => {
 
     expect(globalMemories).toHaveLength(1);
     expect(globalMemories[0].id).toBe('mem-search-2');
+  });
+});
+
+describe('cli - validateCwd', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'cortex-cwd-test-'));
+  });
+
+  it('accepts an existing absolute directory', () => {
+    expect(validateCwd(tmpDir)).toBeNull();
+  });
+
+  it('rejects dash-prefixed values (flags mistaken for cwd)', () => {
+    for (const arg of ['--session', '-x', '--if-needed']) {
+      const error = validateCwd(arg);
+      expect(error).not.toBeNull();
+      expect(error).toContain('looks like a flag');
+    }
+  });
+
+  it('rejects relative paths', () => {
+    const error = validateCwd('some/relative/dir');
+    expect(error).not.toBeNull();
+    expect(error).toContain('must be an absolute path');
+  });
+
+  it('rejects nonexistent directories without creating them', () => {
+    const missing = join(tmpDir, 'does-not-exist');
+
+    const error = validateCwd(missing);
+
+    expect(error).not.toBeNull();
+    expect(error).toContain('does not exist');
+    // Validation must be side-effect free — no phantom directories
+    expect(existsSync(missing)).toBe(false);
+  });
+
+  it('rejects paths pointing at a file, not a directory', () => {
+    const filePath = join(tmpDir, 'file.txt');
+    writeFileSync(filePath, 'not a dir', 'utf8');
+
+    const error = validateCwd(filePath);
+
+    expect(error).not.toBeNull();
+    expect(error).toContain('not a directory');
+  });
+});
+
+describe('cli - summarizeBackfillResults', () => {
+  const okEmpty = { ok: true as const, processed: 0, failed: 0, errors: [], method: 'local' as const };
+
+  it('propagates hard failure when one backfill returns ok:false', () => {
+    const result = summarizeBackfillResults(
+      { ok: false, error: 'project db exploded' },
+      okEmpty
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('project db exploded');
+  });
+
+  it('joins errors when both backfills return ok:false', () => {
+    const result = summarizeBackfillResults(
+      { ok: false, error: 'project failed' },
+      { ok: false, error: 'global failed' }
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('project failed');
+    expect(result.error).toContain('global failed');
+  });
+
+  it('fails when everything failed (failed > 0, processed === 0)', () => {
+    const result = summarizeBackfillResults(
+      { ok: true, processed: 0, failed: 3, errors: ['e1', 'e2', 'e3'], method: 'gemini' },
+      okEmpty
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('all 3');
+    expect(result.warnings).toEqual(['e1', 'e2', 'e3']);
+  });
+
+  it('partial failure succeeds but surfaces counts and warnings', () => {
+    const result = summarizeBackfillResults(
+      { ok: true, processed: 3, failed: 2, errors: ['embed timeout', 'embed 500'], method: 'gemini' },
+      { ok: true, processed: 1, failed: 0, errors: [], method: 'local' }
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.output).toContain('processed 4');
+    expect(result.output).toContain('2 failed');
+    expect(result.warnings).toEqual(['embed timeout', 'embed 500']);
+  });
+
+  it('full success reports processed count with no warnings', () => {
+    const result = summarizeBackfillResults(
+      { ok: true, processed: 5, failed: 0, errors: [], method: 'gemini' },
+      { ok: true, processed: 2, failed: 0, errors: [], method: 'local' }
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.output).toContain('processed 7');
+    expect(result.output).not.toContain('failed');
+    expect(result.warnings).toEqual([]);
   });
 });

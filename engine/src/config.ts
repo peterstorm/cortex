@@ -6,6 +6,7 @@
 
 import { join, basename } from 'node:path';
 import { homedir } from 'node:os';
+import type { SimilaritySpace } from './core/types.js';
 
 // ============================================================================
 // ENVIRONMENT VARIABLES
@@ -131,6 +132,14 @@ export const MAX_TRANSCRIPT_BYTES = 100 * 1024;
 export const EXTRACTION_TIMEOUT_MS = 30_000;
 
 /**
+ * Max transcript chunks processed per extraction run.
+ * The SessionEnd hook fires once per session; a single 100KB chunk per run
+ * would leave most of a long session unextracted. Looping with a cap bounds
+ * worst-case runtime while still draining long transcripts.
+ */
+export const EXTRACT_MAX_CHUNKS_PER_RUN = 5;
+
+/**
  * Surface generation token budget (includes ~200 tokens markdown overhead)
  */
 export const SURFACE_MAX_TOKENS = 2000;
@@ -139,6 +148,14 @@ export const SURFACE_MAX_TOKENS = 2000;
  * Tokens reserved for markdown formatting overhead (headers, markers, metadata)
  */
 export const SURFACE_OVERHEAD_TOKENS = 200;
+
+/**
+ * Maximum summary length in characters, enforced at extraction parse time.
+ * An unbounded summary can single-handedly blow the surface token budget;
+ * summaries are meant to be 1-2 sentences (see extraction prompt).
+ * Truncation happens at a word boundary with an ellipsis.
+ */
+export const SUMMARY_MAX_CHARS = 500;
 
 /**
  * Recency decay half-life in days for ranking formula.
@@ -217,6 +234,13 @@ export const AI_PRUNE_TIMEOUT_MS = 60_000;
 export const AI_PRUNE_BATCH_SIZE = 80;
 
 /**
+ * AI prune: minimum memory age in days before it may be archived.
+ * The "never archive <3 days old" rule is enforced in code, not just in
+ * the LLM prompt — LLM output naming a fresh memory is skipped.
+ */
+export const AI_PRUNE_MIN_AGE_DAYS = 3;
+
+/**
  * Dedup similarity threshold for extraction and remember commands.
  * Candidates scoring above this against existing memories are merged.
  *
@@ -237,10 +261,41 @@ export const DEDUP_SIMILARITY_THRESHOLD = 0.75;
 export const INTRA_BATCH_DEDUP_THRESHOLD = 0.75;
 
 /**
- * Consolidation similarity threshold for detecting duplicate memory pairs.
- * Pairs scoring above this are flagged for merge review.
+ * Consolidation similarity threshold for detecting duplicate memory pairs
+ * in WELL-SEPARATED similarity spaces (Jaccard token overlap, Gemini 768-dim
+ * cosine). Pairs scoring above this are flagged for merge review.
  */
 export const CONSOLIDATION_SIMILARITY_THRESHOLD = 0.5;
+
+/**
+ * Consolidation threshold for raw cosine on 384-dim LOCAL embeddings
+ * (BGE-small-en-v1.5). Local cosine runs "hot": same-domain memories about
+ * DIFFERENT aspects routinely score 0.6-0.75 (see DEDUP_SIMILARITY_THRESHOLD
+ * calibration note). At 0.5 nearly every same-project pair was flagged as a
+ * "duplicate" — O(n²) false positives. 0.8 sits above the same-domain band
+ * (0.6-0.75) and just below the true-duplicate band (0.85+), flagging only
+ * genuinely overlapping content for merge review.
+ */
+export const CONSOLIDATION_LOCAL_COSINE_THRESHOLD = 0.8;
+
+/**
+ * Pick the consolidation duplicate-detection threshold for the similarity
+ * space a pair's score was computed in. Pure function.
+ */
+export function consolidationThresholdFor(space: SimilaritySpace): number {
+  return space === 'local-cosine'
+    ? CONSOLIDATION_LOCAL_COSINE_THRESHOLD
+    : CONSOLIDATION_SIMILARITY_THRESHOLD;
+}
+
+/**
+ * Max relates_to edges created per newly inserted memory during extraction.
+ * Structural guard against edge explosion: even with calibrated bands, a new
+ * memory in a dense project can clear the relate band against many existing
+ * memories; only the strongest few edges carry signal (and every active edge
+ * is fed to the semantic-edges LLM pass).
+ */
+export const MAX_EDGES_PER_MEMORY = 3;
 
 /**
  * Score ceiling for merge-into-existing during extraction dedup.

@@ -11,6 +11,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { spliceSurfaceContent } from '../core/surface.js';
 
 /**
  * Check if a process with given PID is running.
@@ -67,9 +68,9 @@ function acquirePidLock(lockPath: string): void {
   try {
     fs.writeFileSync(lockPath, String(process.pid), { flag: 'wx' });
     return; // Lock acquired successfully
-  } catch (e: any) {
+  } catch (e: unknown) {
     // If error is not EEXIST, propagate it
-    if (e.code !== 'EEXIST') {
+    if ((e as NodeJS.ErrnoException).code !== 'EEXIST') {
       throw e;
     }
   }
@@ -82,8 +83,15 @@ function acquirePidLock(lockPath: string): void {
     );
   }
 
-  // Stale lock - override it
-  fs.writeFileSync(lockPath, String(process.pid), 'utf8');
+  // Stale lock — remove it, then retry the ATOMIC create. A plain overwrite
+  // here would let two processes both observe the stale PID and both
+  // "acquire" the lock (the TOCTOU the wx flag exists to prevent).
+  try {
+    fs.unlinkSync(lockPath);
+  } catch {
+    // Already removed by a competing process
+  }
+  fs.writeFileSync(lockPath, String(process.pid), { flag: 'wx' });
 }
 
 /**
@@ -113,9 +121,20 @@ export function withPidLock<T>(lockPath: string, fn: () => T): T {
 }
 
 /**
- * Write surface content to file with PID lock protection.
+ * Write a marker-wrapped surface block to file with PID lock protection.
+ *
+ * Implements the replace-between-markers contract (FR-024): when the target
+ * file exists and contains both CORTEX_MEMORY markers, only the block between
+ * (and including) the markers is replaced — user content before/after
+ * survives. See spliceSurfaceContent for the corrupt-marker fallback.
+ *
+ * The final write is atomic (temp + rename) so concurrent readers
+ * (UserPromptSubmit hook, pi extension) never observe a torn surface.
+ *
  * Creates parent directories if needed.
  * Throws if another process holds the lock.
+ *
+ * @param content - Marker-wrapped surface block (output of wrapInMarkers)
  */
 export function writeSurface(
   filePath: string,
@@ -129,8 +148,14 @@ export function writeSurface(
     const dir = path.dirname(filePath);
     fs.mkdirSync(dir, { recursive: true });
 
-    // Write content
-    fs.writeFileSync(filePath, content, 'utf8');
+    // Splice into existing content (pure), preserving user content outside markers
+    const existing = readSurface(filePath);
+    const merged = spliceSurfaceContent(existing, content);
+
+    // Atomic write: temp + rename
+    const tempPath = `${filePath}.tmp-${process.pid}`;
+    fs.writeFileSync(tempPath, merged, 'utf8');
+    fs.renameSync(tempPath, filePath);
   });
 }
 
@@ -199,5 +224,10 @@ export function writeTelemetry(
   fs.mkdirSync(dir, { recursive: true });
 
   const json = JSON.stringify(data, null, 2);
-  fs.writeFileSync(filePath, json, 'utf8');
+
+  // Atomic write (temp + rename): concurrent readers must never observe
+  // torn JSON — a torn telemetry file resets all maintenance counters.
+  const tempPath = `${filePath}.tmp-${process.pid}`;
+  fs.writeFileSync(tempPath, json, 'utf8');
+  fs.renameSync(tempPath, filePath);
 }

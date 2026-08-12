@@ -5,6 +5,7 @@
 
 import type { MemoryType, MemoryScope, MemoryCandidate, GitContext } from './types.js';
 import { MEMORY_TYPES, isMemoryType } from './types.js';
+import { SUMMARY_MAX_CHARS } from '../config.js';
 import type { EntityFactCandidate, EntityProfile } from './entities.js';
 import { isValidEntityFactCandidate } from './entities.js';
 
@@ -13,6 +14,16 @@ export interface ParsedExtractionResult {
   readonly memories: readonly MemoryCandidate[];
   readonly entities: readonly EntityFactCandidate[];
 }
+
+/**
+ * Discriminated parse outcome. A parse_error (malformed JSON, unexpected
+ * shape) must be distinguishable from a genuinely-empty extraction —
+ * otherwise the caller saves the checkpoint and the transcript chunk is
+ * permanently consumed with zero extraction.
+ */
+export type ExtractionParseOutcome =
+  | ({ readonly kind: 'ok' } & ParsedExtractionResult)
+  | { readonly kind: 'parse_error'; readonly raw: string };
 
 export interface TruncationResult {
   readonly truncated: string;
@@ -23,13 +34,18 @@ export interface TruncationResult {
  * Truncates transcript to maxBytes while preserving JSONL line boundaries.
  * Returns truncated content and new cursor position for resumable extraction.
  *
+ * The cursor is a CHARACTER offset into `content` (it is consumed via
+ * `content.slice(cursor)`). All branches must advance it in characters —
+ * mixing in byte counts overshoots on multi-byte UTF-8 transcripts,
+ * silently skipping content and resuming mid-JSONL-line.
+ *
  * FR-004: Track cursor position for resumable extraction
  * FR-012: Transcript size threshold 100KB for resumable extraction
  *
  * @param content - JSONL transcript content
  * @param maxBytes - Maximum size in bytes (default 100KB per FR-012)
- * @param cursor - Optional starting position for resuming extraction
- * @returns Truncated content and new cursor position
+ * @param cursor - Optional starting position for resuming extraction (characters)
+ * @returns Truncated content and new cursor position (characters)
  */
 export function truncateTranscript(
   content: string,
@@ -48,36 +64,47 @@ export function truncateTranscript(
     };
   }
 
-  // Find the last complete line within maxBytes
-  // Truncate to maxBytes first, then find last newline
-  const truncatedBuffer = Buffer.from(remainingContent, "utf8").slice(
-    0,
-    maxBytes
-  );
-  const truncatedStr = truncatedBuffer.toString("utf8");
+  // Binary search the largest CHARACTER prefix whose UTF-8 size fits maxBytes.
+  let lo = 0;
+  let hi = remainingContent.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (Buffer.byteLength(remainingContent.slice(0, mid), "utf8") <= maxBytes) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  // Never split a surrogate pair (a lone high surrogate would encode as U+FFFD)
+  let charLimit = lo;
+  const lastCode = remainingContent.charCodeAt(charLimit - 1);
+  if (charLimit > 0 && lastCode >= 0xd800 && lastCode <= 0xdbff) {
+    charLimit--;
+  }
+
+  const window = remainingContent.slice(0, charLimit);
 
   // Find last newline to preserve JSONL boundary
-  const lastNewline = truncatedStr.lastIndexOf("\n");
+  const lastNewline = window.lastIndexOf("\n");
 
   if (lastNewline === -1) {
     // Single JSONL line exceeds maxBytes (common with large tool outputs).
     // Returning empty + unchanged cursor causes a permanent silent skip:
     // every subsequent run finds the same oversized first line and bails.
-    // Fall back to the raw byte slice — Claude tolerates partial JSONL —
-    // and advance cursor by the bytes consumed so progress is guaranteed.
+    // Fall back to the raw window — Claude tolerates partial JSONL —
+    // and advance cursor by the characters consumed so progress is guaranteed.
     return {
-      truncated: truncatedStr,
-      newCursor: cursor + truncatedBuffer.length,
+      truncated: window,
+      newCursor: cursor + window.length,
     };
   }
 
   // Include the newline character
-  const result = truncatedStr.slice(0, lastNewline + 1);
-  const bytesConsumed = Buffer.byteLength(result, "utf8");
+  const result = window.slice(0, lastNewline + 1);
 
   return {
     truncated: result,
-    newCursor: cursor + bytesConsumed,
+    newCursor: cursor + result.length,
   };
 }
 
@@ -105,10 +132,15 @@ export function truncateTranscript(
  * ever land. Strip the marker-bracketed blocks before building the prompt.
  */
 export function stripInjectedMemorySurface(content: string): string {
-  return content.replace(
-    /<!-- CORTEX_MEMORY_START -->[\s\S]*?<!-- CORTEX_MEMORY_END -->/g,
-    ""
-  );
+  return content
+    .replace(
+      /<!-- CORTEX_MEMORY_START -->[\s\S]*?<!-- CORTEX_MEMORY_END -->/g,
+      ""
+    )
+    .replace(
+      /<!-- CORTEX_RECALL_START -->[\s\S]*?<!-- CORTEX_RECALL_END -->/g,
+      ""
+    );
 }
 
 export function buildExtractionPrompt(
@@ -215,11 +247,11 @@ If no significant memories or entities, return empty arrays.`;
  * FR-007: Validate priority range
  *
  * @param response - Raw LLM response text
- * @returns Parsed memories and entity-fact candidates
+ * @returns Discriminated outcome: ok (memories + entities) or parse_error
  */
 export function parseExtractionResponse(
   response: string
-): ParsedExtractionResult {
+): ExtractionParseOutcome {
   try {
     // Extract JSON from response (handle markdown code blocks)
     const jsonMatch = response.match(/```json\s*([\s\S]*?)\s*```/) || [
@@ -243,8 +275,8 @@ export function parseExtractionResponse(
       rawMemories = parsed.memories;
       rawEntities = Array.isArray(parsed.entities) ? parsed.entities : [];
     } else {
-      process.stderr.write(`[cortex:extraction] WARN: Expected array or {memories:[]}, got ${typeof parsed}. Returning empty.\n`);
-      return { memories: [], entities: [] };
+      process.stderr.write(`[cortex:extraction] WARN: Expected array or {memories:[]}, got ${typeof parsed}. Treating as parse error.\n`);
+      return { kind: 'parse_error', raw: response };
     }
 
     // Validate and filter memory candidates
@@ -255,7 +287,7 @@ export function parseExtractionResponse(
 
     const memories: readonly MemoryCandidate[] = validMemories.map((c) => ({
       content: String(c.content),
-      summary: String(c.summary),
+      summary: truncateSummary(String(c.summary)),
       memory_type: isMemoryType(c.memory_type) ? c.memory_type : 'context',
       scope: c.scope === 'global' ? 'global' as const : 'project' as const,
       confidence: Number(c.confidence),
@@ -273,12 +305,36 @@ export function parseExtractionResponse(
         object: String((c as any).object).trim(),
       }));
 
-    return { memories, entities };
+    return { kind: 'ok', memories, entities };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     process.stderr.write(`[cortex:extraction] WARN: Parse failure: ${message}. Response (truncated): ${response.slice(0, 200)}\n`);
-    return { memories: [], entities: [] };
+    return { kind: 'parse_error', raw: response };
   }
+}
+
+/**
+ * Cap a summary at SUMMARY_MAX_CHARS, truncating at a word boundary with an
+ * ellipsis. Pure function. An unbounded LLM summary can single-handedly blow
+ * the surface token budget (and, before selectForSurface skipped oversized
+ * memories, could blank the surface entirely).
+ */
+export function truncateSummary(
+  summary: string,
+  maxChars: number = SUMMARY_MAX_CHARS
+): string {
+  if (summary.length <= maxChars) {
+    return summary;
+  }
+
+  // Reserve one char for the ellipsis
+  const window = summary.slice(0, maxChars - 1);
+  const lastSpace = window.lastIndexOf(' ');
+  // Cut at the last word boundary unless it would discard more than half the
+  // window (e.g. one giant unbroken token) — then hard-cut.
+  const cut = lastSpace > maxChars / 2 ? window.slice(0, lastSpace) : window;
+
+  return cut.trimEnd() + '…';
 }
 
 /**

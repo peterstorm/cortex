@@ -52,6 +52,8 @@ export type ParseResult =
  *
  * Expected format:
  * index-code <file-path> <summary> [--start=N] [--end=N] [--scope=SCOPE] [--tags=tag1,tag2] [--session=ID]
+ *
+ * --session overrides the default sessionId passed by the caller.
  */
 export function parseIndexCodeArgs(
   argv: readonly string[],
@@ -86,6 +88,7 @@ export function parseIndexCodeArgs(
   let endLine: number | undefined;
   let scope: 'project' | 'global' = 'project';
   let tags: string[] = [];
+  let effectiveSessionId = sessionId;
 
   for (let i = 2; i < argv.length; i++) {
     const arg = argv[i];
@@ -120,6 +123,15 @@ export function parseIndexCodeArgs(
     } else if (arg.startsWith('--tags=')) {
       const value = arg.substring(7);
       tags = value.split(',').map((t) => t.trim()).filter((t) => t !== '');
+    } else if (arg.startsWith('--session=')) {
+      const value = arg.substring(10).trim();
+      if (value === '') {
+        return {
+          success: false,
+          error: 'session id must not be empty',
+        };
+      }
+      effectiveSessionId = value;
     } else {
       return {
         success: false,
@@ -145,7 +157,7 @@ export function parseIndexCodeArgs(
       endLine,
       scope,
       tags,
-      sessionId,
+      sessionId: effectiveSessionId,
     },
   };
 }

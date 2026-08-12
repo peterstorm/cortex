@@ -16,7 +16,7 @@ import { SURFACE_STALE_HOURS, SURFACE_OVERHEAD_TOKENS } from '../config.js';
 import { getActiveMemories, getAllEdges, getAllEntities, getCurrentFacts } from '../infra/db.js';
 import { computeAllCentrality } from '../core/graph.js';
 import { selectForSurface } from '../core/ranking.js';
-import { generateSurface, wrapInMarkers } from '../core/surface.js';
+import { generateSurface, wrapInMarkers, renderEntitySection, estimateTokens } from '../core/surface.js';
 import { writeSurface, writeTelemetry } from '../infra/filesystem.js';
 import { getCurrentBranch } from '../infra/git-context.js';
 
@@ -85,12 +85,20 @@ export function runGenerate(options: GenerateOptions): GenerateResult {
     centrality: centralityMap.get(mem.id) ?? 0,
   }));
 
+  // Account the entity section against the token budget BEFORE selection —
+  // it is appended to the surface but was previously unbudgeted, letting the
+  // rendered surface overshoot maxTokens by up to 5 entities × 3 facts.
+  const entitySection = renderEntitySection(entityProfiles);
+  const entityTokens = entitySection ? estimateTokens(entitySection) : 0;
+
   // Pure: Select and rank memories for surface with branch boost
-  // Reserve SURFACE_OVERHEAD_TOKENS for markdown formatting (headers, markers, tags)
+  // Reserve SURFACE_OVERHEAD_TOKENS for markdown formatting (headers, markers)
+  // plus the measured entity section cost. Floor at 200 tokens so a huge
+  // entity section can't zero out memory selection entirely.
   const rankedMemories: RankedMemory[] = selectForSurface(memoriesWithCentrality, {
     currentBranch: branch,
-    targetTokens: 1500 - SURFACE_OVERHEAD_TOKENS,
-    maxTokens: 2000 - SURFACE_OVERHEAD_TOKENS,
+    targetTokens: Math.max(200, 1500 - SURFACE_OVERHEAD_TOKENS - entityTokens),
+    maxTokens: Math.max(200, 2000 - SURFACE_OVERHEAD_TOKENS - entityTokens),
   });
 
   // Pure: Generate surface markdown (includes entity profiles section)
@@ -102,8 +110,10 @@ export function runGenerate(options: GenerateOptions): GenerateResult {
   // I/O: Write surface with PID lock
   writeSurface(surfacePath, markedContent, lockDir);
 
-  // I/O: Write cache
-  writeCache(cachePath, branch, options.cwd, surfaceContent);
+  // I/O: Write cache (fingerprinted against both DBs so archives/merges
+  // that don't go through invalidateSurfaceCache still miss the cache)
+  const fingerprint = computeDbFingerprint(options.projectDb, options.globalDb);
+  writeCache(cachePath, branch, options.cwd, surfaceContent, fingerprint);
 
   // I/O: Write telemetry
   const durationMs = Date.now() - startTime;
@@ -126,16 +136,52 @@ export function runGenerate(options: GenerateOptions): GenerateResult {
 }
 
 /**
+ * Fingerprint the visible (active) memory set of both DBs.
+ * Any archive, merge, insert, or content update changes the fingerprint
+ * (count and/or max(updated_at)), so a cached surface built against a
+ * different memory set is detectably stale regardless of its age.
+ * I/O: Reads from database.
+ */
+export function computeDbFingerprint(projectDb: Database, globalDb: Database): string {
+  const fp = (db: Database): string => {
+    const row = db
+      .prepare(
+        `SELECT count(*) || ':' || coalesce(max(updated_at), '') AS fp FROM memories WHERE status = 'active'`
+      )
+      .get() as { fp: string };
+    return row.fp;
+  };
+  return `${fp(projectDb)}|${fp(globalDb)}`;
+}
+
+/**
+ * Normalize a cwd for cache keying/comparison.
+ * realpathSync resolves symlinks so a symlinked cwd hits the same cache
+ * entry; falls back to path.resolve when the path can't be resolved.
+ */
+function normalizeCwd(cwd: string): string {
+  try {
+    return fs.realpathSync(cwd);
+  } catch {
+    return path.resolve(cwd);
+  }
+}
+
+/**
  * Load cached surface if available and fresh.
- * Returns null if no cache or stale.
+ * Returns null if no cache, stale context (branch/cwd mismatch), or — when
+ * `expectedFingerprint` is provided — the cached DB fingerprint doesn't match
+ * the current one (memories changed since the cache was written).
  */
 export function loadCachedSurface(
   cwd: string,
-  cachePath?: string
+  cachePath?: string,
+  expectedFingerprint?: string
 ): { surface: string; branch: string; staleness: { stale: boolean; age_hours: number } } | null {
   const cacheDir = cachePath ?? path.join(cwd, '.memory', 'surface-cache');
   const branch = getCurrentBranch(cwd);
-  const cacheKey = computeCacheKey(branch, cwd);
+  const normCwd = normalizeCwd(cwd);
+  const cacheKey = computeCacheKey(branch, normCwd);
   const cacheFile = path.join(cacheDir, `${cacheKey}.json`);
 
   try {
@@ -145,10 +191,19 @@ export function loadCachedSurface(
       branch: string;
       cwd: string;
       generated_at: string;
+      db_fingerprint?: string;
     };
 
-    // Validate cache matches current context
-    if (parsed.branch !== branch || parsed.cwd !== cwd) {
+    // Validate cache matches current context (cwd normalized on both sides
+    // so symlinked cwds still hit)
+    if (parsed.branch !== branch || normalizeCwd(parsed.cwd) !== normCwd) {
+      return null;
+    }
+
+    // Validate DB fingerprint when the caller can supply one: a mismatch
+    // (or a legacy cache without one) means the memory set changed —
+    // serving it would resurface archived/forgotten memories.
+    if (expectedFingerprint !== undefined && parsed.db_fingerprint !== expectedFingerprint) {
       return null;
     }
 
@@ -174,18 +229,26 @@ export function loadCachedSurface(
  * Write surface to cache.
  * Cache key: hash of (branch, cwd).
  */
-function writeCache(cacheDir: string, branch: string, cwd: string, surface: string): void {
+function writeCache(
+  cacheDir: string,
+  branch: string,
+  cwd: string,
+  surface: string,
+  dbFingerprint: string
+): void {
   // Ensure cache directory exists
   fs.mkdirSync(cacheDir, { recursive: true });
 
-  const cacheKey = computeCacheKey(branch, cwd);
+  const normCwd = normalizeCwd(cwd);
+  const cacheKey = computeCacheKey(branch, normCwd);
   const cacheFile = path.join(cacheDir, `${cacheKey}.json`);
 
   const cacheData = {
     surface,
     branch,
-    cwd,
+    cwd: normCwd,
     generated_at: new Date().toISOString(),
+    db_fingerprint: dbFingerprint,
   };
 
   fs.writeFileSync(cacheFile, JSON.stringify(cacheData, null, 2), 'utf8');

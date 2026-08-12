@@ -1,2 +1,5 @@
 .memory/
 .claude/cortex-memory.local.md
+dist/
+node_modules/
+.pi/cortex-memory.local.md

@@ -381,6 +381,70 @@ embedLocalSpy
     });
   });
 
+  describe('code memories (FR-053)', () => {
+    it('never embeds code memories, via Gemini or locally', async () => {
+      const db = openDatabase(':memory:');
+
+      isGeminiAvailableSpy.mockReturnValue(true);
+      embedTextsSpy.mockResolvedValue([new Float64Array(768).fill(0.5)]);
+      ensureModelLoadedSpy.mockResolvedValue(true);
+      embedLocalSpy.mockResolvedValue(new Float32Array(384).fill(0.1));
+
+      // Code memory: embedding null BY DESIGN (index-code pairing)
+      const codeMemory = createMemory({
+        id: 'mem-code',
+        content: 'export function foo() { return 42; }',
+        summary: 'export function foo() { return 42; }',
+        memory_type: 'code',
+        scope: 'project',
+        confidence: 1.0,
+        priority: 5,
+        source_type: 'code_index',
+        source_session: 'session-1',
+        source_context: JSON.stringify({ source: 'code_index', file_path: 'src/foo.ts' }),
+      });
+
+      // Prose memory: should still be backfilled
+      const proseMemory = createMemory({
+        id: 'mem-prose',
+        content: 'foo returns the answer',
+        summary: 'foo returns the answer',
+        memory_type: 'code_description',
+        scope: 'project',
+        confidence: 0.9,
+        priority: 5,
+        source_type: 'code_index',
+        source_session: 'session-1',
+        source_context: JSON.stringify({ source: 'code_index', file_path: 'src/foo.ts' }),
+      });
+
+      insertMemory(db, codeMemory);
+      insertMemory(db, proseMemory);
+
+      const result = await backfill(db, 'test-project', 'fake-api-key');
+
+      // Only the prose memory processed (once for Gemini, once for local)
+      expect(result).toEqual({
+        ok: true,
+        processed: 2,
+        failed: 0,
+        errors: [],
+        method: 'gemini',
+      });
+
+      // Gemini batch contains only the prose text — never raw code
+      expect(embedTextsSpy).toHaveBeenCalledTimes(1);
+      expect(embedTextsSpy.mock.calls[0][0]).toEqual([
+        '[code_description] [project:test-project] foo returns the answer',
+      ]);
+      // Local embed called only for the prose memory
+      expect(embedLocalSpy).toHaveBeenCalledTimes(1);
+      expect(embedLocalSpy).toHaveBeenCalledWith(
+        '[code_description] [project:test-project] foo returns the answer'
+      );
+    });
+  });
+
   describe('edge cases', () => {
     it('backfills both embedding types for memories missing each', async () => {
       const db = openDatabase(':memory:');
