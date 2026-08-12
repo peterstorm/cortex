@@ -3,3 +3,6 @@
 node_modules/
 *.checkpoint-*
 .pi/cortex-memory.local.md
+
+# Loom standalone-review / remediation run evidence
+.claude/reviews/

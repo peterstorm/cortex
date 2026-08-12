@@ -97,7 +97,7 @@ export function resolveOpenAiCompatEndpoint(): LlmEndpoint | null {
     return { baseUrl: normalizeBaseUrl(envUrl), apiKey: envKey, model: envModel };
   }
 
-  const piDir = join(homedir(), '.pi', 'agent');
+  const piDir = join(getEnv('HOME') ?? homedir(), '.pi', 'agent');
   const models = readJsonConfig(join(piDir, 'models.json'));
   if (!models || typeof models !== 'object') return null;
 
@@ -117,29 +117,50 @@ export function resolveOpenAiCompatEndpoint(): LlmEndpoint | null {
   if (!providerId) return null;
 
   const provider = (providers as Record<string, unknown>)[providerId];
-  if (!provider || typeof provider !== 'object') return null;
+  if (!provider || typeof provider !== 'object') {
+    warnResolution(`provider '${providerId}' is not defined in ~/.pi/agent/models.json`);
+    return null;
+  }
   const providerRecord = provider as Record<string, unknown>;
 
   if (typeof providerRecord.api === 'string' && NON_OPENAI_APIS.has(providerRecord.api)) {
+    warnResolution(`provider '${providerId}' uses non-OpenAI-compatible api '${providerRecord.api}'`);
     return null;
   }
 
   const baseUrl = providerRecord.baseUrl;
-  if (typeof baseUrl !== 'string' || !baseUrl.startsWith('http')) return null;
+  if (typeof baseUrl !== 'string' || !baseUrl.startsWith('http')) {
+    warnResolution(`provider '${providerId}' has no http baseUrl`);
+    return null;
+  }
 
   const rawKey = providerRecord.apiKey;
-  if (typeof rawKey !== 'string' || rawKey.length === 0) return null;
+  if (typeof rawKey !== 'string' || rawKey.length === 0) {
+    warnResolution(`provider '${providerId}' has no apiKey; direct LLM calls disabled, falling back to subprocess`);
+    return null;
+  }
   const apiKey = rawKey.startsWith('!') ? runShellCommand(rawKey.slice(1)) : rawKey;
-  if (!apiKey) return null;
+  if (!apiKey) {
+    warnResolution(`provider '${providerId}' apiKey command resolved empty; direct LLM calls disabled, falling back to subprocess`);
+    return null;
+  }
 
   const modelsList = providerRecord.models;
   const model =
     Array.isArray(modelsList) && modelsList.length > 0
       ? (modelsList[0] as { id?: unknown })?.id
       : undefined;
-  if (typeof model !== 'string') return null;
+  if (typeof model !== 'string') {
+    warnResolution(`provider '${providerId}' has no models[0].id; direct LLM calls disabled, falling back to subprocess`);
+    return null;
+  }
 
   return { baseUrl: normalizeBaseUrl(baseUrl), apiKey, model };
+}
+
+/** Emit one WARN per rejected user-visible direct-endpoint configuration. */
+function warnResolution(reason: string): void {
+  process.stderr.write(`[cortex:llm] WARN: ${reason}\n`);
 }
 
 /**
@@ -202,11 +223,21 @@ export async function chatCompletionText(
     }
 
     const data = (await response.json()) as {
-      choices?: Array<{ message?: { content?: unknown } }>;
+      choices?: Array<{ message?: { content?: unknown }; finish_reason?: unknown }>;
     };
-    const content = data.choices?.[0]?.message?.content;
+    const choice = data.choices?.[0];
+    const content = choice?.message?.content;
     if (typeof content !== 'string' || content.trim().length === 0) {
       throw new Error('LLM API returned empty content');
+    }
+    if (choice?.finish_reason === 'length') {
+      // Truncation produces cut-off JSON that parses as a generic error
+      // downstream; name the real cause so the operator can raise maxTokens
+      // or shrink the prompt instead of hunting a phantom malformed response.
+      throw new Error(
+        `LLM output truncated (max_tokens=${maxTokens} reached, finish_reason=length); ` +
+          `raise maxTokens or reduce prompt size`
+      );
     }
     return content;
   } finally {

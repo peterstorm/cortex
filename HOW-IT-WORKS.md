@@ -167,7 +167,7 @@ Each new memory keeps at most its 3 strongest edges — a structural guard again
 
 ### Semantic Edge Classification
 
-Jaccard-created `relates_to` edges are upgraded to typed relationships by the `semantic-edges` pipeline, which runs in the SessionEnd worker: it batches edge pairs to the headless LLM CLI (`claude -p --model haiku` by default), which classifies each pair into a typed relation with a strength score.
+Jaccard/cosine-created `relates_to` edges are upgraded to typed relationships by the `semantic-edges` pipeline, which runs in the SessionEnd worker: it batches edge pairs to the configured LLM and classifies each pair into a typed relation with a strength score. Calls prefer the **direct OpenAI-compatible endpoint** (`CORTEX_LLM_API_URL`/`CORTEX_LLM_API_KEY`/`CORTEX_LLM_MODEL`, or the pi provider config in `~/.pi/agent/models.json`) with thinking disabled and schema-guided JSON output; the headless CLI (`pi -p` / `claude -p`) is only the fallback. Attempt tracking (`edges.classified_at` + content hash) prevents declined pairs from being re-classified on every run.
 
 ### Edge Types
 

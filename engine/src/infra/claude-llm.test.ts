@@ -95,6 +95,32 @@ describe('parseEdgeClassificationResponse', () => {
     ).toThrow(/no edges array/);
   });
 
+  it('strict mode parses the schema-guided {"edges": [...]} wrapper shape', () => {
+    const response = JSON.stringify({
+      edges: [
+        { source_id: 'a', target_id: 'b', relation_type: 'derived_from', strength: 0.6 },
+      ],
+    });
+
+    expect(parseEdgeClassificationResponse(response, { strict: true })).toEqual([
+      { source_id: 'a', target_id: 'b', relation_type: 'derived_from', strength: 0.6 },
+    ]);
+  });
+
+  it('strict mode filters invalid entries and keeps valid siblings', () => {
+    const response = JSON.stringify({
+      edges: [
+        { source_id: 'a', target_id: 'b', relation_type: 'refines', strength: 0.7 },
+        { source_id: 'c', target_id: 'd', relation_type: 'REFINES', strength: 0.7 },
+        { source_id: 'e', target_id: 'f', relation_type: 'refines', strength: '0.7' },
+      ],
+    });
+
+    expect(parseEdgeClassificationResponse(response, { strict: true })).toEqual([
+      { source_id: 'a', target_id: 'b', relation_type: 'refines', strength: 0.7 },
+    ]);
+  });
+
   it('strict mode accepts an empty array', () => {
     expect(parseEdgeClassificationResponse('[]', { strict: true })).toEqual([]);
   });
