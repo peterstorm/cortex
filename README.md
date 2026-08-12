@@ -397,7 +397,7 @@ The LLM evaluates active memories in batches and archives low-value ones. Trigge
 | `CORTEX_LLM_MODEL` | Override the model passed to the LLM binary | No (`haiku` for claude; none for pi) |
 | `CLAUDE_PLUGIN_ROOT` | Plugin directory | Auto-set by Claude Code |
 
-Extraction, AI pruning, and edge classification shell out to a headless coding-agent CLI: `claude -p --model haiku` by default, or `pi -p` when running under the pi agent (no `--model` flag, so pi's configured provider default is used). No separate API key needed — it uses your Anthropic subscription.
+Extraction, AI pruning, and edge classification prefer a **direct OpenAI-compatible endpoint** when one is configured: `CORTEX_LLM_API_URL`, `CORTEX_LLM_API_KEY`, and `CORTEX_LLM_MODEL` (or the pi provider config in `~/.pi/agent/models.json` — the active provider's `baseUrl`/`apiKey`/first model). Calls disable model thinking and use schema-guided JSON output where supported. Without a configured endpoint they fall back to a headless coding-agent CLI: `claude -p --model haiku` by default, or `pi -p` when running under the pi agent.
 
 ### Key Constants
 

@@ -1,6 +1,8 @@
 /**
  * AI-powered memory pruning command.
- * Uses claude -p (headless) to evaluate active memories and archive stale/redundant ones.
+ * Uses the configured LLM (direct OpenAI-compatible endpoint first, headless
+ * CLI subprocess as fallback) to evaluate active memories and archive stale/
+ * redundant ones.
  *
  * Smart trigger: runs if session count >= AI_PRUNE_SESSION_INTERVAL
  * OR active memory count >= AI_PRUNE_MEMORY_THRESHOLD.

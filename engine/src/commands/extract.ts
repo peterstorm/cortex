@@ -59,6 +59,7 @@ import {
   getAllEntities,
 } from '../infra/db.js';
 import { extractMemories, isClaudeLlmAvailable } from '../infra/claude-llm.js';
+import { resolveOpenAiCompatEndpoint } from '../infra/llm-client.js';
 import { getGitContext } from '../infra/git-context.js';
 import { acquireLock, releaseLock } from '../infra/lock.js';
 import { runLifecycle } from './lifecycle.js';
@@ -134,15 +135,16 @@ export async function executeExtract(
   }
 
   try {
-    // Validate Claude CLI availability
-    if (!isClaudeLlmAvailable()) {
-      logInfo('Claude CLI not found on PATH — extraction skipped');
+    // Validate LLM availability: the direct OpenAI-compatible endpoint
+    // needs no CLI binary, so the gate accepts either transport.
+    if (!isClaudeLlmAvailable() && resolveOpenAiCompatEndpoint() === null) {
+      logInfo('No LLM available (no OpenAI-compatible endpoint configured and no LLM CLI on PATH) — extraction skipped');
       return {
         success: false,
         extracted_count: 0,
         edge_count: 0,
         cursor_position: 0,
-        error: 'Claude CLI not available',
+        error: 'No LLM available: no OpenAI-compatible endpoint configured and no LLM CLI on PATH',
       };
     }
 

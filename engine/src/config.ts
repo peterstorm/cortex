@@ -127,11 +127,6 @@ export function getProjectName(projectRoot: string): string {
 export const MAX_TRANSCRIPT_BYTES = 100 * 1024;
 
 /**
- * Extraction timeout in milliseconds (30s per NFR-001)
- */
-export const EXTRACTION_TIMEOUT_MS = 30_000;
-
-/**
  * Max transcript chunks processed per extraction run.
  * The SessionEnd hook fires once per session; a single 100KB chunk per run
  * would leave most of a long session unextracted. Looping with a cap bounds
@@ -186,16 +181,15 @@ export const CONSOLIDATION_ACTIVE_THRESHOLD = 80;
 export const DECAY_CHECK_INTERVAL_DAYS = 1;
 
 /**
- * Lifecycle archive threshold in days
- * How long memory must be below confidence threshold before archival (7 days)
- */
-export const ARCHIVE_THRESHOLD_DAYS = 7;
-
-/**
  * Lifecycle prune threshold in days.
  * Once archived, a memory transitions to 'pruned' if untouched for this long.
  * Matches FR-091; previously this constant said 90 but `decay.ts` hard-coded 30 —
  * aligned to the running behavior (30) on 2026-05-07.
+ *
+ * NOTE: the archival threshold is not configurable here — decay.ts hard-codes
+ * 14 days below-confidence (low_confidence_14d). A former
+ * ARCHIVE_THRESHOLD_DAYS=7 constant was removed 2026-08-12 because it was
+ * dead and contradicted the running behavior.
  */
 export const PRUNE_THRESHOLD_DAYS = 30;
 

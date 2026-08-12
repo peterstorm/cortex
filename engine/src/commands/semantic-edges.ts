@@ -48,7 +48,7 @@ export interface SemanticEdgesOptions {
 }
 
 export type SemanticEdgesResult =
-  | { ok: true; classified: number; failed: number; skipped: number }
+  | { ok: true; classified: number; failed: number }
   | { ok: false; error: string };
 
 /**
@@ -82,6 +82,16 @@ async function mapLimit<T, R>(
   });
   await Promise.all(runners);
   return results;
+}
+
+/**
+ * Whether a typed relation is symmetric for traversal purposes. Directional
+ * relations (supersedes, derived_from, source_of, refines, exemplifies)
+ * keep their source→target direction; only the general connection and
+ * contradicts are symmetric. Pure function.
+ */
+export function isBidirectionalRelation(relation: EdgeClassification['relation_type']): boolean {
+  return relation === 'relates_to' || relation === 'contradicts';
 }
 
 /**
@@ -154,7 +164,7 @@ export async function executeSemanticEdges(
   const lock = acquireLock(lockFile);
   if (!lock.acquired) {
     logInfo(`Semantic edges skipped: lock ${lock.reason}`);
-    return { ok: true, classified: 0, failed: 0, skipped: 0 };
+    return { ok: true, classified: 0, failed: 0 };
   }
 
   try {
@@ -173,13 +183,8 @@ export async function executeSemanticEdges(
     const candidates = selectClassificationCandidates(allRows, options.limit);
 
     if (candidates.length === 0) {
-      const unattempted = allRows.filter((r) => r.edge.classified_at === null).length;
-      logInfo(
-        unattempted === 0
-          ? 'All relates_to edges are already classified'
-          : `All ${unattempted} unclassified relates_to edges have a missing endpoint memory`
-      );
-      return { ok: true, classified: 0, failed: 0, skipped: 0 };
+      logInfo('All relates_to edges are already classified (or only content-unchanged declines remain)');
+      return { ok: true, classified: 0, failed: 0 };
     }
 
     logInfo(`Found ${candidates.length} relates_to edges to classify`);
@@ -191,7 +196,6 @@ export async function executeSemanticEdges(
     // Step 3: Batch and classify with bounded concurrency
     let classified = 0;
     let failed = 0;
-    const skipped = 0;
 
     await mapLimit(batches, CONCURRENCY, async (batchPairs) => {
       // Attempt timestamp: set on every edge in this batch once the model
@@ -227,7 +231,9 @@ export async function executeSemanticEdges(
                   target_id: classification.target_id,
                   relation_type: classification.relation_type,
                   strength: classification.strength,
-                  bidirectional: true,
+                  // Directional relation types keep direction; only the
+                  // general connection is symmetric.
+                  bidirectional: isBidirectionalRelation(classification.relation_type),
                   status: 'active',
                   classified_at: attemptedAt,
                   classify_hash: contentHash,
@@ -236,8 +242,20 @@ export async function executeSemanticEdges(
               replaceEdge();
               classified++;
             } catch (err) {
-              // Unique constraint or other DB error — non-fatal
+              const message = err instanceof Error ? err.message : String(err);
+              logError(
+                `Edge ${edgeId} (${classification.source_id}:${classification.target_id} ` +
+                  `-> ${classification.relation_type}) could not be written: ${message}`
+              );
               failed++;
+              // A unique-constraint conflict means a typed edge for this
+              // pair already exists (e.g. the similarity pre-filter re-created
+              // a relates_to candidate after a content change). The
+              // classification is effectively already done — retire the
+              // candidate so it is not re-sent to the LLM on every run.
+              if (/unique constraint/i.test(message)) {
+                markEdgeClassified(db, edgeId, attemptedAt, contentHash);
+              }
             }
           } else {
             // LLM returned relates_to or nothing: keep the edge, but mark
@@ -252,8 +270,8 @@ export async function executeSemanticEdges(
       }
     });
 
-    logInfo(`Semantic edges: classified=${classified}, failed=${failed}, skipped=${skipped}`);
-    return { ok: true, classified, failed, skipped };
+    logInfo(`Semantic edges: classified=${classified}, failed=${failed}`);
+    return { ok: true, classified, failed };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { ok: false, error: `Semantic edges failed: ${message}` };

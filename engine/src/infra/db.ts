@@ -16,7 +16,7 @@ import type {
   SourceType,
   EdgeRelation,
 } from '../core/types.js';
-import { createMemory, createEdge, createExtractionCheckpoint, isEdgeRelation, isMemoryType } from '../core/types.js';
+import { createMemory, createEdge, createExtractionCheckpoint, isEdgeRelation, isMemoryType, isMemoryStatus } from '../core/types.js';
 import type { Entity, Fact, EntityType } from '../core/entities.js';
 import { createEntity, createFact, isEntityType } from '../core/entities.js';
 
@@ -333,7 +333,9 @@ function deserializeFloat32Array(buffer: Buffer): Float32Array {
 
 /**
  * Raw memories-table row shape. Enum-valued columns are typed with the domain
- * unions — the schema CHECK constraints enforce them at write time.
+ * unions; SQLite enforces NOT NULL/UNIQUE/FK only, so enum and range
+ * invariants are enforced at the application boundary — createMemory on
+ * insert, validateMemoryFields on update (see updateMemory).
  */
 type MemoryRow = {
   id: string;
@@ -441,7 +443,37 @@ export function insertMemory(db: Database, memory: Memory): string {
  * @param id - Memory ID to update
  * @param fields - Partial memory fields to update
  */
+/**
+ * Validate the mutable Memory fields before an UPDATE. updateMemory bypasses
+ * the createMemory factory, so this mirrors its construction-time guards
+ * (non-empty text, enum membership, confidence/priority ranges) to keep
+ * invalid Memory instances unpublishable through either write path.
+ */
+function validateMemoryFields(fields: Partial<Memory>, operation: string): void {
+  if (fields.content !== undefined && fields.content.trim() === '') {
+    throw new Error(`${operation}: content must not be empty`);
+  }
+  if (fields.summary !== undefined && fields.summary.trim() === '') {
+    throw new Error(`${operation}: summary must not be empty`);
+  }
+  if (fields.memory_type !== undefined && !isMemoryType(fields.memory_type)) {
+    throw new Error(`${operation}: invalid memory_type: ${fields.memory_type}`);
+  }
+  if (fields.status !== undefined && !isMemoryStatus(fields.status)) {
+    throw new Error(`${operation}: invalid status: ${fields.status}`);
+  }
+  if (fields.confidence !== undefined &&
+      (Number.isNaN(fields.confidence) || fields.confidence < 0 || fields.confidence > 1)) {
+    throw new Error(`${operation}: confidence must be in [0, 1], got ${fields.confidence}`);
+  }
+  if (fields.priority !== undefined &&
+      (Number.isNaN(fields.priority) || fields.priority < 1 || fields.priority > 10)) {
+    throw new Error(`${operation}: priority must be in [1, 10], got ${fields.priority}`);
+  }
+}
+
 export function updateMemory(db: Database, id: string, fields: Partial<Memory>): void {
+  validateMemoryFields(fields, 'updateMemory');
   const updates: string[] = [];
   const values: (string | number | Uint8Array | null)[] = [];
 
@@ -863,7 +895,10 @@ export function getLatestMemoryTimestamp(db: Database): string | null {
  */
 export function insertEdge(
   db: Database,
-  edge: Omit<Edge, 'id' | 'created_at'>
+  edge: Omit<Edge, 'id' | 'created_at' | 'classified_at' | 'classify_hash'> & {
+    classified_at?: string | null;
+    classify_hash?: string | null;
+  }
 ): string {
   const id = randomUUID();
   const created_at = new Date().toISOString();

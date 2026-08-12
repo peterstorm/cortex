@@ -198,21 +198,28 @@ export async function runLlmPrompt(prompt: string, timeoutMs: number): Promise<s
  * endpoint (thinking disabled — ~30x faster on reasoning models) and
  * falling back to the CLI subprocess path when no endpoint is configured
  * or the direct call fails.
+ *
+ * The `direct` flag tells the caller which transport produced the text:
+ * strict parsing is only safe for the direct endpoint's guided decoding;
+ * subprocess output is not schema-guided and needs the tolerant parser.
  */
 async function runLlmPromptDirect(
   prompt: string,
   timeoutMs: number,
   direct: { jsonMode?: boolean; jsonSchema?: object; maxTokens?: number } = {}
-): Promise<string> {
+): Promise<{ text: string; direct: boolean }> {
   const endpoint = resolveOpenAiCompatEndpoint();
   if (endpoint) {
     try {
-      return await chatCompletionText(endpoint, prompt, {
-        jsonMode: direct.jsonMode,
-        jsonSchema: direct.jsonSchema,
-        maxTokens: direct.maxTokens,
-        timeoutMs,
-      });
+      return {
+        text: await chatCompletionText(endpoint, prompt, {
+          jsonMode: direct.jsonMode,
+          jsonSchema: direct.jsonSchema,
+          maxTokens: direct.maxTokens,
+          timeoutMs,
+        }),
+        direct: true,
+      };
     } catch (err) {
       process.stderr.write(
         `[cortex:llm] WARNING: direct LLM call failed (${(err as Error).message ?? err}); ` +
@@ -220,7 +227,7 @@ async function runLlmPromptDirect(
       );
     }
   }
-  return runLlmPrompt(prompt, timeoutMs);
+  return { text: await runLlmPrompt(prompt, timeoutMs), direct: false };
 }
 
 /**
@@ -236,10 +243,11 @@ async function runLlmPromptDirect(
  * @throws Error if the LLM binary not found, non-zero exit, or timeout
  */
 export async function extractMemories(prompt: string): Promise<string> {
-  return runLlmPromptDirect(prompt, EXTRACTION_TIMEOUT_MS, {
+  const { text } = await runLlmPromptDirect(prompt, EXTRACTION_TIMEOUT_MS, {
     jsonMode: true,
     maxTokens: 8192,
   });
+  return text;
 }
 
 /**
@@ -284,14 +292,16 @@ export async function classifyEdges(
   if (pairs.length === 0) return [];
 
   const prompt = buildEdgeClassificationPrompt(pairs);
-  const response = await runLlmPromptDirect(prompt, EDGE_CLASSIFICATION_TIMEOUT_MS, {
+  const { text, direct } = await runLlmPromptDirect(prompt, EDGE_CLASSIFICATION_TIMEOUT_MS, {
     jsonSchema: EDGE_CLASSIFICATION_SCHEMA,
     maxTokens: 4096,
   });
-  // Strict mode on the direct path: guided decoding guarantees structured
-  // output, so a JSON failure means truncation or a server problem — the
-  // caller must count the batch as failed instead of silently dropping it.
-  return parseEdgeClassificationResponse(response, { strict: true });
+  // Strict mode only on the direct path: guided decoding guarantees
+  // structured output, so a JSON failure there means truncation or a server
+  // problem — the caller must count the batch as failed instead of silently
+  // dropping it. The subprocess fallback is not schema-guided (models wrap
+  // JSON in fences/prose), so its output gets the tolerant parser.
+  return parseEdgeClassificationResponse(text, { strict: direct });
 }
 
 /**
@@ -357,15 +367,12 @@ If no strong relationships, return {"edges": []}.`;
 
 /**
  * Parse edge classification response.
- * Pure function - returns parsed edges or empty array on failure.
- */
-/**
- * Parse edge classification response.
  *
  * Default (tolerant) mode extracts JSON from fences/prose and returns [] on
  * any failure, matching the legacy subprocess path. Strict mode (direct API
  * with guided decoding) requires the whole response to be a valid JSON
- * array and throws otherwise — callers must treat that as a batch failure.
+ * object with an edges array and throws otherwise — callers must treat that
+ * as a batch failure.
  */
 export function parseEdgeClassificationResponse(
   response: string,
@@ -392,8 +399,17 @@ export function parseEdgeClassificationResponse(
         `Edge classification response has no edges array: ${String(response).slice(0, 200)}`
       );
     }
-    return array
-      .filter(isValidEdgeClassification)
+    const valid = array.filter(isValidEdgeClassification);
+    if (valid.length !== array.length) {
+      // A dropped item must never degrade into a permanent "declined" verdict:
+      // surface the loss so the operator can distinguish a model/decoder
+      // issue from a genuine decline.
+      process.stderr.write(
+        `[cortex:llm] WARNING: dropping ${array.length - valid.length} of ${array.length} ` +
+          `edge classifications with invalid shape from a strict-mode response\n`
+      );
+    }
+    return valid
       .map((c) => ({
         source_id: String(c.source_id),
         target_id: String(c.target_id),

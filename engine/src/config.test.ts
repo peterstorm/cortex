@@ -13,7 +13,6 @@ import {
   getTelemetryPath,
   getProjectName,
   MAX_TRANSCRIPT_BYTES,
-  EXTRACTION_TIMEOUT_MS,
   SURFACE_MAX_TOKENS,
   DEFAULT_SEARCH_LIMIT,
   GITIGNORE_PATTERNS,
@@ -84,10 +83,6 @@ describe('config - project name extraction', () => {
 describe('config - constants', () => {
   it('MAX_TRANSCRIPT_BYTES is 100KB', () => {
     expect(MAX_TRANSCRIPT_BYTES).toBe(100 * 1024);
-  });
-
-  it('EXTRACTION_TIMEOUT_MS is 30 seconds', () => {
-    expect(EXTRACTION_TIMEOUT_MS).toBe(30_000);
   });
 
   it('SURFACE_MAX_TOKENS is reasonable', () => {

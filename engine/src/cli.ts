@@ -953,7 +953,8 @@ async function handleBackfill(args: string[]): Promise<CommandResult> {
 
 /**
  * Handle 'semantic-edges' subcommand
- * Classify relates_to edges with typed relationships via Claude Haiku
+ * Classify relates_to edges with typed relationships via the configured LLM
+ * (direct OpenAI-compatible endpoint first, CLI subprocess as fallback).
  */
 async function handleSemanticEdges(args: string[]): Promise<CommandResult> {
   if (args.length < 1) {
@@ -980,7 +981,7 @@ async function handleSemanticEdges(args: string[]): Promise<CommandResult> {
 
     return {
       success: true,
-      output: `Semantic edges: classified=${result.classified}, failed=${result.failed}, skipped=${result.skipped}`,
+      output: `Semantic edges: classified=${result.classified}, failed=${result.failed}`,
     };
   } catch (err) {
     return {
