@@ -8,7 +8,9 @@
  */
 
 import type { EdgeRelation } from '../core/types.js';
-import { isEdgeRelation } from '../core/types.js';
+import { isEdgeRelation, EDGE_RELATIONS } from '../core/types.js';
+import { extractJsonSlice } from '../core/json-utils.js';
+import { resolveOpenAiCompatEndpoint, chatCompletionText } from './llm-client.js';
 
 const EXTRACTION_TIMEOUT_MS = 90_000;
 const EDGE_CLASSIFICATION_TIMEOUT_MS = 90_000;
@@ -192,22 +194,86 @@ export async function runLlmPrompt(prompt: string, timeoutMs: number): Promise<s
 }
 
 /**
- * Extract memories from transcript using Claude CLI.
- * Pipes prompt to `claude -p` via stdin and returns raw response text.
- * Caller is responsible for parsing via parseExtractionResponse.
- *
- * @param prompt - Extraction prompt (from buildExtractionPrompt)
- * @returns Raw Claude response text
- * @throws Error if binary not found, non-zero exit, or timeout
+ * Run a prompt through the LLM, preferring the direct OpenAI-compatible
+ * endpoint (thinking disabled — ~30x faster on reasoning models) and
+ * falling back to the CLI subprocess path when no endpoint is configured
+ * or the direct call fails.
  */
-export async function extractMemories(prompt: string): Promise<string> {
-  return runLlmPrompt(prompt, EXTRACTION_TIMEOUT_MS);
+async function runLlmPromptDirect(
+  prompt: string,
+  timeoutMs: number,
+  direct: { jsonMode?: boolean; jsonSchema?: object; maxTokens?: number } = {}
+): Promise<string> {
+  const endpoint = resolveOpenAiCompatEndpoint();
+  if (endpoint) {
+    try {
+      return await chatCompletionText(endpoint, prompt, {
+        jsonMode: direct.jsonMode,
+        jsonSchema: direct.jsonSchema,
+        maxTokens: direct.maxTokens,
+        timeoutMs,
+      });
+    } catch (err) {
+      process.stderr.write(
+        `[cortex:llm] WARNING: direct LLM call failed (${(err as Error).message ?? err}); ` +
+          `falling back to ${getLlmBinary(process.env)} subprocess\n`
+      );
+    }
+  }
+  return runLlmPrompt(prompt, timeoutMs);
 }
 
 /**
- * Classify edges between memory pairs using Claude CLI.
- * Uses a longer timeout (90s) since this runs fire-and-forget
- * and the classification prompt is larger than extraction.
+ * Extract memories from transcript using the LLM.
+ * Pipes prompt to `claude -p` via stdin and returns raw response text.
+ * Caller is responsible for parsing via parseExtractionResponse.
+ *
+ * Prefers the direct OpenAI-compatible endpoint (thinking disabled, valid
+ * JSON output); falls back to the CLI subprocess path.
+ *
+ * @param prompt - Extraction prompt (from buildExtractionPrompt)
+ * @returns Raw LLM response text
+ * @throws Error if the LLM binary not found, non-zero exit, or timeout
+ */
+export async function extractMemories(prompt: string): Promise<string> {
+  return runLlmPromptDirect(prompt, EXTRACTION_TIMEOUT_MS, {
+    jsonMode: true,
+    maxTokens: 8192,
+  });
+}
+
+/**
+ * Strict JSON schema for classification batches. Schema-guided decoding on
+ * the direct API path makes malformed/wrapped/verbose output impossible.
+ */
+const EDGE_CLASSIFICATION_SCHEMA = {
+  type: 'object',
+  properties: {
+    edges: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          source_id: { type: 'string' },
+          target_id: { type: 'string' },
+          relation_type: { type: 'string', enum: [...EDGE_RELATIONS] },
+          strength: { type: 'number' },
+        },
+        required: ['source_id', 'target_id', 'relation_type', 'strength'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['edges'],
+  additionalProperties: false,
+};
+
+/**
+ * Classify edges between memory pairs using the LLM.
+ *
+ * Prefers the direct OpenAI-compatible endpoint with strict schema-guided
+ * decoding (output shape is guaranteed, response parsing is reliable);
+ * falls back to the CLI subprocess path.
  *
  * @param pairs - Memory pairs to classify
  * @returns Array of edge classifications
@@ -218,8 +284,14 @@ export async function classifyEdges(
   if (pairs.length === 0) return [];
 
   const prompt = buildEdgeClassificationPrompt(pairs);
-  const response = await runLlmPrompt(prompt, EDGE_CLASSIFICATION_TIMEOUT_MS);
-  return parseEdgeClassificationResponse(response);
+  const response = await runLlmPromptDirect(prompt, EDGE_CLASSIFICATION_TIMEOUT_MS, {
+    jsonSchema: EDGE_CLASSIFICATION_SCHEMA,
+    maxTokens: 4096,
+  });
+  // Strict mode on the direct path: guided decoding guarantees structured
+  // output, so a JSON failure means truncation or a server problem — the
+  // caller must count the batch as failed instead of silently dropping it.
+  return parseEdgeClassificationResponse(response, { strict: true });
 }
 
 /**
@@ -268,33 +340,73 @@ Rules:
    - 0.3-0.49: Weak relationship
 3. Only return edges with strength >= 0.3
 
-Return JSON array:
-[
-  {
-    "source_id": "id1",
-    "target_id": "id2",
-    "relation_type": "relates_to",
-    "strength": 0.75
-  }
-]
+Return JSON object:
+{
+  "edges": [
+    {
+      "source_id": "id1",
+      "target_id": "id2",
+      "relation_type": "relates_to",
+      "strength": 0.75
+    }
+  ]
+}
 
-If no strong relationships, return empty array [].`;
+If no strong relationships, return {"edges": []}.`;
 }
 
 /**
  * Parse edge classification response.
  * Pure function - returns parsed edges or empty array on failure.
  */
+/**
+ * Parse edge classification response.
+ *
+ * Default (tolerant) mode extracts JSON from fences/prose and returns [] on
+ * any failure, matching the legacy subprocess path. Strict mode (direct API
+ * with guided decoding) requires the whole response to be a valid JSON
+ * array and throws otherwise — callers must treat that as a batch failure.
+ */
 export function parseEdgeClassificationResponse(
-  response: string
+  response: string,
+  options: { strict?: boolean } = {}
 ): readonly EdgeClassification[] {
+  if (options.strict) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(response.trim());
+    } catch (e) {
+      throw new Error(
+        `Edge classification response is not valid JSON (probably truncated): ${(e as Error).message}`
+      );
+    }
+    // Accept both the bare array and the schema-guided {"edges": [...]} shape
+    const array =
+      Array.isArray(parsed)
+        ? parsed
+        : Array.isArray((parsed as { edges?: unknown })?.edges)
+          ? (parsed as { edges: unknown[] }).edges
+          : null;
+    if (array === null) {
+      throw new Error(
+        `Edge classification response has no edges array: ${String(response).slice(0, 200)}`
+      );
+    }
+    return array
+      .filter(isValidEdgeClassification)
+      .map((c) => ({
+        source_id: String(c.source_id),
+        target_id: String(c.target_id),
+        relation_type: c.relation_type,
+        strength: Number(c.strength),
+      }));
+  }
+
   try {
-    // Extract JSON from response (handle markdown code blocks)
-    const jsonMatch = response.match(/```json\s*([\s\S]*?)\s*```/) || [
-      null,
-      response,
-    ];
-    const jsonText = jsonMatch[1] || response;
+    // Extract JSON from response: ```json fence, else the first JSON slice
+    // (handles trailing prose the model adds after the JSON array), else raw.
+    const fenceMatch = response.match(/```json\s*([\s\S]*?)\s*```/);
+    const jsonText = fenceMatch?.[1] ?? extractJsonSlice(response) ?? response;
 
     const parsed = JSON.parse(jsonText.trim());
 

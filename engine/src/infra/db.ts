@@ -59,6 +59,8 @@ CREATE TABLE IF NOT EXISTS edges (
   bidirectional INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'active',
   created_at TEXT NOT NULL,
+  classified_at TEXT,
+  classify_hash TEXT,
   FOREIGN KEY (source_id) REFERENCES memories(id) ON DELETE CASCADE,
   FOREIGN KEY (target_id) REFERENCES memories(id) ON DELETE CASCADE,
   UNIQUE (source_id, target_id, relation_type)
@@ -206,6 +208,7 @@ function initializeSchema(db: Database): void {
   migrateCheckpointUniqueness(db);
   migrateArchivedAt(db);
   migrateCheckpointTranscriptLength(db);
+  migrateEdgeClassifiedAt(db);
 
   if (schemaVersion < CURRENT_SCHEMA_VERSION) {
     db.run(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
@@ -225,6 +228,23 @@ function migrateArchivedAt(db: Database): void {
   const columns = db.prepare(`PRAGMA table_info(memories)`).all() as { name: string }[];
   if (columns.some((c) => c.name === 'archived_at')) return;
   db.run(`ALTER TABLE memories ADD COLUMN archived_at TEXT`);
+}
+
+/**
+ * Idempotent migration: add edges.classified_at / edges.classify_hash for
+ * existing databases. Records when an edge was last attempted by the
+ * semantic-edges LLM pass (and the endpoint content hash at that time) so
+ * declined/typed edges are not re-classified on every maintenance run.
+ */
+function migrateEdgeClassifiedAt(db: Database): void {
+  const columns = db.prepare(`PRAGMA table_info(edges)`).all() as { name: string }[];
+  const names = new Set(columns.map((c) => c.name));
+  if (!names.has('classified_at')) {
+    db.run(`ALTER TABLE edges ADD COLUMN classified_at TEXT`);
+  }
+  if (!names.has('classify_hash')) {
+    db.run(`ALTER TABLE edges ADD COLUMN classify_hash TEXT`);
+  }
 }
 
 /**
@@ -857,11 +877,13 @@ export function insertEdge(
     bidirectional: edge.bidirectional,
     status: edge.status,
     created_at,
+    classified_at: edge.classified_at ?? null,
+    classify_hash: edge.classify_hash ?? null,
   });
 
   const stmt = db.prepare(`
-    INSERT INTO edges (id, source_id, target_id, relation_type, strength, bidirectional, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO edges (id, source_id, target_id, relation_type, strength, bidirectional, status, created_at, classified_at, classify_hash)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   stmt.run(
@@ -872,7 +894,9 @@ export function insertEdge(
     validated.strength,
     validated.bidirectional ? 1 : 0,
     validated.status,
-    validated.created_at
+    validated.created_at,
+    validated.classified_at,
+    validated.classify_hash
   );
 
   return validated.id;
@@ -922,22 +946,24 @@ export function getEdgesForMemory(db: Database, memoryId: string): readonly Edge
  */
 export function getAllEdges(db: Database): readonly Edge[] {
   const stmt = db.prepare(`SELECT * FROM edges WHERE status IN ('active', 'suggested')`);
-  const rows = stmt.all() as any[];
+  const rows = stmt.all() as unknown as Array<Record<string, unknown>>;
 
   return rows.flatMap(row => {
-    if (!isEdgeRelation(row.relation_type)) {
+    if (!isEdgeRelation(asString(row.relation_type))) {
       console.warn(`[cortex:db] Skipping edge ${row.id}: invalid relation_type '${row.relation_type}'`);
       return [];
     }
     return [createEdge({
-      id: row.id,
-      source_id: row.source_id,
-      target_id: row.target_id,
-      relation_type: row.relation_type,
-      strength: row.strength,
+      id: asString(row.id),
+      source_id: asString(row.source_id),
+      target_id: asString(row.target_id),
+      relation_type: asString(row.relation_type) as EdgeRelation,
+      strength: Number(row.strength),
       bidirectional: row.bidirectional === 1,
-      status: row.status,
-      created_at: row.created_at,
+      status: asString(row.status) as Edge['status'],
+      created_at: asString(row.created_at),
+      classified_at: (row.classified_at ?? null) as string | null,
+      classify_hash: (row.classify_hash ?? null) as string | null,
     })];
   });
 }
@@ -954,23 +980,127 @@ export function getRelatesToEdges(db: Database): readonly Edge[] {
     SELECT * FROM edges WHERE relation_type = 'relates_to' AND status IN ('active', 'suggested')
   `);
 
-  const rows = stmt.all() as any[];
+  return edgeRowsToEdges(stmt.all() as unknown as Array<Record<string, unknown>>);
+}
 
-  return rows.flatMap(row => {
-    if (!isEdgeRelation(row.relation_type)) {
+/**
+ * Slim endpoint-memory projection used by the classification pre-filter.
+ */
+export interface EdgeEndpointMemory {
+  readonly id: string;
+  readonly content: string;
+  readonly summary: string;
+  readonly memory_type: string;
+}
+
+export interface EdgeWithMemories {
+  readonly edge: Edge;
+  readonly source: EdgeEndpointMemory;
+  readonly target: EdgeEndpointMemory;
+}
+
+/**
+ * Get relates_to edges joined with their endpoint memories.
+ *
+ * Includes never-attempted edges (classified_at IS NULL) and edges whose
+ * endpoint content changed since the last attempt — the caller compares a
+ * content hash against edge.classify_hash. One query replaces N×2
+ * getMemory lookups.
+ */
+export function getRelatesToEdgesWithMemories(db: Database): readonly EdgeWithMemories[] {
+  const stmt = db.prepare(`
+    SELECT
+      e.*,
+      s.content AS s_content, s.summary AS s_summary, s.memory_type AS s_memory_type,
+      t.content AS t_content, t.summary AS t_summary, t.memory_type AS t_memory_type
+    FROM edges e
+    JOIN memories s ON s.id = e.source_id
+    JOIN memories t ON t.id = e.target_id
+    WHERE e.relation_type = 'relates_to'
+      AND e.status IN ('active', 'suggested')
+    ORDER BY e.created_at
+  `);
+
+  const rows = stmt.all() as unknown as Array<Record<string, unknown>>;
+  return rows.flatMap((row) => {
+    if (!isEdgeRelation(asString(row.relation_type))) return [];
+
+    const edge = createEdge({
+      id: asString(row.id),
+      source_id: asString(row.source_id),
+      target_id: asString(row.target_id),
+      relation_type: asString(row.relation_type) as EdgeRelation,
+      strength: Number(row.strength),
+      bidirectional: row.bidirectional === 1,
+      status: asString(row.status) as Edge['status'],
+      created_at: asString(row.created_at),
+      classified_at: (row.classified_at ?? null) as string | null,
+      classify_hash: (row.classify_hash ?? null) as string | null,
+    });
+
+    return [
+      {
+        edge,
+        source: {
+          id: asString(row.source_id),
+          content: asString(row.s_content),
+          summary: asString(row.s_summary),
+          memory_type: asString(row.s_memory_type),
+        },
+        target: {
+          id: asString(row.target_id),
+          content: asString(row.t_content),
+          summary: asString(row.t_summary),
+          memory_type: asString(row.t_memory_type),
+        },
+      },
+    ];
+  });
+}
+
+/**
+ * Record that an edge was attempted by the semantic classification pass,
+ * along with the endpoint content hash at attempt time. Idempotent; missing
+ * edges (already replaced) are a no-op.
+ */
+export function markEdgeClassified(
+  db: Database,
+  edgeId: string,
+  at: string,
+  contentHash: string
+): void {
+  db.prepare(`UPDATE edges SET classified_at = ?, classify_hash = ? WHERE id = ?`).run(
+    at,
+    contentHash,
+    edgeId
+  );
+}
+
+function edgeRowsToEdges(rows: Array<Record<string, unknown>>): readonly Edge[] {
+  return rows.flatMap((row) => {
+    if (!isEdgeRelation(asString(row.relation_type))) {
       return [];
     }
-    return [createEdge({
-      id: row.id,
-      source_id: row.source_id,
-      target_id: row.target_id,
-      relation_type: row.relation_type,
-      strength: row.strength,
-      bidirectional: row.bidirectional === 1,
-      status: row.status,
-      created_at: row.created_at,
-    })];
+    return [
+      createEdge({
+        id: asString(row.id),
+        source_id: asString(row.source_id),
+        target_id: asString(row.target_id),
+        relation_type: asString(row.relation_type) as EdgeRelation,
+        strength: Number(row.strength),
+        bidirectional: row.bidirectional === 1,
+        status: asString(row.status) as Edge['status'],
+        created_at: asString(row.created_at),
+        classified_at: (row.classified_at ?? null) as string | null,
+        classify_hash: (row.classify_hash ?? null) as string | null,
+      }),
+    ];
   });
+}
+
+/** Narrow a SQLite cell to a string (columns are NOT NULL by schema). */
+function asString(value: unknown): string {
+  return typeof value === 'string' ? value : String(value);
 }
 
 /**

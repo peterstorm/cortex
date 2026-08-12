@@ -8,6 +8,7 @@ import { MEMORY_TYPES, isMemoryType } from './types.js';
 import { SUMMARY_MAX_CHARS } from '../config.js';
 import type { EntityFactCandidate, EntityProfile } from './entities.js';
 import { isValidEntityFactCandidate } from './entities.js';
+import { extractJsonSlice } from './json-utils.js';
 
 /** Result of parsing an extraction response — memories and optional entity-facts */
 export interface ParsedExtractionResult {
@@ -253,12 +254,10 @@ export function parseExtractionResponse(
   response: string
 ): ExtractionParseOutcome {
   try {
-    // Extract JSON from response (handle markdown code blocks)
-    const jsonMatch = response.match(/```json\s*([\s\S]*?)\s*```/) || [
-      null,
-      response,
-    ];
-    const jsonText = jsonMatch[1] || response;
+    // Extract JSON from response: ```json fence, else the first JSON slice
+    // (handles trailing prose the model adds after the JSON value), else raw.
+    const fenceMatch = response.match(/```json\s*([\s\S]*?)\s*```/);
+    const jsonText = fenceMatch?.[1] ?? extractJsonSlice(response) ?? response;
 
     const parsed = JSON.parse(jsonText.trim());
 

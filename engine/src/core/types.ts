@@ -131,6 +131,10 @@ export interface Edge {
   readonly bidirectional: boolean;
   readonly status: EdgeStatus;
   readonly created_at: string; // ISO8601
+  /** ISO8601 timestamp of the last semantic-classification attempt; null when never attempted. */
+  readonly classified_at: string | null;
+  /** Hash of the endpoint memories' content at the last attempt; null when never attempted. */
+  readonly classify_hash: string | null;
 }
 
 // Extraction Checkpoint (FR-004, FR-105)
@@ -307,6 +311,8 @@ export function createEdge(input: {
   bidirectional?: boolean;
   status?: EdgeStatus;
   created_at?: string;
+  classified_at?: string | null;
+  classify_hash?: string | null;
 }): Edge {
   // Validate no self-referencing edges
   if (input.source_id === input.target_id) {
@@ -334,6 +340,8 @@ export function createEdge(input: {
     bidirectional: input.bidirectional ?? false,
     status: input.status ?? 'active',
     created_at: input.created_at ?? now,
+    classified_at: input.classified_at ?? null,
+    classify_hash: input.classify_hash ?? null,
   };
 }
 

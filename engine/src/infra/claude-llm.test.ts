@@ -116,6 +116,56 @@ describe('parseEdgeClassificationResponse', () => {
     ]);
   });
 
+  it('parses JSON followed by trailing prose', () => {
+    const response =
+      '[{"source_id":"mem1","target_id":"mem2","relation_type":"refines","strength":0.7}]\n\n' +
+      'The source refines the target because both concern the same module and the source improves the design.';
+
+    const result = parseEdgeClassificationResponse(response);
+
+    expect(result).toEqual([
+      { source_id: 'mem1', target_id: 'mem2', relation_type: 'refines', strength: 0.7 },
+    ]);
+  });
+
+  it('parses JSON inside prose with no code fence', () => {
+    const response =
+      'Here are the classifications: [{"source_id":"a","target_id":"b","relation_type":"contradicts","strength":0.9}] Hope this helps.';
+
+    const result = parseEdgeClassificationResponse(response);
+
+    expect(result).toEqual([
+      { source_id: 'a', target_id: 'b', relation_type: 'contradicts', strength: 0.9 },
+    ]);
+  });
+
+  it('strict mode throws on truncated JSON', () => {
+    const truncated = '[{"source_id":"a","target_id":"b","relation_type":"refines","strength":0.7},';
+
+    expect(() => parseEdgeClassificationResponse(truncated, { strict: true })).toThrow(
+      /not valid JSON/
+    );
+  });
+
+  it('strict mode throws on non-array JSON', () => {
+    expect(() =>
+      parseEdgeClassificationResponse('{"error":"something"}', { strict: true })
+    ).toThrow(/no edges array/);
+  });
+
+  it('strict mode accepts an empty array', () => {
+    expect(parseEdgeClassificationResponse('[]', { strict: true })).toEqual([]);
+  });
+
+  it('strict mode parses a valid full response', () => {
+    const response =
+      '[{"source_id":"a","target_id":"b","relation_type":"derived_from","strength":0.6}]';
+
+    expect(parseEdgeClassificationResponse(response, { strict: true })).toEqual([
+      { source_id: 'a', target_id: 'b', relation_type: 'derived_from', strength: 0.6 },
+    ]);
+  });
+
   it('parses JSON in markdown code blocks', () => {
     const response = `
 \`\`\`json

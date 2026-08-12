@@ -913,24 +913,111 @@ describe('Database Layer', () => {
       db.close();
     });
 
-    it('persists transcript_length on extraction checkpoints', () => {
+    it('adds classified_at to a legacy edges table', () => {
+      const fs = require('node:fs');
+      const os = require('node:os');
+      const path = require('node:path');
+      const { Database } = require('bun:sqlite');
+
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-edge-migration-'));
+      const dbPath = path.join(dir, 'legacy.db');
+
+      // Simulate a legacy database whose edges table predates classified_at
+      const legacy = new Database(dbPath);
+      legacy.run(`
+        CREATE TABLE memories (
+          id TEXT PRIMARY KEY, content TEXT NOT NULL, summary TEXT NOT NULL,
+          memory_type TEXT NOT NULL, scope TEXT NOT NULL,
+          embedding BLOB, local_embedding BLOB,
+          confidence REAL NOT NULL, priority INTEGER NOT NULL,
+          pinned INTEGER NOT NULL DEFAULT 0,
+          source_type TEXT NOT NULL, source_session TEXT NOT NULL, source_context TEXT NOT NULL,
+          tags TEXT NOT NULL, access_count INTEGER NOT NULL DEFAULT 0,
+          last_accessed_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'active'
+        )
+      `);
+      legacy.run(`
+        CREATE TABLE edges (
+          id TEXT PRIMARY KEY, source_id TEXT NOT NULL, target_id TEXT NOT NULL,
+          relation_type TEXT NOT NULL, strength REAL NOT NULL,
+          bidirectional INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active',
+          created_at TEXT NOT NULL
+        )
+      `);
+      legacy.close();
+
+      const db = openDatabase(dbPath);
+      const edgeCols = (db.prepare(`PRAGMA table_info(edges)`).all() as { name: string }[]).map(c => c.name);
+      expect(edgeCols).toContain('classified_at');
+      db.close();
+
+      // Idempotent: re-opening must not throw (duplicate column)
+      const again = openDatabase(dbPath);
+      const edgeCols2 = (again.prepare(`PRAGMA table_info(edges)`).all() as { name: string }[]).map(c => c.name);
+      expect(edgeCols2).toContain('classified_at');
+      again.close();
+
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('classifiable edges respect attempt tracking and content changes', () => {
+      const { getRelatesToEdgesWithMemories, markEdgeClassified } = require('./db.js');
+      const { selectClassificationCandidates, pairContentHash } = require('../commands/semantic-edges.js');
       const db = openDatabase(':memory:');
 
-      saveExtractionCheckpoint(db, {
-        session_id: 'sess-tl',
-        cursor_position: 42,
-        extracted_at: new Date().toISOString(),
-        transcript_length: 1000,
-      });
-      expect(getExtractionCheckpoint(db, 'sess-tl')!.transcript_length).toBe(1000);
+      function seedMemory(id: string): void {
+        insertMemory(db, createMemory({
+          id, content: `content ${id}`, summary: `summary ${id}`,
+          memory_type: 'context', scope: 'project', confidence: 0.8, priority: 5,
+          source_type: 'manual', source_session: 'sess', source_context: '{}',
+        }));
+      }
+      seedMemory('a');
+      seedMemory('b');
+      seedMemory('c');
 
-      // Omitted → null (legacy callers)
-      saveExtractionCheckpoint(db, {
-        session_id: 'sess-legacy',
-        cursor_position: 7,
-        extracted_at: new Date().toISOString(),
+      const e1 = insertEdge(db, {
+        source_id: 'a', target_id: 'b', relation_type: 'relates_to',
+        strength: 0.5, bidirectional: true, status: 'active',
       });
-      expect(getExtractionCheckpoint(db, 'sess-legacy')!.transcript_length).toBeNull();
+      const e2 = insertEdge(db, {
+        source_id: 'b', target_id: 'c', relation_type: 'relates_to',
+        strength: 0.4, bidirectional: true, status: 'active',
+      });
+
+      // Both unclassified → both classifiable
+      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 0).map(c => c.edgeId).sort())
+        .toEqual([e1, e2].sort());
+
+      // Attempt with unchanged content → no longer classifiable
+      const rows = getRelatesToEdgesWithMemories(db);
+      const e1Row = rows.find(r => r.edge.id === e1)!;
+      const e1Hash = pairContentHash(e1Row.source, e1Row.target);
+      markEdgeClassified(db, e1, '2026-08-12T10:00:00.000Z', e1Hash);
+      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 0).map(c => c.edgeId))
+        .toEqual([e2]);
+
+      // Typed edges are never classifiable
+      insertEdge(db, {
+        source_id: 'a', target_id: 'c', relation_type: 'refines',
+        strength: 0.9, bidirectional: true, status: 'active',
+      });
+      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 0).map(c => c.edgeId))
+        .toEqual([e2]);
+
+      // Content change after the attempt → re-qualifies
+      updateMemory(db, 'a', { content: 'changed content a' });
+      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 0).map(c => c.edgeId).sort())
+        .toEqual([e1, e2].sort());
+
+      // limit is respected (0 = all)
+      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 1).length).toBe(1);
+
+      // classified_at / classify_hash round-trip through reads
+      const e1Stored = getAllEdges(db).find(e => e.id === e1)!;
+      expect(e1Stored.classified_at).toBe('2026-08-12T10:00:00.000Z');
+      expect(e1Stored.classify_hash).toBe(e1Hash);
       db.close();
     });
   });
