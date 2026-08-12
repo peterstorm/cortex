@@ -64,7 +64,8 @@ function batch<T>(arr: readonly T[], size: number): readonly T[][] {
 }
 
 /**
- * Run bounded-concurrency map over an array. Pure function.
+ * Run bounded-concurrency map over an array. Worker failures propagate to
+ * the caller; workers must handle their own per-item errors.
  */
 async function mapLimit<T, R>(
   items: readonly T[],
@@ -135,13 +136,13 @@ export function selectClassificationCandidates(
           id: source.id,
           content: source.content,
           summary: source.summary,
-          memory_type: source.memory_type,
+          memory_type: source.memory_type as Memory['memory_type'],
         },
         target: {
           id: target.id,
           content: target.content,
           summary: target.summary,
-          memory_type: target.memory_type,
+          memory_type: target.memory_type as Memory['memory_type'],
         },
       },
     });
@@ -194,79 +195,126 @@ export async function executeSemanticEdges(
     const batches = batch(candidates, BATCH_SIZE);
 
     // Step 3: Batch and classify with bounded concurrency
+    // Attempt timestamp: set on every edge in this batch once the model
+    // answered, so declined edges are not re-asked on future runs. On a
+    // thrown error or an unparseable response the edges stay unmarked and
+    // are retried next run.
     let classified = 0;
     let failed = 0;
 
     await mapLimit(batches, CONCURRENCY, async (batchPairs) => {
-      // Attempt timestamp: set on every edge in this batch once the model
-      // answered, so declined edges are not re-asked on future runs. On a
-      // thrown error the edges stay unmarked and are retried next run.
       const attemptedAt = new Date().toISOString();
 
+      let classifications: readonly EdgeClassification[];
+      let byIndex: Map<number, EdgeClassification> | null = null;
+      let byKey: Map<string, EdgeClassification>;
       try {
-        const classifications = await classifyEdges(
+        const outcome = await classifyEdges(
           batchPairs.map((p) => p.pair)
         );
-
-        // Build lookup: "sourceId:targetId" -> classification
-        const classMap = new Map<string, EdgeClassification>();
-        for (const c of classifications) {
-          classMap.set(`${c.source_id}:${c.target_id}`, c);
+        if (outcome.kind === 'unparseable') {
+          // Garbage is not a decline: leave the edges unmarked and count the
+          // batch as failed so a later run retries them. The old behavior
+          // ([] on parse failure) permanently retired every pair while
+          // reporting ok:true failed:0.
+          logError(`Classification response was not parseable (${outcome.reason}) — batch of ${batchPairs.length} left unmarked, will be retried`);
+          failed += batchPairs.length;
+          return;
         }
+        classifications = outcome.classifications;
 
-        // Step 4: Replace edges with typed versions
-        for (const { edgeId, pair } of batchPairs) {
+        // Join classifications to pairs. When the model echoed pair_index (the
+        // deterministic protocol this prompt requests), the join is by ordinal
+        // and never depends on free-text ID fidelity: a direction-flipped or
+        // mangled ID cannot silently discard a valid classification. A
+        // response that mixes indexed and unindexed entries, or carries an
+        // out-of-range index, is corrupt — treat it as a batch failure
+        // (edges unmarked, retried) rather than a decline.
+        byIndex = new Map<number, EdgeClassification>();
+        byKey = new Map<string, EdgeClassification>();
+        for (const c of classifications) {
+          if (c.pair_index !== undefined) {
+            if (byIndex.has(c.pair_index)) {
+              throw new Error(
+                `classification response contains duplicate pair_index ${c.pair_index} — corrupt response, batch failed`
+              );
+            }
+            byIndex.set(c.pair_index, c);
+          } else {
+            byKey.set(`${c.source_id}:${c.target_id}`, c);
+          }
+        }
+        if (byIndex.size > 0) {
+          if (byIndex.size !== classifications.length) {
+            throw new Error(
+              `classification response mixed indexed and unindexed entries (${byIndex.size} of ${classifications.length} indexed)`
+            );
+          }
+          for (const index of byIndex.keys()) {
+            if (index < 1 || index > batchPairs.length) {
+              throw new Error(
+                `classification pair_index ${index} is out of range for a ${batchPairs.length}-pair batch`
+              );
+            }
+          }
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        logError(`Classification batch failed: ${message}`);
+        failed += batchPairs.length;
+        return;
+      }
+
+      // Step 4: Replace edges with typed versions. Each edge's write is
+      // guarded separately so a persistence error counts exactly one failure
+      // and is never misattributed to the LLM batch.
+      const joinByIndex = byIndex !== null && byIndex.size > 0;
+      for (const [pairOrdinal, { edgeId, pair }] of batchPairs.entries()) {
+        try {
           const key = `${pair.source.id}:${pair.target.id}`;
-          const classification = classMap.get(key);
+          const classification = joinByIndex
+            ? byIndex!.get(pairOrdinal + 1)
+            : byKey.get(key);
           // Content fingerprint at attempt time, stored for future runs
           const contentHash = pairContentHash(pair.source, pair.target);
 
           if (classification && classification.relation_type !== 'relates_to') {
             // Delete old generic edge + insert typed one atomically
-            try {
-              const replaceEdge = db.transaction(() => {
-                deleteEdge(db, edgeId);
-                insertEdge(db, {
-                  source_id: classification.source_id,
-                  target_id: classification.target_id,
-                  relation_type: classification.relation_type,
-                  strength: classification.strength,
-                  // Directional relation types keep direction; only the
-                  // general connection is symmetric.
-                  bidirectional: isBidirectionalRelation(classification.relation_type),
-                  status: 'active',
-                  classified_at: attemptedAt,
-                  classify_hash: contentHash,
-                });
+            const replaceEdge = db.transaction(() => {
+              deleteEdge(db, edgeId);
+              insertEdge(db, {
+                source_id: classification.source_id,
+                target_id: classification.target_id,
+                relation_type: classification.relation_type,
+                strength: classification.strength,
+                // Directional relation types keep direction; only the
+                // general connection is symmetric.
+                bidirectional: isBidirectionalRelation(classification.relation_type),
+                status: 'active',
+                classified_at: attemptedAt,
+                classify_hash: contentHash,
               });
-              replaceEdge();
-              classified++;
-            } catch (err) {
-              const message = err instanceof Error ? err.message : String(err);
-              logError(
-                `Edge ${edgeId} (${classification.source_id}:${classification.target_id} ` +
-                  `-> ${classification.relation_type}) could not be written: ${message}`
-              );
-              failed++;
-              // A unique-constraint conflict means a typed edge for this
-              // pair already exists (e.g. the similarity pre-filter re-created
-              // a relates_to candidate after a content change). The
-              // classification is effectively already done — retire the
-              // candidate so it is not re-sent to the LLM on every run.
-              if (/unique constraint/i.test(message)) {
-                markEdgeClassified(db, edgeId, attemptedAt, contentHash);
-              }
-            }
+            });
+            replaceEdge();
+            classified++;
           } else {
             // LLM returned relates_to or nothing: keep the edge, but mark
             // it attempted so it is not re-classified on every run.
             markEdgeClassified(db, edgeId, attemptedAt, contentHash);
           }
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          logError(`Edge ${edgeId} write failed (not a classification failure): ${message}`);
+          failed++;
+          // A unique-constraint conflict means a typed edge for this
+          // pair already exists (e.g. the similarity pre-filter re-created
+          // a relates_to candidate after a content change). The
+          // classification is effectively already done — retire the
+          // candidate so it is not re-sent to the LLM on every run.
+          if (/unique constraint/i.test(message)) {
+            markEdgeClassified(db, edgeId, attemptedAt, pairContentHash(pair.source, pair.target));
+          }
         }
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        logError(`Batch classification failed: ${message}`);
-        failed += batchPairs.length;
       }
     });
 

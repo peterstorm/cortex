@@ -8,6 +8,10 @@ import {
   isMemoryType,
   isEdgeRelation,
   isMemoryStatus,
+  isMemoryScope,
+  isSourceType,
+  isEdgeStatus,
+  serializeSourceContext,
   MEMORY_TYPES,
   EDGE_RELATIONS,
   MEMORY_STATUSES,
@@ -15,6 +19,7 @@ import {
   type Edge,
   type MemoryType,
   type EdgeRelation,
+  type EdgeStatus,
   type SimilarityAction,
 } from './types.js';
 
@@ -214,6 +219,126 @@ describe('createMemory', () => {
       });
       expect(memory.status).toBe(status);
     });
+  });
+
+  it('throws when an active memory carries an archived_at timestamp', () => {
+    expect(() => createMemory({
+      id: 'mem-active-archive',
+      content: 'Content',
+      summary: 'Summary',
+      memory_type: 'context',
+      confidence: 0.5,
+      priority: 5,
+      source_type: 'manual',
+      source_session: 'session',
+      scope: 'project',
+      source_context: '{}',
+      status: 'active',
+      archived_at: '2026-08-12T00:00:00.000Z',
+    })).toThrow(/active memory must not have archived_at/);
+  });
+
+  it('throws when archived_at is set on a non-archived, non-pruned status', () => {
+    expect(() => createMemory({
+      id: 'mem-superseded-archive',
+      content: 'Content',
+      summary: 'Summary',
+      memory_type: 'context',
+      confidence: 0.5,
+      priority: 5,
+      source_type: 'manual',
+      source_session: 'session',
+      scope: 'project',
+      source_context: '{}',
+      status: 'superseded',
+      archived_at: '2026-08-12T00:00:00.000Z',
+    })).toThrow(/must not have archived_at/);
+  });
+
+  it('accepts a pruned memory retaining its archive anchor (retention window)', () => {
+    const memory = createMemory({
+      id: 'mem-pruned-anchored',
+      content: 'Content',
+      summary: 'Summary',
+      memory_type: 'context',
+      confidence: 0.5,
+      priority: 5,
+      source_type: 'manual',
+      source_session: 'session',
+      scope: 'project',
+      source_context: '{}',
+      status: 'pruned',
+      archived_at: '2026-08-12T00:00:00.000Z',
+    });
+    expect(memory.archived_at).toBe('2026-08-12T00:00:00.000Z');
+  });
+
+  it('accepts an archived memory with an archived_at anchor', () => {
+    const memory = createMemory({
+      id: 'mem-archived-anchored',
+      content: 'Content',
+      summary: 'Summary',
+      memory_type: 'context',
+      confidence: 0.5,
+      priority: 5,
+      source_type: 'manual',
+      source_session: 'session',
+      scope: 'project',
+      source_context: '{}',
+      status: 'archived',
+      archived_at: '2026-08-12T00:00:00.000Z',
+    });
+    expect(memory.archived_at).toBe('2026-08-12T00:00:00.000Z');
+  });
+
+  it('throws on invalid scope', () => {
+    expect(() => createMemory({
+      id: 'mem-bad-scope',
+      content: 'Content',
+      summary: 'Summary',
+      memory_type: 'context',
+      scope: 'workspace' as never,
+      confidence: 0.5,
+      priority: 5,
+      source_type: 'manual',
+      source_session: 'session',
+      source_context: '{}',
+    })).toThrow(/invalid scope/);
+  });
+
+  it('throws on invalid source_type', () => {
+    expect(() => createMemory({
+      id: 'mem-bad-source',
+      content: 'Content',
+      summary: 'Summary',
+      memory_type: 'context',
+      scope: 'project',
+      confidence: 0.5,
+      priority: 5,
+      source_type: 'imported' as never,
+      source_session: 'session',
+      source_context: '{}',
+    })).toThrow(/invalid source_type/);
+  });
+
+  it('serializes every SourceContext variant deterministically', () => {
+    expect(serializeSourceContext({ source: 'extraction', session_id: 's1', branch: 'main', commits: ['c'], files: ['f'] }))
+      .toBe(JSON.stringify({ source: 'extraction', session_id: 's1', branch: 'main', commits: ['c'], files: ['f'] }));
+    expect(serializeSourceContext({ source: 'manual', session_id: 's2' }))
+      .toBe(JSON.stringify({ source: 'manual', session_id: 's2' }));
+    expect(serializeSourceContext({ source: 'code_index', file_path: 'src/a.ts', start_line: 1, end_line: 2 }))
+      .toBe(JSON.stringify({ source: 'code_index', file_path: 'src/a.ts', start_line: 1, end_line: 2 }));
+    expect(serializeSourceContext({ source: 'consolidation', merged_from: ['a', 'b'], session_id: 's3' }))
+      .toBe(JSON.stringify({ source: 'consolidation', merged_from: ['a', 'b'], session_id: 's3' }));
+  });
+
+  it('exposes working scope/status/type guards', () => {
+    expect(isMemoryScope('project')).toBe(true);
+    expect(isMemoryScope('bogus')).toBe(false);
+    expect(isSourceType('code_index')).toBe(true);
+    expect(isSourceType('bogus')).toBe(false);
+    expect(isEdgeStatus('suggested')).toBe(true);
+    expect(isEdgeStatus('bogus')).toBe(false);
   });
 
   it('sets timestamps automatically', () => {
@@ -500,6 +625,19 @@ describe('createEdge', () => {
         strength: 0.5,
       })
     ).toThrow('invalid relation_type');
+  });
+
+  it('throws on invalid edge status', () => {
+    expect(() =>
+      createEdge({
+        id: 'edge-5',
+        source_id: 'mem-9',
+        target_id: 'mem-10',
+        relation_type: 'relates_to',
+        strength: 0.5,
+        status: 'zombie' as EdgeStatus,
+      })
+    ).toThrow(/invalid edge status/);
   });
 
   it('accepts all valid edge relations', () => {

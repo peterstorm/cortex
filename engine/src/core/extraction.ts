@@ -420,7 +420,8 @@ function isValidCandidate(obj: unknown): obj is MemoryCandidate {
 /**
  * Builds embedding text with metadata prefix for semantic search.
  *
- * FR-108: Embedding metadata prefix: '[memory_type] [project:name] summary content'
+ * FR-108: Embedding metadata prefix: '[memory_type] [project:name] summary'
+ * (only the summary is embedded, never the full content).
  *
  * @param memory - Memory candidate with type and content
  * @param projectName - Project name for prefix

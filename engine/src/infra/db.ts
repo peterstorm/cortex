@@ -436,14 +436,6 @@ export function insertMemory(db: Database, memory: Memory): string {
 }
 
 /**
- * Update memory fields
- * I/O: Writes to database
- *
- * @param db - Database instance
- * @param id - Memory ID to update
- * @param fields - Partial memory fields to update
- */
-/**
  * Validate the mutable Memory fields before an UPDATE. updateMemory bypasses
  * the createMemory factory, so this mirrors its construction-time guards
  * (non-empty text, enum membership, confidence/priority ranges) to keep
@@ -472,7 +464,43 @@ function validateMemoryFields(fields: Partial<Memory>, operation: string): void 
   }
 }
 
+/**
+ * Update memory fields
+ * I/O: Writes to database
+ *
+ * Maintains the status/archived_at coupling: flipping to 'archived' without
+ * an archived_at writes the current time (the archive→prune grace-period
+ * anchor), flipping to 'active' clears it, and a contradiction (active with
+ * a non-null archived_at) is refused.
+ *
+ * @param db - Database instance
+ * @param id - Memory ID to update
+ * @param fields - Partial memory fields to update
+ */
 export function updateMemory(db: Database, id: string, fields: Partial<Memory>): void {
+  if (fields.status === 'active' && fields.archived_at !== undefined && fields.archived_at !== null) {
+    throw new Error('updateMemory: active memory must not have archived_at set');
+  }
+  if (fields.archived_at !== undefined && fields.archived_at !== null &&
+      fields.status !== undefined && fields.status !== 'archived' && fields.status !== 'pruned') {
+    throw new Error(`updateMemory: status ${fields.status} must not have archived_at set (only archived/pruned memories anchor an archive timestamp)`);
+  }
+  // An archived_at-only update on a live row would persist the exact state
+  // createMemory refuses to read back. The coupling guard needs the row's
+  // CURRENT status when the update itself doesn't change it.
+  if (fields.archived_at !== undefined && fields.archived_at !== null && fields.status === undefined) {
+    const row = db.prepare('SELECT status FROM memories WHERE id = ?').get(id) as { status?: unknown } | null;
+    const current = row?.status;
+    if (current !== 'archived' && current !== 'pruned') {
+      throw new Error(`updateMemory: memory ${id} is ${String(current)}; cannot set archived_at without archiving it`);
+    }
+  }
+  if (fields.status === 'archived' && fields.archived_at === undefined) {
+    fields = { ...fields, archived_at: new Date().toISOString() };
+  }
+  if (fields.status === 'active' && fields.archived_at === undefined) {
+    fields = { ...fields, archived_at: null };
+  }
   validateMemoryFields(fields, 'updateMemory');
   const updates: string[] = [];
   const values: (string | number | Uint8Array | null)[] = [];
@@ -968,6 +996,8 @@ export function getEdgesForMemory(db: Database, memoryId: string): readonly Edge
       bidirectional: row.bidirectional === 1,
       status: row.status,
       created_at: row.created_at,
+      classified_at: (row.classified_at ?? null) as string | null,
+      classify_hash: (row.classify_hash ?? null) as string | null,
     })];
   });
 }
@@ -1020,12 +1050,14 @@ export function getRelatesToEdges(db: Database): readonly Edge[] {
 
 /**
  * Slim endpoint-memory projection used by the classification pre-filter.
+ * memory_type comes from a memories row (createMemory-validated); the cast
+ * is the domain union, matching Memory.memory_type.
  */
 export interface EdgeEndpointMemory {
   readonly id: string;
   readonly content: string;
   readonly summary: string;
-  readonly memory_type: string;
+  readonly memory_type: MemoryType;
 }
 
 export interface EdgeWithMemories {
@@ -1037,10 +1069,10 @@ export interface EdgeWithMemories {
 /**
  * Get relates_to edges joined with their endpoint memories.
  *
- * Includes never-attempted edges (classified_at IS NULL) and edges whose
- * endpoint content changed since the last attempt — the caller compares a
- * content hash against edge.classify_hash. One query replaces N×2
- * getMemory lookups.
+ * Returns all active/suggested relates_to edges; the caller selects
+ * never-attempted (classified_at IS NULL) or content-changed candidates by
+ * comparing a content hash against edge.classify_hash. One query replaces
+ * N×2 getMemory lookups.
  */
 export function getRelatesToEdgesWithMemories(db: Database): readonly EdgeWithMemories[] {
   const stmt = db.prepare(`
@@ -1080,13 +1112,13 @@ export function getRelatesToEdgesWithMemories(db: Database): readonly EdgeWithMe
           id: asString(row.source_id),
           content: asString(row.s_content),
           summary: asString(row.s_summary),
-          memory_type: asString(row.s_memory_type),
+          memory_type: asString(row.s_memory_type) as MemoryType,
         },
         target: {
           id: asString(row.target_id),
           content: asString(row.t_content),
           summary: asString(row.t_summary),
-          memory_type: asString(row.t_memory_type),
+          memory_type: asString(row.t_memory_type) as MemoryType,
         },
       },
     ];

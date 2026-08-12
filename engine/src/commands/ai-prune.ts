@@ -4,8 +4,9 @@
  * CLI subprocess as fallback) to evaluate active memories and archive stale/
  * redundant ones.
  *
- * Smart trigger: runs if session count >= AI_PRUNE_SESSION_INTERVAL
- * OR active memory count >= AI_PRUNE_MEMORY_THRESHOLD.
+ * Smart trigger: runs if session count >= AI_PRUNE_SESSION_INTERVAL, or the
+ * active memory count crossed AI_PRUNE_MEMORY_THRESHOLD AND grew >= 1.25x
+ * since the last prune (see shouldRunAiPrune for the exact rule).
  *
  * Imperative shell - orchestrates I/O and pure functions.
  */
@@ -13,7 +14,8 @@
 import type { Database } from 'bun:sqlite';
 import * as fs from 'node:fs';
 import { getActiveMemories, updateMemory, archiveEdgesForMemory, supersedeFactsForMemory } from '../infra/db.js';
-import { isClaudeLlmAvailable, runLlmPrompt } from '../infra/claude-llm.js';
+import { isClaudeLlmAvailable, runLlmPromptDirect } from '../infra/claude-llm.js';
+import { resolveOpenAiCompatEndpoint } from '../infra/llm-client.js';
 import { writeTelemetry } from '../infra/filesystem.js';
 import { invalidateSurfaceCache } from './generate.js';
 import {
@@ -120,13 +122,22 @@ export function parsePruneResponse(response: string): readonly PruneCandidate[] 
     const parsed = JSON.parse(cleaned);
     if (!Array.isArray(parsed)) return [];
 
-    return parsed.filter(
+    const valid = parsed.filter(
       (item: unknown): item is PruneCandidate =>
         typeof item === 'object' &&
         item !== null &&
         typeof (item as Record<string, unknown>).id === 'string' &&
         typeof (item as Record<string, unknown>).reason === 'string'
     );
+    if (valid.length !== parsed.length) {
+      // A partially-garbage response silently requests fewer archives than
+      // the model intended; say how much was discarded.
+      logError(
+        `AI prune response contained ${parsed.length - valid.length} of ${parsed.length} ` +
+          `invalid candidate item(s); they were ignored`
+      );
+    }
+    return valid;
   } catch {
     logError(`Failed to parse AI prune response: ${cleaned.slice(0, 200)}`);
     return [];
@@ -140,7 +151,13 @@ export function parsePruneResponse(response: string): readonly PruneCandidate[] 
 function readTelemetry(path: string): Record<string, unknown> {
   try {
     return JSON.parse(fs.readFileSync(path, 'utf8'));
-  } catch {
+  } catch (err) {
+    // Absent telemetry is the normal first-run case. A file that EXISTS but
+    // cannot be read/parsed silently resets the prune trigger state — say so.
+    if (fs.existsSync(path)) {
+      const message = err instanceof Error ? err.message : String(err);
+      logError(`Telemetry ${path} exists but could not be read/parsed (${message}); trigger state resets`);
+    }
     return {};
   }
 }
@@ -173,12 +190,13 @@ function resetSessionCounter(telemetryPath: string, activeCount: number): void {
 // ============================================================================
 
 /**
- * Call the headless LLM CLI with the prune prompt.
- * Delegates to runLlmPrompt, which handles binary detection (claude vs pi),
- * model/provider selection, pipe draining, and timeout.
+ * Call the LLM with the prune prompt.
+ * Prefers the direct OpenAI-compatible endpoint (thinking disabled); falls
+ * back to the headless CLI subprocess (claude -p / pi -p).
  */
 async function callClaudePrune(prompt: string): Promise<string> {
-  return runLlmPrompt(prompt, AI_PRUNE_TIMEOUT_MS);
+  const { text } = await runLlmPromptDirect(prompt, AI_PRUNE_TIMEOUT_MS, { jsonMode: true });
+  return text;
 }
 
 // ============================================================================
@@ -246,8 +264,12 @@ export async function runAiPrune(
   telemetryPath: string,
   cwd?: string
 ): Promise<AiPruneResult> {
-  if (!isClaudeLlmAvailable()) {
-    return { archived: 0, reviewed: 0, error: 'Claude CLI not available' };
+  if (resolveOpenAiCompatEndpoint() === null && !isClaudeLlmAvailable()) {
+    return {
+      archived: 0,
+      reviewed: 0,
+      error: 'No LLM available: no OpenAI-compatible endpoint configured and no LLM CLI on PATH',
+    };
   }
 
   const projectMemories = getActiveMemories(projectDb);

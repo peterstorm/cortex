@@ -1,13 +1,17 @@
 /**
- * Claude CLI client for memory extraction and edge classification.
- * Shells out to `claude -p` via Bun.spawn — leverages user's Anthropic subscription.
+ * LLM client for memory extraction and edge classification.
+ *
+ * Prefers the direct OpenAI-compatible endpoint (see llm-client.ts — ~30x
+ * faster, thinking disabled, schema-guided decoding); falls back to the
+ * `claude -p` / `pi -p` subprocess path when no endpoint is configured or
+ * the direct call fails.
  *
  * FR-001: Extract memories automatically at session end
  * FR-009: Complete extraction within 30 seconds (p95)
  * FR-056: Support typed edges between memories
  */
 
-import type { EdgeRelation } from '../core/types.js';
+import type { EdgeRelation, MemoryType } from '../core/types.js';
 import { isEdgeRelation, EDGE_RELATIONS } from '../core/types.js';
 import { extractJsonSlice } from '../core/json-utils.js';
 import { resolveOpenAiCompatEndpoint, chatCompletionText } from './llm-client.js';
@@ -23,13 +27,13 @@ export interface MemoryPair {
     readonly id: string;
     readonly content: string;
     readonly summary: string;
-    readonly memory_type: string;
+    readonly memory_type: MemoryType;
   };
   readonly target: {
     readonly id: string;
     readonly content: string;
     readonly summary: string;
-    readonly memory_type: string;
+    readonly memory_type: MemoryType;
   };
 }
 
@@ -37,11 +41,26 @@ export interface MemoryPair {
  * Edge classification result.
  */
 export interface EdgeClassification {
+  /** 1-based ordinal of the pair this classification answers, when the model echoes it. */
+  readonly pair_index?: number;
   readonly source_id: string;
   readonly target_id: string;
   readonly relation_type: EdgeRelation;
   readonly strength: number;
 }
+
+/**
+ * Outcome of one classification batch, as consumed by the caller.
+ *
+ * `ok` carries every classification the model returned for the batch;
+ * `unparseable` means the response could not be interpreted at all (or its
+ * deterministic pair_index protocol was violated) — the caller must count
+ * the batch as failed and leave edges unmarked for retry, never interpret
+ * it as a genuine decline.
+ */
+export type EdgeClassificationOutcome =
+  | { readonly kind: 'ok'; readonly classifications: readonly EdgeClassification[] }
+  | { readonly kind: 'unparseable'; readonly reason: string };
 
 /** Pi's inexpensive, capable models for structured memory extraction. */
 const PI_EXTRACTION_MODELS: Readonly<Record<string, string>> = {
@@ -59,8 +78,12 @@ export interface LlmInvocation {
   readonly model?: string;
 }
 
-/** Detect which CLI binary to use for headless LLM calls. */
+/** Detect which CLI binary to use for headless LLM calls. An explicit
+ * CORTEX_LLM_BINARY override always wins; otherwise the active pi harness
+ * implies `pi`, and the default is `claude`. */
 function getLlmBinary(env: NodeJS.ProcessEnv): 'claude' | 'pi' {
+  const override = env.CORTEX_LLM_BINARY;
+  if (override === 'claude' || override === 'pi') return override;
   return env.PI_CODING_AGENT_DIR || env.PI_CODING_AGENT ? 'pi' : 'claude';
 }
 
@@ -72,7 +95,17 @@ function getDefaultProvider(env: NodeJS.ProcessEnv): string | undefined {
     const content = require('fs').readFileSync(settingsPath, 'utf-8');
     const settings = JSON.parse(content) as { defaultProvider?: unknown };
     return typeof settings.defaultProvider === 'string' ? settings.defaultProvider : undefined;
-  } catch {
+  } catch (err) {
+    // Absent settings.json is the normal case. A file that EXISTS but cannot
+    // be read/parsed silently changes provider/model resolution — surface it.
+    const error = err as NodeJS.ErrnoException;
+    const home = env.HOME || env.USERPROFILE || '';
+    if (error.code !== 'ENOENT') {
+      process.stderr.write(
+        `[cortex:llm] WARN: ${home}/.pi/agent/settings.json exists but could not be read/parsed ` +
+          `(defaultProvider ignored): ${error.message}\n`
+      );
+    }
     return undefined;
   }
 }
@@ -82,15 +115,17 @@ function getDefaultProvider(env: NodeJS.ProcessEnv): string | undefined {
  *
  * Pi does not expose an Anthropic Haiku model through every provider. Prefer
  * the active Pi session's provider, then select its cheap extraction model.
- * Explicit CORTEX_LLM_* values always win; unknown/custom providers reuse the
- * active model instead of sending an unsupported guessed model ID.
+ * Explicit CORTEX_LLM_* values always win. Unknown/custom providers get no
+ * model override (the provider's own default is used); the active session's
+ * model is reused only when the resolved provider is the active provider.
  */
 export function buildLlmInvocation(env: NodeJS.ProcessEnv): LlmInvocation {
   const binary = getLlmBinary(env);
   if (binary === 'claude') {
     return {
       binary,
-      args: [binary, '-p', '--model', 'haiku', '--output-format', 'text'],
+      args: [binary, '-p', '--model', env.CORTEX_LLM_MODEL || 'haiku', '--output-format', 'text'],
+      model: env.CORTEX_LLM_MODEL || 'haiku',
     };
   }
 
@@ -118,12 +153,13 @@ export function isClaudeLlmAvailable(): boolean {
 }
 
 /**
- * Run a prompt through Claude CLI and return raw response text.
- * Shared by extraction and edge classification with configurable timeout.
+ * Run a prompt through the headless LLM CLI (claude -p / pi -p) and return raw response text.
+ * Shared by extraction and edge classification fallbacks and ai-prune with
+ * configurable timeout.
  *
  * @param prompt - Prompt to send via stdin
  * @param timeoutMs - Timeout in milliseconds
- * @returns Raw Claude response text
+ * @returns Raw response text
  * @throws Error if binary not found, non-zero exit, or timeout
  */
 export async function runLlmPrompt(prompt: string, timeoutMs: number): Promise<string> {
@@ -168,7 +204,7 @@ export async function runLlmPrompt(prompt: string, timeoutMs: number): Promise<s
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       proc.kill('SIGKILL');
-      reject(new Error(`Extraction LLM CLI timed out after ${timeoutMs}ms`));
+      reject(new Error(`LLM CLI timed out after ${timeoutMs}ms`));
     }, timeoutMs);
   });
 
@@ -203,7 +239,18 @@ export async function runLlmPrompt(prompt: string, timeoutMs: number): Promise<s
  * strict parsing is only safe for the direct endpoint's guided decoding;
  * subprocess output is not schema-guided and needs the tolerant parser.
  */
-async function runLlmPromptDirect(
+/** Transport used by the classification call; injectable so tests can drive
+ * the strict/tolerant routing without shelling out. */
+export type LlmPromptTransport = (
+  prompt: string,
+  timeoutMs: number,
+  options?: { jsonMode?: boolean; jsonSchema?: object; maxTokens?: number }
+) => Promise<{ text: string; direct: boolean }>;
+
+/** Per-process consecutive direct-endpoint failures; gives the operator a recurrence signal. */
+let consecutiveDirectFailures = 0;
+
+export async function runLlmPromptDirect(
   prompt: string,
   timeoutMs: number,
   direct: { jsonMode?: boolean; jsonSchema?: object; maxTokens?: number } = {}
@@ -211,18 +258,20 @@ async function runLlmPromptDirect(
   const endpoint = resolveOpenAiCompatEndpoint();
   if (endpoint) {
     try {
-      return {
-        text: await chatCompletionText(endpoint, prompt, {
-          jsonMode: direct.jsonMode,
-          jsonSchema: direct.jsonSchema,
-          maxTokens: direct.maxTokens,
-          timeoutMs,
-        }),
-        direct: true,
-      };
+      const text = await chatCompletionText(endpoint, prompt, {
+        jsonMode: direct.jsonMode,
+        jsonSchema: direct.jsonSchema,
+        maxTokens: direct.maxTokens,
+        timeoutMs,
+      });
+      consecutiveDirectFailures = 0;
+      return { text, direct: true };
     } catch (err) {
+      consecutiveDirectFailures++;
+      const count = consecutiveDirectFailures;
+      const recurrence = count === 1 ? '' : ` (${count} consecutive direct-endpoint failures)`;
       process.stderr.write(
-        `[cortex:llm] WARNING: direct LLM call failed (${(err as Error).message ?? err}); ` +
+        `[cortex:llm] WARNING: direct LLM call failed (${(err as Error).message ?? err})${recurrence}; ` +
           `falling back to ${getLlmBinary(process.env)} subprocess\n`
       );
     }
@@ -232,11 +281,11 @@ async function runLlmPromptDirect(
 
 /**
  * Extract memories from transcript using the LLM.
- * Pipes prompt to `claude -p` via stdin and returns raw response text.
- * Caller is responsible for parsing via parseExtractionResponse.
  *
- * Prefers the direct OpenAI-compatible endpoint (thinking disabled, valid
- * JSON output); falls back to the CLI subprocess path.
+ * Runs the extraction prompt via the direct OpenAI-compatible endpoint
+ * (thinking disabled, valid JSON output) or, failing that, the `claude -p` /
+ * `pi -p` subprocess; returns the raw response text. Caller is responsible
+ * for parsing via parseExtractionResponse.
  *
  * @param prompt - Extraction prompt (from buildExtractionPrompt)
  * @returns Raw LLM response text
@@ -262,12 +311,16 @@ const EDGE_CLASSIFICATION_SCHEMA = {
       items: {
         type: 'object',
         properties: {
+          // 1-based ordinal of the pair this classification answers. The
+          // prompt enumerates pairs explicitly, so the join never depends on
+          // the model echoing free-text IDs.
+          pair_index: { type: 'integer' },
           source_id: { type: 'string' },
           target_id: { type: 'string' },
           relation_type: { type: 'string', enum: [...EDGE_RELATIONS] },
-          strength: { type: 'number' },
+          strength: { type: 'number', minimum: 0, maximum: 1 },
         },
-        required: ['source_id', 'target_id', 'relation_type', 'strength'],
+        required: ['pair_index', 'source_id', 'target_id', 'relation_type', 'strength'],
         additionalProperties: false,
       },
     },
@@ -283,24 +336,32 @@ const EDGE_CLASSIFICATION_SCHEMA = {
  * decoding (output shape is guaranteed, response parsing is reliable);
  * falls back to the CLI subprocess path.
  *
+ * The return type distinguishes a real model answer (ok) from an
+ * unparseable response (unparseable): the caller must count the latter as a
+ * batch failure and leave edges unmarked for retry, never as a decline.
+ *
  * @param pairs - Memory pairs to classify
- * @returns Array of edge classifications
+ * @returns Classification outcome; the strict/direct path throws on
+ *          malformed responses instead of returning unparseable
  */
 export async function classifyEdges(
-  pairs: readonly MemoryPair[]
-): Promise<readonly EdgeClassification[]> {
-  if (pairs.length === 0) return [];
+  pairs: readonly MemoryPair[],
+  transport: LlmPromptTransport = runLlmPromptDirect
+): Promise<EdgeClassificationOutcome> {
+  if (pairs.length === 0) return { kind: 'ok', classifications: [] };
 
   const prompt = buildEdgeClassificationPrompt(pairs);
-  const { text, direct } = await runLlmPromptDirect(prompt, EDGE_CLASSIFICATION_TIMEOUT_MS, {
+  const { text, direct } = await transport(prompt, EDGE_CLASSIFICATION_TIMEOUT_MS, {
     jsonSchema: EDGE_CLASSIFICATION_SCHEMA,
     maxTokens: 4096,
   });
-  // Strict mode only on the direct path: guided decoding guarantees
-  // structured output, so a JSON failure there means truncation or a server
-  // problem — the caller must count the batch as failed instead of silently
-  // dropping it. The subprocess fallback is not schema-guided (models wrap
-  // JSON in fences/prose), so its output gets the tolerant parser.
+  // Strict mode only on the direct path: guided decoding bounds the output
+  // shape, so a strict-parse failure means truncation or a server problem —
+  // counting it as a batch failure keeps it from degrading into a silent
+  // decline. Transport failures already trigger the subprocess fallback. The
+  // subprocess fallback is not schema-guided (models wrap JSON in
+  // fences/prose), so its output gets the tolerant parser, which never
+  // throws and reports unparseable responses explicitly.
   return parseEdgeClassificationResponse(text, { strict: direct });
 }
 
@@ -315,6 +376,7 @@ export function buildEdgeClassificationPrompt(
     .map(
       (pair, idx) => `
 Pair ${idx + 1}:
+  pair_index: ${idx + 1}
   Source [${pair.source.id}]:
     Type: ${pair.source.memory_type}
     Summary: ${pair.source.summary}
@@ -354,6 +416,7 @@ Return JSON object:
 {
   "edges": [
     {
+      "pair_index": 1,
       "source_id": "id1",
       "target_id": "id2",
       "relation_type": "relates_to",
@@ -362,22 +425,32 @@ Return JSON object:
   ]
 }
 
+For every classification, "pair_index" must be the number of the pair it
+answers (Pair 1 → pair_index 1, Pair 2 → pair_index 2, ...).
 If no strong relationships, return {"edges": []}.`;
 }
 
 /**
  * Parse edge classification response.
  *
- * Default (tolerant) mode extracts JSON from fences/prose and returns [] on
- * any failure, matching the legacy subprocess path. Strict mode (direct API
- * with guided decoding) requires the whole response to be a valid JSON
- * object with an edges array and throws otherwise — callers must treat that
- * as a batch failure.
+ * Tolerant mode (default) extracts JSON from fences/prose and accepts both
+ * the bare array and the schema-guided {"edges": [...]} wrapper shape the
+ * classification prompt explicitly requests. It never throws: an unparseable
+ * response is reported as {kind:'unparseable'} so the caller can count the
+ * batch as failed and retry instead of mistaking garbage for a decline.
+ * Invalid items inside an otherwise-valid response are dropped; when the
+ * dropped item carried a pair_index (the deterministic protocol), the whole
+ * response is treated as unparseable so the affected pair is retried.
+ *
+ * Strict mode (direct API with guided decoding) requires the whole response
+ * to be a valid JSON object with an edges array, requires every item to be
+ * schema-valid (invalid items are a decoder anomaly and throw with a dropped
+ * count), and throws otherwise — callers must treat that as a batch failure.
  */
 export function parseEdgeClassificationResponse(
   response: string,
   options: { strict?: boolean } = {}
-): readonly EdgeClassification[] {
+): EdgeClassificationOutcome {
   if (options.strict) {
     let parsed: unknown;
     try {
@@ -402,20 +475,23 @@ export function parseEdgeClassificationResponse(
     const valid = array.filter(isValidEdgeClassification);
     if (valid.length !== array.length) {
       // A dropped item must never degrade into a permanent "declined" verdict:
-      // surface the loss so the operator can distinguish a model/decoder
-      // issue from a genuine decline.
-      process.stderr.write(
-        `[cortex:llm] WARNING: dropping ${array.length - valid.length} of ${array.length} ` +
-          `edge classifications with invalid shape from a strict-mode response\n`
+      // schema-guided decoding makes invalid items a decoder/server anomaly,
+      // so the batch fails and the edges are retried instead of retired.
+      throw new Error(
+        `Edge classification response contained ${array.length - valid.length} of ` +
+          `${array.length} items with invalid shape (strict mode)`
       );
     }
-    return valid
-      .map((c) => ({
+    return {
+      kind: 'ok',
+      classifications: valid.map((c) => ({
+        ...(c.pair_index !== undefined ? { pair_index: c.pair_index } : {}),
         source_id: String(c.source_id),
         target_id: String(c.target_id),
         relation_type: c.relation_type,
         strength: Number(c.strength),
-      }));
+      })),
+    };
   }
 
   try {
@@ -424,24 +500,56 @@ export function parseEdgeClassificationResponse(
     const fenceMatch = response.match(/```json\s*([\s\S]*?)\s*```/);
     const jsonText = fenceMatch?.[1] ?? extractJsonSlice(response) ?? response;
 
-    const parsed = JSON.parse(jsonText.trim());
+    const parsed: unknown = JSON.parse(jsonText.trim());
 
-    if (!Array.isArray(parsed)) {
-      return [];
+    // Accept both the bare array and the schema-guided {"edges": [...]} shape
+    const array =
+      Array.isArray(parsed)
+        ? parsed
+        : Array.isArray((parsed as { edges?: unknown })?.edges)
+          ? (parsed as { edges: unknown[] }).edges
+          : null;
+    if (array === null) {
+      return {
+        kind: 'unparseable',
+        reason: 'response contains no edges array',
+      };
     }
 
-    // Validate and filter classifications
-    return parsed
-      .filter(isValidEdgeClassification)
-      .map((c) => ({
+    const valid = array.filter(isValidEdgeClassification);
+    if (valid.length !== array.length) {
+      const dropped = array.filter((item) => !isValidEdgeClassification(item));
+      // A dropped indexed item cannot be retried if we just ignore it: the
+      // pair it answered would look declined. Surface the loss as a batch
+      // failure. Legacy unindexed output keeps the old warn-and-filter.
+      if (dropped.some((item) =>
+        typeof item === 'object' && item !== null &&
+        (item as { pair_index?: unknown }).pair_index !== undefined)) {
+        return {
+          kind: 'unparseable',
+          reason: `${array.length - valid.length} of ${array.length} items had invalid shape (indexed response)`,
+        };
+      }
+      process.stderr.write(
+        `[cortex:llm] WARNING: dropping ${array.length - valid.length} of ${array.length} ` +
+          `edge classifications with invalid shape from a tolerant-mode response\n`
+      );
+    }
+    return {
+      kind: 'ok',
+      classifications: valid.map((c) => ({
+        ...(c.pair_index !== undefined ? { pair_index: c.pair_index } : {}),
         source_id: String(c.source_id),
         target_id: String(c.target_id),
         relation_type: c.relation_type,
         strength: Number(c.strength),
-      }));
+      })),
+    };
   } catch (e) {
-    process.stderr.write(`WARNING: Failed to parse edge classification response: ${(e as Error).message}\n`);
-    return [];
+    return {
+      kind: 'unparseable',
+      reason: `failed to parse edge classification response: ${(e as Error).message}`,
+    };
   }
 }
 
@@ -470,6 +578,17 @@ function isValidEdgeClassification(
   }
 
   if (classification.strength < 0 || classification.strength > 1) {
+    return false;
+  }
+
+  // Optional deterministic-protocol key: when present it must be a 1-based
+  // integer so the caller can join classifications to pairs without trusting
+  // the model's free-text IDs.
+  if (
+    classification.pair_index !== undefined &&
+    (!Number.isInteger(classification.pair_index) ||
+      (classification.pair_index as number) < 1)
+  ) {
     return false;
   }
 

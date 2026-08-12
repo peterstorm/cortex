@@ -123,6 +123,112 @@ describe('resolveOpenAiCompatEndpoint', () => {
     expect(warn).toHaveBeenCalledWith(expect.stringMatching(/no apiKey/));
     warn.mockRestore();
   });
+
+  it('warns when the configured provider is not defined', () => {
+    withEnv({ PI_PROVIDER: 'ghost', HOME: fixtureHome });
+    fs.mkdirSync(nodePath.join(fixtureHome, '.pi', 'agent'), { recursive: true });
+    fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'models.json'), JSON.stringify({
+      providers: {},
+    }));
+    const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    expect(resolveOpenAiCompatEndpoint()).toBeNull();
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/provider 'ghost' is not defined/));
+    warn.mockRestore();
+  });
+
+  it('warns when the configured provider has a non-http baseUrl', () => {
+    withEnv({ PI_PROVIDER: 'no-http', HOME: fixtureHome });
+    fs.mkdirSync(nodePath.join(fixtureHome, '.pi', 'agent'), { recursive: true });
+    fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'models.json'), JSON.stringify({
+      providers: { 'no-http': { baseUrl: 'file:///tmp/x', apiKey: 'k', models: [{ id: 'm' }] } },
+    }));
+    const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    expect(resolveOpenAiCompatEndpoint()).toBeNull();
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/no http baseUrl/));
+    warn.mockRestore();
+  });
+
+  it('warns when the provider apiKey command resolves empty', () => {
+    withEnv({ PI_PROVIDER: 'broken-key', HOME: fixtureHome });
+    fs.mkdirSync(nodePath.join(fixtureHome, '.pi', 'agent'), { recursive: true });
+    fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'models.json'), JSON.stringify({
+      providers: { 'broken-key': { baseUrl: 'http://x/v1', apiKey: '!exit 3', models: [{ id: 'm' }] } },
+    }));
+    const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    expect(resolveOpenAiCompatEndpoint()).toBeNull();
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/apiKey command resolved empty/));
+    warn.mockRestore();
+  });
+
+  it('warns when the configured provider has no models[0].id', () => {
+    withEnv({ PI_PROVIDER: 'modeless', HOME: fixtureHome });
+    fs.mkdirSync(nodePath.join(fixtureHome, '.pi', 'agent'), { recursive: true });
+    fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'models.json'), JSON.stringify({
+      providers: { modeless: { baseUrl: 'http://x/v1', apiKey: 'k', models: [] } },
+    }));
+    const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    expect(resolveOpenAiCompatEndpoint()).toBeNull();
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/no models\[0\]\.id/));
+    warn.mockRestore();
+  });
+
+  it('warns when models.json exists but is corrupt instead of silently disabling the direct path', () => {
+    withEnv({ PI_PROVIDER: 'fixture-llm', HOME: fixtureHome });
+    fs.mkdirSync(nodePath.join(fixtureHome, '.pi', 'agent'), { recursive: true });
+    fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'models.json'), '{ not valid json');
+    const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    expect(resolveOpenAiCompatEndpoint()).toBeNull();
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/could not be read\/parsed/));
+    warn.mockRestore();
+  });
+
+  it('warns when only part of the CORTEX_LLM_* override is set', () => {
+    withEnv({
+      CORTEX_LLM_API_URL: 'http://llm.example/v1',
+      CORTEX_LLM_API_KEY: 'secret',
+      CORTEX_LLM_MODEL: undefined,
+      HOME: fixtureHome,
+    });
+    const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    expect(resolveOpenAiCompatEndpoint()).toBeNull();
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/partial CORTEX_LLM_\* configuration/));
+    warn.mockRestore();
+  });
+
+  it('lets an explicit CORTEX_LLM_PROVIDER override PI_PROVIDER (precedence)', () => {
+    withEnv({ CORTEX_LLM_PROVIDER: 'fixture-llm', PI_PROVIDER: 'other-provider', HOME: fixtureHome });
+    fs.mkdirSync(nodePath.join(fixtureHome, '.pi', 'agent'), { recursive: true });
+    fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'models.json'), JSON.stringify({
+      providers: {
+        'fixture-llm': { baseUrl: 'http://fixture:9000/v1', apiKey: 'k', models: [{ id: 'fixture-model' }] },
+        'other-provider': { baseUrl: 'http://other:9000/v1', apiKey: 'k2', models: [{ id: 'other-model' }] },
+      },
+    }));
+    fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'settings.json'), JSON.stringify({}));
+
+    expect(resolveOpenAiCompatEndpoint()?.model).toBe('fixture-model');
+  });
+
+  it('falls back to settings.defaultProvider when no env provider is set', () => {
+    withEnv({ CORTEX_LLM_PROVIDER: undefined, PI_PROVIDER: undefined, HOME: fixtureHome });
+    fs.mkdirSync(nodePath.join(fixtureHome, '.pi', 'agent'), { recursive: true });
+    fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'models.json'), JSON.stringify({
+      providers: {
+        'default-fixture': { baseUrl: 'http://fixture:9000/v1', apiKey: 'k', models: [{ id: 'default-model' }] },
+      },
+    }));
+    fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'settings.json'), JSON.stringify({
+      defaultProvider: 'default-fixture',
+    }));
+
+    expect(resolveOpenAiCompatEndpoint()?.model).toBe('default-model');
+  });
 });
 
 describe('chatCompletionText', () => {
@@ -197,6 +303,26 @@ describe('chatCompletionText', () => {
       choices: [{ message: { content: '{"edges": [' }, finish_reason: 'length' }],
     }), { status: 200 }), async () => {
       await expect(chatCompletionText(endpoint, 'x', { maxTokens: 128 })).rejects.toThrow(/truncated.*max_tokens=128/);
+    });
+  });
+
+  it('throws a timeout-named error when the request exceeds timeoutMs', async () => {
+    // A fetch stub that never settles: only the AbortController can release it.
+    await withStubbedFetch((_url, init) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        reject(init.signal?.reason ?? new Error('aborted'));
+      });
+    }), async () => {
+      await expect(chatCompletionText(endpoint, 'x', { timeoutMs: 10 }))
+        .rejects.toThrow(/timed out after 10ms/);
+    });
+  });
+
+  it('throws a readable error when the response body is not JSON', async () => {
+    await withStubbedFetch(async () => new Response('<html>gateway error</html>', { status: 200 }), async () => {
+      await expect(chatCompletionText(endpoint, 'x')).rejects.toThrow(
+        /Unexpected token|Unexpected end|JSON/
+      );
     });
   });
 });

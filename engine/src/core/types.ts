@@ -30,10 +30,21 @@ export const LocalEmbedding = (a: Float32Array): LocalEmbedding => a as LocalEmb
 
 /** Shared schema for source_context JSON — used by extract, remember, index-code */
 export type SourceContext =
-  | { readonly source: 'extraction'; readonly session_id: string; readonly branch?: string }
+  | { readonly source: 'extraction'; readonly session_id: string; readonly branch?: string; readonly commits?: readonly string[]; readonly files?: readonly string[] }
   | { readonly source: 'manual'; readonly session_id: string }
   | { readonly source: 'code_index'; readonly file_path: string; readonly start_line?: number; readonly end_line?: number; readonly session_id?: string }
   | { readonly source: 'consolidation'; readonly merged_from: readonly string[]; readonly session_id: string };
+
+/**
+ * Serialize a SourceContext for storage in memory.source_context.
+ *
+ * Every producer (extract, remember, index-code, consolidate) builds the
+ * stored JSON through this helper so the union stays the single source of
+ * truth for the serialized shapes.
+ */
+export function serializeSourceContext(context: SourceContext): string {
+  return JSON.stringify(context);
+}
 
 // Memory Type (FR-103)
 export type MemoryType =
@@ -70,8 +81,20 @@ export const MEMORY_STATUSES: readonly MemoryStatus[] = [
 // Memory Scope
 export type MemoryScope = 'project' | 'global';
 
+export const MEMORY_SCOPES: readonly MemoryScope[] = ['project', 'global'] as const;
+
+export function isMemoryScope(value: unknown): value is MemoryScope {
+  return typeof value === 'string' && (MEMORY_SCOPES as readonly string[]).includes(value);
+}
+
 // Source Type
 export type SourceType = 'extraction' | 'manual' | 'code_index';
+
+export const SOURCE_TYPES: readonly SourceType[] = ['extraction', 'manual', 'code_index'] as const;
+
+export function isSourceType(value: unknown): value is SourceType {
+  return typeof value === 'string' && (SOURCE_TYPES as readonly string[]).includes(value);
+}
 
 // Core Memory domain object (FR-103)
 export interface Memory {
@@ -120,6 +143,12 @@ export const EDGE_RELATIONS: readonly EdgeRelation[] = [
 
 // Edge Status
 export type EdgeStatus = 'active' | 'suggested' | 'archived';
+
+export const EDGE_STATUSES: readonly EdgeStatus[] = ['active', 'suggested', 'archived'] as const;
+
+export function isEdgeStatus(value: unknown): value is EdgeStatus {
+  return typeof value === 'string' && (EDGE_STATUSES as readonly string[]).includes(value);
+}
 
 // Graph edge (FR-104)
 export interface Edge {
@@ -267,11 +296,34 @@ export function createMemory(input: {
     throw new Error(`invalid memory_type: ${input.memory_type}`);
   }
 
+  // Validate scope
+  if (input.scope !== undefined && !isMemoryScope(input.scope)) {
+    throw new Error(`invalid scope: ${input.scope}`);
+  }
+
+  // Validate source_type
+  if (input.source_type !== undefined && !isSourceType(input.source_type)) {
+    throw new Error(`invalid source_type: ${input.source_type}`);
+  }
+
   // Validate status
   const status = input.status ?? 'active';
   if (!MEMORY_STATUSES.includes(status)) {
     throw new Error(`invalid status: ${status}`);
   }
+
+  // The archived_at field is the archive anchor: it must be null while the
+  // memory is active; archived and pruned memories may carry it (pruning
+  // keeps the anchor for the retention window).
+  const archivedAt = input.archived_at ?? null;
+  if (status === 'active' && archivedAt !== null) {
+    throw new Error('active memory must not have archived_at set');
+  }
+  if (archivedAt !== null && status !== 'archived' && status !== 'pruned') {
+    throw new Error(`status ${status} must not have archived_at set (only archived memories anchor an archive timestamp)`);
+  }
+
+
 
   const now = new Date().toISOString();
 
@@ -295,7 +347,7 @@ export function createMemory(input: {
     created_at: input.created_at ?? now,
     updated_at: input.updated_at ?? now,
     status,
-    archived_at: input.archived_at ?? null,
+    archived_at: archivedAt,
   };
 }
 
@@ -329,6 +381,12 @@ export function createEdge(input: {
     throw new Error(`invalid relation_type: ${input.relation_type}`);
   }
 
+  // Validate status
+  const status = input.status ?? 'active';
+  if (!isEdgeStatus(status)) {
+    throw new Error(`invalid edge status: ${status}`);
+  }
+
   const now = new Date().toISOString();
 
   return {
@@ -338,7 +396,7 @@ export function createEdge(input: {
     relation_type: input.relation_type,
     strength: input.strength,
     bidirectional: input.bidirectional ?? false,
-    status: input.status ?? 'active',
+    status,
     created_at: input.created_at ?? now,
     classified_at: input.classified_at ?? null,
     classify_hash: input.classify_hash ?? null,

@@ -23,11 +23,17 @@ import { tokenize, jaccardSimilarity, classifySimilarity } from '../core/similar
 import { deduplicateCandidates, applyDedupMerges, executeExtract, computeEdgeCandidates } from './extract.js';
 
 // Mock the LLM boundary so executeExtract tests never shell out to `claude`,
-// and the local embedding model so no ONNX weights are loaded.
+// and the local embedding model so no ONNX weights are loaded. The
+// availability flag is a vi.fn so the gate's branches are exercisable.
 const mockExtractMemories = vi.fn();
+const mockIsClaudeLlmAvailable = vi.fn();
+const mockResolveEndpoint = vi.fn();
 vi.mock('../infra/claude-llm.js', () => ({
-  isClaudeLlmAvailable: () => true,
+  isClaudeLlmAvailable: () => mockIsClaudeLlmAvailable(),
   extractMemories: (prompt: string) => mockExtractMemories(prompt),
+}));
+vi.mock('../infra/llm-client.js', () => ({
+  resolveOpenAiCompatEndpoint: () => mockResolveEndpoint(),
 }));
 vi.mock('../infra/local-embed.ts', () => ({
   ensureModelLoaded: async () => false,
@@ -44,12 +50,40 @@ describe('extract command - core logic', () => {
     // Setup in-memory database
     db = openDatabase(':memory:');
 
+    mockIsClaudeLlmAvailable.mockReset().mockReturnValue(true);
+    mockResolveEndpoint.mockReset().mockReturnValue(null);
+
     // Setup test input
     input = {
       session_id: 'test-session-123',
       transcript_path: '/tmp/transcript.jsonl',
       cwd: '/home/user/project',
     };
+  });
+
+  describe('LLM availability gate', () => {
+    it('proceeds when the direct endpoint is configured and no CLI is available', async () => {
+      // The A01 fix: the gate accepts either transport, so a direct-endpoint
+      // user without the CLI binary is NOT skipped. The run then fails on the
+      // missing transcript (proving the gate was passed), not on availability.
+      mockIsClaudeLlmAvailable.mockReturnValue(false);
+      mockResolveEndpoint.mockReturnValue({ baseUrl: 'http://llm.example/v1', apiKey: 'k', model: 'm' });
+
+      const result = await executeExtract(input, db);
+
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toMatch(/failed to read transcript/i);
+    });
+
+    it('skips extraction when no transport is available at all', async () => {
+      mockIsClaudeLlmAvailable.mockReturnValue(false);
+      mockResolveEndpoint.mockReturnValue(null);
+
+      const result = await executeExtract(input, db);
+
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toMatch(/no LLM available/i);
+    });
   });
 
   describe('transcript truncation', () => {

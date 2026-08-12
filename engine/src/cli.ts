@@ -4,7 +4,8 @@
  *
  * Satisfies:
  * - FR-119: Receive Stop hook input as JSON stdin (session_id, transcript_path, cwd)
- * - FR-120: Parse transcript as JSONL format
+ * - FR-120: Dispatch Stop-hook commands; transcript JSONL parsing lives in
+ *   core/extraction.ts (FR-002/FR-012)
  *
  * Architecture:
  * Thin orchestrator - parses subcommand + args, reads stdin, dispatches to commands
@@ -22,6 +23,11 @@
  * - inspect: Telemetry display
  * - backfill: Process embedding queue
  * - prompt-recall: Keyword recall from user prompt (UserPromptSubmit hook)
+ * - ai-prune: AI-powered memory pruning
+ * - maintenance: Combined lifecycle + ai-prune + semantic-edges maintenance
+ * - semantic-edges: Typed-edge classification
+ * - load-surface: Surface load cache
+ * - entity-query: Entity/fact graph queries
  */
 
 import { Database } from 'bun:sqlite';
@@ -969,11 +975,19 @@ async function handleSemanticEdges(args: string[]): Promise<CommandResult> {
 
   const limit = (() => {
     const limitArg = args.find(a => a.startsWith('--limit='));
-    return limitArg ? parseInt(limitArg.split('=')[1], 10) : 0;
+    if (!limitArg) return { invalid: false as const, value: 0 };
+    const parsed = parseInt(limitArg.split('=')[1], 10);
+    if (Number.isNaN(parsed) || parsed < 0) {
+      return { invalid: true as const };
+    }
+    return { invalid: false as const, value: parsed };
   })();
+  if (limit.invalid) {
+    return { success: false, error: '--limit must be a non-negative integer' };
+  }
 
   try {
-    const result = await executeSemanticEdges(projectDb, { limit, lockDir: getLockDir(cwd) });
+    const result = await executeSemanticEdges(projectDb, { limit: limit.value, lockDir: getLockDir(cwd) });
 
     if (!result.ok) {
       return { success: false, error: result.error };
@@ -1157,8 +1171,13 @@ async function handlePromptRecall(): Promise<CommandResult> {
       if (existsSync(surfacePath)) {
         surfaceContent = readFileSync(surfacePath, 'utf8');
       }
-    } catch {
-      // Ignore read errors
+    } catch (err) {
+      // Best-effort hook: a surface read failure must not fail the prompt,
+      // but it must not vanish without a trace either.
+      process.stderr.write(
+        `[cortex] WARN: prompt-recall could not read surface file ${surfacePath}: ` +
+          `${err instanceof Error ? err.message : String(err)}\n`
+      );
     }
 
     // Read-only open: this hook fires on EVERY user prompt and only reads.
@@ -1172,7 +1191,11 @@ async function handlePromptRecall(): Promise<CommandResult> {
       } catch {
         try {
           return openDatabase(path);
-        } catch {
+        } catch (err) {
+          process.stderr.write(
+            `[cortex] WARN: prompt-recall could not open database ${path}: ` +
+              `${err instanceof Error ? err.message : String(err)}\n`
+          );
           return null;
         }
       }
@@ -1197,8 +1220,14 @@ async function handlePromptRecall(): Promise<CommandResult> {
       projectDb?.close();
       globalDb?.close();
     }
-  } catch {
-    // Never fail — prompt-recall is best-effort
+  } catch (err) {
+    // Never fail — prompt-recall is best-effort. But never silent: a broken
+    // hook must leave a trace, or a corrupt DB would dead-silence memory
+    // injection on every prompt with no way to diagnose it.
+    process.stderr.write(
+      `[cortex] WARN: prompt-recall failed (best-effort, continuing): ` +
+        `${err instanceof Error ? err.message : String(err)}\n`
+    );
     return { success: true };
   }
 }

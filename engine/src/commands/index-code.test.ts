@@ -235,6 +235,7 @@ describe('buildCodeSourceContext', () => {
 
     const parsed = JSON.parse(result);
     expect(parsed).toEqual({
+      source: 'code_index',
       file_path: '/src/file.ts',
       start_line: 10,
       end_line: 20,

@@ -18,7 +18,7 @@
  * an OpenAI-compatible endpoint cannot be resolved.
  */
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -55,10 +55,19 @@ function getEnv(name: string): string | undefined {
   return process.env[name] ?? undefined;
 }
 
+/**
+ * Read a JSON config file, or null when it does not exist (a legitimately
+ * absent config is the normal case). A file that EXISTS but cannot be read
+ * or parsed is a user-visible configuration failure and warns instead of
+ * silently disabling the direct path.
+ */
 function readJsonConfig(path: string): unknown {
   try {
     return JSON.parse(readFileSync(path, 'utf8')) as unknown;
-  } catch {
+  } catch (err) {
+    if (existsSync(path)) {
+      warnResolution(`config ${path} exists but could not be read/parsed: ${(err as Error).message}`);
+    }
     return null;
   }
 }
@@ -72,7 +81,11 @@ function runShellCommand(command: string): string | null {
     if (result.status !== 0) return null;
     const out = (result.stdout ?? '').trim();
     return out.length > 0 ? out : null;
-  } catch {
+  } catch (err) {
+    // The command itself never ran (spawn ENOENT, EACCES, signal) — a
+    // different failure class from "the command printed nothing", and the
+    // caller's 'resolved empty' warning would misattribute it.
+    warnResolution(`apiKey shell command could not be started: ${err instanceof Error ? err.message : String(err)}`);
     return null;
   }
 }
@@ -95,6 +108,18 @@ export function resolveOpenAiCompatEndpoint(): LlmEndpoint | null {
   const envModel = getEnv('CORTEX_LLM_MODEL');
   if (envUrl && envKey && envModel) {
     return { baseUrl: normalizeBaseUrl(envUrl), apiKey: envKey, model: envModel };
+  }
+  // A partial CORTEX_LLM_* override is almost always a mistake: the user
+  // thinks they configured the direct path, and the fall-through may resolve
+  // a different endpoint than they intended. Name the missing variables.
+  const envSet = [envUrl, envKey, envModel].filter((value) => value !== undefined);
+  if (envSet.length > 0) {
+    const missing = (['CORTEX_LLM_API_URL', 'CORTEX_LLM_API_KEY', 'CORTEX_LLM_MODEL'] as const)
+      .filter((key) => getEnv(key) === undefined);
+    warnResolution(
+      `partial CORTEX_LLM_* configuration: ${envSet.length} of 3 variables set, ` +
+        `missing ${missing.join(', ')}; falling through to the pi provider config`
+    );
   }
 
   const piDir = join(getEnv('HOME') ?? homedir(), '.pi', 'agent');
@@ -205,7 +230,11 @@ export async function chatCompletionText(
   }
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const effectiveTimeoutMs = timeoutMs;
+  const timer = setTimeout(
+    () => controller.abort(new Error(`LLM request timed out after ${effectiveTimeoutMs}ms`)),
+    effectiveTimeoutMs,
+  );
   try {
     const response = await fetch(`${endpoint.baseUrl}/chat/completions`, {
       method: 'POST',
@@ -240,6 +269,15 @@ export async function chatCompletionText(
       );
     }
     return content;
+  } catch (err) {
+    // The timeout aborts with a reason; surface it as a timeout-named error
+    // so operators can distinguish "prompt exceeded the deadline" from a
+    // generic network/abort failure.
+    const message = err instanceof Error ? err.message : String(err);
+    if ((err as Error)?.name === 'AbortError' || message.includes('timed out after')) {
+      throw new Error(`LLM request timed out after ${effectiveTimeoutMs}ms`);
+    }
+    throw err;
   } finally {
     clearTimeout(timer);
   }

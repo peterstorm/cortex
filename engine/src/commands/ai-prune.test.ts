@@ -16,9 +16,17 @@ import { AI_PRUNE_MIN_AGE_DAYS } from '../config.js';
 
 // Mock the LLM boundary — each test sets the response via mockRunLlmPrompt
 const mockRunLlmPrompt = vi.fn();
+const mockIsClaudeLlmAvailable = vi.fn();
+const mockResolveEndpoint = vi.fn();
 vi.mock('../infra/claude-llm.js', () => ({
-  isClaudeLlmAvailable: () => true,
-  runLlmPrompt: (prompt: string, timeout: number) => mockRunLlmPrompt(prompt, timeout),
+  isClaudeLlmAvailable: () => mockIsClaudeLlmAvailable(),
+  runLlmPromptDirect: async (prompt: string, timeout: number) => ({
+    text: await mockRunLlmPrompt(prompt, timeout),
+    direct: false,
+  }),
+}));
+vi.mock('../infra/llm-client.js', () => ({
+  resolveOpenAiCompatEndpoint: () => mockResolveEndpoint(),
 }));
 
 import { runAiPrune, isTooYoungToArchive, shouldRunAiPrune, parsePruneResponse } from './ai-prune.js';
@@ -79,6 +87,35 @@ describe('isTooYoungToArchive', () => {
 describe('runAiPrune age guard (enforced in code, not just prompt)', () => {
   beforeEach(() => {
     mockRunLlmPrompt.mockReset();
+    mockIsClaudeLlmAvailable.mockReset().mockReturnValue(true);
+    mockResolveEndpoint.mockReset().mockReturnValue(null);
+  });
+
+  it('proceeds via the direct endpoint when no CLI is available (dual-transport gate)', async () => {
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    const telemetryPath = makeTelemetryPath();
+    mockIsClaudeLlmAvailable.mockReturnValue(false);
+    mockResolveEndpoint.mockReturnValue({ baseUrl: 'http://llm.example/v1', apiKey: 'k', model: 'm' });
+
+    const result = await runAiPrune(projectDb, globalDb, telemetryPath);
+
+    // The gate passed and the (mocked) direct transport was called;
+    // with no memories the run completes as an empty ok.
+    expect(mockRunLlmPrompt).not.toHaveBeenCalled();
+    expect(result.error).toBeUndefined();
+  });
+
+  it('fails with the dual-transport error when neither endpoint nor CLI exists', async () => {
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    const telemetryPath = makeTelemetryPath();
+    mockIsClaudeLlmAvailable.mockReturnValue(false);
+    mockResolveEndpoint.mockReturnValue(null);
+
+    const result = await runAiPrune(projectDb, globalDb, telemetryPath);
+
+    expect(result.error).toMatch(/no LLM available/i);
   });
 
   it('does not archive a fresh memory even when the LLM names it', async () => {

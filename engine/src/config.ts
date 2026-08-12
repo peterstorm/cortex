@@ -247,10 +247,12 @@ export const DEDUP_SIMILARITY_THRESHOLD = 0.75;
 
 /**
  * Intra-batch dedup threshold for candidates within a single extraction.
- * Higher than cross-session threshold because candidates from the same session
- * naturally share domain vocabulary and semantic space. At 0.45, a focused session
- * about one subsystem would have most candidates killed by intra-batch dedup.
- * 0.75 catches only truly redundant candidates (near-identical content).
+ * Equal to the cross-session threshold (0.75); the real distinction is that
+ * intra-batch dedup runs REGARDLESS of the existing-memory match outcome,
+ * which is what stops near-identical content from landing twice inside one
+ * session (see deduplicateCandidates). 0.75 catches only truly redundant
+ * candidates (near-identical content); the previous "higher than cross-
+ * session" rationale collapsed when both constants were aligned at 0.75.
  */
 export const INTRA_BATCH_DEDUP_THRESHOLD = 0.75;
 

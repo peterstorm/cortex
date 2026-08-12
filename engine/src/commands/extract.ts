@@ -15,7 +15,7 @@
  * 3. Truncate if needed (pure)
  * 4. Get git context
  * 5. Build extraction prompt (pure)
- * 6. Call Claude CLI
+ * 6. Call the LLM (direct endpoint first, CLI subprocess as fallback)
  * 7. Parse response (pure)
  * 8. For each candidate:
  *    - Insert memory
@@ -29,7 +29,7 @@ import { randomUUID } from 'node:crypto';
 import { basename, join } from 'node:path';
 import type { Database } from 'bun:sqlite';
 import type { GitContext, HookInput, Memory, MemoryCandidate } from '../core/types.js';
-import { createMemory } from '../core/types.js';
+import { createMemory, serializeSourceContext } from '../core/types.js';
 import {
   truncateTranscript,
   buildExtractionPrompt,
@@ -231,8 +231,8 @@ export async function executeExtract(
       // Pure: Build extraction prompt (with entity context)
       const prompt = buildExtractionPrompt(truncated, gitContext, projectName, knownEntityProfiles);
 
-      // I/O: Call Claude CLI for extraction (async)
-      logInfo(`Using Claude for memory extraction (chunk ${chunkIndex + 1}, cursor ${cursor})`);
+      // I/O: Call the LLM for extraction (async)
+      logInfo(`LLM extraction (chunk ${chunkIndex + 1}, cursor ${cursor})`);
       let response: string;
       try {
         response = await extractMemories(prompt);
@@ -469,7 +469,9 @@ function candidateToMemory(
   const id = randomUUID();
   const now = new Date().toISOString();
 
-  const sourceContext = JSON.stringify({
+  const sourceContext = serializeSourceContext({
+    source: 'extraction',
+    session_id: sessionId,
     branch: gitContext.branch,
     commits: gitContext.recent_commits.slice(0, 3), // Top 3 commits
     files: gitContext.changed_files.slice(0, 10),   // Top 10 files
@@ -567,7 +569,9 @@ export function applyDedupMerges(
  * Deduplicate extraction candidates against existing memories and each other.
  * Pure function — uses hybrid Jaccard+cosine similarity to filter near-duplicates.
  *
- * Three outcomes per candidate:
+ * Four outcomes per candidate:
+ * - intra-batch duplicate (score >= intraBatchThreshold vs an already-kept
+ *   candidate): **always skip**, regardless of the existing-memory match outcome
  * - score >= mergeCeiling: **skip** (true duplicate)
  * - score in [threshold, mergeCeiling): **merge** into existing memory
  * - score < threshold: **keep** (new memory)
@@ -577,6 +581,10 @@ export function applyDedupMerges(
  * @param threshold - Similarity threshold for dedup (default DEDUP_SIMILARITY_THRESHOLD)
  * @param candidateEmbeddings - Map of candidate index → local embedding (optional)
  * @param mergeCeiling - Score at or above which candidates are skipped instead of merged (default MERGE_CEILING_THRESHOLD)
+ * @param intraBatchThreshold - Intra-batch dedup threshold (default
+ *   INTRA_BATCH_DEDUP_THRESHOLD); candidates scoring >= it against an
+ *   already-kept candidate are skipped whether or not they also match an
+ *   existing memory
  * @returns Kept candidates, count of skipped duplicates, and merge targets
  */
 export function deduplicateCandidates(
@@ -630,8 +638,9 @@ export function deduplicateCandidates(
     // matches an existing memory — otherwise near-identical content lands
     // both as a new memory (the kept candidate) and appended to an existing
     // one (this candidate merged into its match).
-    // Uses a higher threshold than cross-session dedup because candidates from
-    // the same session naturally share domain vocabulary and semantic space.
+    // The intra-batch threshold equals the cross-session threshold (0.75);
+    // the real difference is that this check runs unconditionally, which is
+    // what stops near-identical content from landing twice within one session.
     let intraBatchDuplicate = false;
     for (let j = 0; j < keptTokenSets.length; j++) {
       const score = hybridSimilarity(
@@ -768,8 +777,14 @@ function computeSimilarityAndCreateEdges(
           status: candidate.status,
         });
         edgeCount++;
-      } catch {
-        // Duplicate edge constraint - skip silently
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        // Duplicate edge constraint is the expected re-ask case (the pair's
+        // typed edge may already exist); every other failure — SQLITE_BUSY,
+        // FK violations, disk errors — must not vanish silently.
+        if (!/unique constraint/i.test(message)) {
+          logError(`Failed to create edge ${newMem.id} -> ${candidate.targetId}: ${message}`);
+        }
       }
     }
   }

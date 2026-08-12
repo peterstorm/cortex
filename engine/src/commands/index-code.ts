@@ -19,7 +19,7 @@
 import { randomUUID } from 'crypto';
 import type { Database } from 'bun:sqlite';
 import type { Memory } from '../core/types.js';
-import { createMemory } from '../core/types.js';
+import { createMemory, serializeSourceContext } from '../core/types.js';
 import { buildEmbeddingText } from '../core/extraction.js';
 import { insertMemory, insertEdge, updateMemory, deleteEdgesForMemory, routeToDatabase, getActiveCodeMemoriesByFilePath, getActiveProseMemoriesByFilePath } from '../infra/db.js';
 import { embedTexts, isGeminiAvailable } from '../infra/gemini-embed.ts';
@@ -194,7 +194,8 @@ export function buildCodeSourceContext(
   endLine?: number,
   sessionId?: string
 ): string {
-  return JSON.stringify({
+  return serializeSourceContext({
+    source: 'code_index',
     file_path: filePath,
     start_line: startLine,
     end_line: endLine,

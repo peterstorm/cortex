@@ -21,7 +21,7 @@ import {
   repointFactSources,
 } from '../infra/db.js';
 import { tokenize, hybridSimilarityScored } from '../core/similarity.js';
-import { createMemory } from '../core/types.js';
+import { createMemory, serializeSourceContext } from '../core/types.js';
 import type { SimilaritySpace } from '../core/types.js';
 import { consolidationThresholdFor } from '../config.js';
 import { invalidateSurfaceCache } from './generate.js';
@@ -179,7 +179,7 @@ export function buildMergedMemory(
   const memory_type = memoryA.priority >= memoryB.priority ? memoryA.memory_type : memoryB.memory_type;
 
   // Build source context with merge metadata
-  const source_context = JSON.stringify({
+  const source_context = serializeSourceContext({
     source: 'consolidation',
     merged_from: [memoryA.id, memoryB.id],
     session_id: sessionId,

@@ -24,7 +24,7 @@ import {
 } from './db.js';
 import { rankBySimilarity } from '../core/similarity.js';
 import { createMemory, createEdge } from '../core/types.js';
-import type { Memory, Edge, MemoryScope } from '../core/types.js';
+import type { Memory, Edge, MemoryScope, MemoryType, MemoryStatus } from '../core/types.js';
 
 describe('Database Layer', () => {
   describe('openDatabase', () => {
@@ -161,6 +161,203 @@ describe('Database Layer', () => {
       expect(retrieved?.tags).toEqual(['updated']);
       expect(retrieved?.summary).toBe('Original summary'); // Unchanged
 
+      db.close();
+    });
+
+    it('rejects invalid memory_type through updateMemory (C6 validation is enforced)', () => {
+      const memory = createMemory({
+        id: 'mem-invalid-type',
+        content: 'c',
+        summary: 's',
+        memory_type: 'context',
+        scope: 'project',
+        confidence: 0.5,
+        priority: 5,
+        source_type: 'manual',
+        source_session: 's',
+        source_context: '{}',
+      });
+      insertMemory(db, memory);
+
+      expect(() => updateMemory(db, 'mem-invalid-type', { memory_type: 'not-a-type' as unknown as MemoryType }))
+        .toThrow(/invalid memory_type/);
+      db.close();
+    });
+
+    it('rejects invalid status through updateMemory', () => {
+      const memory = createMemory({
+        id: 'mem-invalid-status',
+        content: 'c',
+        summary: 's',
+        memory_type: 'context',
+        scope: 'project',
+        confidence: 0.5,
+        priority: 5,
+        source_type: 'manual',
+        source_session: 's',
+        source_context: '{}',
+      });
+      insertMemory(db, memory);
+
+      expect(() => updateMemory(db, 'mem-invalid-status', { status: 'zombie' as unknown as MemoryStatus }))
+        .toThrow(/invalid status/);
+      db.close();
+    });
+
+    it('rejects out-of-range confidence through updateMemory', () => {
+      const memory = createMemory({
+        id: 'mem-invalid-confidence',
+        content: 'c',
+        summary: 's',
+        memory_type: 'context',
+        scope: 'project',
+        confidence: 0.5,
+        priority: 5,
+        source_type: 'manual',
+        source_session: 's',
+        source_context: '{}',
+      });
+      insertMemory(db, memory);
+
+      expect(() => updateMemory(db, 'mem-invalid-confidence', { confidence: 1.4 }))
+        .toThrow(/confidence must be in \[0, 1\]/);
+      db.close();
+    });
+
+    it('rejects out-of-range priority through updateMemory', () => {
+      const memory = createMemory({
+        id: 'mem-invalid-priority',
+        content: 'c',
+        summary: 's',
+        memory_type: 'context',
+        scope: 'project',
+        confidence: 0.5,
+        priority: 5,
+        source_type: 'manual',
+        source_session: 's',
+        source_context: '{}',
+      });
+      insertMemory(db, memory);
+
+      expect(() => updateMemory(db, 'mem-invalid-priority', { priority: 11 }))
+        .toThrow(/priority must be in \[1, 10\]/);
+      db.close();
+    });
+
+    it('rejects empty content through updateMemory', () => {
+      const memory = createMemory({
+        id: 'mem-invalid-content',
+        content: 'c',
+        summary: 's',
+        memory_type: 'context',
+        scope: 'project',
+        confidence: 0.5,
+        priority: 5,
+        source_type: 'manual',
+        source_session: 's',
+        source_context: '{}',
+      });
+      insertMemory(db, memory);
+
+      expect(() => updateMemory(db, 'mem-invalid-content', { content: '   ' }))
+        .toThrow(/content must not be empty/);
+      db.close();
+    });
+
+    it('maintains the status/archived_at coupling when archiving', () => {
+      const memory = createMemory({
+        id: 'mem-archive-coupling',
+        content: 'c',
+        summary: 's',
+        memory_type: 'context',
+        scope: 'project',
+        confidence: 0.5,
+        priority: 5,
+        source_type: 'manual',
+        source_session: 's',
+        source_context: '{}',
+      });
+      insertMemory(db, memory);
+
+      // Flipping to archived without archived_at writes the archive anchor.
+      updateMemory(db, 'mem-archive-coupling', { status: 'archived' });
+      const archived = getMemory(db, 'mem-archive-coupling');
+      expect(archived?.status).toBe('archived');
+      expect(archived?.archived_at).not.toBeNull();
+
+      // Re-activating clears the anchor.
+      updateMemory(db, 'mem-archive-coupling', { status: 'active' });
+      const reactivated = getMemory(db, 'mem-archive-coupling');
+      expect(reactivated?.status).toBe('active');
+      expect(reactivated?.archived_at).toBeNull();
+      db.close();
+    });
+
+    it('refuses an active memory with a non-null archived_at through updateMemory', () => {
+      const memory = createMemory({
+        id: 'mem-active-archive',
+        content: 'c',
+        summary: 's',
+        memory_type: 'context',
+        scope: 'project',
+        confidence: 0.5,
+        priority: 5,
+        source_type: 'manual',
+        source_session: 's',
+        source_context: '{}',
+      });
+      insertMemory(db, memory);
+
+      expect(() => updateMemory(db, 'mem-active-archive', {
+        status: 'active',
+        archived_at: '2026-08-12T00:00:00.000Z',
+      })).toThrow(/active memory must not have archived_at/);
+      db.close();
+    });
+
+    it('refuses an archived_at-only update on an active row (no status change)', () => {
+      const memory = createMemory({
+        id: 'mem-anchor-only',
+        content: 'c',
+        summary: 's',
+        memory_type: 'context',
+        scope: 'project',
+        confidence: 0.5,
+        priority: 5,
+        source_type: 'manual',
+        source_session: 's',
+        source_context: '{}',
+      });
+      insertMemory(db, memory);
+
+      expect(() => updateMemory(db, 'mem-anchor-only', {
+        archived_at: '2026-08-12T00:00:00.000Z',
+      })).toThrow(/cannot set archived_at without archiving/);
+      // The row is untouched and still readable.
+      const retrieved = getMemory(db, 'mem-anchor-only');
+      expect(retrieved?.archived_at).toBeNull();
+      db.close();
+    });
+
+    it('allows re-anchoring an already-archived memory through archived_at only', () => {
+      const memory = createMemory({
+        id: 'mem-reanchor',
+        content: 'c',
+        summary: 's',
+        memory_type: 'context',
+        scope: 'project',
+        confidence: 0.5,
+        priority: 5,
+        source_type: 'manual',
+        source_session: 's',
+        source_context: '{}',
+        status: 'archived',
+        archived_at: '2026-08-01T00:00:00.000Z',
+      });
+      insertMemory(db, memory);
+
+      updateMemory(db, 'mem-reanchor', { archived_at: '2026-08-02T00:00:00.000Z' });
+      expect(getMemory(db, 'mem-reanchor')?.archived_at).toBe('2026-08-02T00:00:00.000Z');
       db.close();
     });
 
@@ -494,6 +691,26 @@ describe('Database Layer', () => {
       expect(edges[0].target_id).toBe('mem-edge-2');
       expect(edges[0].relation_type).toBe('relates_to');
       expect(edges[0].strength).toBe(0.7);
+
+      db.close();
+    });
+
+    it('materializes classified_at/classify_hash through getEdgesForMemory (attempt-tracking parity)', () => {
+      insertEdge(db, {
+        source_id: 'mem-edge-1',
+        target_id: 'mem-edge-2',
+        relation_type: 'relates_to',
+        strength: 0.5,
+        bidirectional: true,
+        status: 'active',
+        classified_at: '2026-08-12T00:00:00.000Z',
+        classify_hash: 'abc123',
+      });
+
+      const edges = getEdgesForMemory(db, 'mem-edge-1');
+      expect(edges).toHaveLength(1);
+      expect(edges[0].classified_at).toBe('2026-08-12T00:00:00.000Z');
+      expect(edges[0].classify_hash).toBe('abc123');
 
       db.close();
     });

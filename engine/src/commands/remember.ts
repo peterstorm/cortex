@@ -13,7 +13,7 @@
 import { randomUUID } from 'crypto';
 import type { Database } from 'bun:sqlite';
 import type { MemoryType, MemoryScope, Memory } from '../core/types.js';
-import { createMemory, isMemoryType } from '../core/types.js';
+import { createMemory, isMemoryType, serializeSourceContext } from '../core/types.js';
 import { insertMemory, routeToDatabase, getActiveMemories } from '../infra/db.js';
 import { tokenize, hybridSimilarity } from '../core/similarity.js';
 import { buildEmbeddingText } from '../core/extraction.js';
@@ -162,7 +162,7 @@ export function buildMemoryFromArgs(args: RememberArgs): Memory {
       : args.content.substring(0, 197) + '...';
 
   // Build source_context with session info
-  const sourceContext = JSON.stringify({
+  const sourceContext = serializeSourceContext({
     source: 'manual',
     session_id: args.sessionId,
   });
