@@ -16,6 +16,7 @@ import { Type } from "typebox";
 
 const STUB_URL = process.env.STUB_URL ?? "http://127.0.0.1:8799/v1";
 const MAX_FAILURE_DIAGNOSTIC_CHARS = 200;
+const PROBE_TIMEOUT_MS = 10_000;
 
 function boundedFailureDiagnostic(error: unknown): string {
 	const message = error instanceof Error ? error.message : String(error);
@@ -33,9 +34,19 @@ export default function registerContextReturnProbe(pi: ExtensionAPI): void {
 			echo: Type.String({ description: "Payload to echo through the subagent" }),
 		}),
 
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx): Promise<AgentToolResult> {
+		async execute(_toolCallId, params, signal, _onUpdate, _ctx): Promise<AgentToolResult> {
 			let subagentText = "(subagent request failed)";
 			let failure: string | null = null;
+			const requestController = new AbortController();
+			const cancelRequest = (): void => {
+				requestController.abort(signal.reason ?? new Error("subagent probe cancelled"));
+			};
+			if (signal.aborted) cancelRequest();
+			else signal.addEventListener("abort", cancelRequest, { once: true });
+			const timeout = setTimeout(() => {
+				requestController.abort(new Error(`subagent probe timed out after ${PROBE_TIMEOUT_MS}ms`));
+			}, PROBE_TIMEOUT_MS);
+
 			try {
 				const res = await fetch(`${STUB_URL}/chat/completions`, {
 					method: "POST",
@@ -54,6 +65,7 @@ export default function registerContextReturnProbe(pi: ExtensionAPI): void {
 							{ role: "user", content: `Echo this payload back: ${params.echo}` },
 						],
 					}),
+					signal: requestController.signal,
 				});
 				if (!res.ok) {
 					throw new Error(`HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ""}`);
@@ -65,6 +77,9 @@ export default function registerContextReturnProbe(pi: ExtensionAPI): void {
 			} catch (error) {
 				failure = boundedFailureDiagnostic(error);
 				subagentText = `(subagent request failed: ${failure})`;
+			} finally {
+				clearTimeout(timeout);
+				signal.removeEventListener("abort", cancelRequest);
 			}
 			return {
 				content: [{ type: "text", text: `Subagent returned: ${subagentText}` }],

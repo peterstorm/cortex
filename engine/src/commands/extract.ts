@@ -229,10 +229,18 @@ export async function executeExtract(
       // Pure: Truncate transcript if >100KB (FR-012)
       const { truncated, newCursor } = truncateTranscript(transcriptContent, 100_000, cursor);
 
-      // Skip if no new content
+      // A whitespace-only window still represents durable progress. Persist it
+      // before continuing so a retry cannot reload the old cursor and stall on
+      // the same blank bytes forever.
       if (truncated.trim() === '') {
+        saveExtractionCheckpoint(projectDb, {
+          session_id: input.session_id,
+          cursor_position: newCursor,
+          extracted_at: new Date().toISOString(),
+          transcript_length: transcriptContent.length,
+        });
         cursor = newCursor;
-        break;
+        continue;
       }
 
       // Pure: Build extraction prompt (with entity context)
@@ -535,8 +543,17 @@ function extractionMemoryId(
   chunkCursor: number,
   candidate: MemoryCandidate,
 ): string {
+  const canonicalCandidate = JSON.stringify({
+    scope: candidate.scope,
+    content: candidate.content,
+    summary: candidate.summary,
+    memory_type: candidate.memory_type,
+    confidence: candidate.confidence,
+    priority: candidate.priority,
+    tags: [...candidate.tags].sort(),
+  });
   const digest = createHash('sha256')
-    .update(`${sessionId}\0${chunkCursor}\0${candidate.scope}\0${candidate.content}`)
+    .update(`${sessionId}\0${chunkCursor}\0${canonicalCandidate}`)
     .digest('hex')
     .slice(0, 32);
   return `extraction-${digest}`;

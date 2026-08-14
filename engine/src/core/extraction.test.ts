@@ -76,7 +76,7 @@ describe("truncateTranscript", () => {
 
   it("handles multi-byte UTF-8 characters correctly", () => {
     const content = "emoji🎉\nline2\n";
-    // "emoji🎉\n" is 11 bytes (emoji=5 + 🎉=4 + \n=1 + line2=5 + \n=1 = 16 bytes)
+    // "emoji🎉\n" is 10 bytes; the complete fixture is 16 bytes.
     const result = truncateTranscript(content, 20);
 
     expect(result.truncated).toBe("emoji🎉\nline2\n");

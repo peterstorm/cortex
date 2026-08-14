@@ -391,6 +391,19 @@ export async function runAiPrune(
       continue;
     }
 
+    // Parse, then validate the model's references before performing writes.
+    // A mixed valid/unknown response is one semantically invalid batch: do not
+    // archive valid siblings and do not reset cadence as if review succeeded.
+    const unknownIds = parsed.candidates
+      .map((candidate) => candidate.id)
+      .filter((id) => !projectIds.has(id) && !globalIds.has(id));
+    if (unknownIds.length > 0) {
+      for (const id of unknownIds) {
+        logError(`AI suggested unknown memory ID: ${id}`);
+      }
+      continue;
+    }
+
     successfulBatches++;
     reviewedMemories += batch.length;
 
@@ -423,8 +436,6 @@ export async function runAiPrune(
         archiveGlobalMemory(candidate.id, archivedAt);
         totalArchived++;
         logInfo(`Archived ${candidate.id.slice(0, 8)}: ${candidate.reason}`);
-      } else {
-        logError(`AI suggested unknown memory ID: ${candidate.id}`);
       }
     }
   }

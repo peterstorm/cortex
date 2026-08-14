@@ -23,11 +23,11 @@ function captureProbe(): RegisteredProbe {
 	return registered;
 }
 
-async function executeProbe(): Promise<AgentToolResult> {
+async function executeProbe(signal: AbortSignal = new AbortController().signal): Promise<AgentToolResult> {
 	return captureProbe().execute(
 		"tool-call-1",
 		{ echo: "hello" },
-		new AbortController().signal,
+		signal,
 		undefined,
 		{},
 	);
@@ -36,6 +36,7 @@ async function executeProbe(): Promise<AgentToolResult> {
 const originalFetch = globalThis.fetch;
 
 afterEach(() => {
+	vi.useRealTimers();
 	globalThis.fetch = originalFetch;
 });
 
@@ -69,6 +70,38 @@ describe("subagent_probe failure diagnostics", () => {
 
 		expect(details.failure).toBe("HTTP 503 Service Unavailable");
 		expect(json).not.toHaveBeenCalled();
+	});
+
+	it("propagates tool cancellation to the in-flight request", async () => {
+		const controller = new AbortController();
+		globalThis.fetch = vi.fn((_input, init) => new Promise((_resolve, reject) => {
+			const requestSignal = init?.signal;
+			if (!requestSignal) throw new Error("missing request signal");
+			requestSignal.addEventListener("abort", () => reject(requestSignal.reason), { once: true });
+		})) as unknown as typeof fetch;
+
+		const pending = executeProbe(controller.signal);
+		controller.abort(new Error("operator cancelled probe"));
+		const result = await pending;
+		const details = result.details as { failure?: string };
+
+		expect(details.failure).toBe("operator cancelled probe");
+	});
+
+	it("times out a stalled backend request", async () => {
+		vi.useFakeTimers();
+		globalThis.fetch = vi.fn((_input, init) => new Promise((_resolve, reject) => {
+			const requestSignal = init?.signal;
+			if (!requestSignal) throw new Error("missing request signal");
+			requestSignal.addEventListener("abort", () => reject(requestSignal.reason), { once: true });
+		})) as unknown as typeof fetch;
+
+		const pending = executeProbe();
+		vi.advanceTimersByTime(10_000);
+		const result = await pending;
+		const details = result.details as { failure?: string };
+
+		expect(details.failure).toBe("subagent probe timed out after 10000ms");
 	});
 
 	it("bounds diagnostics returned through tool content and details", async () => {

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
   parseRememberArgs,
   buildMemoryFromArgs,
@@ -479,6 +479,29 @@ describe('Remember Command', () => {
       if (result.success) return;
 
       expect(result.error).toContain('content is required');
+    });
+
+    it('fails closed without inserting when the dedup read fails', async () => {
+      const dbModule = await import('../infra/db.js');
+      const readSpy = vi.spyOn(dbModule, 'getActiveMemories')
+        .mockImplementationOnce(() => { throw new Error('SQLITE_CORRUPT: malformed row'); });
+
+      try {
+        const result = await executeRemember(
+          ['must remain deduplicated'],
+          sessionId,
+          projectDb,
+          globalDb
+        );
+
+        expect(result).toEqual({
+          success: false,
+          error: 'dedup check failed; memory not inserted: SQLITE_CORRUPT: malformed row',
+        });
+      } finally {
+        readSpy.mockRestore();
+      }
+      expect(dbModule.getActiveMemories(projectDb)).toHaveLength(0);
     });
 
     it('queues embeddings for backfill (null embeddings)', async () => {

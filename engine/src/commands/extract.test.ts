@@ -822,6 +822,77 @@ describe('executeExtract (mocked LLM)', () => {
     db.close();
   });
 
+  it('checkpoints a blank chunk and continues to later extractable content', async () => {
+    const laterLine = '{"role":"user","content":"remember the durable sqlite decision"}\n';
+    const transcript = `${' '.repeat(100_000)}${laterLine}`;
+    const { cwd, transcriptPath } = makeTestProject(transcript);
+    const db = openDatabase(':memory:');
+    mockExtractMemories.mockResolvedValue(memoriesResponse('durable sqlite decision'));
+
+    const result = await executeExtract(
+      { session_id: 's-blank-window', transcript_path: transcriptPath, cwd }, db
+    );
+
+    expect(result).toMatchObject({
+      kind: 'succeeded',
+      extracted_count: 1,
+      cursor_position: transcript.length,
+    });
+    expect(mockExtractMemories).toHaveBeenCalledTimes(1);
+    expect(mockExtractMemories.mock.calls[0][0]).toContain('durable sqlite decision');
+    expect(getExtractionCheckpoint(db, 's-blank-window')?.cursor_position).toBe(transcript.length);
+    db.close();
+  });
+
+  it('uses complete candidate metadata for deterministic extraction IDs', async () => {
+    const transcript = '{"role":"user","content":"two interpretations of shared evidence"}\n';
+    const { cwd, transcriptPath } = makeTestProject(transcript);
+    const response = JSON.stringify({
+      memories: [
+        {
+          content: 'shared evidence',
+          summary: 'alpha bravo charlie delta echo foxtrot golf hotel',
+          memory_type: 'decision',
+          scope: 'project',
+          confidence: 0.9,
+          priority: 8,
+          tags: ['alpha'],
+        },
+        {
+          content: 'shared evidence',
+          summary: 'india juliet kilo lima mike november oscar papa',
+          memory_type: 'gotcha',
+          scope: 'project',
+          confidence: 0.7,
+          priority: 6,
+          tags: ['beta'],
+        },
+      ],
+      entities: [],
+    });
+    mockExtractMemories.mockResolvedValue(response);
+    const firstDb = openDatabase(':memory:');
+    const secondDb = openDatabase(':memory:');
+
+    const first = await executeExtract(
+      { session_id: 's-candidate-identity', transcript_path: transcriptPath, cwd }, firstDb
+    );
+    const second = await executeExtract(
+      { session_id: 's-candidate-identity', transcript_path: transcriptPath, cwd }, secondDb
+    );
+    const firstIds = getActiveMemories(firstDb).map((memory) => memory.id).sort();
+    const secondIds = getActiveMemories(secondDb).map((memory) => memory.id).sort();
+
+    expect(first).toMatchObject({ kind: 'succeeded', extracted_count: 2 });
+    expect(second).toMatchObject({ kind: 'succeeded', extracted_count: 2 });
+    expect(firstIds).toHaveLength(2);
+    expect(new Set(firstIds).size).toBe(2);
+    expect(secondIds).toEqual(firstIds);
+    expect(getExtractionCheckpoint(firstDb, 's-candidate-identity')?.cursor_position).toBe(transcript.length);
+    firstDb.close();
+    secondDb.close();
+  });
+
   it('includes the model-load error when falling back to Jaccard dedup', async () => {
     const transcript = '{"role":"user","content":"a durable decision"}\n';
     const { cwd, transcriptPath } = makeTestProject(transcript);

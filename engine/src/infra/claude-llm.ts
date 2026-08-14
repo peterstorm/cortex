@@ -304,8 +304,9 @@ export async function extractMemories(prompt: string): Promise<string> {
 }
 
 /**
- * Strict JSON schema for classification batches. Schema-guided decoding on
- * the direct API path makes malformed/wrapped/verbose output impossible.
+ * Strict JSON schema requested for direct classification batches. The parser
+ * still rejects malformed, wrapped, truncated, or provider-noncompliant output
+ * so transport failures remain explicit and retryable.
  */
 const EDGE_CLASSIFICATION_SCHEMA = {
   type: 'object',

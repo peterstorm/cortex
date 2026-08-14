@@ -330,21 +330,49 @@ describe('AI prune failure telemetry', () => {
     globalDb.close();
   });
 
-  it('does not reset cadence when only some batches were valid', async () => {
+  it('invalidates cache but does not reset cadence when an earlier batch archives and a later batch fails', async () => {
     mockRunLlmPrompt
-      .mockResolvedValueOnce('{"candidates":[]}')
+      .mockResolvedValueOnce('{"candidates":[{"id":"partial-0","reason":"obsolete"}]}')
       .mockRejectedValueOnce(new Error('second batch unavailable'));
     const projectDb = openDatabase(':memory:');
     const globalDb = openDatabase(':memory:');
     const telemetryPath = makeTelemetryPath();
+    const cwd = nodePath.dirname(telemetryPath);
+    const cacheDir = nodePath.join(cwd, '.memory', 'surface-cache');
+    fs.mkdirSync(cacheDir, { recursive: true });
+    fs.writeFileSync(nodePath.join(cacheDir, 'stale.json'), '{"surface":"stale"}', 'utf8');
     for (let index = 0; index < 81; index++) {
       insertMemory(projectDb, makeMemory(`partial-${index}`, 10));
     }
 
+    const result = await runAiPrune(projectDb, globalDb, telemetryPath, cwd);
+
+    expect(result).toMatchObject({ archived: 1, reviewed: 80 });
+    expect(result.error).toContain('1 of 2 AI prune batches failed');
+    expect(getMemory(projectDb, 'partial-0')?.status).toBe('archived');
+    expect(fs.readdirSync(cacheDir).filter((file) => file.endsWith('.json'))).toHaveLength(0);
+    expect(fs.existsSync(telemetryPath)).toBe(false);
+    projectDb.close();
+    globalDb.close();
+  });
+
+  it('rejects a mixed valid and unknown ID batch before archiving any sibling', async () => {
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    const telemetryPath = makeTelemetryPath();
+    for (let index = 0; index < 8; index++) {
+      insertMemory(projectDb, makeMemory(`semantic-${index}`, 10));
+    }
+    mockRunLlmPrompt.mockResolvedValue(JSON.stringify({ candidates: [
+      { id: 'semantic-0', reason: 'obsolete' },
+      { id: 'hallucinated-id', reason: 'model drift' },
+    ] }));
+
     const result = await runAiPrune(projectDb, globalDb, telemetryPath);
 
-    expect(result).toMatchObject({ archived: 0, reviewed: 80 });
-    expect(result.error).toContain('1 of 2 AI prune batches failed');
+    expect(result).toMatchObject({ archived: 0, reviewed: 0 });
+    expect(result.error).toContain('All 1 AI prune batches failed');
+    expect(getMemory(projectDb, 'semantic-0')?.status).toBe('active');
     expect(fs.existsSync(telemetryPath)).toBe(false);
     projectDb.close();
     globalDb.close();

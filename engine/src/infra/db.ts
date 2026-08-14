@@ -262,7 +262,8 @@ function migrateCheckpointTranscriptLength(db: Database): void {
 /**
  * One-time migration: extraction_checkpoints.session_id must be unique so
  * saveExtractionCheckpoint can UPSERT. Older databases may hold duplicate
- * rows from concurrent writers — keep the newest per session, then index.
+ * rows from concurrent writers — keep the latest inserted row per session
+ * (the highest rowid), then index.
  */
 function migrateCheckpointUniqueness(db: Database): void {
   const existing = db
@@ -1042,7 +1043,8 @@ export function getAllEdges(db: Database): readonly Edge[] {
 }
 
 /**
- * Get all 'relates_to' edges (Jaccard-created, candidates for semantic classification)
+ * Get all 'relates_to' edges (similarity pre-filter candidates produced by
+ * hybrid local-embedding/Jaccard matching)
  * I/O: Reads from database
  *
  * @param db - Database instance

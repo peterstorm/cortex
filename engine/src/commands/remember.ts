@@ -45,11 +45,9 @@ export interface RememberArgs {
   readonly sessionId: string;
 }
 
-export interface ParseResult {
-  readonly success: boolean;
-  readonly error?: string;
-  readonly args?: RememberArgs;
-}
+export type ParseResult =
+  | { readonly success: true; readonly args: RememberArgs }
+  | { readonly success: false; readonly error: string };
 
 /**
  * Parse args array into RememberArgs
@@ -328,8 +326,8 @@ export async function executeRemember(
   // Parse args (pure)
   const parseResult = parseRememberArgs(argv, sessionId);
 
-  if (!parseResult.success || !parseResult.args) {
-    return formatErrorResult(parseResult.error ?? 'unknown parse error');
+  if (!parseResult.success) {
+    return formatErrorResult(parseResult.error);
   }
 
   const args = parseResult.args;
@@ -376,9 +374,8 @@ export async function executeRemember(
       return formatErrorResult(`near-duplicate of existing memory: "${duplicateOf}"`);
     }
   } catch (err) {
-    // Non-fatal — proceed with insert if dedup check fails
     const message = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`[cortex:remember] WARN: dedup check failed: ${message}\n`);
+    return formatErrorResult(`dedup check failed; memory not inserted: ${message}`);
   }
 
   // Insert into database (I/O)
