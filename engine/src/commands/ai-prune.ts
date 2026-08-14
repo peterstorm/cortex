@@ -13,6 +13,7 @@
 
 import type { Database } from 'bun:sqlite';
 import * as fs from 'node:fs';
+import type { Memory } from '../core/types.js';
 import { getActiveMemories, updateMemory, archiveEdgesForMemory, supersedeFactsForMemory } from '../infra/db.js';
 import { isClaudeLlmAvailable, runLlmPromptDirect } from '../infra/claude-llm.js';
 import { resolveOpenAiCompatEndpoint } from '../infra/llm-client.js';
@@ -267,6 +268,20 @@ export function isTooYoungToArchive(
 }
 
 /**
+ * High-confidence architecture and decision memories are stable project
+ * knowledge. Enforce their prompt-level protection in code because model
+ * output is untrusted.
+ */
+export function isProtectedStableMemory(
+  memory: Pick<Memory, 'memory_type' | 'confidence'>
+): boolean {
+  return (
+    (memory.memory_type === 'architecture' || memory.memory_type === 'decision') &&
+    memory.confidence >= 0.8
+  );
+}
+
+/**
  * Split array into chunks of given size (pure).
  */
 function chunk<T>(arr: readonly T[], size: number): T[][] {
@@ -327,6 +342,9 @@ export async function runAiPrune(
   const projectIds = new Set(projectMemories.map(m => m.id));
   const globalIds = new Set(globalMemories.map(m => m.id));
   const pinnedIds = new Set(allMemories.filter(m => m.pinned).map(m => m.id));
+  const protectedStableIds = new Set(
+    allMemories.filter(isProtectedStableMemory).map(m => m.id)
+  );
   const createdAtById = new Map(allMemories.map(m => [m.id, m.created_at]));
 
   const batches = chunk(memoryData, AI_PRUNE_BATCH_SIZE);
@@ -379,6 +397,11 @@ export async function runAiPrune(
     for (const candidate of parsed.candidates) {
       if (pinnedIds.has(candidate.id)) {
         logInfo(`Skipping pinned memory ${candidate.id.slice(0, 8)}`);
+        continue;
+      }
+
+      if (protectedStableIds.has(candidate.id)) {
+        logInfo(`Skipping high-confidence architecture/decision memory ${candidate.id.slice(0, 8)}`);
         continue;
       }
 

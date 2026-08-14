@@ -3,7 +3,7 @@
  * Includes property-based tests with fast-check.
  */
 
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import * as fc from "fast-check";
 import {
   truncateTranscript,
@@ -458,6 +458,26 @@ describe("parseExtractionResponse", () => {
     expect(result.entities).toEqual([]);
   });
 
+  it("accepts an omitted entities field for backward compatibility", () => {
+    const result = parseExtractionResponse(JSON.stringify({ memories: [] }));
+
+    expect(result).toEqual({ kind: "ok", memories: [], entities: [] });
+  });
+
+  it.each([null, {}, "not-an-array", 42, true])(
+    "returns parse_error when a present entities field is not an array: %j",
+    (entities) => {
+      const response = JSON.stringify({ memories: [], entities });
+      const result = parseExtractionResponse(response);
+
+      expect(result).toMatchObject({
+        kind: "parse_error",
+        raw: response,
+        reason: expect.stringContaining("expected entities to be an array"),
+      });
+    }
+  );
+
   it("returns parse_error when any memory type is invalid (FR-005)", () => {
     const response = JSON.stringify([
       {
@@ -646,7 +666,6 @@ describe("parseExtractionResponse", () => {
   });
 
   it("rejects a mixed-validity memory response so the whole chunk can retry", () => {
-    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const response = JSON.stringify({
       memories: [
         {
@@ -662,16 +681,14 @@ describe("parseExtractionResponse", () => {
       entities: [],
     });
 
-    try {
-      expect(parseExtractionResponse(response)).toEqual({ kind: "parse_error", raw: response });
-      expect(stderr).toHaveBeenCalledWith(expect.stringContaining("1 of 2 memory candidate"));
-    } finally {
-      stderr.mockRestore();
-    }
+    expect(parseExtractionResponse(response)).toEqual({
+      kind: "parse_error",
+      raw: response,
+      reason: "1 of 2 memory candidate(s) had invalid shape",
+    });
   });
 
   it("rejects a mixed-validity entity response so the whole chunk can retry", () => {
-    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const response = JSON.stringify({
       memories: [],
       entities: [
@@ -680,12 +697,11 @@ describe("parseExtractionResponse", () => {
       ],
     });
 
-    try {
-      expect(parseExtractionResponse(response)).toEqual({ kind: "parse_error", raw: response });
-      expect(stderr).toHaveBeenCalledWith(expect.stringContaining("1 of 2 entity candidate"));
-    } finally {
-      stderr.mockRestore();
-    }
+    expect(parseExtractionResponse(response)).toEqual({
+      kind: "parse_error",
+      raw: response,
+      reason: "1 of 2 entity candidate(s) had invalid shape",
+    });
   });
 
   // Property-based tests

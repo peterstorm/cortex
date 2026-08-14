@@ -3,7 +3,7 @@
  *
  * Satisfies:
  * - FR-001: Extract memories automatically at session end
- * - FR-004: Track cursor position via extractions table
+ * - FR-004: Track cursor position via extraction_checkpoints table
  * - FR-009: Keep session shutdown non-blocking through bounded detached work
  * - FR-010: Handle extraction errors without blocking session closure
  * - FR-011: Log extraction errors to inspect later
@@ -258,8 +258,8 @@ export async function executeExtract(
         // Malformed LLM output is NOT "nothing to extract" — advancing the
         // checkpoint would permanently consume this chunk with zero
         // extraction. Mirror the invocation-failure path above.
-        logError('Extraction response could not be parsed — checkpoint not advanced');
-        return chunkFailure('Extraction response parse error');
+        logError(`Extraction response could not be parsed (${parseOutcome.reason}) — checkpoint not advanced`);
+        return chunkFailure(`Extraction response parse error: ${parseOutcome.reason}`);
       }
       const candidates = parseOutcome.memories;
       const entityCandidates = parseOutcome.entities;

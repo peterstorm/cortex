@@ -234,9 +234,10 @@ describe('extract command - core logic', () => {
         },
       ]);
 
-      expect(parseExtractionResponse(response)).toEqual({
+      expect(parseExtractionResponse(response)).toMatchObject({
         kind: 'parse_error',
         raw: response,
+        reason: expect.stringContaining('memory candidate'),
       });
     });
   });
@@ -745,6 +746,29 @@ describe('executeExtract (mocked LLM)', () => {
     expect(retry.kind).toBe('succeeded');
     expect(retry.cursor_position).toBe(transcript.length);
     expect(getExtractionCheckpoint(db, 's-parse')!.cursor_position).toBe(transcript.length);
+    db.close();
+  });
+
+  it('does not advance the checkpoint for a non-array entities envelope', async () => {
+    const transcript = '{"role":"user","content":"remember Cortex uses SQLite"}\n';
+    const { cwd, transcriptPath } = makeTestProject(transcript);
+    const db = openDatabase(':memory:');
+    mockExtractMemories.mockResolvedValue(JSON.stringify({
+      memories: [],
+      entities: { entity_name: 'Cortex', entity_type: 'project', predicate: 'uses', object: 'SQLite' },
+    }));
+
+    const result = await executeExtract(
+      { session_id: 's-malformed-entities', transcript_path: transcriptPath, cwd }, db
+    );
+
+    expect(result).toMatchObject({
+      kind: 'failed',
+      cursor_position: 0,
+      error: expect.stringContaining('entities to be an array'),
+    });
+    expect(getExtractionCheckpoint(db, 's-malformed-entities')).toBeNull();
+    expect(getActiveMemories(db)).toHaveLength(0);
     db.close();
   });
 

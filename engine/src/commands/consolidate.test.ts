@@ -12,6 +12,7 @@ import {
   detectDuplicates,
   mergePair,
   executeConsolidate,
+  removeCheckpointFile,
   type MemoryPair,
 } from './consolidate.js';
 import { createMemory } from '../core/types.js';
@@ -46,6 +47,24 @@ function createTestMemory(overrides: Partial<Memory> = {}): Memory {
     ...overrides,
   });
 }
+
+// ============================================================================
+// CHECKPOINT CLEANUP
+// ============================================================================
+
+describe('removeCheckpointFile', () => {
+  test('treats an already-absent checkpoint as successfully removed', () => {
+    expect(() => removeCheckpointFile('/tmp/missing-checkpoint', () => {
+      throw Object.assign(new Error('not found'), { code: 'ENOENT' });
+    })).not.toThrow();
+  });
+
+  test('surfaces checkpoint cleanup failures other than ENOENT', () => {
+    expect(() => removeCheckpointFile('/tmp/protected-checkpoint', () => {
+      throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+    })).toThrow('Failed to remove checkpoint /tmp/protected-checkpoint: permission denied');
+  });
+});
 
 // ============================================================================
 // FUNCTIONAL CORE TESTS (Pure Functions)

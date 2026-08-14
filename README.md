@@ -396,8 +396,10 @@ The LLM evaluates active memories in batches and archives low-value ones. Trigge
 |---|---|---|
 | `GEMINI_API_KEY` | Embeddings + semantic search (embeddings only — never used for extraction) | No (falls back to keyword search + local embeddings) |
 | `CORTEX_GEMINI_ENV` | Path to a file hooks source to get `GEMINI_API_KEY` (default: sops-nix path) | No |
+| `CORTEX_LLM_API_URL` | Base URL (or `/chat/completions` URL) for an explicit OpenAI-compatible LLM endpoint | No |
+| `CORTEX_LLM_API_KEY` | API key for the explicit OpenAI-compatible LLM endpoint | Required with `CORTEX_LLM_API_URL` |
 | `CORTEX_LLM_BINARY` | Force the headless LLM binary (`claude` or `pi`) | No (auto-detected) |
-| `CORTEX_LLM_MODEL` | Override the model passed to the LLM binary | No (`haiku` for claude; none for pi) |
+| `CORTEX_LLM_MODEL` | Model for explicit direct endpoint configuration, or override passed to the fallback LLM binary | Required with explicit direct endpoint config; otherwise no (`haiku` for claude; none for pi) |
 | `CLAUDE_PLUGIN_ROOT` | Plugin directory | Auto-set by Claude Code |
 
 Extraction, AI pruning, and edge classification prefer a **direct OpenAI-compatible endpoint** when one is configured: `CORTEX_LLM_API_URL`, `CORTEX_LLM_API_KEY`, and `CORTEX_LLM_MODEL` (or the pi provider config in `~/.pi/agent/models.json` — the active provider's `baseUrl`/`apiKey`/first model). Calls disable model thinking and use schema-guided JSON output where supported. Without a configured endpoint they fall back to a headless coding-agent CLI: `claude -p --model haiku` by default, or `pi -p --thinking off` when running under the pi agent.

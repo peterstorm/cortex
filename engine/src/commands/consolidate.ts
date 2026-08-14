@@ -389,6 +389,23 @@ export function mergePair(
  * @param options - Consolidate options
  * @returns Consolidate result
  */
+export function removeCheckpointFile(
+  checkpointPath: string,
+  remove: (path: string) => void = unlinkSync
+): void {
+  try {
+    remove(checkpointPath);
+  } catch (err) {
+    const code = typeof err === 'object' && err !== null && 'code' in err
+      ? (err as { readonly code?: unknown }).code
+      : undefined;
+    if (code === 'ENOENT') return;
+
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`Failed to remove checkpoint ${checkpointPath}: ${message}`);
+  }
+}
+
 export function executeConsolidate(
   db: Database,
   options: ConsolidateOptions = {}
@@ -428,8 +445,9 @@ export function executeConsolidate(
       break;
     }
 
-    // Clean up checkpoint file on success
-    try { unlinkSync(checkpointPath); } catch { /* already gone */ }
+    // Clean up checkpoint file on success. Only an already-absent file is
+    // benign; permission and filesystem failures must enter rollback/error.
+    removeCheckpointFile(checkpointPath);
 
     return {
       pairs_found: totalPairsFound,

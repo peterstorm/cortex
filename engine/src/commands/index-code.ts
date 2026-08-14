@@ -430,9 +430,8 @@ export async function executeIndexCode(
     matchingCodeMemories = getActiveCodeMemoriesByFilePath(targetDb, args.filePath);
     matchingProseMemories = getActiveProseMemoriesByFilePath(targetDb, args.filePath);
   } catch (err) {
-    // Non-fatal: continue without superseding
     const message = err instanceof Error ? err.message : String(err);
-    console.error(`Warning: failed to find existing memories: ${message}`);
+    return formatErrorResult(`failed to find existing memories before re-indexing: ${message}`);
   }
 
   // All DB writes in a single transaction for atomicity

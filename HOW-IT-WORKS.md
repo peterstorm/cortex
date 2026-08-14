@@ -265,8 +265,10 @@ Memories are inserted without embeddings (to avoid blocking extraction). A backg
 |---|---|---|
 | `GEMINI_API_KEY` | Embedding backfill + semantic search (embeddings only — never used for extraction) | Yes (for embeddings + semantic recall) |
 | `CORTEX_GEMINI_ENV` | Path to a file the hooks source to get `GEMINI_API_KEY` (defaults to the sops-nix path `~/.config/sops-nix/secrets/rendered/gemini-env`) | No |
+| `CORTEX_LLM_API_URL` | Base URL (or `/chat/completions` URL) for an explicit OpenAI-compatible LLM endpoint | No |
+| `CORTEX_LLM_API_KEY` | API key for the explicit OpenAI-compatible LLM endpoint | Required with `CORTEX_LLM_API_URL` |
 | `CORTEX_LLM_BINARY` | Force the headless LLM binary (`claude` or `pi`) | No (auto-detected) |
-| `CORTEX_LLM_MODEL` | Override the model passed to the LLM binary | No |
+| `CORTEX_LLM_MODEL` | Model for explicit direct endpoint configuration, or override passed to the fallback LLM binary | Required with explicit direct endpoint config; otherwise no |
 | `CLAUDE_PLUGIN_ROOT` | Plugin directory (set by Claude Code) | Auto |
 
 Extraction, AI pruning, and edge classification prefer a configured direct OpenAI-compatible endpoint. The fallback is a headless coding-agent CLI: `claude -p --model haiku` by default (must be on PATH — it is when running inside Claude Code hooks), or `pi -p --thinking off` when running under the pi agent. The Pi fallback selects a provider-specific inexpensive extraction model when known and otherwise uses the configured provider/default model. No separate API key is needed for the CLI fallback.

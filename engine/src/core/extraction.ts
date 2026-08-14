@@ -24,7 +24,7 @@ export interface ParsedExtractionResult {
  */
 export type ExtractionParseOutcome =
   | ({ readonly kind: 'ok' } & ParsedExtractionResult)
-  | { readonly kind: 'parse_error'; readonly raw: string };
+  | { readonly kind: 'parse_error'; readonly raw: string; readonly reason: string };
 
 export interface TruncationResult {
   readonly truncated: string;
@@ -272,12 +272,24 @@ export function parseExtractionResponse(
       rawMemories = parsed;
       rawEntities = [];
     } else if (typeof parsed === 'object' && parsed !== null && Array.isArray(parsed.memories)) {
-      // New format: { memories: [...], entities: [...] }
+      // New format: { memories: [...], entities?: [...] }. An omitted entities
+      // field is backward-compatible; a present non-array field is malformed
+      // and must retry the whole transcript chunk.
       rawMemories = parsed.memories;
+      if (Object.hasOwn(parsed, 'entities') && !Array.isArray(parsed.entities)) {
+        return {
+          kind: 'parse_error',
+          raw: response,
+          reason: `expected entities to be an array when present, got ${parsed.entities === null ? 'null' : typeof parsed.entities}`,
+        };
+      }
       rawEntities = Array.isArray(parsed.entities) ? parsed.entities : [];
     } else {
-      process.stderr.write(`[cortex:extraction] WARN: Expected array or {memories:[]}, got ${typeof parsed}. Treating as parse error.\n`);
-      return { kind: 'parse_error', raw: response };
+      return {
+        kind: 'parse_error',
+        raw: response,
+        reason: `expected an array or an object with a memories array, got ${parsed === null ? 'null' : typeof parsed}`,
+      };
     }
 
     // A checkpoint covers the whole transcript chunk, not individual model
@@ -286,10 +298,11 @@ export function parseExtractionResponse(
     const validMemories = rawMemories.filter(isValidCandidate);
     const invalidMemoryCount = rawMemories.length - validMemories.length;
     if (invalidMemoryCount > 0) {
-      process.stderr.write(
-        `[cortex:extraction] WARN: ${invalidMemoryCount} of ${rawMemories.length} memory candidate(s) had invalid shape; treating response as parse error\n`
-      );
-      return { kind: 'parse_error', raw: response };
+      return {
+        kind: 'parse_error',
+        raw: response,
+        reason: `${invalidMemoryCount} of ${rawMemories.length} memory candidate(s) had invalid shape`,
+      };
     }
 
     const memories: readonly MemoryCandidate[] = validMemories.map((c) => ({
@@ -306,10 +319,11 @@ export function parseExtractionResponse(
     const validEntities = rawEntities.filter(isValidEntityFactCandidate);
     const invalidEntityCount = rawEntities.length - validEntities.length;
     if (invalidEntityCount > 0) {
-      process.stderr.write(
-        `[cortex:extraction] WARN: ${invalidEntityCount} of ${rawEntities.length} entity candidate(s) had invalid shape; treating response as parse error\n`
-      );
-      return { kind: 'parse_error', raw: response };
+      return {
+        kind: 'parse_error',
+        raw: response,
+        reason: `${invalidEntityCount} of ${rawEntities.length} entity candidate(s) had invalid shape`,
+      };
     }
     const entities: readonly EntityFactCandidate[] = validEntities
       .map((c) => ({
@@ -322,8 +336,7 @@ export function parseExtractionResponse(
     return { kind: 'ok', memories, entities };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`[cortex:extraction] WARN: Parse failure: ${message}. Response (truncated): ${response.slice(0, 200)}\n`);
-    return { kind: 'parse_error', raw: response };
+    return { kind: 'parse_error', raw: response, reason: `JSON parse failure: ${message}` };
   }
 }
 

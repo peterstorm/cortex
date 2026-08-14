@@ -32,11 +32,21 @@ export interface AssertionResult {
 	detail: string;
 }
 
+export interface PiRunResult {
+	stdout: string;
+	stderr: string;
+	code: number | null;
+	signal: NodeJS.Signals | null;
+	timedOut: boolean;
+	error?: string;
+}
+
 export interface ContextReturnReport {
 	assertions: AssertionResult[];
 	requests: readonly RecordedRequest[];
 	piStdout: string;
 	piStderr: string;
+	piRun: PiRunResult;
 }
 
 function assertState(name: string, pass: boolean, detail: string): AssertionResult {
@@ -73,9 +83,16 @@ function parsePiEvents(stdout: string): Array<{ type: string; message?: { usage?
 	return events;
 }
 
-function runPi(args: string[], env: NodeJS.ProcessEnv, cwd: string, timeoutMs: number): Promise<{ stdout: string; stderr: string; code: number | null }> {
+export function runPi(
+	args: string[],
+	env: NodeJS.ProcessEnv,
+	cwd: string,
+	timeoutMs: number,
+	binary: string = PI_BIN,
+	spawnProcess: typeof spawn = spawn,
+): Promise<PiRunResult> {
 	return new Promise((resolvePromise) => {
-		const child = spawn(PI_BIN, args, {
+		const child = spawnProcess(binary, args, {
 			// stdin must be closed: pi -p reads stdin until EOF (it supports `echo x | pi`),
 			// so an inherited open pipe hangs startup forever.
 			stdio: ["ignore", "pipe", "pipe"],
@@ -84,22 +101,29 @@ function runPi(args: string[], env: NodeJS.ProcessEnv, cwd: string, timeoutMs: n
 		});
 		let stdout = "";
 		let stderr = "";
+		let timedOut = false;
+		let settled = false;
 		child.stdout.on("data", (d: Buffer) => {
 			stdout += d.toString("utf-8");
 		});
 		child.stderr.on("data", (d: Buffer) => {
 			stderr += d.toString("utf-8");
 		});
+		const finish = (result: Omit<PiRunResult, "stdout" | "stderr">): void => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			resolvePromise({ stdout, stderr, ...result });
+		};
 		const timer = setTimeout(() => {
+			timedOut = true;
 			child.kill("SIGKILL");
 		}, timeoutMs);
 		child.on("error", (err) => {
-			clearTimeout(timer);
-			resolvePromise({ stdout, stderr, code: null });
+			finish({ code: null, signal: null, timedOut, error: err.message });
 		});
-		child.on("close", (code) => {
-			clearTimeout(timer);
-			resolvePromise({ stdout, stderr, code });
+		child.on("close", (code, signal) => {
+			finish({ code, signal, timedOut });
 		});
 	});
 }
@@ -175,8 +199,8 @@ export async function runContextReturnTest(opts: { timeoutMs?: number; prompt?: 
 		piStderr = run.stderr;
 
 		const requests = getStubState().requests;
-		const assertions = buildAssertions(requests, piStdout, run.code, piStderr);
-		return { assertions, requests, piStdout, piStderr };
+		const assertions = buildAssertions(requests, piStdout, run.code, piStderr, run);
+		return { assertions, requests, piStdout, piStderr, piRun: run };
 	} finally {
 		await stopStub();
 		await rm(workDir, { recursive: true, force: true });
@@ -188,6 +212,7 @@ export function buildAssertions(
 	piStdout: string,
 	piExitCode: number | null,
 	piStderr: string,
+	piRun?: Pick<PiRunResult, "signal" | "timedOut" | "error">,
 ): AssertionResult[] {
 	const out: AssertionResult[] = [];
 
@@ -197,11 +222,16 @@ export function buildAssertions(
 	const resume = parents.find((r) => r.reply === "end_turn" && r.messages.some((m) => (m as { role?: string }).role === "tool"));
 
 	// A. pi exited cleanly and produced the expected request pattern.
+	const failureKind = piRun?.timedOut
+		? `timed out (signal ${piRun.signal ?? "unknown"})`
+		: piRun?.error
+			? `spawn error: ${piRun.error}`
+			: `exit code ${piExitCode}${piRun?.signal ? ` (signal ${piRun.signal})` : ""}`;
 	out.push(
 		assertState(
 			"pi exited 0",
 			piExitCode === 0,
-			piExitCode === 0 ? "clean exit" : `exit code ${piExitCode}; stderr: ${piStderr.slice(0, 400)}`,
+			piExitCode === 0 ? "clean exit" : `${failureKind}; stderr: ${piStderr.slice(0, 400)}`,
 		),
 	);
 	out.push(

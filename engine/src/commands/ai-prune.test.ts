@@ -29,7 +29,13 @@ vi.mock('../infra/llm-client.js', () => ({
   resolveOpenAiCompatEndpoint: () => mockResolveEndpoint(),
 }));
 
-import { runAiPrune, isTooYoungToArchive, shouldRunAiPrune, parsePruneResponse } from './ai-prune.js';
+import {
+  runAiPrune,
+  isProtectedStableMemory,
+  isTooYoungToArchive,
+  shouldRunAiPrune,
+  parsePruneResponse,
+} from './ai-prune.js';
 
 const tempDirs: string[] = [];
 
@@ -81,6 +87,20 @@ describe('isTooYoungToArchive', () => {
   it('boundary: exactly at the minimum age is old enough', () => {
     const createdAt = new Date(now.getTime() - AI_PRUNE_MIN_AGE_DAYS * 24 * 60 * 60 * 1000).toISOString();
     expect(isTooYoungToArchive(createdAt, now)).toBe(false);
+  });
+});
+
+describe('isProtectedStableMemory', () => {
+  it.each(['architecture', 'decision'] as const)(
+    'protects high-confidence %s memories at the 0.8 boundary',
+    (memoryType) => {
+      expect(isProtectedStableMemory({ memory_type: memoryType, confidence: 0.8 })).toBe(true);
+      expect(isProtectedStableMemory({ memory_type: memoryType, confidence: 0.799 })).toBe(false);
+    }
+  );
+
+  it('does not protect other memory types solely because confidence is high', () => {
+    expect(isProtectedStableMemory({ memory_type: 'pattern', confidence: 1 })).toBe(false);
   });
 });
 
@@ -168,6 +188,46 @@ describe('runAiPrune age guard (enforced in code, not just prompt)', () => {
 
     expect(getMemory(projectDb, 'pinned-1')!.status).toBe('active');
     expect(result.archived).toBe(0);
+
+    projectDb.close();
+    globalDb.close();
+  });
+
+  it('keeps LLM-nominated high-confidence architecture and decision memories active in both databases', async () => {
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    const telemetryPath = makeTelemetryPath();
+
+    for (let i = 0; i < 5; i++) {
+      insertMemory(projectDb, makeMemory(`ordinary-${i}`, 30));
+    }
+    insertMemory(projectDb, makeMemory('protected-architecture', 30, {
+      memory_type: 'architecture',
+      confidence: 0.8,
+    }));
+    insertMemory(globalDb, makeMemory('protected-decision', 30, {
+      memory_type: 'decision',
+      scope: 'global',
+      confidence: 0.95,
+    }));
+    insertMemory(globalDb, makeMemory('ordinary-global', 30, {
+      scope: 'global',
+      confidence: 0.95,
+    }));
+
+    mockRunLlmPrompt.mockResolvedValue(JSON.stringify({ candidates: [
+      { id: 'protected-architecture', reason: 'model ignored the stable-memory rule' },
+      { id: 'protected-decision', reason: 'model ignored the stable-memory rule' },
+      { id: 'ordinary-global', reason: 'stale context' },
+    ] }));
+
+    const result = await runAiPrune(projectDb, globalDb, telemetryPath);
+
+    expect(getMemory(projectDb, 'protected-architecture')!.status).toBe('active');
+    expect(getMemory(globalDb, 'protected-decision')!.status).toBe('active');
+    expect(getMemory(globalDb, 'ordinary-global')!.status).toBe('archived');
+    expect(result.archived).toBe(1);
+    expect(result.reviewed).toBe(8);
 
     projectDb.close();
     globalDb.close();

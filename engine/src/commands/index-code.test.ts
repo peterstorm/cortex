@@ -465,6 +465,25 @@ export function multiply(a: number, b: number): number {
     }
   });
 
+  test('fails before insertion when existing-memory lookup is unavailable', async () => {
+    const unavailableDb = openDatabase(':memory:');
+    unavailableDb.close();
+
+    const result = await executeIndexCode(
+      [testFilePath, 'Math utility functions'],
+      'session-lookup-failure',
+      unavailableDb,
+      globalDb,
+      undefined,
+      'test-project'
+    );
+
+    expect(result).toEqual({
+      success: false,
+      error: expect.stringContaining('failed to find existing memories before re-indexing'),
+    });
+  });
+
   test('indexes code successfully without embedding', async () => {
     const result = await executeIndexCode(
       [testFilePath, 'Math utility functions'],

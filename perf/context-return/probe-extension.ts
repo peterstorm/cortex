@@ -15,6 +15,12 @@ import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-ag
 import { Type } from "typebox";
 
 const STUB_URL = process.env.STUB_URL ?? "http://127.0.0.1:8799/v1";
+const MAX_FAILURE_DIAGNOSTIC_CHARS = 200;
+
+function boundedFailureDiagnostic(error: unknown): string {
+	const message = error instanceof Error ? error.message : String(error);
+	return message.slice(0, MAX_FAILURE_DIAGNOSTIC_CHARS);
+}
 
 export default function registerContextReturnProbe(pi: ExtensionAPI): void {
 	pi.registerTool({
@@ -29,6 +35,7 @@ export default function registerContextReturnProbe(pi: ExtensionAPI): void {
 
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx): Promise<AgentToolResult> {
 			let subagentText = "(subagent request failed)";
+			let failure: string | null = null;
 			try {
 				const res = await fetch(`${STUB_URL}/chat/completions`, {
 					method: "POST",
@@ -48,16 +55,20 @@ export default function registerContextReturnProbe(pi: ExtensionAPI): void {
 						],
 					}),
 				});
+				if (!res.ok) {
+					throw new Error(`HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ""}`);
+				}
 				const data = (await res.json()) as {
 					choices?: Array<{ message?: { content?: string | null } }>;
 				};
 				subagentText = data.choices?.[0]?.message?.content ?? "(empty subagent response)";
-			} catch {
-				// Keep the tool result usable; the test fails on missing traffic anyway.
+			} catch (error) {
+				failure = boundedFailureDiagnostic(error);
+				subagentText = `(subagent request failed: ${failure})`;
 			}
 			return {
 				content: [{ type: "text", text: `Subagent returned: ${subagentText}` }],
-				details: { simulated: true, subagentText },
+				details: { simulated: true, subagentText, ...(failure === null ? {} : { failure }) },
 			};
 		},
 	});
