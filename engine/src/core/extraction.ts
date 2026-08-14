@@ -112,20 +112,6 @@ export function truncateTranscript(
 }
 
 /**
- * Builds extraction prompt for LLM given transcript and git context.
- *
- * FR-002: Extract from JSONL transcript format
- * FR-005: Extract memory type (8 types)
- * FR-006: Extract confidence (0-1)
- * FR-007: Extract priority (1-10)
- * FR-008: Classify scope (project/global, >0.8 confidence = global)
- *
- * @param transcript - JSONL transcript content (possibly truncated)
- * @param gitContext - Git repository context
- * @param projectName - Project name for context
- * @returns Prompt string for LLM
- */
-/**
  * Strip injected cortex memory surface blocks from transcript content.
  * The UserPromptSubmit hook re-injects the surface markdown on every user
  * turn, so a multi-turn transcript repeats the same memory text dozens of
@@ -146,6 +132,20 @@ export function stripInjectedMemorySurface(content: string): string {
     );
 }
 
+/**
+ * Builds extraction prompt for LLM given transcript and git context.
+ *
+ * FR-002: Extract from JSONL transcript format
+ * FR-005: Extract memory type (8 types)
+ * FR-006: Extract confidence (0-1)
+ * FR-007: Extract priority (1-10)
+ * FR-008: Classify scope (project/global, >0.8 confidence = global)
+ *
+ * @param transcript - JSONL transcript content (possibly truncated)
+ * @param gitContext - Git repository context
+ * @param projectName - Project name for context
+ * @returns Prompt string for LLM
+ */
 export function buildExtractionPrompt(
   transcript: string,
   gitContext: GitContext,

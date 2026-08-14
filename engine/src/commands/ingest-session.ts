@@ -7,7 +7,7 @@
 
 export type IngestionStepResult =
   | Readonly<{ kind: 'succeeded'; output?: string }>
-  | Readonly<{ kind: 'failed'; error: string; output?: string }>
+  | Readonly<{ kind: 'failed'; retryable: boolean; error: string; output?: string }>
   | Readonly<{ kind: 'deferred'; reason: string }>;
 
 export type IngestionStepOutcome =
@@ -47,6 +47,7 @@ async function runStep(operation: () => Promise<IngestionStepResult>): Promise<I
   } catch (error) {
     return {
       kind: 'failed',
+      retryable: false,
       error: error instanceof Error ? error.message : String(error),
     };
   }
@@ -58,19 +59,23 @@ async function runExtractionWithRetry(
 ): Promise<Exclude<IngestionStepResult, { kind: 'deferred' }>> {
   for (let attempt = 1; attempt <= policy.maxExtractionAttempts; attempt++) {
     const result = await runStep(extract);
-    if (result.kind !== 'deferred') return result;
+    if (result.kind === 'succeeded' || (result.kind === 'failed' && !result.retryable)) {
+      return result;
+    }
+    const retryReason = result.kind === 'deferred' ? result.reason : result.error;
 
     if (attempt === policy.maxExtractionAttempts) {
       return {
         kind: 'failed',
-        error: `extraction remained deferred after ${attempt} attempt(s): ${result.reason}`,
+        retryable: false,
+        error: `extraction remained retryable after ${attempt} attempt(s): ${retryReason}`,
       };
     }
 
     await policy.sleep(policy.retryDelayMs(attempt));
   }
 
-  return { kind: 'failed', error: 'extraction retry policy had no attempts' };
+  return { kind: 'failed', retryable: false, error: 'extraction retry policy had no attempts' };
 }
 
 /**
@@ -90,13 +95,13 @@ export async function runSessionIngestion(
   const backfill: IngestionStepOutcome = extraction.kind === 'succeeded'
     ? await runStep(operations.backfill).then((result) =>
         result.kind === 'deferred'
-          ? { kind: 'failed', error: `backfill unexpectedly deferred: ${result.reason}` }
+          ? { kind: 'failed', retryable: false, error: `backfill unexpectedly deferred: ${result.reason}` }
           : result)
     : { kind: 'skipped', reason: 'extraction failed' };
 
   const maintenanceResult = await runStep(operations.maintenance);
   const maintenance: IngestionStepOutcome = maintenanceResult.kind === 'deferred'
-    ? { kind: 'failed', error: `maintenance unexpectedly deferred: ${maintenanceResult.reason}` }
+    ? { kind: 'failed', retryable: false, error: `maintenance unexpectedly deferred: ${maintenanceResult.reason}` }
     : maintenanceResult;
 
   return { extraction, backfill, maintenance };

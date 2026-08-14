@@ -62,7 +62,7 @@ There's also an `entity-query` CLI command for entity-first temporal retrieval (
 When your session ends, the hook detaches a background worker (so nothing blocks the session) that runs the pipeline sequentially:
 
 1. **Read transcript** — the JSONL file Claude Code writes during the session
-2. **Resume from checkpoint** — extraction advances in 100KB chunks and picks up where it left off; an invocation processes at most five chunks, then the detached ingestion worker retries the deferred extraction until it reaches EOF
+2. **Resume from checkpoint** — extraction advances in 100KB chunks and picks up where it left off; an invocation processes at most five chunks, then the detached ingestion worker retries deferred or transiently failed extraction until it reaches EOF
 3. **Send to the LLM** — prefer the configured direct OpenAI-compatible endpoint with thinking disabled; fall back to `claude -p --model haiku`, or `pi -p --thinking off` under the pi agent
 4. **Parse response** — validate each memory/entity candidate (type, confidence, priority); an all-invalid non-empty candidate array is a retryable parse failure, while global-scoped memories go to the global DB
 5. **Store in DB** — insert memories, retain the chunk checkpoint on any memory/fact write failure, and compute similarity edges; entity-only or global-only responses get a deterministic project-local provenance memory so facts always have a valid source

@@ -17,7 +17,7 @@ import {
 } from './llm-client.js';
 
 const ENV_KEYS = ['CORTEX_LLM_API_URL', 'CORTEX_LLM_API_KEY', 'CORTEX_LLM_MODEL',
-  'CORTEX_LLM_PROVIDER', 'PI_PROVIDER', 'HOME'];
+  'CORTEX_LLM_PROVIDER', 'CORTEX_PI_PROVIDER', 'PI_PROVIDER', 'HOME'];
 
 function withEnv(values: Record<string, string | undefined>): void {
   for (const [key, value] of Object.entries(values)) {
@@ -220,6 +220,43 @@ describe('resolveOpenAiCompatEndpoint', () => {
     fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'settings.json'), JSON.stringify({}));
 
     expect(resolveOpenAiCompatEndpoint()?.model).toBe('fixture-model');
+  });
+
+  it('uses the provider selected by the active Pi session before inherited PI_PROVIDER', () => {
+    withEnv({
+      CORTEX_LLM_PROVIDER: undefined,
+      CORTEX_PI_PROVIDER: 'selected-provider',
+      PI_PROVIDER: 'provider-at-start',
+      HOME: fixtureHome,
+    });
+    fs.mkdirSync(nodePath.join(fixtureHome, '.pi', 'agent'), { recursive: true });
+    fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'models.json'), JSON.stringify({
+      providers: {
+        'selected-provider': { baseUrl: 'http://selected:9000/v1', apiKey: 'selected', models: [{ id: 'selected-model' }] },
+        'provider-at-start': { baseUrl: 'http://initial:9000/v1', apiKey: 'initial', models: [{ id: 'initial-model' }] },
+      },
+    }));
+    fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'settings.json'), JSON.stringify({}));
+
+    expect(resolveOpenAiCompatEndpoint()?.model).toBe('selected-model');
+  });
+
+  it('lets an explicit Cortex provider override the active Pi provider', () => {
+    withEnv({
+      CORTEX_LLM_PROVIDER: 'explicit-provider',
+      CORTEX_PI_PROVIDER: 'selected-provider',
+      HOME: fixtureHome,
+    });
+    fs.mkdirSync(nodePath.join(fixtureHome, '.pi', 'agent'), { recursive: true });
+    fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'models.json'), JSON.stringify({
+      providers: {
+        'explicit-provider': { baseUrl: 'http://explicit:9000/v1', apiKey: 'explicit', models: [{ id: 'explicit-model' }] },
+        'selected-provider': { baseUrl: 'http://selected:9000/v1', apiKey: 'selected', models: [{ id: 'selected-model' }] },
+      },
+    }));
+    fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'settings.json'), JSON.stringify({}));
+
+    expect(resolveOpenAiCompatEndpoint()?.model).toBe('explicit-model');
   });
 
   it('falls back to settings.defaultProvider when no env provider is set', () => {

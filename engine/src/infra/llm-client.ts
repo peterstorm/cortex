@@ -11,7 +11,8 @@
  * Endpoint resolution order:
  *  1. Explicit env: CORTEX_LLM_API_URL + CORTEX_LLM_API_KEY + CORTEX_LLM_MODEL
  *  2. pi's provider config (~/.pi/agent/models.json + settings.json), using
- *     CORTEX_LLM_PROVIDER, then PI_PROVIDER, then settings.defaultProvider.
+ *     CORTEX_LLM_PROVIDER, CORTEX_PI_PROVIDER (the active session selection),
+ *     PI_PROVIDER, then settings.defaultProvider.
  *     The provider's `!command` apiKey style is executed via bash.
  *
  * Falls back to null (caller then uses the legacy subprocess path) whenever
@@ -145,7 +146,10 @@ export function resolveOpenAiCompatEndpoint(): LlmEndpoint | null {
       : undefined;
 
   const providerId =
-    getEnv('CORTEX_LLM_PROVIDER') || getEnv('PI_PROVIDER') || defaultProvider;
+    getEnv('CORTEX_LLM_PROVIDER') ||
+    getEnv('CORTEX_PI_PROVIDER') ||
+    getEnv('PI_PROVIDER') ||
+    defaultProvider;
   if (!providerId) return null;
 
   const provider = (providers as Record<string, unknown>)[providerId];

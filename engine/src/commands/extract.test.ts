@@ -78,8 +78,8 @@ describe('extract command - core logic', () => {
 
       const result = await executeExtract(input, db);
 
-      expect(result.success).toBe(false);
-      if (!result.success) expect(result.error).toMatch(/failed to read transcript/i);
+      expect(result.kind).toBe('failed');
+      if (result.kind === 'failed') expect(result.error).toMatch(/failed to read transcript/i);
     });
 
     it('skips extraction when no transport is available at all', async () => {
@@ -88,8 +88,8 @@ describe('extract command - core logic', () => {
 
       const result = await executeExtract(input, db);
 
-      expect(result.success).toBe(false);
-      if (!result.success) expect(result.error).toMatch(/no LLM available/i);
+      expect(result.kind).toBe('failed');
+      if (result.kind === 'failed') expect(result.error).toMatch(/no LLM available/i);
     });
   });
 
@@ -714,9 +714,10 @@ describe('executeExtract (mocked LLM)', () => {
       { session_id: 's-lock', transcript_path: transcriptPath, cwd }, db
     );
 
-    expect(result.skipped).toBe(true);
-    expect(result.success).toBe(true);
-    expect(result.error).toContain('another extraction running');
+    expect(result).toMatchObject({
+      kind: 'deferred',
+      reason: expect.stringContaining('another extraction is running'),
+    });
     expect(mockExtractMemories).not.toHaveBeenCalled();
     db.close();
   });
@@ -732,8 +733,8 @@ describe('executeExtract (mocked LLM)', () => {
       { session_id: 's-parse', transcript_path: transcriptPath, cwd }, db
     );
 
-    expect(result.success).toBe(false);
-    expect(result.error).toContain('parse');
+    expect(result.kind).toBe('failed');
+    if (result.kind === 'failed') expect(result.error).toContain('parse');
     expect(result.cursor_position).toBe(0);
     // Transcript must NOT be consumed — no checkpoint saved
     expect(getExtractionCheckpoint(db, 's-parse')).toBeNull();
@@ -743,7 +744,7 @@ describe('executeExtract (mocked LLM)', () => {
     const retry = await executeExtract(
       { session_id: 's-parse', transcript_path: transcriptPath, cwd }, db
     );
-    expect(retry.success).toBe(true);
+    expect(retry.kind).toBe('succeeded');
     expect(retry.cursor_position).toBe(transcript.length);
     expect(getExtractionCheckpoint(db, 's-parse')!.cursor_position).toBe(transcript.length);
     db.close();
@@ -760,7 +761,7 @@ describe('executeExtract (mocked LLM)', () => {
       { session_id: 's-empty', transcript_path: transcriptPath, cwd }, db
     );
 
-    expect(result.success).toBe(true);
+    expect(result.kind).toBe('succeeded');
     expect(result.extracted_count).toBe(0);
     expect(result.cursor_position).toBe(transcript.length);
     const checkpoint = getExtractionCheckpoint(db, 's-empty');
@@ -781,7 +782,7 @@ describe('executeExtract (mocked LLM)', () => {
       const result = await executeExtract(
         { session_id: 's-model-fallback', transcript_path: transcriptPath, cwd }, db
       );
-      expect(result.success).toBe(true);
+      expect(result.kind).toBe('succeeded');
       expect(stderr).toHaveBeenCalledWith(
         expect.stringContaining('ONNX initialization failed'),
       );
@@ -810,7 +811,7 @@ describe('executeExtract (mocked LLM)', () => {
       { session_id: 's-shrink', transcript_path: transcriptPath, cwd }, db
     );
 
-    expect(result.success).toBe(true);
+    expect(result.kind).toBe('succeeded');
     // Extraction re-ran from 0 over the full (new) content
     expect(mockExtractMemories).toHaveBeenCalledTimes(1);
     expect(mockExtractMemories.mock.calls[0][0]).toContain('rewritten short transcript');
@@ -839,7 +840,7 @@ describe('executeExtract (mocked LLM)', () => {
       { session_id: 's-shrink2', transcript_path: transcriptPath, cwd }, db
     );
 
-    expect(result.success).toBe(true);
+    expect(result.kind).toBe('succeeded');
     // Re-extracted from 0: prompt contains the very start of the transcript
     expect(mockExtractMemories.mock.calls[0][0]).toContain('compacted transcript');
     expect(getExtractionCheckpoint(db, 's-shrink2')!.cursor_position).toBe(transcript.length);
@@ -857,7 +858,7 @@ describe('executeExtract (mocked LLM)', () => {
       { session_id: 's-budget', transcript_path: transcriptPath, cwd }, db
     );
 
-    expect(first).toMatchObject({ success: true, deferred: true });
+    expect(first).toMatchObject({ kind: 'deferred' });
     expect(first.cursor_position).toBeGreaterThan(0);
     expect(first.cursor_position).toBeLessThan(transcript.length);
     expect(mockExtractMemories).toHaveBeenCalledTimes(5);
@@ -866,8 +867,7 @@ describe('executeExtract (mocked LLM)', () => {
       { session_id: 's-budget', transcript_path: transcriptPath, cwd }, db
     );
 
-    expect(retry.success).toBe(true);
-    expect(retry.deferred).not.toBe(true);
+    expect(retry.kind).toBe('succeeded');
     expect(retry.cursor_position).toBe(transcript.length);
     expect(getExtractionCheckpoint(db, 's-budget')!.cursor_position).toBe(transcript.length);
     expect(mockExtractMemories.mock.calls.length).toBeGreaterThan(5);
@@ -890,7 +890,7 @@ describe('executeExtract (mocked LLM)', () => {
       { session_id: 's-chunks', transcript_path: transcriptPath, cwd }, db
     );
 
-    expect(result.success).toBe(true);
+    expect(result.kind).toBe('succeeded');
     expect(mockExtractMemories).toHaveBeenCalledTimes(3);
     expect(result.cursor_position).toBe(transcript.length);
     expect(result.extracted_count).toBe(3);
@@ -917,14 +917,105 @@ describe('executeExtract (mocked LLM)', () => {
         { session_id: 's-write-failure', transcript_path: transcriptPath, cwd }, db
       );
 
-      expect(result.success).toBe(false);
-      expect(result.error).toContain('memory candidate write');
+      expect(result.kind).toBe('failed');
+      if (result.kind === 'failed') expect(result.error).toContain('memory candidate write');
       expect(result.extracted_count).toBe(1);
       expect(result.cursor_position).toBe(0);
       expect(getExtractionCheckpoint(db, 's-write-failure')).toBeNull();
       expect(getActiveMemories(db)).toHaveLength(1);
     } finally {
       insertSpy.mockRestore();
+      db.close();
+    }
+  });
+
+  it('does not checkpoint a chunk when edge persistence fails', async () => {
+    const transcript = '{"role":"user","content":"SQLite backs durable project storage"}\n';
+    const { cwd, transcriptPath } = makeTestProject(transcript);
+    const db = openDatabase(':memory:');
+    const now = new Date().toISOString();
+    insertMemory(db, createMemory({
+      id: 'existing-edge-target',
+      content: 'SQLite provides durable project storage',
+      summary: 'durable SQLite storage',
+      memory_type: 'decision',
+      scope: 'project',
+      confidence: 0.9,
+      priority: 5,
+      source_type: 'manual',
+      source_session: 'seed',
+      source_context: '{}',
+      created_at: now,
+      updated_at: now,
+      last_accessed_at: now,
+    }));
+    mockExtractMemories.mockResolvedValue(memoriesResponse(
+      'SQLite migration keeps durable project database storage',
+    ));
+    const dbModule = await import('../infra/db.js');
+    const insertEdgeSpy = vi.spyOn(dbModule, 'insertEdge')
+      .mockImplementationOnce(() => { throw new Error('SQLITE_BUSY: database is locked'); });
+
+    try {
+      const result = await executeExtract(
+        { session_id: 's-edge-failure', transcript_path: transcriptPath, cwd }, db
+      );
+
+      expect(result).toMatchObject({ kind: 'failed', retryable: true });
+      if (result.kind === 'failed') expect(result.error).toContain('Edge persistence failed');
+      expect(getExtractionCheckpoint(db, 's-edge-failure')).toBeNull();
+
+      insertEdgeSpy.mockRestore();
+      const retry = await executeExtract(
+        { session_id: 's-edge-failure', transcript_path: transcriptPath, cwd }, db
+      );
+      expect(retry.kind).toBe('succeeded');
+      expect(getExtractionCheckpoint(db, 's-edge-failure')?.cursor_position).toBe(transcript.length);
+      expect(db.query('SELECT relation_type FROM edges').all()).toEqual([
+        { relation_type: 'relates_to' },
+      ]);
+    } finally {
+      insertEdgeSpy.mockRestore();
+      db.close();
+    }
+  });
+
+  it('does not checkpoint a chunk when entity persistence fails', async () => {
+    const transcript = '{"role":"user","content":"NixOS configures this workstation"}\n';
+    const { cwd, transcriptPath } = makeTestProject(transcript);
+    const db = openDatabase(':memory:');
+    mockExtractMemories.mockResolvedValue(JSON.stringify({
+      memories: [],
+      entities: [{
+        entity_name: 'NixOS',
+        entity_type: 'tool',
+        predicate: 'configures',
+        object: 'this workstation',
+      }],
+    }));
+    const dbModule = await import('../infra/db.js');
+    const entitySpy = vi.spyOn(dbModule, 'upsertEntity')
+      .mockImplementationOnce(() => { throw new Error('SQLITE_IOERR: write failed'); });
+
+    try {
+      const result = await executeExtract(
+        { session_id: 's-entity-failure', transcript_path: transcriptPath, cwd }, db
+      );
+
+      expect(result).toMatchObject({ kind: 'failed', retryable: true });
+      if (result.kind === 'failed') expect(result.error).toContain('Entity processing failed');
+      expect(getExtractionCheckpoint(db, 's-entity-failure')).toBeNull();
+
+      entitySpy.mockRestore();
+      const retry = await executeExtract(
+        { session_id: 's-entity-failure', transcript_path: transcriptPath, cwd }, db
+      );
+      expect(retry.kind).toBe('succeeded');
+      const [entity] = getAllEntities(db);
+      expect(getCurrentFacts(db, entity.id)).toHaveLength(1);
+      expect(getExtractionCheckpoint(db, 's-entity-failure')?.cursor_position).toBe(transcript.length);
+    } finally {
+      entitySpy.mockRestore();
       db.close();
     }
   });
@@ -947,7 +1038,7 @@ describe('executeExtract (mocked LLM)', () => {
       { session_id: 's-entity-only', transcript_path: transcriptPath, cwd }, db
     );
 
-    expect(result.success).toBe(true);
+    expect(result.kind).toBe('succeeded');
     expect(result.extracted_count).toBe(1);
     const [entity] = getAllEntities(db);
     expect(entity.name).toBe('NixOS');
@@ -986,7 +1077,7 @@ describe('executeExtract (mocked LLM)', () => {
       globalDb,
     );
 
-    expect(result.success).toBe(true);
+    expect(result.kind).toBe('succeeded');
     expect(getActiveMemories(globalDb)).toHaveLength(1);
     expect(getActiveMemories(projectDb)).toHaveLength(1);
     const [entity] = getAllEntities(projectDb);
@@ -1009,8 +1100,8 @@ describe('executeExtract (mocked LLM)', () => {
       { session_id: 's-chunk-fail', transcript_path: transcriptPath, cwd }, db
     );
 
-    expect(result.success).toBe(false);
-    expect(result.error).toContain('Claude extraction failed');
+    expect(result.kind).toBe('failed');
+    if (result.kind === 'failed') expect(result.error).toContain('Claude extraction failed');
     // First chunk's progress persisted; cursor parked at the failed chunk
     expect(result.extracted_count).toBe(1);
     expect(result.cursor_position).toBeGreaterThan(0);
@@ -1143,15 +1234,33 @@ describe('computeEdgeCandidates', () => {
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
 
     try {
-      expect(computeSimilarityAndCreateEdges(db, [newMem], [existing])).toBe(0);
-      expect(stderr).toHaveBeenCalledWith(
-        expect.stringContaining('Failed to create edge new -> existing: SQLITE_BUSY'),
+      expect(() => computeSimilarityAndCreateEdges(db, [newMem], [existing])).toThrow(
+        'Failed to create edge new -> existing: SQLITE_BUSY',
       );
+      expect(stderr).not.toHaveBeenCalled();
     } finally {
       stderr.mockRestore();
       insertSpy.mockRestore();
       db.close();
     }
+  });
+
+  it('treats an existing edge as an idempotent retry success', () => {
+    const db = openDatabase(':memory:');
+    const newMem = makeEdgeMemory('new', { ...newMemText, local_embedding: localVecAt(1) });
+    const existing = makeEdgeMemory('existing', { ...existingText(0), local_embedding: localVecAt(0.7) });
+    insertMemory(db, newMem);
+    insertMemory(db, existing);
+    db.run(`
+      INSERT INTO edges (
+        id, source_id, target_id, relation_type, strength,
+        bidirectional, status, created_at, classified_at, classify_hash
+      ) VALUES (?, ?, ?, 'relates_to', 0.7, 1, 'active', ?, NULL, NULL)
+    `, ['existing-edge', 'new', 'existing', new Date().toISOString()]);
+
+    expect(() => computeSimilarityAndCreateEdges(db, [newMem], [existing])).not.toThrow();
+    expect(computeSimilarityAndCreateEdges(db, [newMem], [existing])).toBe(0);
+    db.close();
   });
 
   it('per-memory edge cap is enforced for Jaccard edges too', () => {

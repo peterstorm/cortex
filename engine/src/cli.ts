@@ -52,7 +52,7 @@ import { ensureGitignored, writeSurface } from './infra/filesystem.js';
 import { acquireLock, releaseLock } from './infra/lock.js';
 
 // Command imports
-import { executeExtract } from './commands/extract.js';
+import { executeExtract, type ExtractionResult } from './commands/extract.js';
 import { runGenerate, loadCachedSurface, computeDbFingerprint } from './commands/generate.js';
 import { wrapInMarkers } from './core/surface.js';
 import { executeRecall, formatRecallResult, formatRecallError } from './commands/recall.js';
@@ -74,6 +74,8 @@ import {
   formatSessionIngestionResult,
   isSessionIngestionSuccessful,
   runSessionIngestion,
+  type IngestionStepResult,
+  type SessionIngestionRetryPolicy,
 } from './commands/ingest-session.js';
 import { disposeLocalModel, embedLocal } from './infra/local-embed.js';
 
@@ -81,12 +83,14 @@ import { disposeLocalModel, embedLocal } from './infra/local-embed.js';
 // TYPES
 // ============================================================================
 
-type CommandResult = {
+export type CommandResult = {
   readonly success: boolean;
   readonly output?: string;
   readonly error?: string;
-  /** The command did no work because another durable worker owns it; retryable. */
+  /** The command did no work yet and should be attempted again. */
   readonly deferred?: boolean;
+  /** A failed command may succeed unchanged on a bounded retry. */
+  readonly retryable?: boolean;
 };
 
 // ============================================================================
@@ -195,8 +199,15 @@ export function validateCwd(cwd: string): string | null {
     if (!statSync(cwd).isDirectory()) {
       return `Invalid cwd '${cwd}': not a directory`;
     }
-  } catch {
-    return `Invalid cwd '${cwd}': directory does not exist`;
+  } catch (error) {
+    const code = typeof error === 'object' && error !== null && 'code' in error
+      ? String((error as NodeJS.ErrnoException).code)
+      : null;
+    if (code === 'ENOENT') {
+      return `Invalid cwd '${cwd}': directory does not exist`;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    return `Invalid cwd '${cwd}': cannot inspect directory${code ? ` (${code})` : ''}: ${message}`;
   }
   return null;
 }
@@ -250,6 +261,22 @@ function initDatabases(cwd: string): [Database, Database] {
 // COMMAND HANDLERS
 // ============================================================================
 
+/** Translate the extraction ADT into the CLI command protocol. */
+export function extractionToCommandResult(result: ExtractionResult): CommandResult {
+  if (result.kind === 'succeeded') {
+    return { success: true, output: JSON.stringify(result) };
+  }
+  if (result.kind === 'deferred') {
+    return { success: true, deferred: true, output: JSON.stringify(result) };
+  }
+  return {
+    success: false,
+    retryable: result.retryable,
+    output: JSON.stringify(result),
+    error: result.error,
+  };
+}
+
 /** Execute extraction for already-parsed session metadata. */
 async function handleExtractInput(input: HookInput): Promise<CommandResult> {
   try {
@@ -265,15 +292,11 @@ async function handleExtractInput(input: HookInput): Promise<CommandResult> {
 
   try {
     const result = await executeExtract(input, projectDb, globalDb);
-    return {
-      success: result.success,
-      output: JSON.stringify(result),
-      error: result.error,
-      deferred: result.skipped === true || result.deferred === true,
-    };
+    return extractionToCommandResult(result);
   } catch (err) {
     return {
       success: false,
+      retryable: true,
       error: `Extract failed: ${err}`,
     };
   } finally {
@@ -747,9 +770,8 @@ async function handleLifecycle(args: string[]): Promise<CommandResult> {
 }
 
 /**
- * Handle 'ai-prune' subcommand
- * AI-powered memory pruning via claude -p
- * --if-needed: smart trigger — skip if session count < 5 AND memory count < 50
+ * Handle `ai-prune`: direct OpenAI-compatible LLM first, CLI fallback.
+ * `--if-needed` runs on the session interval or sufficient memory growth.
  */
 async function handleAiPrune(args: string[]): Promise<CommandResult> {
   if (args.length < 1) {
@@ -1128,6 +1150,40 @@ async function handleEntityQuery(args: string[]): Promise<CommandResult> {
   }
 }
 
+export type PromptRecallDatabaseOpeners = Readonly<{
+  readOnly: (path: string) => Database;
+  readWrite: (path: string) => Database;
+  warn: (message: string) => void;
+}>;
+
+/** Open a prompt-recall DB read-only, with an observable read-write fallback. */
+export function openPromptRecallDatabase(
+  path: string,
+  openers: PromptRecallDatabaseOpeners = {
+    readOnly: openDatabaseReadOnly,
+    readWrite: openDatabase,
+    warn: (message) => process.stderr.write(`${message}\n`),
+  },
+): Database | null {
+  try {
+    return openers.readOnly(path);
+  } catch (error) {
+    openers.warn(
+      `[cortex] WARN: prompt-recall read-only open failed for ${path}; ` +
+        `falling back to read-write: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    try {
+      return openers.readWrite(path);
+    } catch (fallbackError) {
+      openers.warn(
+        `[cortex] WARN: prompt-recall could not open database ${path}: ` +
+          `${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`,
+      );
+      return null;
+    }
+  }
+}
+
 /**
  * Handle 'prompt-recall' subcommand (UserPromptSubmit hook)
  * Reads stdin JSON with prompt + cwd, runs keyword FTS5 recall
@@ -1196,23 +1252,8 @@ async function handlePromptRecall(): Promise<CommandResult> {
     // That path skips schema DDL/migrations and avoids the writer lock. If it
     // fails (e.g. odd filesystem semantics), the best-effort fallback uses the
     // normal read-write open and may initialize schema or take the writer lock.
-    const openReadOnly = (path: string): Database | null => {
-      try {
-        return openDatabaseReadOnly(path);
-      } catch {
-        try {
-          return openDatabase(path);
-        } catch (err) {
-          process.stderr.write(
-            `[cortex] WARN: prompt-recall could not open database ${path}: ` +
-              `${err instanceof Error ? err.message : String(err)}\n`
-          );
-          return null;
-        }
-      }
-    };
-    const projectDb = hasProjectDb ? openReadOnly(projectDbPath) : null;
-    const globalDb = hasGlobalDb ? openReadOnly(globalDbPath) : null;
+    const projectDb = hasProjectDb ? openPromptRecallDatabase(projectDbPath) : null;
+    const globalDb = hasGlobalDb ? openPromptRecallDatabase(globalDbPath) : null;
 
     try {
       const memories = await executePromptRecallWithFallback(projectDb, globalDb, {
@@ -1294,34 +1335,42 @@ async function handleMaintenance(args: string[]): Promise<CommandResult> {
  * Keeping sequencing in this worker lets the extension return immediately
  * while preserving extract → backfill → maintenance ordering.
  */
-async function handleIngestSession(): Promise<CommandResult> {
-  const input = await readStdinJson();
-  if (!input) {
-    return {
-      success: false,
-      error: 'No stdin input provided (expected JSON with session_id, transcript_path, cwd)',
-    };
+export type IngestSessionCommandOperations = Readonly<{
+  extract: (input: HookInput) => Promise<CommandResult>;
+  backfill: (cwd: string) => Promise<CommandResult>;
+  maintenance: (cwd: string) => Promise<CommandResult>;
+}>;
+
+/** Parse one CLI command result into the detached ingestion protocol. */
+export function commandToIngestionStep(result: CommandResult): IngestionStepResult {
+  if (result.deferred) {
+    return { kind: 'deferred', reason: result.error ?? result.output ?? 'command deferred' };
   }
+  return result.success
+    ? { kind: 'succeeded', ...(result.output === undefined ? {} : { output: result.output }) }
+    : {
+        kind: 'failed',
+        retryable: result.retryable === true,
+        error: result.error ?? 'command failed without an error',
+        ...(result.output === undefined ? {} : { output: result.output }),
+      };
+}
 
-  const asIngestionStep = async (command: Promise<CommandResult>) => {
-    const result = await command;
-    if (result.deferred) {
-      return { kind: 'deferred' as const, reason: result.error ?? result.output ?? 'command deferred' };
-    }
-    return result.success
-      ? { kind: 'succeeded' as const, ...(result.output === undefined ? {} : { output: result.output }) }
-      : {
-          kind: 'failed' as const,
-          error: result.error ?? 'command failed without an error',
-          ...(result.output === undefined ? {} : { output: result.output }),
-        };
-  };
-
+/** Injectable shell boundary for the complete detached ingestion pipeline. */
+export async function runIngestSessionInput(
+  input: HookInput,
+  operations: IngestSessionCommandOperations = {
+    extract: handleExtractInput,
+    backfill: (cwd) => handleBackfill([cwd]),
+    maintenance: (cwd) => handleMaintenance([cwd]),
+  },
+  retryPolicy?: SessionIngestionRetryPolicy,
+): Promise<CommandResult> {
   const result = await runSessionIngestion({
-    extract: () => asIngestionStep(handleExtractInput(input)),
-    backfill: () => asIngestionStep(handleBackfill([input.cwd])),
-    maintenance: () => asIngestionStep(handleMaintenance([input.cwd])),
-  });
+    extract: async () => commandToIngestionStep(await operations.extract(input)),
+    backfill: async () => commandToIngestionStep(await operations.backfill(input.cwd)),
+    maintenance: async () => commandToIngestionStep(await operations.maintenance(input.cwd)),
+  }, retryPolicy);
 
   const success = isSessionIngestionSuccessful(result);
   return {
@@ -1329,6 +1378,16 @@ async function handleIngestSession(): Promise<CommandResult> {
     output: formatSessionIngestionResult(result),
     error: success ? undefined : 'Session ingestion completed with failed step(s)',
   };
+}
+
+async function handleIngestSession(): Promise<CommandResult> {
+  const input = await readStdinJson();
+  return input
+    ? runIngestSessionInput(input)
+    : {
+        success: false,
+        error: 'No stdin input provided (expected JSON with session_id, transcript_path, cwd)',
+      };
 }
 
 // ============================================================================

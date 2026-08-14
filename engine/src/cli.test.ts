@@ -5,12 +5,20 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Database } from 'bun:sqlite';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { parseHookInput, parseRecallArgs, validateCwd, summarizeBackfillResults } from './cli.js';
+import {
+  extractionToCommandResult,
+  openPromptRecallDatabase,
+  parseHookInput,
+  parseRecallArgs,
+  runIngestSessionInput,
+  summarizeBackfillResults,
+  validateCwd,
+} from './cli.js';
 import { openDatabase, insertMemory } from './infra/db.js';
 import { createMemory } from './core/types.js';
 import { getProjectName } from './config.js';
@@ -565,9 +573,33 @@ describe('cli - validateCwd', () => {
     expect(error).not.toBeNull();
     expect(error).toContain('not a directory');
   });
+
+  it('reports non-ENOENT filesystem failures instead of calling them missing', () => {
+    const loop = join(tmpDir, 'symlink-loop');
+    symlinkSync(loop, loop);
+
+    const error = validateCwd(loop);
+
+    expect(error).toContain('ELOOP');
+    expect(error).not.toContain('directory does not exist');
+  });
 });
 
 describe('cli - prompt-recall best-effort diagnostics', () => {
+  it('reports a read-only open failure before using the read-write fallback', () => {
+    const fallback = openDatabase(':memory:');
+    const warnings: string[] = [];
+    const opened = openPromptRecallDatabase('/fixture/memory.db', {
+      readOnly: () => { throw new Error('readonly filesystem rejected open'); },
+      readWrite: () => fallback,
+      warn: (message) => { warnings.push(message); },
+    });
+
+    expect(opened).toBe(fallback);
+    expect(warnings).toEqual([expect.stringContaining('read-only open failed')]);
+    fallback.close();
+  });
+
   it('warns on malformed hook input while preserving a successful exit', () => {
     const home = mkdtempSync(join(tmpdir(), 'cortex-prompt-recall-home-'));
     try {
@@ -583,6 +615,86 @@ describe('cli - prompt-recall best-effort diagnostics', () => {
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
+  });
+});
+
+describe('cli - detached ingestion adapter', () => {
+  it('maps extraction deferral and retries it before backfill', async () => {
+    const calls: string[] = [];
+    let attempts = 0;
+    const result = await runIngestSessionInput({
+      session_id: 'session-adapter',
+      transcript_path: '/tmp/transcript.jsonl',
+      cwd: '/tmp',
+    }, {
+      extract: async () => {
+        calls.push('extract');
+        attempts++;
+        return extractionToCommandResult(attempts === 1
+          ? {
+              kind: 'deferred',
+              reason: 'chunk budget exhausted',
+              extracted_count: 2,
+              edge_count: 1,
+              cursor_position: 100_000,
+            }
+          : {
+              kind: 'succeeded',
+              extracted_count: 3,
+              edge_count: 1,
+              cursor_position: 150_000,
+            });
+      },
+      backfill: async () => { calls.push('backfill'); return { success: true, output: 'embedded' }; },
+      maintenance: async () => { calls.push('maintenance'); return { success: true, output: 'maintained' }; },
+    }, {
+      maxExtractionAttempts: 2,
+      retryDelayMs: () => 0,
+      sleep: async () => {},
+    });
+
+    expect(calls).toEqual(['extract', 'extract', 'backfill', 'maintenance']);
+    expect(result.success).toBe(true);
+    expect(result.output).toContain('extract:');
+  });
+
+  it('maps retryable extraction failures into the bounded retry path', async () => {
+    const calls: string[] = [];
+    let attempts = 0;
+    const result = await runIngestSessionInput({
+      session_id: 'session-retryable',
+      transcript_path: '/tmp/transcript.jsonl',
+      cwd: '/tmp',
+    }, {
+      extract: async () => {
+        calls.push('extract');
+        attempts++;
+        return extractionToCommandResult(attempts === 1
+          ? {
+              kind: 'failed',
+              retryable: true,
+              error: 'temporary LLM timeout',
+              extracted_count: 0,
+              edge_count: 0,
+              cursor_position: 0,
+            }
+          : {
+              kind: 'succeeded',
+              extracted_count: 1,
+              edge_count: 0,
+              cursor_position: 10,
+            });
+      },
+      backfill: async () => { calls.push('backfill'); return { success: true }; },
+      maintenance: async () => { calls.push('maintenance'); return { success: true }; },
+    }, {
+      maxExtractionAttempts: 2,
+      retryDelayMs: () => 0,
+      sleep: async () => {},
+    });
+
+    expect(calls).toEqual(['extract', 'extract', 'backfill', 'maintenance']);
+    expect(result.success).toBe(true);
   });
 });
 

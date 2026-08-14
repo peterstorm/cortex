@@ -8,7 +8,11 @@ import {
 } from './ingest-session.js';
 
 const succeeded = (output: string): IngestionStepResult => ({ kind: 'succeeded', output });
-const failed = (error: string): IngestionStepResult => ({ kind: 'failed', error });
+const failed = (error: string, retryable = false): IngestionStepResult => ({
+  kind: 'failed',
+  retryable,
+  error,
+});
 const deferred = (reason: string): IngestionStepResult => ({ kind: 'deferred', reason });
 
 const immediateRetryPolicy = (
@@ -69,9 +73,43 @@ describe('runSessionIngestion', () => {
     expect(calls).toEqual(['extract', 'extract', 'maintenance']);
     expect(isSessionIngestionSuccessful(result)).toBe(false);
     expect(result).toMatchObject({
-      extraction: { kind: 'failed', error: expect.stringContaining('remained deferred after 2 attempt') },
+      extraction: { kind: 'failed', error: expect.stringContaining('remained retryable after 2 attempt') },
       backfill: { kind: 'skipped', reason: 'extraction failed' },
     });
+  });
+
+  it('retries a transient extraction failure before backfill', async () => {
+    const calls: string[] = [];
+    const delays: number[] = [];
+    let attempts = 0;
+    const result = await runSessionIngestion({
+      extract: async () => {
+        calls.push('extract');
+        attempts++;
+        return attempts === 1
+          ? failed('temporary provider timeout', true)
+          : succeeded('recovered transcript');
+      },
+      backfill: async () => { calls.push('backfill'); return succeeded('embedded'); },
+      maintenance: async () => { calls.push('maintenance'); return succeeded('generated'); },
+    }, immediateRetryPolicy(2, delays));
+
+    expect(calls).toEqual(['extract', 'extract', 'backfill', 'maintenance']);
+    expect(delays).toEqual([10]);
+    expect(result.extraction).toEqual({ kind: 'succeeded', output: 'recovered transcript' });
+    expect(isSessionIngestionSuccessful(result)).toBe(true);
+  });
+
+  it('does not retry a terminal extraction failure', async () => {
+    const calls: string[] = [];
+    const result = await runSessionIngestion({
+      extract: async () => { calls.push('extract'); return failed('invalid transcript path'); },
+      backfill: async () => { calls.push('backfill'); return succeeded('unexpected'); },
+      maintenance: async () => { calls.push('maintenance'); return succeeded('surface refreshed'); },
+    }, immediateRetryPolicy(3));
+
+    expect(calls).toEqual(['extract', 'maintenance']);
+    expect(result.extraction).toMatchObject({ kind: 'failed', retryable: false });
   });
 
   it('skips backfill after extraction failure but still runs maintenance', async () => {

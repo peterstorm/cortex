@@ -84,20 +84,23 @@ export interface FactConflict {
   readonly newValue: string;
 }
 
-export interface ExtractionResult {
-  readonly success: boolean;
-  readonly extracted_count: number;
-  readonly edge_count: number;
-  readonly cursor_position: number;
-  readonly dedup_skipped?: number;
-  readonly dedup_merged?: number;
-  readonly entity_conflicts?: readonly FactConflict[];
-  /** True when this run was skipped because another extraction holds the lock. */
-  readonly skipped?: boolean;
-  /** True when bounded work remains and the detached worker must invoke extraction again. */
-  readonly deferred?: boolean;
-  readonly error?: string;
-}
+type ExtractionProgress = Readonly<{
+  extracted_count: number;
+  edge_count: number;
+  cursor_position: number;
+  dedup_skipped?: number;
+  dedup_merged?: number;
+  entity_conflicts?: readonly FactConflict[];
+}>;
+
+/**
+ * One extraction attempt outcome. The discriminator makes success, deferral,
+ * retryable failure, and terminal failure mutually exclusive.
+ */
+export type ExtractionResult =
+  | Readonly<{ kind: 'succeeded' } & ExtractionProgress>
+  | Readonly<{ kind: 'deferred'; reason: string } & ExtractionProgress>
+  | Readonly<{ kind: 'failed'; retryable: boolean; error: string } & ExtractionProgress>;
 
 // ============================================================================
 // IMPERATIVE SHELL - I/O ORCHESTRATION
@@ -127,12 +130,11 @@ export async function executeExtract(
   if (!lock.acquired) {
     logInfo(`Extraction skipped: lock ${lock.reason}`);
     return {
-      success: true,
+      kind: 'deferred',
+      reason: 'another extraction is running',
       extracted_count: 0,
       edge_count: 0,
       cursor_position: 0,
-      skipped: true,
-      error: 'skipped: another extraction running',
     };
   }
 
@@ -142,7 +144,8 @@ export async function executeExtract(
     if (!isClaudeLlmAvailable() && resolveOpenAiCompatEndpoint() === null) {
       logInfo('No LLM available (no OpenAI-compatible endpoint configured and no LLM CLI on PATH) — extraction skipped');
       return {
-        success: false,
+        kind: 'failed',
+        retryable: false,
         extracted_count: 0,
         edge_count: 0,
         cursor_position: 0,
@@ -158,7 +161,8 @@ export async function executeExtract(
       const message = err instanceof Error ? err.message : String(err);
       logError(`Failed to read transcript: ${message}`);
       return {
-        success: false,
+        kind: 'failed',
+        retryable: false,
         extracted_count: 0,
         edge_count: 0,
         cursor_position: 0,
@@ -203,7 +207,8 @@ export async function executeExtract(
     // the next run retries it; progress from earlier chunks in this run is
     // already checkpointed.
     const chunkFailure = (error: string): ExtractionResult => ({
-      success: false,
+      kind: 'failed',
+      retryable: true,
       extracted_count: totalInserted,
       edge_count: edgeCount,
       cursor_position: cursor,
@@ -305,8 +310,8 @@ export async function executeExtract(
         scopedCandidates: readonly MemoryCandidate[],
         scopedEmbeddings: Map<number, Float32Array>,
         existing: readonly Memory[]
-      ): { inserted: Memory[]; skipped: number; merged: number; writeFailures: number } => {
-        const { kept, skipped, merges } = deduplicateCandidates(
+      ): { inserted: Memory[]; reused: Memory[]; skipped: number; merged: number; writeFailures: number } => {
+        const { kept, reused, skipped, merges } = deduplicateCandidates(
           scopedCandidates, existing, DEDUP_SIMILARITY_THRESHOLD, scopedEmbeddings, MERGE_CEILING_THRESHOLD
         );
 
@@ -339,13 +344,13 @@ export async function executeExtract(
           }
         }
 
-        return { inserted, skipped, merged: mergeResult.merged, writeFailures };
+        return { inserted, reused, skipped, merged: mergeResult.merged, writeFailures };
       };
 
       const projectResult = processScope(projectDb, projectCandidates, projectEmbeddings, existingMemories);
       const globalResult = globalDb && globalCandidates.length > 0
         ? processScope(globalDb, globalCandidates, globalEmbeddings, getActiveMemories(globalDb))
-        : { inserted: [] as Memory[], skipped: 0, merged: 0, writeFailures: 0 };
+        : { inserted: [] as Memory[], reused: [] as Memory[], skipped: 0, merged: 0, writeFailures: 0 };
 
       if (globalResult.inserted.length > 0) {
         logInfo(`Routed ${globalResult.inserted.length} global-scoped memories to global DB`);
@@ -372,7 +377,13 @@ export async function executeExtract(
 
       // Edges and entity facts stay project-DB-only: edges/facts have FK
       // constraints into the same database, so cross-DB links are impossible.
-      const insertedMemories: Memory[] = [...projectResult.inserted];
+      // Exact existing matches are reused on checkpoint retries. This makes
+      // relationship persistence idempotent: if the memory landed before an
+      // edge write failed, the retry can still recreate the missing edge.
+      const insertedMemories: Memory[] = [
+        ...projectResult.inserted,
+        ...projectResult.reused,
+      ];
 
       // Entity-only and global-only responses still need project-local fact
       // provenance. Persist one deterministic context memory for this chunk so
@@ -395,7 +406,9 @@ export async function executeExtract(
         }
       }
 
-      // Compute similarity and create edges (FR-061)
+      // Compute similarity and create edges (FR-061). Non-duplicate edge
+      // persistence failures are checkpoint-critical: retrying the chunk is
+      // the only way to recover relationships that never reached the DB.
       if (insertedMemories.length > 0) {
         try {
           edgeCount += computeSimilarityAndCreateEdges(
@@ -405,8 +418,8 @@ export async function executeExtract(
           );
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
-          logError(`Failed to compute similarity: ${message}`);
-          // Non-fatal - continue
+          logError(`Failed to persist similarity edge: ${message}`);
+          return chunkFailure('Edge persistence failed; checkpoint not advanced');
         }
       }
 
@@ -443,15 +456,14 @@ export async function executeExtract(
 
     if (cursor < transcriptContent.length) {
       return {
-        success: true,
-        deferred: true,
+        kind: 'deferred',
+        reason: `Extraction chunk budget exhausted at cursor ${cursor} of ${transcriptContent.length}; retry required`,
         extracted_count: totalInserted,
         edge_count: edgeCount,
         cursor_position: cursor,
         dedup_skipped: dedupSkipped > 0 ? dedupSkipped : undefined,
         dedup_merged: dedupMergedCount > 0 ? dedupMergedCount : undefined,
         entity_conflicts: entityConflicts.length > 0 ? entityConflicts : undefined,
-        error: `Extraction chunk budget exhausted at cursor ${cursor} of ${transcriptContent.length}; retry required`,
       };
     }
 
@@ -476,7 +488,7 @@ export async function executeExtract(
     }
 
     return {
-      success: true,
+      kind: 'succeeded',
       extracted_count: totalInserted,
       edge_count: edgeCount,
       cursor_position: cursor,
@@ -489,7 +501,8 @@ export async function executeExtract(
     const message = err instanceof Error ? err.message : String(err);
     logError(`Unexpected extraction error: ${message}`);
     return {
-      success: false,
+      kind: 'failed',
+      retryable: true,
       extracted_count: 0,
       edge_count: 0,
       cursor_position: 0,
@@ -638,7 +651,8 @@ export function applyDedupMerges(
  *   INTRA_BATCH_DEDUP_THRESHOLD); candidates scoring >= it against an
  *   already-kept candidate are skipped whether or not they also match an
  *   existing memory
- * @returns Kept candidates, count of skipped duplicates, and merge targets
+ * @returns Kept candidates, exact existing matches reusable for idempotent
+ * persistence retries, count of skipped duplicates, and merge targets
  */
 export function deduplicateCandidates(
   candidates: readonly MemoryCandidate[],
@@ -647,7 +661,7 @@ export function deduplicateCandidates(
   candidateEmbeddings: Map<number, Float32Array> = new Map(),
   mergeCeiling: number = MERGE_CEILING_THRESHOLD,
   intraBatchThreshold: number = INTRA_BATCH_DEDUP_THRESHOLD
-): { kept: MemoryCandidate[]; skipped: number; merges: DeduplicateMerge[] } {
+): { kept: MemoryCandidate[]; reused: Memory[]; skipped: number; merges: DeduplicateMerge[] } {
   // Pre-tokenize existing memories once
   const existingTokenSets = existingMemories.map(
     (m) => tokenize(`${m.summary} ${m.content}`)
@@ -662,6 +676,7 @@ export function deduplicateCandidates(
   const keptTokenSets: ReadonlySet<string>[] = [];
   const keptEmbeddings: (Float32Array | null)[] = [];
   const merges: DeduplicateMerge[] = [];
+  const reused: Memory[] = [];
   let skipped = 0;
 
   for (let i = 0; i < candidates.length; i++) {
@@ -712,8 +727,10 @@ export function deduplicateCandidates(
       // Intra-batch duplicates are always skipped (no merge target)
       skipped++;
     } else if (bestScore >= mergeCeiling) {
-      // True duplicate — skip entirely
+      // True duplicate — do not insert again, but retain the persisted match
+      // so checkpoint retries can replay idempotent edge/fact writes.
       skipped++;
+      if (bestMatchIndex >= 0) reused.push(existingMemories[bestMatchIndex]);
     } else if (bestScore >= threshold && bestMatchIndex >= 0) {
       // Similar but not identical — merge into existing memory
       merges.push({
@@ -727,7 +744,7 @@ export function deduplicateCandidates(
     }
   }
 
-  return { kept, skipped, merges };
+  return { kept, reused, skipped, merges };
 }
 
 /** An edge to create between a new memory and an existing one */
@@ -832,11 +849,14 @@ export function computeSimilarityAndCreateEdges(
         edgeCount++;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        // Duplicate edge constraint is the expected re-ask case (the pair's
-        // typed edge may already exist); every other failure — SQLITE_BUSY,
-        // FK violations, disk errors — must not vanish silently.
+        // Duplicate edge constraint is the expected idempotent re-ask case
+        // (the pair's typed edge may already exist). Every other failure must
+        // block checkpoint advancement so the relationship remains retryable.
         if (!/unique constraint/i.test(message)) {
-          logError(`Failed to create edge ${newMem.id} -> ${candidate.targetId}: ${message}`);
+          throw new Error(
+            `Failed to create edge ${newMem.id} -> ${candidate.targetId}: ${message}`,
+            { cause: err },
+          );
         }
       }
     }

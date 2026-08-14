@@ -1,7 +1,7 @@
 /**
  * Core domain types for Cortex memory system.
- * All types are discriminated unions or readonly interfaces.
- * Factory functions validate invariants at construction time.
+ * Uses readonly domain shapes, literal and nominal types, discriminated
+ * unions, and factory validation for construction-time invariants.
  */
 
 // ============================================================================

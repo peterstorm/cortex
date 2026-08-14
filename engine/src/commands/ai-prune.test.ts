@@ -314,7 +314,12 @@ describe('AI prune failure telemetry', () => {
 // surface cache and supersedes facts from archived memories
 // ============================================================================
 
-import { upsertEntity, insertFact, getCurrentFacts } from '../infra/db.js';
+import {
+  getCurrentFacts,
+  insertEdge,
+  insertFact,
+  upsertEntity,
+} from '../infra/db.js';
 
 describe('ai-prune side effects (findings 1b, 12)', () => {
   beforeEach(() => {
@@ -368,6 +373,62 @@ describe('ai-prune side effects (findings 1b, 12)', () => {
 
     expect(result.archived).toBe(0);
     expect(fs.readdirSync(cacheDir).filter(f => f.endsWith('.json'))).toHaveLength(1);
+
+    projectDb.close();
+    globalDb.close();
+  });
+
+  it('archives a global memory and applies global side effects', async () => {
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    const telemetryPath = makeTelemetryPath();
+    const cwd = nodePath.dirname(telemetryPath);
+    const cacheDir = nodePath.join(cwd, '.memory', 'surface-cache');
+    fs.mkdirSync(cacheDir, { recursive: true });
+    fs.writeFileSync(nodePath.join(cacheDir, 'global-stale.json'), '{"surface":"stale"}', 'utf8');
+
+    for (let i = 0; i < 6; i++) {
+      insertMemory(projectDb, makeMemory(`project-old-${i}`, 30));
+    }
+    insertMemory(globalDb, makeMemory('global-target', 30, { scope: 'global' }));
+    insertMemory(globalDb, makeMemory('global-peer', 30, { scope: 'global' }));
+    insertEdge(globalDb, {
+      source_id: 'global-target',
+      target_id: 'global-peer',
+      relation_type: 'relates_to',
+      strength: 0.8,
+      bidirectional: true,
+      status: 'active',
+    });
+    const entityId = upsertEntity(globalDb, 'GlobalTool', 'tool');
+    insertFact(globalDb, {
+      id: 'global-fact',
+      entity_id: entityId,
+      predicate: 'used by',
+      object: 'all projects',
+      source_memory_id: 'global-target',
+      confidence: 0.9,
+      valid_from: new Date().toISOString(),
+      valid_to: null,
+      created_at: new Date().toISOString(),
+    });
+
+    mockRunLlmPrompt.mockResolvedValue(JSON.stringify({ candidates: [
+      { id: 'global-target', reason: 'obsolete global context' },
+    ] }));
+
+    const result = await runAiPrune(projectDb, globalDb, telemetryPath, cwd);
+
+    expect(result.archived).toBe(1);
+    expect(getMemory(globalDb, 'global-target')).toMatchObject({
+      status: 'archived',
+      archived_at: expect.any(String),
+    });
+    expect(globalDb.query('SELECT status FROM edges').all()).toEqual([
+      { status: 'archived' },
+    ]);
+    expect(getCurrentFacts(globalDb, entityId)).toHaveLength(0);
+    expect(fs.readdirSync(cacheDir).filter((file) => file.endsWith('.json'))).toHaveLength(0);
 
     projectDb.close();
     globalDb.close();

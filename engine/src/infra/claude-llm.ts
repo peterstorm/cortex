@@ -2,9 +2,10 @@
  * LLM client for memory extraction and edge classification.
  *
  * Prefers the direct OpenAI-compatible endpoint (see llm-client.ts — ~30x
- * faster, thinking disabled, schema-guided decoding); falls back to the
- * `claude -p` / `pi -p` subprocess path when no endpoint is configured or
- * the direct call fails.
+ * faster with thinking disabled). Callers request either JSON mode or strict
+ * schema-guided decoding as appropriate. Falls back to the `claude -p` /
+ * `pi -p` subprocess path when no endpoint is configured or the direct call
+ * fails.
  *
  * FR-001: Extract memories automatically at session end
  * FR-009: Complete extraction within 30 seconds (p95)
@@ -441,9 +442,8 @@ If no strong relationships, return {"edges": []}.`;
  * classification prompt explicitly requests. It never throws: an unparseable
  * response is reported as {kind:'unparseable'} so the caller can count the
  * batch as failed and retry instead of mistaking garbage for a decline.
- * Invalid items inside an otherwise-valid response are dropped; when the
- * dropped item carried a pair_index (the deterministic protocol), the whole
- * response is treated as unparseable so the affected pair is retried.
+ * Any invalid item makes the whole response unparseable so no affected pair
+ * can be mistaken for a genuine decline; the caller retries the batch.
  *
  * Strict mode (direct API with guided decoding) requires the whole response
  * to be a valid JSON object with an edges array, requires every item to be

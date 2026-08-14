@@ -1453,11 +1453,11 @@ function validateTableName(name: string): void {
 }
 
 /**
- * Restore database from checkpoint
- * I/O: Overwrites current database with checkpoint
+ * Restore database from checkpoint.
  *
- * Note: This requires closing the current database and copying the checkpoint.
- * In production, this would need to be handled at a higher level.
+ * Validates and attaches the checkpoint to the open database, validates every
+ * copied table, transactionally replaces main-table contents and cleans FTS
+ * orphans, then detaches the checkpoint even when restoration fails.
  *
  * @param db - Database instance
  * @param checkpointPath - Path to checkpoint file
