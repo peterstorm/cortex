@@ -29,7 +29,7 @@ Claude Code reads `.claude/cortex-memory.local.md` as context, giving it "memory
 
 ### Session Start
 
-A `SessionStart` hook loads a cached "surface" — a compact markdown summary of the most relevant memories. The cache is keyed by `sha256(branch:cwd)` and valid for 24 hours. If stale or missing, it regenerates from the database — but only for projects that already have a `.memory/cortex.db` (the hook never creates databases in untouched projects). Additionally, a `UserPromptSubmit` hook pipes the surface file contents on every prompt, and a second `UserPromptSubmit` hook (`prompt-recall.sh`) runs keyword recall against your prompt — strict AND search over prompt keywords first, OR fallback, plus a conservative semantic fallback (0.65 cosine floor) when keywords find nothing.
+A `SessionStart` hook loads a cached "surface" — a compact markdown summary of the most relevant memories. The cache is keyed by `sha256(branch:cwd)` and valid for 24 hours. If stale or missing, it regenerates from the database — but only for projects that already have a `.memory/cortex.db` (the hook never creates databases in untouched projects). In Pi, this cache refresh is detached so startup and `/new` do not wait on the engine CLI; an existing surface remains readable until the atomic refresh completes. Additionally, a `UserPromptSubmit` hook pipes the surface file contents on every prompt, and a second `UserPromptSubmit` hook (`prompt-recall.sh`) runs keyword recall against your prompt — strict AND search over prompt keywords first, OR fallback, plus a conservative semantic fallback (0.65 cosine floor) when keywords find nothing.
 
 ### During a Session
 
@@ -46,7 +46,9 @@ A `SessionEnd` hook detaches a background worker (so nothing blocks the session)
 5. **AI Prune** — When due, the LLM evaluates active memories and archives low-value ones
 6. **Generate** — Rebuild the surface file LAST, after all archival, so the next session never starts from a surface containing just-archived memories
 
-Steps 3-6 run through one per-project-locked `maintenance` command. Simultaneous session shutdowns therefore cannot multiply expensive LLM workers, and a separate AI-prune lock protects manual invocations. Each detached session worker writes PID-scoped extraction, backfill, and maintenance logs under `/tmp`.
+Steps 3-6 run through one per-project-locked `maintenance` command. Simultaneous session shutdowns therefore cannot multiply expensive LLM workers, and a separate AI-prune lock protects manual invocations. Claude Code's detached hook worker writes PID-scoped extraction, backfill, and maintenance logs under `/tmp`.
+
+The Pi extension launches extract → backfill → maintenance as one detached `ingest-session` worker. Its `session_shutdown` handler returns immediately, so `/new` and `/q` do not wait for transcript ingestion.
 
 Nested extraction LLMs inherit `CORTEX_EXTRACTING=1`; both Pi and Claude Code shutdown handlers treat that marker as a terminal no-op. This invariant prevents a headless extraction process from recursively spawning another maintenance pipeline. All hooks remain non-blocking and never fail the parent session.
 
@@ -397,7 +399,7 @@ The LLM evaluates active memories in batches and archives low-value ones. Trigge
 | `CORTEX_LLM_MODEL` | Override the model passed to the LLM binary | No (`haiku` for claude; none for pi) |
 | `CLAUDE_PLUGIN_ROOT` | Plugin directory | Auto-set by Claude Code |
 
-Extraction, AI pruning, and edge classification prefer a **direct OpenAI-compatible endpoint** when one is configured: `CORTEX_LLM_API_URL`, `CORTEX_LLM_API_KEY`, and `CORTEX_LLM_MODEL` (or the pi provider config in `~/.pi/agent/models.json` — the active provider's `baseUrl`/`apiKey`/first model). Calls disable model thinking and use schema-guided JSON output where supported. Without a configured endpoint they fall back to a headless coding-agent CLI: `claude -p --model haiku` by default, or `pi -p` when running under the pi agent.
+Extraction, AI pruning, and edge classification prefer a **direct OpenAI-compatible endpoint** when one is configured: `CORTEX_LLM_API_URL`, `CORTEX_LLM_API_KEY`, and `CORTEX_LLM_MODEL` (or the pi provider config in `~/.pi/agent/models.json` — the active provider's `baseUrl`/`apiKey`/first model). Calls disable model thinking and use schema-guided JSON output where supported. Without a configured endpoint they fall back to a headless coding-agent CLI: `claude -p --model haiku` by default, or `pi -p --thinking off` when running under the pi agent.
 
 ### Key Constants
 

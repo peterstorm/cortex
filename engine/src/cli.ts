@@ -12,6 +12,7 @@
  *
  * Subcommands:
  * - extract: Session-end extraction (Stop hook)
+ * - ingest-session: Detached extract + backfill + maintenance pipeline for Pi
  * - generate: Push surface generation
  * - recall: Semantic search
  * - remember: Explicit memory creation
@@ -69,6 +70,7 @@ import type { BackfillResult } from './commands/backfill.js';
 import { executeSemanticEdges } from './commands/semantic-edges.js';
 import { executePromptRecallWithFallback, formatPromptRecall } from './commands/prompt-recall.js';
 import { executeEntityQuery, formatEntityQueryResult } from './commands/entity-query.js';
+import { formatSessionIngestionResult, runSessionIngestion } from './commands/ingest-session.js';
 import { disposeLocalModel, embedLocal } from './infra/local-embed.js';
 
 // ============================================================================
@@ -242,19 +244,8 @@ function initDatabases(cwd: string): [Database, Database] {
 // COMMAND HANDLERS
 // ============================================================================
 
-/**
- * Handle 'extract' subcommand (Stop hook)
- * Reads stdin JSON for hook input
- */
-async function handleExtract(): Promise<CommandResult> {
-  const input = await readStdinJson();
-  if (!input) {
-    return {
-      success: false,
-      error: 'No stdin input provided (expected JSON with session_id, transcript_path, cwd)',
-    };
-  }
-
+/** Execute extraction for already-parsed session metadata. */
+async function handleExtractInput(input: HookInput): Promise<CommandResult> {
   try {
     ensureGitignored(input.cwd, GITIGNORE_PATTERNS);
   } catch (err) {
@@ -282,6 +273,20 @@ async function handleExtract(): Promise<CommandResult> {
     projectDb.close();
     globalDb.close();
   }
+}
+
+/**
+ * Handle 'extract' subcommand (Stop hook)
+ * Reads stdin JSON for hook input.
+ */
+async function handleExtract(): Promise<CommandResult> {
+  const input = await readStdinJson();
+  return input
+    ? handleExtractInput(input)
+    : {
+        success: false,
+        error: 'No stdin input provided (expected JSON with session_id, transcript_path, cwd)',
+      };
 }
 
 /**
@@ -1278,6 +1283,33 @@ async function handleMaintenance(args: string[]): Promise<CommandResult> {
   }
 }
 
+/**
+ * Handle the complete detached Pi session-end pipeline from one stdin payload.
+ * Keeping sequencing in this worker lets the extension return immediately
+ * while preserving extract → backfill → maintenance ordering.
+ */
+async function handleIngestSession(): Promise<CommandResult> {
+  const input = await readStdinJson();
+  if (!input) {
+    return {
+      success: false,
+      error: 'No stdin input provided (expected JSON with session_id, transcript_path, cwd)',
+    };
+  }
+
+  const result = await runSessionIngestion({
+    extract: () => handleExtractInput(input),
+    backfill: () => handleBackfill([input.cwd]),
+    maintenance: () => handleMaintenance([input.cwd]),
+  });
+
+  return {
+    success: result.success,
+    output: formatSessionIngestionResult(result),
+    error: result.success ? undefined : 'Session ingestion completed with failed step(s)',
+  };
+}
+
 // ============================================================================
 // MAIN DISPATCH
 // ============================================================================
@@ -1291,7 +1323,7 @@ async function main() {
 
   if (args.length === 0) {
     logError('Usage: cli.ts <subcommand> [args...]');
-    logError('Subcommands: extract, generate, recall, remember, index-code, forget, consolidate, lifecycle, ai-prune, maintenance, traverse, inspect, backfill, semantic-edges, load-surface, prompt-recall, entity-query');
+    logError('Subcommands: extract, ingest-session, generate, recall, remember, index-code, forget, consolidate, lifecycle, ai-prune, maintenance, traverse, inspect, backfill, semantic-edges, load-surface, prompt-recall, entity-query');
     process.exit(1);
   }
 
@@ -1304,6 +1336,9 @@ async function main() {
     switch (subcommand) {
       case 'extract':
         result = await handleExtract();
+        break;
+      case 'ingest-session':
+        result = await handleIngestSession();
         break;
       case 'generate':
         result = await handleGenerate(subcommandArgs);

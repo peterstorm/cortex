@@ -164,15 +164,18 @@ export default function (pi: ExtensionAPI) {
       ? { provider: ctx.model.provider, id: ctx.model.id }
       : undefined;
 
+    // Surface refresh is cache-backed and safe to complete in the background.
+    // An existing surface remains readable while the locked atomic writer
+    // refreshes it, so session startup and /new never wait on the engine CLI.
     const cwd = ctx.cwd;
-    runCli(["load-surface", cwd], { timeout: 10_000, cwd });
+    runCliDetached(["load-surface", cwd], { cwd });
   });
 
   pi.on("model_select", async (event) => {
     activeModel = { provider: event.model.provider, id: event.model.id };
   });
 
-  // ─── Session End: Extract + generate + lifecycle ────────────────────
+  // ─── Session End: enqueue extraction + maintenance asynchronously ──
   pi.on("session_shutdown", async (event, ctx) => {
     // A nested `pi -p` extraction inherits this marker. Never let that child
     // invoke Cortex's shutdown pipeline again: doing so recursively forks one
@@ -189,34 +192,27 @@ export default function (pi: ExtensionAPI) {
       ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : activeModel,
     );
 
-    // Persistent sessions have a JSONL transcript. In-memory/ephemeral Pi
-    // sessions do not, so skip only extraction rather than passing an empty
-    // path through to the engine and producing an ENOENT error.
-    let extractResult = "";
+    // Persistent sessions have a JSONL transcript. Enqueue the entire ordered
+    // pipeline in one detached worker so /new and /q never await extraction,
+    // embedding, or maintenance. The transcript remains on disk after the Pi
+    // session runtime is torn down, so the worker can safely read it later.
     if (transcriptPath && existsSync(transcriptPath)) {
       const hookInput = JSON.stringify({
         session_id: extractionSessionId,
         transcript_path: transcriptPath,
         cwd,
       });
-      extractResult = runCli(["extract"], {
+      runCliDetached(["ingest-session"], {
         stdin: hookInput,
-        timeout: 60_000,
         cwd,
         env: llmEnv,
       });
-    } else {
-      process.stderr.write("[cortex] No persisted Pi session transcript; extraction skipped\n");
+      return;
     }
 
-    // Step 2: Backfill embeddings
-    if (extractResult) {
-      runCli(["backfill", cwd], { timeout: 30_000, cwd });
-    }
-
-    // Steps 3-6 run in one detached, per-project locked worker. This prevents
-    // simultaneous session shutdowns from multiplying semantic-edge and AI
-    // prune LLM calls while keeping shutdown latency independent of maintenance.
+    // Ephemeral sessions have no transcript to ingest, but existing memory may
+    // still need lifecycle work or a surface refresh.
+    process.stderr.write("[cortex] No persisted Pi session transcript; extraction skipped\n");
     runCliDetached(["maintenance", cwd], { cwd, env: llmEnv });
   });
 

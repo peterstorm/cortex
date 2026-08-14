@@ -63,14 +63,16 @@ When your session ends, the hook detaches a background worker (so nothing blocks
 
 1. **Read transcript** — the JSONL file Claude Code writes during the session
 2. **Resume from checkpoint** — if transcript > 100KB, extraction is resumable; picks up where it left off
-3. **Send to the LLM CLI** — pipes extraction prompt to `claude -p --model haiku` (uses your Anthropic subscription), or `pi -p` when running under the pi agent
+3. **Send to the LLM** — prefer the configured direct OpenAI-compatible endpoint with thinking disabled; fall back to `claude -p --model haiku`, or `pi -p --thinking off` under the pi agent
 4. **Parse response** — validate each memory candidate (type, confidence, priority); global-scoped candidates go to the global DB
 5. **Store in DB** — insert memories, compute similarity edges to existing memories
 6. **Backfill embeddings** — embed newly stored memories (Gemini, or local fallback)
 7. **Maintenance (sequential)** — semantic edge classification, then lifecycle (decay/archive/prune), then AI prune. These used to be concurrent detached spawns, but SQLite allows one writer and lifecycle + AI prune both read-modify-write telemetry — so they now run one after another.
 8. **Regenerate surface LAST** — after all archival, so the surface never contains memories archived earlier in the same pipeline; the next session starts fresh
 
-Each step logs to a per-process file `/tmp/cortex-<step>.<pid>.log` (extract, backfill, semantic-edges, lifecycle, ai-prune, generate).
+In Pi, `session_shutdown` only starts a detached `ingest-session` worker and then returns. The worker owns all eight ordered steps, so `/new` and `/q` never await transcript extraction, embedding, or maintenance.
+
+The Claude Code hook logs to PID-scoped files under `/tmp` (`cortex-extract`, `cortex-backfill`, and `cortex-maintenance`).
 
 ---
 
@@ -263,6 +265,6 @@ Memories are inserted without embeddings (to avoid blocking extraction). A backg
 | `CORTEX_LLM_MODEL` | Override the model passed to the LLM binary | No |
 | `CLAUDE_PLUGIN_ROOT` | Plugin directory (set by Claude Code) | Auto |
 
-Extraction, AI pruning, and edge classification shell out to a headless coding-agent CLI: `claude -p --model haiku` by default (must be on PATH — it is when running inside Claude Code hooks), or `pi -p` when running under the pi agent (no `--model` flag, so pi's configured provider default is used). No API key needed — it uses your Anthropic subscription.
+Extraction, AI pruning, and edge classification prefer a configured direct OpenAI-compatible endpoint. The fallback is a headless coding-agent CLI: `claude -p --model haiku` by default (must be on PATH — it is when running inside Claude Code hooks), or `pi -p --thinking off` when running under the pi agent. The Pi fallback selects a provider-specific inexpensive extraction model when known and otherwise uses the configured provider/default model. No separate API key is needed for the CLI fallback.
 
 Without `GEMINI_API_KEY`, Gemini embeddings are skipped (the bundled local BGE model still embeds) and recall falls back accordingly. Extraction still works via the LLM CLI. Because hooks don't inherit your shell profile, they source the key from the `CORTEX_GEMINI_ENV` file.

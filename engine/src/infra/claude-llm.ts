@@ -139,7 +139,10 @@ export function buildLlmInvocation(env: NodeJS.ProcessEnv): LlmInvocation {
 
   if (provider) args.push('--provider', provider);
   if (model) args.push('--model', model);
-  args.push('--no-session');
+  // Structured ingestion does not benefit from hidden reasoning. Pinning this
+  // also prevents the headless child from inheriting the interactive session's
+  // PI_REASONING_LEVEL through its environment.
+  args.push('--thinking', 'off', '--no-session');
 
   return { binary, args, provider, model };
 }

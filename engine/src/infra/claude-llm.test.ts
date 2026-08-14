@@ -20,7 +20,7 @@ describe('buildLlmInvocation', () => {
 
     expect(invocation).toEqual({
       binary: 'pi',
-      args: ['pi', '-p', '--provider', 'openai-codex', '--model', 'gpt-5.4-mini', '--no-session'],
+      args: ['pi', '-p', '--provider', 'openai-codex', '--model', 'gpt-5.4-mini', '--thinking', 'off', '--no-session'],
       provider: 'openai-codex',
       model: 'gpt-5.4-mini',
     });
@@ -36,7 +36,7 @@ describe('buildLlmInvocation', () => {
 
     expect(invocation).toEqual({
       binary: 'pi',
-      args: ['pi', '-p', '--provider', 'google', '--model', 'gemini-2.5-flash-lite', '--no-session'],
+      args: ['pi', '-p', '--provider', 'google', '--model', 'gemini-2.5-flash-lite', '--thinking', 'off', '--no-session'],
       provider: 'google',
       model: 'gemini-2.5-flash-lite',
     });
@@ -51,7 +51,7 @@ describe('buildLlmInvocation', () => {
 
     expect(invocation).toEqual({
       binary: 'pi',
-      args: ['pi', '-p', '--provider', 'company-proxy', '--model', 'memory-fast-v2', '--no-session'],
+      args: ['pi', '-p', '--provider', 'company-proxy', '--model', 'memory-fast-v2', '--thinking', 'off', '--no-session'],
       provider: 'company-proxy',
       model: 'memory-fast-v2',
     });
@@ -68,7 +68,7 @@ describe('buildLlmInvocation', () => {
     expect(invocation.args).not.toContain('--model');
     expect(invocation).toEqual({
       binary: 'pi',
-      args: ['pi', '-p', '--provider', 'some-unknown-provider', '--no-session'],
+      args: ['pi', '-p', '--provider', 'some-unknown-provider', '--thinking', 'off', '--no-session'],
       provider: 'some-unknown-provider',
       model: undefined,
     });
@@ -99,7 +99,7 @@ describe('buildLlmInvocation', () => {
 
     expect(invocation).toEqual({
       binary: 'pi',
-      args: ['pi', '-p', '--no-session'],
+      args: ['pi', '-p', '--thinking', 'off', '--no-session'],
       provider: undefined,
       model: undefined,
     });
