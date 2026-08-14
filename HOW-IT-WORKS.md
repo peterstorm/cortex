@@ -62,10 +62,10 @@ There's also an `entity-query` CLI command for entity-first temporal retrieval (
 When your session ends, the hook detaches a background worker (so nothing blocks the session) that runs the pipeline sequentially:
 
 1. **Read transcript** — the JSONL file Claude Code writes during the session
-2. **Resume from checkpoint** — if transcript > 100KB, extraction is resumable; picks up where it left off
+2. **Resume from checkpoint** — extraction advances in 100KB chunks and picks up where it left off; an invocation processes at most five chunks, then the detached ingestion worker retries the deferred extraction until it reaches EOF
 3. **Send to the LLM** — prefer the configured direct OpenAI-compatible endpoint with thinking disabled; fall back to `claude -p --model haiku`, or `pi -p --thinking off` under the pi agent
-4. **Parse response** — validate each memory candidate (type, confidence, priority); global-scoped candidates go to the global DB
-5. **Store in DB** — insert memories, compute similarity edges to existing memories
+4. **Parse response** — validate each memory/entity candidate (type, confidence, priority); an all-invalid non-empty candidate array is a retryable parse failure, while global-scoped memories go to the global DB
+5. **Store in DB** — insert memories, retain the chunk checkpoint on any memory/fact write failure, and compute similarity edges; entity-only or global-only responses get a deterministic project-local provenance memory so facts always have a valid source
 6. **Backfill embeddings** — embed newly stored memories (Gemini, or local fallback)
 7. **Maintenance (sequential)** — semantic edge classification, then lifecycle (decay/archive/prune), then AI prune. These used to be concurrent detached spawns, but SQLite allows one writer and lifecycle + AI prune both read-modify-write telemetry — so they now run one after another.
 8. **Regenerate surface LAST** — after all archival, so the surface never contains memories archived earlier in the same pipeline; the next session starts fresh

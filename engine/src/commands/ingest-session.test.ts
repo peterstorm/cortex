@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   formatSessionIngestionResult,
+  isSessionIngestionSuccessful,
   runSessionIngestion,
   type IngestionStepResult,
   type SessionIngestionRetryPolicy,
@@ -29,7 +30,7 @@ describe('runSessionIngestion', () => {
     });
 
     expect(calls).toEqual(['extract', 'backfill', 'maintenance']);
-    expect(result.success).toBe(true);
+    expect(isSessionIngestionSuccessful(result)).toBe(true);
     expect(formatSessionIngestionResult(result)).toBe(
       'extract: 1 memory\nbackfill: embedded\nmaintenance: generated',
     );
@@ -51,8 +52,8 @@ describe('runSessionIngestion', () => {
 
     expect(calls).toEqual(['extract', 'extract', 'extract', 'backfill', 'maintenance']);
     expect(delays).toEqual([10, 20]);
+    expect(isSessionIngestionSuccessful(result)).toBe(true);
     expect(result).toMatchObject({
-      success: true,
       extraction: { kind: 'succeeded', output: 'retried transcript' },
     });
   });
@@ -66,8 +67,8 @@ describe('runSessionIngestion', () => {
     }, immediateRetryPolicy(2));
 
     expect(calls).toEqual(['extract', 'extract', 'maintenance']);
+    expect(isSessionIngestionSuccessful(result)).toBe(false);
     expect(result).toMatchObject({
-      success: false,
       extraction: { kind: 'failed', error: expect.stringContaining('remained deferred after 2 attempt') },
       backfill: { kind: 'skipped', reason: 'extraction failed' },
     });
@@ -82,8 +83,8 @@ describe('runSessionIngestion', () => {
     });
 
     expect(calls).toEqual(['extract', 'maintenance']);
+    expect(isSessionIngestionSuccessful(result)).toBe(false);
     expect(result).toMatchObject({
-      success: false,
       backfill: { kind: 'skipped', reason: 'extraction failed' },
       maintenance: { kind: 'succeeded' },
     });
@@ -96,8 +97,8 @@ describe('runSessionIngestion', () => {
       maintenance: async () => succeeded('surface refreshed'),
     });
 
+    expect(isSessionIngestionSuccessful(result)).toBe(false);
     expect(result).toMatchObject({
-      success: false,
       backfill: { kind: 'failed', error: 'embedding crashed' },
       maintenance: { kind: 'succeeded' },
     });

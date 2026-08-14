@@ -70,7 +70,11 @@ import type { BackfillResult } from './commands/backfill.js';
 import { executeSemanticEdges } from './commands/semantic-edges.js';
 import { executePromptRecallWithFallback, formatPromptRecall } from './commands/prompt-recall.js';
 import { executeEntityQuery, formatEntityQueryResult } from './commands/entity-query.js';
-import { formatSessionIngestionResult, runSessionIngestion } from './commands/ingest-session.js';
+import {
+  formatSessionIngestionResult,
+  isSessionIngestionSuccessful,
+  runSessionIngestion,
+} from './commands/ingest-session.js';
 import { disposeLocalModel, embedLocal } from './infra/local-embed.js';
 
 // ============================================================================
@@ -265,7 +269,7 @@ async function handleExtractInput(input: HookInput): Promise<CommandResult> {
       success: result.success,
       output: JSON.stringify(result),
       error: result.error,
-      deferred: result.skipped === true,
+      deferred: result.skipped === true || result.deferred === true,
     };
   } catch (err) {
     return {
@@ -1188,11 +1192,10 @@ async function handlePromptRecall(): Promise<CommandResult> {
       );
     }
 
-    // Read-only open: this hook fires on EVERY user prompt and only reads.
-    // Skips schema DDL/migrations and never takes the writer lock. Falls
-    // back to the normal read-write open if the read-only open fails
-    // (e.g. odd filesystem semantics) — best-effort, like the rest of
-    // this handler.
+    // Read-only fast path: this hook fires on EVERY user prompt and only reads.
+    // That path skips schema DDL/migrations and avoids the writer lock. If it
+    // fails (e.g. odd filesystem semantics), the best-effort fallback uses the
+    // normal read-write open and may initialize schema or take the writer lock.
     const openReadOnly = (path: string): Database | null => {
       try {
         return openDatabaseReadOnly(path);
@@ -1320,10 +1323,11 @@ async function handleIngestSession(): Promise<CommandResult> {
     maintenance: () => asIngestionStep(handleMaintenance([input.cwd])),
   });
 
+  const success = isSessionIngestionSuccessful(result);
   return {
-    success: result.success,
+    success,
     output: formatSessionIngestionResult(result),
-    error: result.success ? undefined : 'Session ingestion completed with failed step(s)',
+    error: success ? undefined : 'Session ingestion completed with failed step(s)',
   };
 }
 

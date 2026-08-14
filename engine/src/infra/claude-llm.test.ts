@@ -318,7 +318,7 @@ describe('parseEdgeClassificationResponse', () => {
     expect(result.kind).toBe('unparseable');
   });
 
-  it('filters invalid classifications in tolerant mode and keeps valid siblings', () => {
+  it('fails a tolerant batch when any unindexed classification is invalid', () => {
     const response = JSON.stringify([
       { source_id: 'mem1', target_id: 'mem2', relation_type: 'relates_to', strength: 0.8 },
       { source_id: 'mem3', target_id: 'mem4', relation_type: 'invalid', strength: 0.7 },
@@ -327,12 +327,7 @@ describe('parseEdgeClassificationResponse', () => {
 
     const result = parseEdgeClassificationResponse(response);
 
-    expect(result).toEqual({
-      kind: 'ok',
-      classifications: [
-        { source_id: 'mem1', target_id: 'mem2', relation_type: 'relates_to', strength: 0.8 },
-      ],
-    });
+    expect(result.kind).toBe('unparseable');
   });
 
   it('treats a dropped indexed item as unparseable so the pair is retried', () => {

@@ -635,7 +635,7 @@ describe("parseExtractionResponse", () => {
     expect(result.memories[0].tags).toEqual([]);
   });
 
-  it("returns empty when all candidates are invalid", () => {
+  it("returns parse_error when all candidates are invalid", () => {
     const response = JSON.stringify([
       {
         content: "Missing fields",
@@ -651,8 +651,7 @@ describe("parseExtractionResponse", () => {
       },
     ]);
 
-    const result = okParse(parseExtractionResponse(response));
-    expect(result.memories).toEqual([]);
+    expect(parseExtractionResponse(response).kind).toBe("parse_error");
   });
 
   it("reports every dropped item in a mixed-validity response", () => {

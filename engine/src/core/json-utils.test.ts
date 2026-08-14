@@ -45,6 +45,16 @@ describe('extractJsonSlice', () => {
     const result = extractJsonSlice('Here are the edges: [{"id":1}]');
     expect(result).toBe('[{"id":1}]');
   });
+
+  it('stops at the balanced value when trailing prose repeats its closer', () => {
+    const json = '[{"id":1}]';
+    expect(extractJsonSlice(`${json}\nExplanation mentions ] afterward.`)).toBe(json);
+  });
+
+  it('ignores balanced delimiters and escaped quotes inside JSON strings', () => {
+    const json = '{"text":"literal } and ] plus \\"quoted { text\\"","items":[1]}';
+    expect(extractJsonSlice(`prefix ${json} suffix }`)).toBe(json);
+  });
 });
 
 describe('parseJsonFromLlmText', () => {

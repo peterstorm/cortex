@@ -15,7 +15,6 @@ export type IngestionStepOutcome =
   | Readonly<{ kind: 'skipped'; reason: string }>;
 
 export type SessionIngestionResult = Readonly<{
-  success: boolean;
   extraction: IngestionStepOutcome;
   backfill: IngestionStepOutcome;
   maintenance: IngestionStepOutcome;
@@ -100,12 +99,14 @@ export async function runSessionIngestion(
     ? { kind: 'failed', error: `maintenance unexpectedly deferred: ${maintenanceResult.reason}` }
     : maintenanceResult;
 
-  const outcomes = [extraction, backfill, maintenance];
-  const success = outcomes.every(
+  return { extraction, backfill, maintenance };
+}
+
+/** Derive pipeline success from its outcomes so contradictory states cannot be constructed. */
+export function isSessionIngestionSuccessful(result: SessionIngestionResult): boolean {
+  return [result.extraction, result.backfill, result.maintenance].every(
     (outcome) => outcome.kind === 'succeeded' || outcome.kind === 'skipped',
   );
-
-  return { success, extraction, backfill, maintenance };
 }
 
 export function formatSessionIngestionResult(result: SessionIngestionResult): string {

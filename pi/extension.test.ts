@@ -36,7 +36,9 @@ function registerHandlers(): Map<string, (...args: unknown[]) => unknown> {
     on: (name: string, handler: (...args: unknown[]) => unknown) => {
       handlers.set(name, handler);
     },
-    registerCommand: () => undefined,
+    registerCommand: (name: string, command: { handler: (...args: unknown[]) => unknown }) => {
+      handlers.set(`command:${name}`, command.handler);
+    },
   } as never);
   return handlers;
 }
@@ -139,6 +141,38 @@ describe('Cortex Pi extension shutdown', () => {
     expect(child.unref).toHaveBeenCalledOnce();
   });
 
+  it('enqueues maintenance when an ephemeral session has no transcript', async () => {
+    const child = fakeChild();
+    childProcess.spawn.mockReturnValue(child as never);
+    const handlers = registerHandlers();
+    const cwd = tempProject();
+
+    await handlers.get('session_shutdown')?.({ reason: 'quit' }, {
+      cwd,
+      model: { provider: 'openai-codex', id: 'gpt-5.6-sol' },
+      sessionManager: {
+        getSessionFile: () => undefined,
+        getSessionId: () => 'ephemeral-session',
+      },
+    });
+
+    expect(childProcess.spawn).toHaveBeenCalledTimes(1);
+    expect(childProcess.spawn).toHaveBeenCalledWith(
+      'bun',
+      [expect.stringMatching(/engine\/src\/cli\.ts$/), 'maintenance', cwd],
+      expect.objectContaining({
+        cwd,
+        detached: true,
+        stdio: ['ignore', expect.any(Number), expect.any(Number)],
+        env: expect.objectContaining({
+          CORTEX_PI_PROVIDER: 'openai-codex',
+          CORTEX_PI_MODEL: 'gpt-5.6-sol',
+        }),
+      }),
+    );
+    expect(child.unref).toHaveBeenCalledOnce();
+  });
+
   it('falls back to session-start metadata and model when shutdown context omits them', async () => {
     const child = fakeChild();
     childProcess.spawn.mockReturnValue(child as never);
@@ -180,6 +214,29 @@ describe('Cortex Pi extension shutdown', () => {
 });
 
 describe('Cortex Pi extension diagnostics and surface contract', () => {
+  it('shows cortex-status CLI failures as errors instead of no-data info', async () => {
+    const failure = Object.assign(new Error('bun exited'), {
+      status: 2,
+      signal: null,
+      stderr: Buffer.from('database is corrupt'),
+    });
+    childProcess.execFileSync.mockImplementationOnce(() => { throw failure; });
+    const handlers = registerHandlers();
+    const cwd = tempProject();
+    const notify = vi.fn();
+
+    await handlers.get('command:cortex-status')?.('', { cwd, ui: { notify } });
+
+    expect(notify).toHaveBeenCalledWith(
+      expect.stringContaining('Cortex status failed:'),
+      'error',
+    );
+    expect(notify).not.toHaveBeenCalledWith(
+      'No cortex data found for this project',
+      'info',
+    );
+  });
+
   it('reports synchronous CLI failures instead of presenting them as no data', async () => {
     const failure = Object.assign(new Error('bun exited'), {
       status: 2,

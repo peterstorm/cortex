@@ -17,6 +17,8 @@ import {
   getActiveMemories,
   getExtractionCheckpoint,
   saveExtractionCheckpoint,
+  getAllEntities,
+  getCurrentFacts,
 } from '../infra/db.js';
 import { truncateTranscript, buildExtractionPrompt, parseExtractionResponse } from '../core/extraction.js';
 import { tokenize, jaccardSimilarity, classifySimilarity } from '../core/similarity.js';
@@ -192,7 +194,16 @@ describe('extract command - core logic', () => {
       expect(result.kind).toBe('parse_error');
     });
 
-    it('filters invalid candidates', () => {
+    it('returns parse_error when a non-empty candidate array is entirely invalid', () => {
+      const response = JSON.stringify({
+        memories: [{ content: 'missing every required field' }],
+        entities: [],
+      });
+
+      expect(parseExtractionResponse(response).kind).toBe('parse_error');
+    });
+
+    it('filters invalid candidates when at least one candidate remains valid', () => {
       const response = JSON.stringify([
         {
           content: 'Valid',
@@ -565,6 +576,52 @@ describe('applyDedupMerges', () => {
     db.close();
   });
 
+  it('is idempotent when a checkpoint retry replays an already merged candidate', () => {
+    const db = openDatabase(':memory:');
+    insertMemory(db, makeMemory({
+      id: 'replayed-target',
+      content: `target content\n---\n${candidate.content}`,
+    }));
+
+    const result = applyDedupMerges(
+      db,
+      [{ candidate, existingMemoryId: 'replayed-target' }],
+      () => null,
+      'sess',
+      gitContext
+    );
+
+    expect(result).toMatchObject({ merged: 1, writeFailures: 0 });
+    expect(getMemory(db, 'replayed-target')!.content).toBe(
+      `target content\n---\n${candidate.content}`
+    );
+    db.close();
+  });
+
+  it('reports a merge write failure so the caller can withhold the checkpoint', async () => {
+    const db = openDatabase(':memory:');
+    insertMemory(db, makeMemory({ id: 'busy-target' }));
+    const dbModule = await import('../infra/db.js');
+    const updateSpy = vi.spyOn(dbModule, 'updateMemory')
+      .mockImplementationOnce(() => { throw new Error('SQLITE_BUSY: database is locked'); });
+
+    try {
+      const result = applyDedupMerges(
+        db,
+        [{ candidate, existingMemoryId: 'busy-target' }],
+        () => null,
+        'sess',
+        gitContext
+      );
+
+      expect(result).toMatchObject({ merged: 0, writeFailures: 1 });
+      expect(result.fallbackInserted).toHaveLength(0);
+    } finally {
+      updateSpy.mockRestore();
+      db.close();
+    }
+  });
+
   it('inserts the candidate as a NEW memory when the target was archived concurrently', () => {
     const db = openDatabase(':memory:');
     insertMemory(db, makeMemory({ id: 'dead-target', status: 'archived' }));
@@ -789,6 +846,34 @@ describe('executeExtract (mocked LLM)', () => {
     db.close();
   });
 
+  it('defers after five chunks and drains a transcript larger than 500KB on retry', async () => {
+    const line = JSON.stringify({ role: 'user', content: 'z'.repeat(90) }) + '\n';
+    const transcript = line.repeat(Math.ceil(550_000 / line.length));
+    const { cwd, transcriptPath } = makeTestProject(transcript);
+    const db = openDatabase(':memory:');
+    mockExtractMemories.mockResolvedValue('{"memories": [], "entities": []}');
+
+    const first = await executeExtract(
+      { session_id: 's-budget', transcript_path: transcriptPath, cwd }, db
+    );
+
+    expect(first).toMatchObject({ success: true, deferred: true });
+    expect(first.cursor_position).toBeGreaterThan(0);
+    expect(first.cursor_position).toBeLessThan(transcript.length);
+    expect(mockExtractMemories).toHaveBeenCalledTimes(5);
+
+    const retry = await executeExtract(
+      { session_id: 's-budget', transcript_path: transcriptPath, cwd }, db
+    );
+
+    expect(retry.success).toBe(true);
+    expect(retry.deferred).not.toBe(true);
+    expect(retry.cursor_position).toBe(transcript.length);
+    expect(getExtractionCheckpoint(db, 's-budget')!.cursor_position).toBe(transcript.length);
+    expect(mockExtractMemories.mock.calls.length).toBeGreaterThan(5);
+    db.close();
+  });
+
   it('drains a 250KB transcript fully in one run via the chunk loop', async () => {
     // ~250KB of JSONL — 3 chunks at the 100KB cap
     const line = JSON.stringify({ role: 'user', content: 'x'.repeat(90) }) + '\n';
@@ -812,6 +897,102 @@ describe('executeExtract (mocked LLM)', () => {
     expect(getExtractionCheckpoint(db, 's-chunks')!.cursor_position).toBe(transcript.length);
     expect(getActiveMemories(db)).toHaveLength(3);
     db.close();
+  });
+
+  it('does not checkpoint a chunk when an individual memory insert fails', async () => {
+    const transcript = '{"role":"user","content":"two durable decisions"}\n';
+    const { cwd, transcriptPath } = makeTestProject(transcript);
+    const db = openDatabase(':memory:');
+    mockExtractMemories.mockResolvedValue(
+      memoriesResponse('alpha storage decision', 'bravo transport decision')
+    );
+    const dbModule = await import('../infra/db.js');
+    const realInsert = dbModule.insertMemory;
+    const insertSpy = vi.spyOn(dbModule, 'insertMemory')
+      .mockImplementationOnce(() => { throw new Error('SQLITE_BUSY: database is locked'); })
+      .mockImplementation((database, memory) => realInsert(database, memory));
+
+    try {
+      const result = await executeExtract(
+        { session_id: 's-write-failure', transcript_path: transcriptPath, cwd }, db
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('memory candidate write');
+      expect(result.extracted_count).toBe(1);
+      expect(result.cursor_position).toBe(0);
+      expect(getExtractionCheckpoint(db, 's-write-failure')).toBeNull();
+      expect(getActiveMemories(db)).toHaveLength(1);
+    } finally {
+      insertSpy.mockRestore();
+      db.close();
+    }
+  });
+
+  it('persists entity-only extraction with a deterministic project provenance memory', async () => {
+    const transcript = '{"role":"user","content":"NixOS configures this workstation"}\n';
+    const { cwd, transcriptPath } = makeTestProject(transcript);
+    const db = openDatabase(':memory:');
+    mockExtractMemories.mockResolvedValue(JSON.stringify({
+      memories: [],
+      entities: [{
+        entity_name: 'NixOS',
+        entity_type: 'tool',
+        predicate: 'configures',
+        object: 'this workstation',
+      }],
+    }));
+
+    const result = await executeExtract(
+      { session_id: 's-entity-only', transcript_path: transcriptPath, cwd }, db
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.extracted_count).toBe(1);
+    const [entity] = getAllEntities(db);
+    expect(entity.name).toBe('NixOS');
+    const [fact] = getCurrentFacts(db, entity.id);
+    expect(fact.object).toBe('this workstation');
+    expect(getMemory(db, fact.source_memory_id)?.tags).toContain('extraction-provenance');
+    db.close();
+  });
+
+  it('persists entity facts when all model memories are routed to the global DB', async () => {
+    const transcript = '{"role":"user","content":"SQLite is used globally"}\n';
+    const { cwd, transcriptPath } = makeTestProject(transcript);
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    mockExtractMemories.mockResolvedValue(JSON.stringify({
+      memories: [{
+        content: 'SQLite is a portable embedded database.',
+        summary: 'SQLite is portable.',
+        memory_type: 'context',
+        scope: 'global',
+        confidence: 0.9,
+        priority: 5,
+        tags: ['sqlite'],
+      }],
+      entities: [{
+        entity_name: 'SQLite',
+        entity_type: 'tool',
+        predicate: 'is',
+        object: 'an embedded database',
+      }],
+    }));
+
+    const result = await executeExtract(
+      { session_id: 's-global-entity', transcript_path: transcriptPath, cwd },
+      projectDb,
+      globalDb,
+    );
+
+    expect(result.success).toBe(true);
+    expect(getActiveMemories(globalDb)).toHaveLength(1);
+    expect(getActiveMemories(projectDb)).toHaveLength(1);
+    const [entity] = getAllEntities(projectDb);
+    expect(getCurrentFacts(projectDb, entity.id)).toHaveLength(1);
+    projectDb.close();
+    globalDb.close();
   });
 
   it('stops the chunk loop at a failed chunk without advancing past it', async () => {

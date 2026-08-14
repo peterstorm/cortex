@@ -1006,11 +1006,12 @@ export function getEdgesForMemory(db: Database, memoryId: string): readonly Edge
 }
 
 /**
- * Get all edges in database
+ * Get all active or suggested edges in the database.
+ * Archived edges are intentionally excluded.
  * I/O: Reads from database
  *
  * @param db - Database instance
- * @returns Readonly array of all edges
+ * @returns Readonly array of active/suggested edges
  */
 export function getAllEdges(db: Database): readonly Edge[] {
   const stmt = db.prepare(`SELECT * FROM edges WHERE status IN ('active', 'suggested')`);

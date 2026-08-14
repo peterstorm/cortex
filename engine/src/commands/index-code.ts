@@ -335,7 +335,7 @@ export function formatErrorResult(error: string): IndexCodeError {
  * 1. Parse args (pure)
  * 2. Read file content (I/O)
  * 3. Extract line range (pure)
- * 4. Embed prose summary via Voyage (I/O) - NOT raw code (FR-053)
+ * 4. Embed prose summary via Gemini (I/O) - NOT raw code (FR-053)
  * 5. Check for existing code memories at same file_path (I/O)
  * 6. Mark existing as superseded (I/O)
  * 7. Insert prose memory (I/O)

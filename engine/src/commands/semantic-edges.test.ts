@@ -196,6 +196,43 @@ describe('executeSemanticEdges', () => {
     });
   });
 
+  it('rejects an unknown unindexed pair instead of retiring it as a decline', async () => {
+    seedMemory('a');
+    seedMemory('b');
+    const edgeId = insertEdge(db, { source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active' });
+    mockClassifyEdges.mockResolvedValue({
+      kind: 'ok',
+      classifications: [
+        { source_id: 'b', target_id: 'a', relation_type: 'refines', strength: 0.7 },
+      ],
+    });
+
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+
+    expect(result).toEqual({ ok: true, classified: 0, failed: 1 });
+    const kept = getAllEdges(db).find((edge) => edge.id === edgeId)!;
+    expect(kept.classified_at).toBeNull();
+    expect(kept.classify_hash).toBeNull();
+  });
+
+  it('rejects duplicate unindexed answers as a corrupt batch', async () => {
+    seedMemory('a');
+    seedMemory('b');
+    const edgeId = insertEdge(db, { source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active' });
+    mockClassifyEdges.mockResolvedValue({
+      kind: 'ok',
+      classifications: [
+        { source_id: 'a', target_id: 'b', relation_type: 'refines', strength: 0.7 },
+        { source_id: 'a', target_id: 'b', relation_type: 'supersedes', strength: 0.8 },
+      ],
+    });
+
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+
+    expect(result).toEqual({ ok: true, classified: 0, failed: 1 });
+    expect(getAllEdges(db).find((edge) => edge.id === edgeId)!.classified_at).toBeNull();
+  });
+
   it('treats an out-of-range pair_index as a corrupt response (failed, unmarked)', async () => {
     seedMemory('a');
     seedMemory('b');

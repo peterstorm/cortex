@@ -188,6 +188,18 @@ describe('parsePruneResponse / shouldRunAiPrune (sanity)', () => {
     expect(parsePruneResponse('{"candidates":[]}')).toEqual({ kind: 'ok', candidates: [] });
   });
 
+  it('parses subprocess fallback output wrapped in markdown or prose', () => {
+    expect(parsePruneResponse(
+      'Result:\n```json\n{"candidates":[{"id":"abc","reason":"stale"}]}\n```\nDone.'
+    )).toEqual({
+      kind: 'ok',
+      candidates: [{ id: 'abc', reason: 'stale' }],
+    });
+    expect(parsePruneResponse(
+      'Candidates: {"candidates":[]} Explanation mentions } afterward.'
+    )).toEqual({ kind: 'ok', candidates: [] });
+  });
+
   it('rejects the old top-level array and partially invalid candidates', () => {
     expect(parsePruneResponse('[{"id":"abc","reason":"stale"}]').kind).toBe('unparseable');
     expect(parsePruneResponse('{"candidates":[{"id":"abc"}]}').kind).toBe('unparseable');

@@ -4,7 +4,7 @@
  * Satisfies:
  * - FR-001: Extract memories automatically at session end
  * - FR-004: Track cursor position via extractions table
- * - FR-009: Complete extraction within 30 seconds (p95)
+ * - FR-009: Keep session shutdown non-blocking through bounded detached work
  * - FR-010: Handle extraction errors without blocking session closure
  * - FR-011: Log extraction errors to inspect later
  * - FR-012: Support resumable extraction if transcript >100KB
@@ -25,7 +25,7 @@
  */
 
 import { readFileSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { basename, join } from 'node:path';
 import type { Database } from 'bun:sqlite';
 import type { GitContext, HookInput, Memory, MemoryCandidate } from '../core/types.js';
@@ -92,8 +92,10 @@ export interface ExtractionResult {
   readonly dedup_skipped?: number;
   readonly dedup_merged?: number;
   readonly entity_conflicts?: readonly FactConflict[];
-  /** True when this run was skipped because another extraction holds the lock */
+  /** True when this run was skipped because another extraction holds the lock. */
   readonly skipped?: boolean;
+  /** True when bounded work remains and the detached worker must invoke extraction again. */
+  readonly deferred?: boolean;
   readonly error?: string;
 }
 
@@ -303,7 +305,7 @@ export async function executeExtract(
         scopedCandidates: readonly MemoryCandidate[],
         scopedEmbeddings: Map<number, Float32Array>,
         existing: readonly Memory[]
-      ): { inserted: Memory[]; skipped: number; merged: number } => {
+      ): { inserted: Memory[]; skipped: number; merged: number; writeFailures: number } => {
         const { kept, skipped, merges } = deduplicateCandidates(
           scopedCandidates, existing, DEDUP_SIMILARITY_THRESHOLD, scopedEmbeddings, MERGE_CEILING_THRESHOLD
         );
@@ -317,10 +319,12 @@ export async function executeExtract(
           db, merges, embeddingFor, input.session_id, gitContext
         );
 
-        // Process each candidate — individual insert failures are non-fatal.
-        // Intentional: we continue inserting remaining candidates even if one
-        // fails, because partial extraction is better than none (FR-010).
+        // Continue best-effort writes within the chunk, but retain every
+        // failure. The chunk checkpoint is withheld below if any candidate
+        // failed, so successful siblings survive while failed candidates are
+        // retried instead of being permanently consumed (FR-010).
         const inserted: Memory[] = [...mergeResult.fallbackInserted];
+        let writeFailures = mergeResult.writeFailures;
         for (const candidate of kept) {
           try {
             const memory = candidateToMemory(
@@ -329,18 +333,19 @@ export async function executeExtract(
             insertMemory(db, memory);
             inserted.push(memory);
           } catch (err) {
+            writeFailures++;
             const message = err instanceof Error ? err.message : String(err);
             logError(`Failed to insert memory: ${message}`);
           }
         }
 
-        return { inserted, skipped, merged: mergeResult.merged };
+        return { inserted, skipped, merged: mergeResult.merged, writeFailures };
       };
 
       const projectResult = processScope(projectDb, projectCandidates, projectEmbeddings, existingMemories);
       const globalResult = globalDb && globalCandidates.length > 0
         ? processScope(globalDb, globalCandidates, globalEmbeddings, getActiveMemories(globalDb))
-        : { inserted: [] as Memory[], skipped: 0, merged: 0 };
+        : { inserted: [] as Memory[], skipped: 0, merged: 0, writeFailures: 0 };
 
       if (globalResult.inserted.length > 0) {
         logInfo(`Routed ${globalResult.inserted.length} global-scoped memories to global DB`);
@@ -357,9 +362,38 @@ export async function executeExtract(
         logInfo(`Dedup: merged ${chunkMerged} candidates into existing memories`);
       }
 
+      totalInserted += projectResult.inserted.length + globalResult.inserted.length;
+      const memoryWriteFailures = projectResult.writeFailures + globalResult.writeFailures;
+      if (memoryWriteFailures > 0) {
+        return chunkFailure(
+          `${memoryWriteFailures} memory candidate write(s) failed; checkpoint not advanced`
+        );
+      }
+
       // Edges and entity facts stay project-DB-only: edges/facts have FK
       // constraints into the same database, so cross-DB links are impossible.
-      const insertedMemories: Memory[] = projectResult.inserted;
+      const insertedMemories: Memory[] = [...projectResult.inserted];
+
+      // Entity-only and global-only responses still need project-local fact
+      // provenance. Persist one deterministic context memory for this chunk so
+      // retries reuse the same source instead of duplicating it.
+      if (entityCandidates.length > 0 && insertedMemories.length === 0) {
+        try {
+          const provenance = ensureEntityFactProvenanceMemory(
+            projectDb,
+            entityCandidates,
+            input.session_id,
+            cursor,
+            gitContext,
+          );
+          insertedMemories.push(provenance.memory);
+          if (provenance.inserted) totalInserted++;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          logError(`Failed to persist entity-fact provenance: ${message}`);
+          return chunkFailure('Entity-fact provenance write failed; checkpoint not advanced');
+        }
+      }
 
       // Compute similarity and create edges (FR-061)
       if (insertedMemories.length > 0) {
@@ -376,8 +410,10 @@ export async function executeExtract(
         }
       }
 
-      // Process entity-fact candidates from extraction
-      if (entityCandidates.length > 0 && insertedMemories.length > 0) {
+      // Process entity-fact candidates from extraction. Fact persistence is
+      // checkpoint-critical: partial inserts are idempotent on retry, while
+      // advancing here would make failed facts unrecoverable.
+      if (entityCandidates.length > 0) {
         try {
           const entityResult = processEntityFacts(projectDb, entityCandidates, insertedMemories);
           if (entityResult.entitiesCreated > 0 || entityResult.factsCreated > 0) {
@@ -391,11 +427,9 @@ export async function executeExtract(
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           logError(`Entity processing failed: ${message}`);
-          // Non-fatal - continue
+          return chunkFailure('Entity processing failed; checkpoint not advanced');
         }
       }
-
-      totalInserted += projectResult.inserted.length + globalResult.inserted.length;
 
       // I/O: Save checkpoint (FR-004) — per chunk so partial progress persists
       saveExtractionCheckpoint(projectDb, {
@@ -407,7 +441,21 @@ export async function executeExtract(
       cursor = newCursor;
     }
 
-    // I/O: Run lifecycle (decay, archive, prune) — once per run
+    if (cursor < transcriptContent.length) {
+      return {
+        success: true,
+        deferred: true,
+        extracted_count: totalInserted,
+        edge_count: edgeCount,
+        cursor_position: cursor,
+        dedup_skipped: dedupSkipped > 0 ? dedupSkipped : undefined,
+        dedup_merged: dedupMergedCount > 0 ? dedupMergedCount : undefined,
+        entity_conflicts: entityConflicts.length > 0 ? entityConflicts : undefined,
+        error: `Extraction chunk budget exhausted at cursor ${cursor} of ${transcriptContent.length}; retry required`,
+      };
+    }
+
+    // I/O: Run lifecycle (decay, archive, prune) — once after reaching EOF
     try {
       runLifecycle(projectDb);
     } catch (err) {
@@ -464,9 +512,9 @@ function candidateToMemory(
   candidate: MemoryCandidate,
   sessionId: string,
   gitContext: { branch: string; recent_commits: readonly string[]; changed_files: readonly string[] },
-  localEmbedding: Float32Array | null = null
+  localEmbedding: Float32Array | null = null,
+  id: string = randomUUID(),
 ): Memory {
-  const id = randomUUID();
   const now = new Date().toISOString();
 
   const sourceContext = serializeSourceContext({
@@ -522,7 +570,7 @@ export interface DeduplicateMerge {
  * @param embeddingFor - Lookup for a candidate's local embedding (may return null)
  * @param sessionId - Current session ID for source tracking
  * @param gitContext - Git context for fallback-inserted memories
- * @returns Count of successful merges and memories inserted as fallback
+ * @returns Successful merges, fallback memories, and checkpoint-blocking write failures
  */
 export function applyDedupMerges(
   db: Database,
@@ -530,8 +578,9 @@ export function applyDedupMerges(
   embeddingFor: (candidate: MemoryCandidate) => Float32Array | null,
   sessionId: string,
   gitContext: GitContext
-): { merged: number; fallbackInserted: Memory[] } {
+): { merged: number; fallbackInserted: Memory[]; writeFailures: number } {
   let merged = 0;
+  let writeFailures = 0;
   const fallbackInserted: Memory[] = [];
 
   for (const merge of merges) {
@@ -549,20 +598,24 @@ export function applyDedupMerges(
         fallbackInserted.push(memory);
         continue;
       }
-      updateMemory(db, merge.existingMemoryId, {
-        content: `${existingMem.content}\n---\n${merge.candidate.content}`,
-        // Null out embeddings so backfill regenerates with updated content
-        embedding: null,
-        local_embedding: null,
-      });
+      const mergedSegments = existingMem.content.split('\n---\n');
+      if (!mergedSegments.includes(merge.candidate.content)) {
+        updateMemory(db, merge.existingMemoryId, {
+          content: `${existingMem.content}\n---\n${merge.candidate.content}`,
+          // Null out embeddings so backfill regenerates with updated content
+          embedding: null,
+          local_embedding: null,
+        });
+      }
       merged++;
     } catch (err) {
+      writeFailures++;
       const message = err instanceof Error ? err.message : String(err);
       logError(`Failed to merge into ${merge.existingMemoryId}: ${message}`);
     }
   }
 
-  return { merged, fallbackInserted };
+  return { merged, fallbackInserted, writeFailures };
 }
 
 /**
@@ -829,6 +882,44 @@ async function generateCandidateEmbeddings(
   }
 
   return embeddings;
+}
+
+/**
+ * Ensure entity facts have a project-local source memory even when the model
+ * returned no project-scoped memory. The ID is deterministic per session chunk
+ * so a retry after partial fact persistence reuses the same provenance row.
+ */
+function ensureEntityFactProvenanceMemory(
+  db: Database,
+  candidates: readonly EntityFactCandidate[],
+  sessionId: string,
+  chunkCursor: number,
+  gitContext: GitContext,
+): { readonly memory: Memory; readonly inserted: boolean } {
+  const id = `entity-provenance-${createHash('sha256')
+    .update(`${sessionId}:${chunkCursor}`)
+    .digest('hex')
+    .slice(0, 32)}`;
+  const existing = getMemory(db, id);
+  if (existing !== null) return { memory: existing, inserted: false };
+
+  const factLines = candidates.map(
+    (candidate) => `- ${candidate.entity_name} ${candidate.predicate} ${candidate.object}`
+  );
+  const memory = candidateToMemory({
+    content: `Entity facts extracted from this session chunk:\n${factLines.join('\n')}`,
+    summary: `Entity facts: ${candidates
+      .slice(0, 3)
+      .map((candidate) => candidate.entity_name)
+      .join(', ')}`,
+    memory_type: 'context',
+    scope: 'project',
+    confidence: 0.7,
+    priority: 5,
+    tags: ['entities', 'extraction-provenance'],
+  }, sessionId, gitContext, null, id);
+  insertMemory(db, memory);
+  return { memory, inserted: true };
 }
 
 /**

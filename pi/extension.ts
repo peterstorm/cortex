@@ -17,16 +17,20 @@ import { getSurfaceOutputPath } from "../engine/src/config.js";
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const CLI_PATH = join(PACKAGE_ROOT, "engine", "src", "cli.ts");
 
-/** Run a bun CLI command, returning stdout. Never throws. */
-function runCli(args: string[], options?: {
+type CliRunResult =
+  | Readonly<{ ok: true; output: string }>
+  | Readonly<{ ok: false; error: string }>;
+
+/** Run a bun CLI command and retain failure identity. Never throws. */
+function runCliResult(args: string[], options?: {
   stdin?: string;
   timeout?: number;
   cwd?: string;
   env?: NodeJS.ProcessEnv;
-}): string {
+}): CliRunResult {
   try {
     const input = options?.stdin ?? "";
-    return execFileSync("bun", [CLI_PATH, ...args], {
+    const output = execFileSync("bun", [CLI_PATH, ...args], {
       input,
       timeout: options?.timeout ?? 30_000,
       cwd: options?.cwd,
@@ -37,6 +41,7 @@ function runCli(args: string[], options?: {
         ...options?.env,
       },
     }).trim();
+    return { ok: true, output };
   } catch (error) {
     // Never block the Pi lifecycle, but preserve enough bounded diagnostics to
     // distinguish "no data" from a broken runtime or engine command.
@@ -46,19 +51,22 @@ function runCli(args: string[], options?: {
       stderr?: Buffer | string;
     };
     const message = failure.message ?? String(error);
-    if (message.includes("TIMEOUT")) {
-      process.stderr.write(`[cortex] CLI timeout: ${args.join(" ")} (cwd=${options?.cwd ?? process.cwd()})\n`);
-    } else {
-      const stderr = String(failure.stderr ?? "").trim().slice(0, 1_000);
-      process.stderr.write(
-        `[cortex] CLI failed: bun ${args.join(" ")} ` +
-          `(cwd=${options?.cwd ?? process.cwd()}, status=${failure.status ?? "n/a"}, ` +
-          `signal=${failure.signal ?? "none"}): ${message}` +
-          (stderr === "" ? "" : `\n${stderr}`) + "\n"
-      );
-    }
-    return "";
+    const stderr = String(failure.stderr ?? "").trim().slice(0, 1_000);
+    const diagnostic = message.includes("TIMEOUT")
+      ? `CLI timeout: ${args.join(" ")} (cwd=${options?.cwd ?? process.cwd()})`
+      : `CLI failed: bun ${args.join(" ")} ` +
+        `(cwd=${options?.cwd ?? process.cwd()}, status=${failure.status ?? "n/a"}, ` +
+        `signal=${failure.signal ?? "none"}): ${message}` +
+        (stderr === "" ? "" : `\n${stderr}`);
+    process.stderr.write(`[cortex] ${diagnostic}\n`);
+    return { ok: false, error: diagnostic };
   }
+}
+
+/** Best-effort stdout adapter for lifecycle hooks that intentionally degrade. */
+function runCli(args: string[], options?: Parameters<typeof runCliResult>[1]): string {
+  const result = runCliResult(args, options);
+  return result.ok ? result.output : "";
 }
 
 /** Run a bun CLI command detached (fire-and-forget). */
@@ -277,9 +285,11 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("cortex-status", {
     description: "Show cortex memory health and stats",
     handler: async (_args, ctx) => {
-      const output = runCli(["inspect", ctx.cwd], { timeout: 10_000, cwd: ctx.cwd });
-      if (output) {
-        ctx.ui.notify(output.split("\n").slice(0, 8).join("\n"), "info");
+      const result = runCliResult(["inspect", ctx.cwd], { timeout: 10_000, cwd: ctx.cwd });
+      if (!result.ok) {
+        ctx.ui.notify(`Cortex status failed: ${result.error}`, "error");
+      } else if (result.output) {
+        ctx.ui.notify(result.output.split("\n").slice(0, 8).join("\n"), "info");
       } else {
         ctx.ui.notify("No cortex data found for this project", "info");
       }

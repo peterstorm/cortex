@@ -9,11 +9,9 @@
 /**
  * Extract the first JSON value (object or array) from a text blob.
  *
- * Strategy: find the earliest opening `{` or `[`, then slice through the
- * last matching closer. This tolerates leading and trailing prose, but
- * deliberately does not perform brace matching — for LLM-shaped output
- * (one JSON value plus prose) the first-open/last-close heuristic is
- * correct and cheap.
+ * Strategy: find the earliest opening `{` or `[`, then scan until that JSON
+ * value's delimiters balance. The scanner is string/escape-aware, so braces
+ * inside JSON strings and matching delimiters in trailing prose are ignored.
  *
  * @param text - Raw LLM response text
  * @returns The JSON slice, or null when no JSON-looking value exists
@@ -24,20 +22,40 @@ export function extractJsonSlice(text: string): string | null {
 
   if (firstBrace === -1 && firstBracket === -1) return null;
 
-  let start: number;
-  let closer: '}' | ']';
-  if (firstBracket === -1 || (firstBrace !== -1 && firstBrace < firstBracket)) {
-    start = firstBrace;
-    closer = '}';
-  } else {
-    start = firstBracket;
-    closer = ']';
+  const start = firstBracket === -1 || (firstBrace !== -1 && firstBrace < firstBracket)
+    ? firstBrace
+    : firstBracket;
+  const expectedClosers: Array<'}' | ']'> = [];
+  let inString = false;
+  let escaped = false;
+
+  for (let index = start; index < text.length; index++) {
+    const character = text[index];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === '\\') {
+        escaped = true;
+      } else if (character === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (character === '"') {
+      inString = true;
+    } else if (character === '{') {
+      expectedClosers.push('}');
+    } else if (character === '[') {
+      expectedClosers.push(']');
+    } else if (character === '}' || character === ']') {
+      if (expectedClosers.pop() !== character) return null;
+      if (expectedClosers.length === 0) return text.slice(start, index + 1);
+    }
   }
 
-  const end = text.lastIndexOf(closer);
-  if (end <= start) return null;
-
-  return text.slice(start, end + 1);
+  return null;
 }
 
 /**

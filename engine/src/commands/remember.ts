@@ -334,7 +334,7 @@ export async function executeRemember(
 
   const args = parseResult.args;
 
-  // Build memory object (pure)
+  // Build the persistence-boundary memory object (allocates ID/timestamps)
   let memory: Memory;
   try {
     memory = buildMemoryFromArgs(args);

@@ -17,6 +17,7 @@ import { getActiveMemories, updateMemory, archiveEdgesForMemory, supersedeFactsF
 import { isClaudeLlmAvailable, runLlmPromptDirect } from '../infra/claude-llm.js';
 import { resolveOpenAiCompatEndpoint } from '../infra/llm-client.js';
 import { writeTelemetry } from '../infra/filesystem.js';
+import { parseJsonFromLlmText } from '../core/json-utils.js';
 import { invalidateSurfaceCache } from './generate.js';
 import {
   AI_PRUNE_SESSION_INTERVAL,
@@ -117,45 +118,33 @@ ${memoryLines}`;
  * partially invalid output into a successful "archive nothing" decision.
  */
 export function parsePruneResponse(response: string): PruneParseOutcome {
-  const cleaned = response
-    .replace(/```json\s*/gi, '')
-    .replace(/```\s*/g, '')
-    .trim();
+  const parsed = parseJsonFromLlmText<unknown>(response);
+  if (typeof parsed !== 'object' || parsed === null) {
+    return { kind: 'unparseable', reason: 'expected a parseable JSON object envelope' };
+  }
 
-  try {
-    const parsed: unknown = JSON.parse(cleaned);
-    if (typeof parsed !== 'object' || parsed === null) {
-      return { kind: 'unparseable', reason: 'expected a JSON object envelope' };
-    }
+  const candidates = (parsed as Record<string, unknown>).candidates;
+  if (!Array.isArray(candidates)) {
+    return { kind: 'unparseable', reason: 'expected a candidates array' };
+  }
 
-    const candidates = (parsed as Record<string, unknown>).candidates;
-    if (!Array.isArray(candidates)) {
-      return { kind: 'unparseable', reason: 'expected a candidates array' };
-    }
-
-    const valid = candidates.filter(
-      (item: unknown): item is PruneCandidate =>
-        typeof item === 'object' &&
-        item !== null &&
-        typeof (item as Record<string, unknown>).id === 'string' &&
-        (item as Record<string, unknown>).id !== '' &&
-        typeof (item as Record<string, unknown>).reason === 'string' &&
-        (item as Record<string, unknown>).reason !== ''
-    );
-    if (valid.length !== candidates.length) {
-      return {
-        kind: 'unparseable',
-        reason: `${candidates.length - valid.length} of ${candidates.length} candidate item(s) were invalid`,
-      };
-    }
-
-    return { kind: 'ok', candidates: valid };
-  } catch (err) {
+  const valid = candidates.filter(
+    (item: unknown): item is PruneCandidate =>
+      typeof item === 'object' &&
+      item !== null &&
+      typeof (item as Record<string, unknown>).id === 'string' &&
+      (item as Record<string, unknown>).id !== '' &&
+      typeof (item as Record<string, unknown>).reason === 'string' &&
+      (item as Record<string, unknown>).reason !== ''
+  );
+  if (valid.length !== candidates.length) {
     return {
       kind: 'unparseable',
-      reason: `invalid JSON: ${err instanceof Error ? err.message : String(err)}`,
+      reason: `${candidates.length - valid.length} of ${candidates.length} candidate item(s) were invalid`,
     };
   }
+
+  return { kind: 'ok', candidates: valid };
 }
 
 // ============================================================================

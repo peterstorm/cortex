@@ -32,7 +32,9 @@ export interface TruncationResult {
 }
 
 /**
- * Truncates transcript to maxBytes while preserving JSONL line boundaries.
+ * Truncates transcript to maxBytes while preserving JSONL line boundaries
+ * when possible. An oversized single line falls back to a raw byte-bounded
+ * window so the cursor can still make progress.
  * Returns truncated content and new cursor position for resumable extraction.
  *
  * The cursor is a CHARACTER offset into `content` (it is consumed via
@@ -283,6 +285,12 @@ export function parseExtractionResponse(
     // masquerade as a fully successful extraction.
     const validMemories = rawMemories.filter(isValidCandidate);
     const invalidMemoryCount = rawMemories.length - validMemories.length;
+    if (rawMemories.length > 0 && validMemories.length === 0) {
+      process.stderr.write(
+        `[cortex:extraction] WARN: all ${rawMemories.length} memory candidate(s) had invalid shape; treating response as parse error\n`
+      );
+      return { kind: 'parse_error', raw: response };
+    }
     if (invalidMemoryCount > 0) {
       process.stderr.write(
         `[cortex:extraction] WARN: dropped ${invalidMemoryCount} of ${rawMemories.length} invalid memory candidate(s)\n`
@@ -303,6 +311,12 @@ export function parseExtractionResponse(
     // mixed-validity contract as memories.
     const validEntities = rawEntities.filter(isValidEntityFactCandidate);
     const invalidEntityCount = rawEntities.length - validEntities.length;
+    if (rawEntities.length > 0 && validEntities.length === 0) {
+      process.stderr.write(
+        `[cortex:extraction] WARN: all ${rawEntities.length} entity candidate(s) had invalid shape; treating response as parse error\n`
+      );
+      return { kind: 'parse_error', raw: response };
+    }
     if (invalidEntityCount > 0) {
       process.stderr.write(
         `[cortex:extraction] WARN: dropped ${invalidEntityCount} of ${rawEntities.length} invalid entity candidate(s)\n`

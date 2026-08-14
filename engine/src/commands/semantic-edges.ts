@@ -13,8 +13,8 @@
  *    tracking via edges.classified_at; content-changed edges re-qualify)
  * 2. Load source/target memories for each
  * 3. Batch pairs and send to the LLM for classification (bounded concurrency)
- * 4. Replace generic edges with typed ones; mark every attempted edge so
- *    declined classifications are not re-asked on the next maintenance run
+ * 4. Replace generic edges with typed ones; after a successfully parsed model
+ *    answer, mark answered/declined edges so they are not re-asked next run
  *
  * Designed to run as fire-and-forget step in extract-and-generate hook.
  */
@@ -232,6 +232,9 @@ export async function executeSemanticEdges(
         // (edges unmarked, retried) rather than a decline.
         byIndex = new Map<number, EdgeClassification>();
         byKey = new Map<string, EdgeClassification>();
+        const expectedKeys = new Set(
+          batchPairs.map(({ pair }) => `${pair.source.id}:${pair.target.id}`)
+        );
         for (const c of classifications) {
           if (c.pair_index !== undefined) {
             if (byIndex.has(c.pair_index)) {
@@ -241,7 +244,18 @@ export async function executeSemanticEdges(
             }
             byIndex.set(c.pair_index, c);
           } else {
-            byKey.set(`${c.source_id}:${c.target_id}`, c);
+            const key = `${c.source_id}:${c.target_id}`;
+            if (!expectedKeys.has(key)) {
+              throw new Error(
+                `classification response referenced unknown unindexed pair ${key} — batch failed`
+              );
+            }
+            if (byKey.has(key)) {
+              throw new Error(
+                `classification response contains duplicate unindexed pair ${key} — batch failed`
+              );
+            }
+            byKey.set(key, c);
           }
         }
         if (byIndex.size > 0) {
@@ -290,8 +304,8 @@ export async function executeSemanticEdges(
                 target_id: joinByIndex ? pair.target.id : classification.target_id,
                 relation_type: classification.relation_type,
                 strength: classification.strength,
-                // Directional relation types keep direction; only the
-                // general connection is symmetric.
+                // Directional relation types keep direction; relates_to and
+                // contradicts are symmetric.
                 bidirectional: isBidirectionalRelation(classification.relation_type),
                 status: 'active',
                 classified_at: attemptedAt,

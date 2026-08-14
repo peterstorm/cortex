@@ -39,7 +39,7 @@ Seven slash commands let you interact with memory directly: `/remember`, `/recal
 
 A `SessionEnd` hook detaches a background worker (so nothing blocks the session) that runs the pipeline sequentially:
 
-1. **Extract** — Read the session transcript (JSONL), truncate if >100KB (resumable via cursor checkpoints), add git context (branch, commits, changed files), and use the configured direct OpenAI-compatible endpoint with thinking disabled, falling back to a headless coding-agent CLI when no direct endpoint is available; global-scoped candidates are routed to the global DB
+1. **Extract** — Read the session transcript (JSONL) in resumable 100KB chunks, add git context (branch, commits, changed files), and use the configured direct OpenAI-compatible endpoint with thinking disabled, falling back to a headless coding-agent CLI when no direct endpoint is available; each invocation is bounded to five chunks, and the detached ingestion worker retries a deferred result until the cursor reaches EOF before backfill; global-scoped candidates are routed to the global DB, while entity-only/global-only responses receive a project-local provenance memory so extracted facts are retained
 2. **Backfill** — Compute embeddings for newly extracted memories (Gemini API, or local HuggingFace fallback)
 3. **Semantic Edges** — Classify similarity-created `relates_to` edges into typed relationships
 4. **Lifecycle** — Decay confidence, archive stale memories, prune old ones

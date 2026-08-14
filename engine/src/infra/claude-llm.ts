@@ -521,22 +521,13 @@ export function parseEdgeClassificationResponse(
 
     const valid = array.filter(isValidEdgeClassification);
     if (valid.length !== array.length) {
-      const dropped = array.filter((item) => !isValidEdgeClassification(item));
-      // A dropped indexed item cannot be retried if we just ignore it: the
-      // pair it answered would look declined. Surface the loss as a batch
-      // failure. Legacy unindexed output keeps the old warn-and-filter.
-      if (dropped.some((item) =>
-        typeof item === 'object' && item !== null &&
-        (item as { pair_index?: unknown }).pair_index !== undefined)) {
-        return {
-          kind: 'unparseable',
-          reason: `${array.length - valid.length} of ${array.length} items had invalid shape (indexed response)`,
-        };
-      }
-      process.stderr.write(
-        `[cortex:llm] WARNING: dropping ${array.length - valid.length} of ${array.length} ` +
-          `edge classifications with invalid shape from a tolerant-mode response\n`
-      );
+      // Any dropped item can correspond to a pair the shell would otherwise
+      // retire as an implicit decline. Fail the whole tolerant batch so every
+      // edge remains unmarked and retryable.
+      return {
+        kind: 'unparseable',
+        reason: `${array.length - valid.length} of ${array.length} items had invalid shape (tolerant response)`,
+      };
     }
     return {
       kind: 'ok',
