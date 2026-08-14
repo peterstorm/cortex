@@ -20,9 +20,9 @@ Cortex maintains **two** SQLite databases:
 | Database | Location | Scope |
 |---|---|---|
 | **Project** | `<project>/.memory/cortex.db` | Project-specific memories (default) |
-| **Global** | `~/.claude/memory/cortex-global.db` | Cross-project knowledge |
+| **Global** | Claude: `~/.claude/memory/cortex-global.db`; Pi: `~/.pi/agent/memory/cortex-global.db` | Cross-project knowledge |
 
-During extraction, candidates the LLM classifies as scope "global" (e.g., "TypeScript generics work like this" vs "our API uses X pattern") are routed to the **global** database; everything else lands in the project database.
+During extraction, candidates the LLM classifies as scope "global" (e.g., "TypeScript generics work like this" vs "our API uses X pattern") are routed to the active harness's **global** database; everything else lands in the project database.
 
 ---
 
@@ -238,7 +238,7 @@ Memories are inserted without embeddings (to avoid blocking extraction). A backg
 
 ~/.claude/
   memory/
-    cortex-global.db       # Global SQLite database
+    cortex-global.db       # Claude global SQLite database
   plugins/
     cortex/
       .claude-plugin/
@@ -251,6 +251,10 @@ Memories are inserted without embeddings (to avoid blocking extraction). A backg
           prompt-recall.sh         # UserPromptSubmit hook (keyword recall)
       engine/src/          # TypeScript source
       commands/            # Skill markdown files
+
+~/.pi/agent/
+  memory/
+    cortex-global.db       # Pi global SQLite database
 ```
 
 ---

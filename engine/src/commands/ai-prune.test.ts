@@ -434,6 +434,51 @@ describe('ai-prune side effects (findings 1b, 12)', () => {
     globalDb.close();
   });
 
+  it('rolls back the memory archive when a dependent edge update fails', async () => {
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    const telemetryPath = makeTelemetryPath();
+
+    try {
+      for (let i = 0; i < 8; i++) {
+        insertMemory(projectDb, makeMemory(`atomic-${i}`, 30));
+      }
+      insertEdge(projectDb, {
+        source_id: 'atomic-0',
+        target_id: 'atomic-1',
+        relation_type: 'relates_to',
+        strength: 0.8,
+        bidirectional: true,
+        status: 'active',
+      });
+      projectDb.exec(`
+        CREATE TRIGGER fail_archive_edge
+        BEFORE UPDATE OF status ON edges
+        WHEN NEW.status = 'archived'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced dependent archive failure');
+        END;
+      `);
+      mockRunLlmPrompt.mockResolvedValue(JSON.stringify({ candidates: [
+        { id: 'atomic-0', reason: 'obsolete' },
+      ] }));
+
+      await expect(runAiPrune(projectDb, globalDb, telemetryPath)).rejects.toThrow(
+        'forced dependent archive failure'
+      );
+      expect(getMemory(projectDb, 'atomic-0')).toMatchObject({
+        status: 'active',
+        archived_at: null,
+      });
+      expect(projectDb.query('SELECT status FROM edges').all()).toEqual([
+        { status: 'active' },
+      ]);
+    } finally {
+      projectDb.close();
+      globalDb.close();
+    }
+  });
+
   it('supersedes facts sourced from an archived memory (finding 12)', async () => {
     const projectDb = openDatabase(':memory:');
     const globalDb = openDatabase(':memory:');

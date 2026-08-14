@@ -600,6 +600,23 @@ describe('cli - prompt-recall best-effort diagnostics', () => {
     fallback.close();
   });
 
+  it('warns when valid JSON is missing the prompt-recall contract fields', () => {
+    const home = mkdtempSync(join(tmpdir(), 'cortex-prompt-recall-home-'));
+    try {
+      const result = spawnSync('bun', [CLI_PATH, 'prompt-recall'], {
+        input: JSON.stringify({ prompt: 42 }),
+        encoding: 'utf8',
+        env: { ...process.env, HOME: home },
+      });
+
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain('prompt-recall ignored malformed input');
+      expect(result.stderr).toContain('string prompt and cwd');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('warns on malformed hook input while preserving a successful exit', () => {
     const home = mkdtempSync(join(tmpdir(), 'cortex-prompt-recall-home-'));
     try {

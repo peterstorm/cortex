@@ -111,6 +111,47 @@ describe('resolveOpenAiCompatEndpoint', () => {
     expect(resolveOpenAiCompatEndpoint()).toBeNull();
   });
 
+  it.each(['anthropic-messages', 'openai-responses'])(
+    'rejects Pi api adapter %s because it does not expose chat/completions',
+    (api) => {
+      withEnv({ PI_PROVIDER: 'incompatible', HOME: fixtureHome });
+      fs.mkdirSync(nodePath.join(fixtureHome, '.pi', 'agent'), { recursive: true });
+      fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'models.json'), JSON.stringify({
+        providers: {
+          incompatible: {
+            api,
+            baseUrl: 'https://provider.example/v1',
+            apiKey: 'k',
+            models: [{ id: 'm' }],
+          },
+        },
+      }));
+
+      expect(resolveOpenAiCompatEndpoint()).toBeNull();
+    }
+  );
+
+  it('accepts Pi openai-completions providers', () => {
+    withEnv({ PI_PROVIDER: 'compatible', HOME: fixtureHome });
+    fs.mkdirSync(nodePath.join(fixtureHome, '.pi', 'agent'), { recursive: true });
+    fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'models.json'), JSON.stringify({
+      providers: {
+        compatible: {
+          api: 'openai-completions',
+          baseUrl: 'http://fixture:9000/v1',
+          apiKey: 'k',
+          models: [{ id: 'fixture-model' }],
+        },
+      },
+    }));
+
+    expect(resolveOpenAiCompatEndpoint()).toEqual({
+      baseUrl: 'http://fixture:9000/v1',
+      apiKey: 'k',
+      model: 'fixture-model',
+    });
+  });
+
   it('warns and returns null when the configured provider lacks an apiKey', () => {
     withEnv({ PI_PROVIDER: 'keyless', HOME: fixtureHome });
     fs.mkdirSync(nodePath.join(fixtureHome, '.pi', 'agent'), { recursive: true });

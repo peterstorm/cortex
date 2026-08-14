@@ -280,21 +280,16 @@ export function parseExtractionResponse(
       return { kind: 'parse_error', raw: response };
     }
 
-    // Validate and filter memory candidates. Mixed-validity output remains
-    // usable, but every dropped item is observable so schema drift cannot
-    // masquerade as a fully successful extraction.
+    // A checkpoint covers the whole transcript chunk, not individual model
+    // items. Accepting only the valid subset would permanently consume every
+    // malformed candidate, so any invalid item makes the response retryable.
     const validMemories = rawMemories.filter(isValidCandidate);
     const invalidMemoryCount = rawMemories.length - validMemories.length;
-    if (rawMemories.length > 0 && validMemories.length === 0) {
-      process.stderr.write(
-        `[cortex:extraction] WARN: all ${rawMemories.length} memory candidate(s) had invalid shape; treating response as parse error\n`
-      );
-      return { kind: 'parse_error', raw: response };
-    }
     if (invalidMemoryCount > 0) {
       process.stderr.write(
-        `[cortex:extraction] WARN: dropped ${invalidMemoryCount} of ${rawMemories.length} invalid memory candidate(s)\n`
+        `[cortex:extraction] WARN: ${invalidMemoryCount} of ${rawMemories.length} memory candidate(s) had invalid shape; treating response as parse error\n`
       );
+      return { kind: 'parse_error', raw: response };
     }
 
     const memories: readonly MemoryCandidate[] = validMemories.map((c) => ({
@@ -307,20 +302,14 @@ export function parseExtractionResponse(
       tags: Array.isArray(c.tags) ? c.tags.map(String) : [],
     }));
 
-    // Validate and filter entity-fact candidates with the same observable
-    // mixed-validity contract as memories.
+    // Entity facts share the same all-or-retry checkpoint contract.
     const validEntities = rawEntities.filter(isValidEntityFactCandidate);
     const invalidEntityCount = rawEntities.length - validEntities.length;
-    if (rawEntities.length > 0 && validEntities.length === 0) {
-      process.stderr.write(
-        `[cortex:extraction] WARN: all ${rawEntities.length} entity candidate(s) had invalid shape; treating response as parse error\n`
-      );
-      return { kind: 'parse_error', raw: response };
-    }
     if (invalidEntityCount > 0) {
       process.stderr.write(
-        `[cortex:extraction] WARN: dropped ${invalidEntityCount} of ${rawEntities.length} invalid entity candidate(s)\n`
+        `[cortex:extraction] WARN: ${invalidEntityCount} of ${rawEntities.length} entity candidate(s) had invalid shape; treating response as parse error\n`
       );
+      return { kind: 'parse_error', raw: response };
     }
     const entities: readonly EntityFactCandidate[] = validEntities
       .map((c) => ({

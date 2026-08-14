@@ -46,6 +46,18 @@ describe('extractJsonSlice', () => {
     expect(result).toBe('[{"id":1}]');
   });
 
+  it('skips a prose bracket and extracts a later JSON object', () => {
+    expect(
+      extractJsonSlice('Note [draft]. Result: {"candidates":[]}')
+    ).toBe('{"candidates":[]}');
+  });
+
+  it('skips a prose brace and extracts a later JSON array', () => {
+    expect(
+      extractJsonSlice('Template {name}. Result: [{"id":1}]')
+    ).toBe('[{"id":1}]');
+  });
+
   it('stops at the balanced value when trailing prose repeats its closer', () => {
     const json = '[{"id":1}]';
     expect(extractJsonSlice(`${json}\nExplanation mentions ] afterward.`)).toBe(json);
@@ -68,6 +80,12 @@ describe('parseJsonFromLlmText', () => {
     expect(
       parseJsonFromLlmText<number[]>('[1,2,3]\n\nBoth numbers are small.')
     ).toEqual([1, 2, 3]);
+  });
+
+  it('parses valid JSON after an earlier prose delimiter', () => {
+    expect(
+      parseJsonFromLlmText<{ candidates: unknown[] }>('Note [draft]. Result: {"candidates":[]}')
+    ).toEqual({ candidates: [] });
   });
 
   it('returns null for unparseable text', () => {

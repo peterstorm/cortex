@@ -41,15 +41,8 @@ export interface ChatCompletionOptions {
   readonly timeoutMs?: number;
 }
 
-/** Provider APIs that are not OpenAI-compatible chat/completions. */
-const NON_OPENAI_APIS = new Set([
-  'anthropic',
-  'google-generative-ai',
-  'google-vertex',
-  'vertex',
-  'aws-bedrock',
-  'azure-ai',
-]);
+/** Pi API adapters proven to expose the OpenAI `/chat/completions` contract. */
+const OPENAI_CHAT_COMPLETIONS_APIS = new Set(['openai-completions']);
 
 function getEnv(name: string): string | undefined {
   if (typeof Bun !== 'undefined') return Bun.env[name] ?? undefined;
@@ -159,8 +152,13 @@ export function resolveOpenAiCompatEndpoint(): LlmEndpoint | null {
   }
   const providerRecord = provider as Record<string, unknown>;
 
-  if (typeof providerRecord.api === 'string' && NON_OPENAI_APIS.has(providerRecord.api)) {
-    warnResolution(`provider '${providerId}' uses non-OpenAI-compatible api '${providerRecord.api}'`);
+  if (
+    typeof providerRecord.api === 'string' &&
+    !OPENAI_CHAT_COMPLETIONS_APIS.has(providerRecord.api)
+  ) {
+    warnResolution(
+      `provider '${providerId}' uses api '${providerRecord.api}', not the OpenAI chat-completions adapter`
+    );
     return null;
   }
 
@@ -227,7 +225,8 @@ export async function chatCompletionText(
     chat_template_kwargs: { thinking: false },
   };
   if (options.jsonSchema) {
-    // Strict schema-guided decoding: the model cannot deviate from the shape.
+    // Request strict schema-guided decoding where the provider supports it;
+    // callers still parse defensively because provider compliance can vary.
     body.response_format = {
       type: 'json_schema',
       json_schema: {

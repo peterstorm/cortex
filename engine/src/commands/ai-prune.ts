@@ -338,6 +338,20 @@ export async function runAiPrune(
   let successfulBatches = 0;
   let reviewedMemories = 0;
 
+  // A memory and the graph/entity records derived from it form one archive
+  // consistency boundary. If any dependent write fails, SQLite rolls the
+  // entire archive back so a later prune can retry the still-active memory.
+  const archiveProjectMemory = projectDb.transaction((id: string, archivedAt: string) => {
+    updateMemory(projectDb, id, { status: 'archived', archived_at: archivedAt });
+    archiveEdgesForMemory(projectDb, id);
+    supersedeFactsForMemory(projectDb, id);
+  });
+  const archiveGlobalMemory = globalDb.transaction((id: string, archivedAt: string) => {
+    updateMemory(globalDb, id, { status: 'archived', archived_at: archivedAt });
+    archiveEdgesForMemory(globalDb, id);
+    supersedeFactsForMemory(globalDb, id);
+  });
+
   for (let i = 0; i < batches.length; i++) {
     const batch = batches[i];
     logInfo(`Batch ${i + 1}/${totalBatches}: ${batch.length} memories`);
@@ -379,15 +393,11 @@ export async function runAiPrune(
       // archived_at anchors the archive→prune grace period (FR-091)
       const archivedAt = new Date().toISOString();
       if (projectIds.has(candidate.id)) {
-        updateMemory(projectDb, candidate.id, { status: 'archived', archived_at: archivedAt });
-        archiveEdgesForMemory(projectDb, candidate.id);
-        supersedeFactsForMemory(projectDb, candidate.id);
+        archiveProjectMemory(candidate.id, archivedAt);
         totalArchived++;
         logInfo(`Archived ${candidate.id.slice(0, 8)}: ${candidate.reason}`);
       } else if (globalIds.has(candidate.id)) {
-        updateMemory(globalDb, candidate.id, { status: 'archived', archived_at: archivedAt });
-        archiveEdgesForMemory(globalDb, candidate.id);
-        supersedeFactsForMemory(globalDb, candidate.id);
+        archiveGlobalMemory(candidate.id, archivedAt);
         totalArchived++;
         logInfo(`Archived ${candidate.id.slice(0, 8)}: ${candidate.reason}`);
       } else {

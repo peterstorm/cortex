@@ -446,9 +446,10 @@ If no strong relationships, return {"edges": []}.`;
  * can be mistaken for a genuine decline; the caller retries the batch.
  *
  * Strict mode (direct API with guided decoding) requires the whole response
- * to be a valid JSON object with an edges array, requires every item to be
- * schema-valid (invalid items are a decoder anomaly and throw with a dropped
- * count), and throws otherwise — callers must treat that as a batch failure.
+ * to be valid JSON and accepts either the guided {"edges": [...]} envelope or
+ * a legacy bare array. Every item must be schema-valid; pair_index remains
+ * optional for legacy compatibility. Invalid items are decoder anomalies and
+ * throw so callers retry the batch rather than retiring affected pairs.
  */
 export function parseEdgeClassificationResponse(
   response: string,

@@ -458,7 +458,7 @@ describe("parseExtractionResponse", () => {
     expect(result.entities).toEqual([]);
   });
 
-  it("filters out invalid memory types (FR-005)", () => {
+  it("returns parse_error when any memory type is invalid (FR-005)", () => {
     const response = JSON.stringify([
       {
         content: "Valid",
@@ -480,13 +480,10 @@ describe("parseExtractionResponse", () => {
       },
     ]);
 
-    const result = okParse(parseExtractionResponse(response));
-
-    expect(result.memories).toHaveLength(1);
-    expect(result.memories[0].memory_type).toBe("decision");
+    expect(parseExtractionResponse(response).kind).toBe("parse_error");
   });
 
-  it("filters out invalid confidence values (FR-006)", () => {
+  it("returns parse_error when any confidence value is invalid (FR-006)", () => {
     const response = JSON.stringify([
       {
         content: "Valid",
@@ -517,13 +514,10 @@ describe("parseExtractionResponse", () => {
       },
     ]);
 
-    const result = okParse(parseExtractionResponse(response));
-
-    expect(result.memories).toHaveLength(1);
-    expect(result.memories[0].confidence).toBe(0.5);
+    expect(parseExtractionResponse(response).kind).toBe("parse_error");
   });
 
-  it("filters out invalid priority values (FR-007)", () => {
+  it("returns parse_error when any priority value is invalid (FR-007)", () => {
     const response = JSON.stringify([
       {
         content: "Valid",
@@ -563,10 +557,7 @@ describe("parseExtractionResponse", () => {
       },
     ]);
 
-    const result = okParse(parseExtractionResponse(response));
-
-    expect(result.memories).toHaveLength(1);
-    expect(result.memories[0].priority).toBe(5);
+    expect(parseExtractionResponse(response).kind).toBe("parse_error");
   });
 
   it("validates all 8 memory types", () => {
@@ -654,7 +645,7 @@ describe("parseExtractionResponse", () => {
     expect(parseExtractionResponse(response).kind).toBe("parse_error");
   });
 
-  it("reports every dropped item in a mixed-validity response", () => {
+  it("rejects a mixed-validity memory response so the whole chunk can retry", () => {
     const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const response = JSON.stringify({
       memories: [
@@ -668,6 +659,21 @@ describe("parseExtractionResponse", () => {
         },
         { content: "Missing required fields" },
       ],
+      entities: [],
+    });
+
+    try {
+      expect(parseExtractionResponse(response)).toEqual({ kind: "parse_error", raw: response });
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining("1 of 2 memory candidate"));
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
+  it("rejects a mixed-validity entity response so the whole chunk can retry", () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const response = JSON.stringify({
+      memories: [],
       entities: [
         { entity_name: "Cortex", entity_type: "project", predicate: "uses", object: "SQLite" },
         { entity_name: "Broken entity" },
@@ -675,11 +681,8 @@ describe("parseExtractionResponse", () => {
     });
 
     try {
-      const result = okParse(parseExtractionResponse(response));
-      expect(result.memories).toHaveLength(1);
-      expect(result.entities).toHaveLength(1);
-      expect(stderr).toHaveBeenCalledWith(expect.stringContaining("dropped 1 of 2 invalid memory candidate"));
-      expect(stderr).toHaveBeenCalledWith(expect.stringContaining("dropped 1 of 2 invalid entity candidate"));
+      expect(parseExtractionResponse(response)).toEqual({ kind: "parse_error", raw: response });
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining("1 of 2 entity candidate"));
     } finally {
       stderr.mockRestore();
     }

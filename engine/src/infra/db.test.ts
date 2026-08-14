@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { Database } from 'bun:sqlite';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -593,6 +593,23 @@ describe('Database Layer', () => {
       expect(byIds.map((c) => c.memory.id).sort()).toEqual(['mem-emb-1', 'mem-emb-3']);
 
       db.close();
+    });
+
+    it('warns when an ID-filtered non-null embedding cannot be deserialized', () => {
+      db.run('UPDATE memories SET embedding = 0 WHERE id = ?', ['mem-emb-1']);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+      try {
+        const candidates = getMemoriesWithEmbeddingByIds(db, ['mem-emb-1'], 'gemini');
+
+        expect(candidates).toEqual([]);
+        expect(warn).toHaveBeenCalledWith(
+          '[cortex:db] Skipping memory mem-emb-1: embedding deserialized to null'
+        );
+      } finally {
+        warn.mockRestore();
+        db.close();
+      }
     });
 
     it('fetches and ranks by gemini embedding similarity', () => {

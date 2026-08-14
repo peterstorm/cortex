@@ -203,7 +203,7 @@ describe('extract command - core logic', () => {
       expect(parseExtractionResponse(response).kind).toBe('parse_error');
     });
 
-    it('filters invalid candidates when at least one candidate remains valid', () => {
+    it('returns parse_error when a response mixes valid and invalid candidates', () => {
       const response = JSON.stringify([
         {
           content: 'Valid',
@@ -234,12 +234,10 @@ describe('extract command - core logic', () => {
         },
       ]);
 
-      const result = parseExtractionResponse(response);
-
-      expect(result.kind).toBe('ok');
-      if (result.kind !== 'ok') throw new Error('expected ok');
-      expect(result.memories.length).toBe(1);
-      expect(result.memories[0].content).toBe('Valid');
+      expect(parseExtractionResponse(response)).toEqual({
+        kind: 'parse_error',
+        raw: response,
+      });
     });
   });
 
@@ -750,6 +748,36 @@ describe('executeExtract (mocked LLM)', () => {
     db.close();
   });
 
+  it('does not persist survivors or advance the checkpoint for mixed-validity output', async () => {
+    const transcript = '{"role":"user","content":"one valid and one malformed memory"}\n';
+    const { cwd, transcriptPath } = makeTestProject(transcript);
+    const db = openDatabase(':memory:');
+    mockExtractMemories.mockResolvedValue(JSON.stringify({
+      memories: [
+        {
+          content: 'valid storage decision',
+          summary: 'valid storage decision',
+          memory_type: 'decision',
+          scope: 'project',
+          confidence: 0.9,
+          priority: 5,
+          tags: [],
+        },
+        { content: 'missing required fields' },
+      ],
+      entities: [],
+    }));
+
+    const result = await executeExtract(
+      { session_id: 's-mixed-parse', transcript_path: transcriptPath, cwd }, db
+    );
+
+    expect(result).toMatchObject({ kind: 'failed', cursor_position: 0 });
+    expect(getExtractionCheckpoint(db, 's-mixed-parse')).toBeNull();
+    expect(getActiveMemories(db)).toHaveLength(0);
+    db.close();
+  });
+
   it('advances the checkpoint on a genuinely-empty extraction', async () => {
     const transcript = '{"role":"user","content":"nothing memorable"}\n';
     const { cwd, transcriptPath } = makeTestProject(transcript);
@@ -929,6 +957,48 @@ describe('executeExtract (mocked LLM)', () => {
     }
   });
 
+  it('does not checkpoint when a global-scoped memory write fails', async () => {
+    const transcript = '{"role":"user","content":"a durable global decision"}\n';
+    const { cwd, transcriptPath } = makeTestProject(transcript);
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    mockExtractMemories.mockResolvedValue(JSON.stringify({
+      memories: [{
+        content: 'global transport decision',
+        summary: 'global transport decision',
+        memory_type: 'decision',
+        scope: 'global',
+        confidence: 0.9,
+        priority: 5,
+        tags: [],
+      }],
+      entities: [],
+    }));
+    const dbModule = await import('../infra/db.js');
+    const realInsert = dbModule.insertMemory;
+    const insertSpy = vi.spyOn(dbModule, 'insertMemory').mockImplementation((database, memory) => {
+      if (database === globalDb) throw new Error('SQLITE_BUSY: global database is locked');
+      return realInsert(database, memory);
+    });
+
+    try {
+      const result = await executeExtract(
+        { session_id: 's-global-write-failure', transcript_path: transcriptPath, cwd },
+        projectDb,
+        globalDb,
+      );
+
+      expect(result).toMatchObject({ kind: 'failed', cursor_position: 0 });
+      if (result.kind === 'failed') expect(result.error).toContain('memory candidate write');
+      expect(getExtractionCheckpoint(projectDb, 's-global-write-failure')).toBeNull();
+      expect(getActiveMemories(globalDb)).toHaveLength(0);
+    } finally {
+      insertSpy.mockRestore();
+      projectDb.close();
+      globalDb.close();
+    }
+  });
+
   it('does not checkpoint a chunk when edge persistence fails', async () => {
     const transcript = '{"role":"user","content":"SQLite backs durable project storage"}\n';
     const { cwd, transcriptPath } = makeTestProject(transcript);
@@ -980,6 +1050,63 @@ describe('executeExtract (mocked LLM)', () => {
     }
   });
 
+  it('does not replay relationships for an ordinary exact duplicate', async () => {
+    const transcript = '{"role":"user","content":"repeat an existing storage decision"}\n';
+    const { cwd, transcriptPath } = makeTestProject(transcript);
+    const db = openDatabase(':memory:');
+    const now = new Date().toISOString();
+    const duplicate = createMemory({
+      id: 'existing-duplicate',
+      content: 'SQLite migration keeps durable project database storage',
+      summary: 'durable SQLite project storage',
+      memory_type: 'decision',
+      scope: 'project',
+      confidence: 0.9,
+      priority: 5,
+      source_type: 'manual',
+      source_session: 'earlier-session',
+      source_context: '{}',
+      created_at: now,
+      updated_at: now,
+      last_accessed_at: now,
+    });
+    const related = createMemory({
+      id: 'typed-edge-target',
+      content: 'SQLite provides durable project database storage',
+      summary: 'durable SQLite database storage',
+      memory_type: 'architecture',
+      scope: 'project',
+      confidence: 0.9,
+      priority: 5,
+      source_type: 'manual',
+      source_session: 'earlier-session',
+      source_context: '{}',
+      created_at: now,
+      updated_at: now,
+      last_accessed_at: now,
+    });
+    insertMemory(db, duplicate);
+    insertMemory(db, related);
+    db.run(`
+      INSERT INTO edges (
+        id, source_id, target_id, relation_type, strength,
+        bidirectional, status, created_at, classified_at, classify_hash
+      ) VALUES ('typed-edge', 'existing-duplicate', 'typed-edge-target', 'refines', 0.9, 1, 'active', ?, NULL, NULL)
+    `, [now]);
+    mockExtractMemories.mockResolvedValue(memoriesResponse(duplicate.content));
+
+    const result = await executeExtract(
+      { session_id: 's-ordinary-duplicate', transcript_path: transcriptPath, cwd }, db
+    );
+
+    expect(result.kind).toBe('succeeded');
+    expect(getActiveMemories(db)).toHaveLength(2);
+    expect(db.query('SELECT relation_type FROM edges ORDER BY relation_type').all()).toEqual([
+      { relation_type: 'refines' },
+    ]);
+    db.close();
+  });
+
   it('does not checkpoint a chunk when entity persistence fails', async () => {
     const transcript = '{"role":"user","content":"NixOS configures this workstation"}\n';
     const { cwd, transcriptPath } = makeTestProject(transcript);
@@ -1005,6 +1132,10 @@ describe('executeExtract (mocked LLM)', () => {
       expect(result).toMatchObject({ kind: 'failed', retryable: true });
       if (result.kind === 'failed') expect(result.error).toContain('Entity processing failed');
       expect(getExtractionCheckpoint(db, 's-entity-failure')).toBeNull();
+      const [provenanceBeforeRetry] = getActiveMemories(db).filter(
+        (memory) => memory.tags.includes('extraction-provenance')
+      );
+      expect(provenanceBeforeRetry).toBeDefined();
 
       entitySpy.mockRestore();
       const retry = await executeExtract(
@@ -1012,10 +1143,84 @@ describe('executeExtract (mocked LLM)', () => {
       );
       expect(retry.kind).toBe('succeeded');
       const [entity] = getAllEntities(db);
-      expect(getCurrentFacts(db, entity.id)).toHaveLength(1);
+      const [fact] = getCurrentFacts(db, entity.id);
+      expect(fact.source_memory_id).toBe(provenanceBeforeRetry.id);
+      expect(getActiveMemories(db).filter(
+        (memory) => memory.tags.includes('extraction-provenance')
+      )).toHaveLength(1);
       expect(getExtractionCheckpoint(db, 's-entity-failure')?.cursor_position).toBe(transcript.length);
     } finally {
       entitySpy.mockRestore();
+      db.close();
+    }
+  });
+
+  it('rolls back fact supersession when replacement insertion fails', async () => {
+    const transcript = '{"role":"user","content":"Cortex now uses PostgreSQL"}\n';
+    const { cwd, transcriptPath } = makeTestProject(transcript);
+    const db = openDatabase(':memory:');
+    const now = new Date().toISOString();
+    const source = createMemory({
+      id: 'old-fact-source',
+      content: 'Cortex uses SQLite',
+      summary: 'Cortex storage',
+      memory_type: 'architecture',
+      scope: 'project',
+      confidence: 0.9,
+      priority: 8,
+      source_type: 'manual',
+      source_session: 'seed',
+      source_context: '{}',
+      created_at: now,
+      updated_at: now,
+      last_accessed_at: now,
+    });
+    insertMemory(db, source);
+    const dbModule = await import('../infra/db.js');
+    const entityId = dbModule.upsertEntity(db, 'Cortex', 'project');
+    dbModule.insertFact(db, {
+      id: 'old-storage-fact',
+      entity_id: entityId,
+      predicate: 'uses',
+      object: 'SQLite',
+      source_memory_id: source.id,
+      confidence: 0.9,
+      valid_from: now,
+      valid_to: null,
+      created_at: now,
+    });
+    mockExtractMemories.mockResolvedValue(JSON.stringify({
+      memories: [{
+        content: 'Cortex storage migrated from SQLite to PostgreSQL',
+        summary: 'Cortex uses PostgreSQL',
+        memory_type: 'architecture',
+        scope: 'project',
+        confidence: 0.9,
+        priority: 8,
+        tags: [],
+      }],
+      entities: [{
+        entity_name: 'Cortex',
+        entity_type: 'project',
+        predicate: 'uses',
+        object: 'PostgreSQL',
+      }],
+    }));
+    const insertFactSpy = vi.spyOn(dbModule, 'insertFact')
+      .mockImplementation(() => { throw new Error('SQLITE_IOERR: replacement insert failed'); });
+
+    try {
+      const result = await executeExtract(
+        { session_id: 's-fact-rollback', transcript_path: transcriptPath, cwd }, db
+      );
+
+      expect(result).toMatchObject({ kind: 'failed', retryable: true });
+      expect(getExtractionCheckpoint(db, 's-fact-rollback')).toBeNull();
+      expect(getCurrentFacts(db, entityId)).toEqual([
+        expect.objectContaining({ id: 'old-storage-fact', object: 'SQLite', valid_to: null }),
+      ]);
+    } finally {
+      insertFactSpy.mockRestore();
       db.close();
     }
   });

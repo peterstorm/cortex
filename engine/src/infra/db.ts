@@ -178,8 +178,9 @@ export const CURRENT_SCHEMA_VERSION = 1;
 function initializeSchema(db: Database): void {
   // WAL allows only one writer; the SessionEnd pipeline spawns detached
   // workers (semantic-edges, lifecycle, ai-prune) that can collide. Without
-  // a busy timeout a collision throws SQLITE_BUSY immediately — and detached
-  // workers log to /dev/null, so the write is silently lost.
+  // a busy timeout a collision throws SQLITE_BUSY immediately. Pi records
+  // detached output in .memory/logs/pi-detached.log (or inherits output if
+  // log setup fails), but the write still needs a bounded retry window.
   // MUST be set BEFORE the WAL pragma: journal_mode=WAL itself takes a write
   // lock, so a concurrent writer would otherwise cause an unprotected
   // SQLITE_BUSY on open.
@@ -888,7 +889,10 @@ export function getMemoriesWithEmbeddingByIds(
   for (const row of rows) {
     const memory = rowToMemory(row);
     const memoryEmbedding = type === 'gemini' ? memory.embedding : memory.local_embedding;
-    if (!memoryEmbedding) continue;
+    if (!memoryEmbedding) {
+      console.warn(`[cortex:db] Skipping memory ${memory.id}: ${column} deserialized to null`);
+      continue;
+    }
     results.push({ memory, embedding: memoryEmbedding });
   }
 

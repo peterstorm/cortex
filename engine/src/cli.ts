@@ -1219,6 +1219,9 @@ async function handlePromptRecall(): Promise<CommandResult> {
     const prompt = parsed?.prompt;
     const cwd = parsed?.cwd;
     if (typeof prompt !== 'string' || typeof cwd !== 'string') {
+      process.stderr.write(
+        '[cortex] WARN: prompt-recall ignored malformed input: expected string prompt and cwd\n'
+      );
       return { success: true };
     }
 

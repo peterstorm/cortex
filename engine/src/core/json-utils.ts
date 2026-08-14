@@ -9,22 +9,32 @@
 /**
  * Extract the first JSON value (object or array) from a text blob.
  *
- * Strategy: find the earliest opening `{` or `[`, then scan until that JSON
- * value's delimiters balance. The scanner is string/escape-aware, so braces
- * inside JSON strings and matching delimiters in trailing prose are ignored.
+ * Strategy: scan each opening `{` or `[` in order until a balanced slice is
+ * also valid JSON. The scanner is string/escape-aware, so prose delimiters,
+ * braces inside JSON strings, and matching delimiters after the value do not
+ * prevent a later valid value from being found.
  *
  * @param text - Raw LLM response text
  * @returns The JSON slice, or null when no JSON-looking value exists
  */
 export function extractJsonSlice(text: string): string | null {
-  const firstBrace = text.indexOf('{');
-  const firstBracket = text.indexOf('[');
+  for (let start = 0; start < text.length; start++) {
+    if (text[start] !== '{' && text[start] !== '[') continue;
 
-  if (firstBrace === -1 && firstBracket === -1) return null;
+    const candidate = balancedJsonCandidate(text, start);
+    if (candidate === null) continue;
+    try {
+      JSON.parse(candidate);
+      return candidate;
+    } catch {
+      // A prose delimiter (for example "[draft]") is not JSON. Keep
+      // scanning rather than allowing it to hide a later structured result.
+    }
+  }
+  return null;
+}
 
-  const start = firstBracket === -1 || (firstBrace !== -1 && firstBrace < firstBracket)
-    ? firstBrace
-    : firstBracket;
+function balancedJsonCandidate(text: string, start: number): string | null {
   const expectedClosers: Array<'}' | ']'> = [];
   let inString = false;
   let escaped = false;

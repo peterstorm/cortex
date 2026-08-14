@@ -320,8 +320,10 @@ export async function executeExtract(
         // candidate to be inserted as a NEW memory instead of being dropped.
         const embeddingFor = (candidate: MemoryCandidate): Float32Array | null =>
           scopedEmbeddings.get(scopedCandidates.indexOf(candidate)) ?? null;
+        const idForCandidate = (candidate: MemoryCandidate): string =>
+          extractionMemoryId(input.session_id, cursor, candidate);
         const mergeResult = applyDedupMerges(
-          db, merges, embeddingFor, input.session_id, gitContext
+          db, merges, embeddingFor, input.session_id, gitContext, idForCandidate
         );
 
         // Continue best-effort writes within the chunk, but retain every
@@ -333,7 +335,11 @@ export async function executeExtract(
         for (const candidate of kept) {
           try {
             const memory = candidateToMemory(
-              candidate, input.session_id, gitContext, embeddingFor(candidate)
+              candidate,
+              input.session_id,
+              gitContext,
+              embeddingFor(candidate),
+              idForCandidate(candidate),
             );
             insertMemory(db, memory);
             inserted.push(memory);
@@ -377,12 +383,15 @@ export async function executeExtract(
 
       // Edges and entity facts stay project-DB-only: edges/facts have FK
       // constraints into the same database, so cross-DB links are impossible.
-      // Exact existing matches are reused on checkpoint retries. This makes
-      // relationship persistence idempotent: if the memory landed before an
-      // edge write failed, the retry can still recreate the missing edge.
+      // A deterministic session/chunk/candidate identity proves whether an
+      // exact match came from this checkpoint retry. Ordinary duplicates have
+      // a different identity and must not replay generic relationships.
+      const retryMemoryIds = new Set(
+        projectCandidates.map((candidate) => extractionMemoryId(input.session_id, cursor, candidate))
+      );
       const insertedMemories: Memory[] = [
         ...projectResult.inserted,
-        ...projectResult.reused,
+        ...projectResult.reused.filter((memory) => retryMemoryIds.has(memory.id)),
       ];
 
       // Entity-only and global-only responses still need project-local fact
@@ -521,6 +530,18 @@ export async function executeExtract(
  * Convert a memory candidate to a persisted Memory shape.
  * This persistence-boundary helper allocates identity and timestamps.
  */
+function extractionMemoryId(
+  sessionId: string,
+  chunkCursor: number,
+  candidate: MemoryCandidate,
+): string {
+  const digest = createHash('sha256')
+    .update(`${sessionId}\0${chunkCursor}\0${candidate.scope}\0${candidate.content}`)
+    .digest('hex')
+    .slice(0, 32);
+  return `extraction-${digest}`;
+}
+
 function candidateToMemory(
   candidate: MemoryCandidate,
   sessionId: string,
@@ -590,7 +611,8 @@ export function applyDedupMerges(
   merges: readonly DeduplicateMerge[],
   embeddingFor: (candidate: MemoryCandidate) => Float32Array | null,
   sessionId: string,
-  gitContext: GitContext
+  gitContext: GitContext,
+  idForCandidate: (candidate: MemoryCandidate) => string = () => randomUUID(),
 ): { merged: number; fallbackInserted: Memory[]; writeFailures: number } {
   let merged = 0;
   let writeFailures = 0;
@@ -605,7 +627,11 @@ export function applyDedupMerges(
           `Merge target ${merge.existingMemoryId} is ${existingMem ? `'${existingMem.status}'` : 'missing'} — inserting candidate as new memory`
         );
         const memory = candidateToMemory(
-          merge.candidate, sessionId, gitContext, embeddingFor(merge.candidate)
+          merge.candidate,
+          sessionId,
+          gitContext,
+          embeddingFor(merge.candidate),
+          idForCandidate(merge.candidate),
         );
         insertMemory(db, memory);
         fallbackInserted.push(memory);
@@ -982,16 +1008,6 @@ function processEntityFacts(
       (f) => f.predicate.toLowerCase() === candidate.predicate.toLowerCase() &&
              f.object.toLowerCase() !== candidate.object.toLowerCase()
     );
-    if (conflicting) {
-      supersedeFact(db, conflicting.id);
-      conflicts.push({
-        entityName: candidate.entity_name,
-        predicate: candidate.predicate,
-        oldValue: conflicting.object,
-        newValue: candidate.object,
-      });
-    }
-
     // Skip if exact duplicate fact already exists
     const exactDup = existingFacts.find(
       (f) => f.predicate.toLowerCase() === candidate.predicate.toLowerCase() &&
@@ -999,19 +1015,32 @@ function processEntityFacts(
     );
     if (exactDup) continue;
 
-    // Insert new fact
-    const factId = randomUUID();
-    insertFact(db, {
-      id: factId,
-      entity_id: entityId,
-      predicate: candidate.predicate,
-      object: candidate.object,
-      source_memory_id: defaultSourceId,
-      confidence: 0.7, // Default confidence for extracted facts
-      valid_from: now,
-      valid_to: null,
-      created_at: now,
+    // Replacing a current fact is one consistency boundary: insertion failure
+    // must leave the old fact current rather than creating a factless gap.
+    const persistReplacement = db.transaction(() => {
+      if (conflicting) supersedeFact(db, conflicting.id);
+      insertFact(db, {
+        id: randomUUID(),
+        entity_id: entityId,
+        predicate: candidate.predicate,
+        object: candidate.object,
+        source_memory_id: defaultSourceId,
+        confidence: 0.7, // Default confidence for extracted facts
+        valid_from: now,
+        valid_to: null,
+        created_at: now,
+      });
     });
+    persistReplacement();
+
+    if (conflicting) {
+      conflicts.push({
+        entityName: candidate.entity_name,
+        predicate: candidate.predicate,
+        oldValue: conflicting.object,
+        newValue: candidate.object,
+      });
+    }
     factsCreated++;
   }
 
