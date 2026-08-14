@@ -16,7 +16,7 @@ import type {
   SourceType,
   EdgeRelation,
 } from '../core/types.js';
-import { createMemory, createEdge, createExtractionCheckpoint, isEdgeRelation, isMemoryType, isMemoryStatus } from '../core/types.js';
+import { createMemory, createEdge, createExtractionCheckpoint, isEdgeRelation, isMemoryType, isMemoryStatus, isMemoryScope } from '../core/types.js';
 import type { Entity, Fact, EntityType } from '../core/entities.js';
 import { createEntity, createFact, isEntityType } from '../core/entities.js';
 
@@ -453,6 +453,9 @@ function validateMemoryFields(fields: Partial<Memory>, operation: string): void 
   }
   if (fields.status !== undefined && !isMemoryStatus(fields.status)) {
     throw new Error(`${operation}: invalid status: ${fields.status}`);
+  }
+  if (fields.scope !== undefined && !isMemoryScope(fields.scope)) {
+    throw new Error(`${operation}: invalid scope: ${fields.scope}`);
   }
   if (fields.confidence !== undefined &&
       (Number.isNaN(fields.confidence) || fields.confidence < 0 || fields.confidence > 1)) {

@@ -457,8 +457,8 @@ export async function executeExtract(
 // ============================================================================
 
 /**
- * Convert memory candidate to full Memory object
- * Pure function - builds domain object
+ * Convert a memory candidate to a persisted Memory shape.
+ * This persistence-boundary helper allocates identity and timestamps.
  */
 function candidateToMemory(
   candidate: MemoryCandidate,
@@ -758,7 +758,7 @@ export function computeEdgeCandidates(
  * @param existingMemories - Pre-fetched active memories (avoids redundant DB call)
  * @returns Number of edges created
  */
-function computeSimilarityAndCreateEdges(
+export function computeSimilarityAndCreateEdges(
   db: Database,
   newMemories: readonly Memory[],
   existingMemories: readonly Memory[]
@@ -810,8 +810,9 @@ async function generateCandidateEmbeddings(
       logInfo('Local embedding model unavailable — falling back to Jaccard-only dedup');
       return embeddings;
     }
-  } catch {
-    logInfo('Local embedding model failed to load — falling back to Jaccard-only dedup');
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logInfo(`Local embedding model failed to load (${message}) — falling back to Jaccard-only dedup`);
     return embeddings;
   }
 

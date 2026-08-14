@@ -41,10 +41,8 @@ describe('config - path resolution', () => {
     expect(result).toBe('/project/.memory/surface-cache');
   });
 
-  it('getSurfaceOutputPath returns correct path', () => {
-    const result = getSurfaceOutputPath('/project');
-    // Harness-dependent: .claude or .pi
-    expect(result).toMatch(/\/project\/\.(claude|pi)\/cortex-memory\.local\.md/);
+  it('getSurfaceOutputPath always returns the unified .claude path', () => {
+    expect(getSurfaceOutputPath('/project')).toBe('/project/.claude/cortex-memory.local.md');
   });
 
   it('getLockDir returns correct path', () => {

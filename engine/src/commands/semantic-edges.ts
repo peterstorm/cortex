@@ -283,8 +283,11 @@ export async function executeSemanticEdges(
             const replaceEdge = db.transaction(() => {
               deleteEdge(db, edgeId);
               insertEdge(db, {
-                source_id: classification.source_id,
-                target_id: classification.target_id,
+                // pair_index binds this answer to trusted input endpoints. The
+                // model-echoed IDs are diagnostic only and may be reversed or
+                // mangled; never let them redefine a directional edge.
+                source_id: joinByIndex ? pair.source.id : classification.source_id,
+                target_id: joinByIndex ? pair.target.id : classification.target_id,
                 relation_type: classification.relation_type,
                 strength: classification.strength,
                 // Directional relation types keep direction; only the

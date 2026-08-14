@@ -20,8 +20,8 @@ const mockIsClaudeLlmAvailable = vi.fn();
 const mockResolveEndpoint = vi.fn();
 vi.mock('../infra/claude-llm.js', () => ({
   isClaudeLlmAvailable: () => mockIsClaudeLlmAvailable(),
-  runLlmPromptDirect: async (prompt: string, timeout: number) => ({
-    text: await mockRunLlmPrompt(prompt, timeout),
+  runLlmPromptDirect: async (prompt: string, timeout: number, options: unknown) => ({
+    text: await mockRunLlmPrompt(prompt, timeout, options),
     direct: false,
   }),
 }));
@@ -130,10 +130,10 @@ describe('runAiPrune age guard (enforced in code, not just prompt)', () => {
     insertMemory(projectDb, makeMemory('fresh-1', 1));
 
     // LLM (mis)behaves: names both a fresh memory and an old one
-    mockRunLlmPrompt.mockResolvedValue(JSON.stringify([
+    mockRunLlmPrompt.mockResolvedValue(JSON.stringify({ candidates: [
       { id: 'fresh-1', reason: 'looks redundant' },
       { id: 'old-0', reason: 'stale session context' },
-    ]));
+    ] }));
 
     const result = await runAiPrune(projectDb, globalDb, telemetryPath);
 
@@ -160,9 +160,9 @@ describe('runAiPrune age guard (enforced in code, not just prompt)', () => {
     }
     insertMemory(projectDb, makeMemory('pinned-1', 30, { pinned: true }));
 
-    mockRunLlmPrompt.mockResolvedValue(JSON.stringify([
+    mockRunLlmPrompt.mockResolvedValue(JSON.stringify({ candidates: [
       { id: 'pinned-1', reason: 'redundant' },
-    ]));
+    ] }));
 
     const result = await runAiPrune(projectDb, globalDb, telemetryPath);
 
@@ -175,14 +175,22 @@ describe('runAiPrune age guard (enforced in code, not just prompt)', () => {
 });
 
 describe('parsePruneResponse / shouldRunAiPrune (sanity)', () => {
-  it('parses a valid response', () => {
-    const parsed = parsePruneResponse('[{"id": "abc", "reason": "stale"}]');
-    expect(parsed).toHaveLength(1);
-    expect(parsed[0].id).toBe('abc');
+  it('parses a valid object envelope', () => {
+    const parsed = parsePruneResponse('{"candidates":[{"id":"abc","reason":"stale"}]}');
+    expect(parsed).toEqual({
+      kind: 'ok',
+      candidates: [{ id: 'abc', reason: 'stale' }],
+    });
   });
 
-  it('returns empty for malformed output', () => {
-    expect(parsePruneResponse('nonsense')).toHaveLength(0);
+  it('distinguishes malformed output from a valid empty decision', () => {
+    expect(parsePruneResponse('nonsense').kind).toBe('unparseable');
+    expect(parsePruneResponse('{"candidates":[]}')).toEqual({ kind: 'ok', candidates: [] });
+  });
+
+  it('rejects the old top-level array and partially invalid candidates', () => {
+    expect(parsePruneResponse('[{"id":"abc","reason":"stale"}]').kind).toBe('unparseable');
+    expect(parsePruneResponse('{"candidates":[{"id":"abc"}]}').kind).toBe('unparseable');
   });
 
   it('triggers on session interval', () => {
@@ -203,6 +211,8 @@ describe('parsePruneResponse / shouldRunAiPrune (sanity)', () => {
 describe('AI prune failure telemetry', () => {
   beforeEach(() => {
     mockRunLlmPrompt.mockReset();
+    mockIsClaudeLlmAvailable.mockReset().mockReturnValue(true);
+    mockResolveEndpoint.mockReset().mockReturnValue(null);
   });
 
   it('does not mark a prune complete when every LLM batch fails', async () => {
@@ -216,6 +226,70 @@ describe('AI prune failure telemetry', () => {
 
     const result = await runAiPrune(projectDb, globalDb, telemetryPath);
 
+    expect(result).toMatchObject({ archived: 0, reviewed: 0 });
+    expect(result.error).toContain('All 1 AI prune batches failed');
+    expect(fs.existsSync(telemetryPath)).toBe(false);
+    projectDb.close();
+    globalDb.close();
+  });
+
+  it('uses an object JSON schema compatible with the pruning envelope', async () => {
+    mockRunLlmPrompt.mockResolvedValue('{"candidates":[]}');
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    const telemetryPath = makeTelemetryPath();
+    for (let index = 0; index < 8; index++) {
+      insertMemory(projectDb, makeMemory(`schema-${index}`, 10));
+    }
+
+    await runAiPrune(projectDb, globalDb, telemetryPath);
+
+    expect(mockRunLlmPrompt).toHaveBeenCalledWith(
+      expect.stringContaining('{"candidates": ['),
+      expect.any(Number),
+      expect.objectContaining({
+        jsonSchema: expect.objectContaining({
+          type: 'object',
+          required: ['candidates'],
+        }),
+      }),
+    );
+    projectDb.close();
+    globalDb.close();
+  });
+
+  it('does not reset cadence when only some batches were valid', async () => {
+    mockRunLlmPrompt
+      .mockResolvedValueOnce('{"candidates":[]}')
+      .mockRejectedValueOnce(new Error('second batch unavailable'));
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    const telemetryPath = makeTelemetryPath();
+    for (let index = 0; index < 81; index++) {
+      insertMemory(projectDb, makeMemory(`partial-${index}`, 10));
+    }
+
+    const result = await runAiPrune(projectDb, globalDb, telemetryPath);
+
+    expect(result).toMatchObject({ archived: 0, reviewed: 80 });
+    expect(result.error).toContain('1 of 2 AI prune batches failed');
+    expect(fs.existsSync(telemetryPath)).toBe(false);
+    projectDb.close();
+    globalDb.close();
+  });
+
+  it('treats malformed output as a failed batch rather than an empty decision', async () => {
+    mockRunLlmPrompt.mockResolvedValue('{"not_candidates":[]}');
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    const telemetryPath = makeTelemetryPath();
+    for (let index = 0; index < 8; index++) {
+      insertMemory(projectDb, makeMemory(`malformed-${index}`, 10));
+    }
+
+    const result = await runAiPrune(projectDb, globalDb, telemetryPath);
+
+    expect(result).toMatchObject({ archived: 0, reviewed: 0 });
     expect(result.error).toContain('All 1 AI prune batches failed');
     expect(fs.existsSync(telemetryPath)).toBe(false);
     projectDb.close();
@@ -233,6 +307,8 @@ import { upsertEntity, insertFact, getCurrentFacts } from '../infra/db.js';
 describe('ai-prune side effects (findings 1b, 12)', () => {
   beforeEach(() => {
     mockRunLlmPrompt.mockReset();
+    mockIsClaudeLlmAvailable.mockReset().mockReturnValue(true);
+    mockResolveEndpoint.mockReset().mockReturnValue(null);
   });
 
   it('invalidates the surface cache when memories are archived', async () => {
@@ -248,9 +324,9 @@ describe('ai-prune side effects (findings 1b, 12)', () => {
     for (let i = 0; i < 8; i++) {
       insertMemory(projectDb, makeMemory(`old-${i}`, 30));
     }
-    mockRunLlmPrompt.mockResolvedValue(JSON.stringify([
+    mockRunLlmPrompt.mockResolvedValue(JSON.stringify({ candidates: [
       { id: 'old-0', reason: 'stale' },
-    ]));
+    ] }));
 
     const result = await runAiPrune(projectDb, globalDb, telemetryPath, cwd);
 
@@ -274,7 +350,7 @@ describe('ai-prune side effects (findings 1b, 12)', () => {
     for (let i = 0; i < 8; i++) {
       insertMemory(projectDb, makeMemory(`old-${i}`, 30));
     }
-    mockRunLlmPrompt.mockResolvedValue('[]');
+    mockRunLlmPrompt.mockResolvedValue('{"candidates":[]}');
 
     const result = await runAiPrune(projectDb, globalDb, telemetryPath, cwd);
 
@@ -307,9 +383,9 @@ describe('ai-prune side effects (findings 1b, 12)', () => {
     });
     expect(getCurrentFacts(projectDb, entityId)).toHaveLength(1);
 
-    mockRunLlmPrompt.mockResolvedValue(JSON.stringify([
+    mockRunLlmPrompt.mockResolvedValue(JSON.stringify({ candidates: [
       { id: 'old-0', reason: 'stale' },
-    ]));
+    ] }));
 
     const result = await runAiPrune(projectDb, globalDb, telemetryPath);
 

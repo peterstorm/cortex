@@ -39,7 +39,7 @@ Seven slash commands let you interact with memory directly: `/remember`, `/recal
 
 A `SessionEnd` hook detaches a background worker (so nothing blocks the session) that runs the pipeline sequentially:
 
-1. **Extract** — Read the session transcript (JSONL), truncate if >100KB (resumable via cursor checkpoints), add git context (branch, commits, changed files), and pipe to a headless coding-agent CLI (`claude -p --model haiku` by default) for memory extraction; global-scoped candidates are routed to the global DB
+1. **Extract** — Read the session transcript (JSONL), truncate if >100KB (resumable via cursor checkpoints), add git context (branch, commits, changed files), and use the configured direct OpenAI-compatible endpoint with thinking disabled, falling back to a headless coding-agent CLI when no direct endpoint is available; global-scoped candidates are routed to the global DB
 2. **Backfill** — Compute embeddings for newly extracted memories (Gemini API, or local HuggingFace fallback)
 3. **Semantic Edges** — Classify similarity-created `relates_to` edges into typed relationships
 4. **Lifecycle** — Decay confidence, archive stale memories, prune old ones
@@ -197,7 +197,8 @@ During extraction, candidates the LLM classifies as scope `"global"` are routed 
 
 | Service | Purpose | Required |
 |---|---|---|
-| Headless agent CLI (`claude -p --model haiku`, or `pi -p` under the pi agent) | Memory extraction, AI pruning, edge classification | Yes (uses your Anthropic subscription; override with `CORTEX_LLM_BINARY`/`CORTEX_LLM_MODEL`) |
+| OpenAI-compatible LLM endpoint | Preferred transport for memory extraction, AI pruning, and edge classification; configure `CORTEX_LLM_API_URL`, `CORTEX_LLM_API_KEY`, and `CORTEX_LLM_MODEL`, or a compatible Pi provider | No (falls back to a headless CLI) |
+| Headless agent CLI (`claude -p --model haiku`, or `pi -p` under the Pi agent) | Fallback transport when no direct OpenAI-compatible endpoint is configured | No (required only when the direct endpoint is unavailable; override with `CORTEX_LLM_BINARY`/`CORTEX_LLM_MODEL`) |
 | Gemini Embedding-001 | Semantic embeddings (768-dim) — the only thing `GEMINI_API_KEY` is used for | No (falls back to local) |
 | HuggingFace Transformers | Local embedding fallback (BGE-small-en-v1.5, 384-dim) | Bundled |
 
@@ -423,7 +424,8 @@ Extraction, AI pruning, and edge classification prefer a **direct OpenAI-compati
     cortex.db                   # Project SQLite database
     surface-cache/              # Cached surfaces (branch-keyed)
     locks/                      # PID lock files
-    cortex-status.json          # Telemetry (extraction stats, timing)
+    cortex-status.json          # Generated health telemetry (extraction stats, timing)
+    telemetry.json              # Maintenance and AI-prune cadence state
   .claude/
     cortex-memory.local.md      # Surface file Claude reads
 

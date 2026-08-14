@@ -204,6 +204,27 @@ describe('Database Layer', () => {
       db.close();
     });
 
+    it('rejects invalid scope through updateMemory', () => {
+      const memory = createMemory({
+        id: 'mem-invalid-scope',
+        content: 'c',
+        summary: 's',
+        memory_type: 'context',
+        scope: 'project',
+        confidence: 0.5,
+        priority: 5,
+        source_type: 'manual',
+        source_session: 's',
+        source_context: '{}',
+      });
+      insertMemory(db, memory);
+
+      expect(() => updateMemory(db, 'mem-invalid-scope', { scope: 'workspace' as unknown as MemoryScope }))
+        .toThrow(/invalid scope/);
+      expect(getMemory(db, 'mem-invalid-scope')?.scope).toBe('project');
+      db.close();
+    });
+
     it('rejects out-of-range confidence through updateMemory', () => {
       const memory = createMemory({
         id: 'mem-invalid-confidence',

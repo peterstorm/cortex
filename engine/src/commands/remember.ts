@@ -144,8 +144,9 @@ export function parseRememberArgs(
 }
 
 /**
- * Build Memory object from parsed args
- * Pure function - validates and creates domain object
+ * Build a Memory object from parsed args at the persistence boundary.
+ * Allocates a UUID and current timestamps, so callers must not treat repeated
+ * calls with equal arguments as referentially transparent.
  *
  * Note: embeddings are null to queue for backfill (FR-045)
  * Summary is derived from content (first 200 chars)

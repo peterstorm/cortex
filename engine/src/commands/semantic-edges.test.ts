@@ -188,7 +188,12 @@ describe('executeSemanticEdges', () => {
 
     expect(result).toEqual({ ok: true, classified: 1, failed: 0 });
     const typed = getAllEdges(db).find((e) => e.id !== edgeId)!;
-    expect(typed.relation_type).toBe('supersedes');
+    expect(typed).toMatchObject({
+      source_id: 'a',
+      target_id: 'b',
+      relation_type: 'supersedes',
+      bidirectional: false,
+    });
   });
 
   it('treats an out-of-range pair_index as a corrupt response (failed, unmarked)', async () => {

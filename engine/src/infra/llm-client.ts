@@ -78,7 +78,14 @@ function runShellCommand(command: string): string | null {
       encoding: 'utf8',
       timeout: 15_000,
     });
-    if (result.status !== 0) return null;
+    if (result.status !== 0) {
+      const stderr = (result.stderr ?? '').trim().slice(0, 1_000);
+      warnResolution(
+        `apiKey shell command failed (status=${result.status ?? 'null'}, signal=${result.signal ?? 'none'})` +
+          (stderr === '' ? '' : `: ${stderr}`)
+      );
+      return null;
+    }
     const out = (result.stdout ?? '').trim();
     return out.length > 0 ? out : null;
   } catch (err) {

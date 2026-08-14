@@ -8,10 +8,11 @@
 
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { existsSync, readFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { shouldRunShutdownPipeline, type CortexShutdownReason } from "./shutdown-policy.js";
+import { getSurfaceOutputPath } from "../engine/src/config.js";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const CLI_PATH = join(PACKAGE_ROOT, "engine", "src", "cli.ts");
@@ -36,11 +37,25 @@ function runCli(args: string[], options?: {
         ...options?.env,
       },
     }).trim();
-  } catch (e) {
-    // Never block — log and return empty
-    const msg = (e as Error).message ?? "";
-    if (msg.includes("TIMEOUT")) {
-      process.stderr.write(`[cortex] CLI timeout: ${args.join(" ")}\n`);
+  } catch (error) {
+    // Never block the Pi lifecycle, but preserve enough bounded diagnostics to
+    // distinguish "no data" from a broken runtime or engine command.
+    const failure = error as Error & {
+      status?: number;
+      signal?: string;
+      stderr?: Buffer | string;
+    };
+    const message = failure.message ?? String(error);
+    if (message.includes("TIMEOUT")) {
+      process.stderr.write(`[cortex] CLI timeout: ${args.join(" ")} (cwd=${options?.cwd ?? process.cwd()})\n`);
+    } else {
+      const stderr = String(failure.stderr ?? "").trim().slice(0, 1_000);
+      process.stderr.write(
+        `[cortex] CLI failed: bun ${args.join(" ")} ` +
+          `(cwd=${options?.cwd ?? process.cwd()}, status=${failure.status ?? "n/a"}, ` +
+          `signal=${failure.signal ?? "none"}): ${message}` +
+          (stderr === "" ? "" : `\n${stderr}`) + "\n"
+      );
     }
     return "";
   }
@@ -52,9 +67,27 @@ function runCliDetached(args: string[], options?: {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
 }): void {
+  let logFd: number | undefined;
+  let outputTarget: number | "inherit" = "inherit";
+  try {
+    if (options?.cwd) {
+      const logDir = join(options.cwd, ".memory", "logs");
+      mkdirSync(logDir, { recursive: true });
+      logFd = openSync(join(logDir, "pi-detached.log"), "a", 0o600);
+      outputTarget = logFd;
+    }
+  } catch (error) {
+    process.stderr.write(
+      `[cortex] detached CLI log setup failed for ${args.join(" ")}: ` +
+        `${error instanceof Error ? error.message : String(error)}; inheriting output\n`
+    );
+  }
+
   try {
     const proc = spawn("bun", [CLI_PATH, ...args], {
-      stdio: options?.stdin ? ["pipe", "ignore", "ignore"] : ["ignore", "ignore", "ignore"],
+      stdio: options?.stdin
+        ? ["pipe", outputTarget, outputTarget]
+        : ["ignore", outputTarget, outputTarget],
       detached: true,
       cwd: options?.cwd,
       env: {
@@ -63,17 +96,30 @@ function runCliDetached(args: string[], options?: {
         ...options?.env,
       },
     });
+    proc.once?.("error", (error) => {
+      process.stderr.write(`[cortex] detached CLI spawn failed for ${args.join(" ")}: ${error.message}\n`);
+    });
     if (options?.stdin && proc.stdin) {
+      proc.stdin.once?.("error", (error) => {
+        process.stderr.write(`[cortex] detached CLI stdin failed for ${args.join(" ")}: ${error.message}\n`);
+      });
       proc.stdin.write(options.stdin);
       proc.stdin.end();
     }
     proc.unref();
-  } catch {}
+  } catch (error) {
+    process.stderr.write(
+      `[cortex] detached CLI setup failed for ${args.join(" ")}: ` +
+        `${error instanceof Error ? error.message : String(error)}\n`
+    );
+  } finally {
+    if (logFd !== undefined) closeSync(logFd);
+  }
 }
 
-/** Get the surface file path for current project */
+/** Get the unified surface file path for the current project. */
 function getSurfacePath(cwd: string): string {
-  return join(cwd, ".pi", "cortex-memory.local.md");
+  return getSurfaceOutputPath(cwd);
 }
 
 type PiModelSelection = Readonly<{
@@ -101,7 +147,12 @@ function loadGeminiEnv(): void {
         const match = line.match(/^export\s+(\w+)=["']?(.+?)["']?\s*$/);
         if (match) process.env[match[1]] = match[2];
       }
-    } catch {}
+    } catch (error) {
+      process.stderr.write(
+        `[cortex] Failed to read Gemini environment file ${envFile}: ` +
+          `${error instanceof Error ? error.message : String(error)}\n`
+      );
+    }
   }
 }
 
@@ -129,7 +180,12 @@ export default function (pi: ExtensionAPI) {
       try {
         const surface = readFileSync(surfacePath, "utf-8").trim();
         if (surface) parts.push(surface);
-      } catch {}
+      } catch (error) {
+        process.stderr.write(
+          `[cortex] Failed to read memory surface ${surfacePath}: ` +
+            `${error instanceof Error ? error.message : String(error)}\n`
+        );
+      }
     }
 
     // 3. Prompt recall (keyword search based on user's prompt)

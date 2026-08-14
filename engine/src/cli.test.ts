@@ -5,13 +5,17 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Database } from 'bun:sqlite';
-import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import { parseHookInput, parseRecallArgs, validateCwd, summarizeBackfillResults } from './cli.js';
 import { openDatabase, insertMemory } from './infra/db.js';
 import { createMemory } from './core/types.js';
 import { getProjectName } from './config.js';
+
+const CLI_PATH = join(dirname(fileURLToPath(import.meta.url)), 'cli.ts');
 
 describe('cli - parseHookInput', () => {
   it('should parse valid hook input JSON', () => {
@@ -560,6 +564,25 @@ describe('cli - validateCwd', () => {
 
     expect(error).not.toBeNull();
     expect(error).toContain('not a directory');
+  });
+});
+
+describe('cli - prompt-recall best-effort diagnostics', () => {
+  it('warns on malformed hook input while preserving a successful exit', () => {
+    const home = mkdtempSync(join(tmpdir(), 'cortex-prompt-recall-home-'));
+    try {
+      const result = spawnSync('bun', [CLI_PATH, 'prompt-recall'], {
+        input: '{not valid json',
+        encoding: 'utf8',
+        env: { ...process.env, HOME: home },
+      });
+
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain('prompt-recall failed (best-effort, continuing)');
+      expect(result.stderr).toContain('JSON');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });
 

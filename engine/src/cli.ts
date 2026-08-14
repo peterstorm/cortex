@@ -81,6 +81,8 @@ type CommandResult = {
   readonly success: boolean;
   readonly output?: string;
   readonly error?: string;
+  /** The command did no work because another durable worker owns it; retryable. */
+  readonly deferred?: boolean;
 };
 
 // ============================================================================
@@ -263,6 +265,7 @@ async function handleExtractInput(input: HookInput): Promise<CommandResult> {
       success: result.success,
       output: JSON.stringify(result),
       error: result.error,
+      deferred: result.skipped === true,
     };
   } catch (err) {
     return {
@@ -1297,10 +1300,24 @@ async function handleIngestSession(): Promise<CommandResult> {
     };
   }
 
+  const asIngestionStep = async (command: Promise<CommandResult>) => {
+    const result = await command;
+    if (result.deferred) {
+      return { kind: 'deferred' as const, reason: result.error ?? result.output ?? 'command deferred' };
+    }
+    return result.success
+      ? { kind: 'succeeded' as const, ...(result.output === undefined ? {} : { output: result.output }) }
+      : {
+          kind: 'failed' as const,
+          error: result.error ?? 'command failed without an error',
+          ...(result.output === undefined ? {} : { output: result.output }),
+        };
+  };
+
   const result = await runSessionIngestion({
-    extract: () => handleExtractInput(input),
-    backfill: () => handleBackfill([input.cwd]),
-    maintenance: () => handleMaintenance([input.cwd]),
+    extract: () => asIngestionStep(handleExtractInput(input)),
+    backfill: () => asIngestionStep(handleBackfill([input.cwd])),
+    maintenance: () => asIngestionStep(handleMaintenance([input.cwd])),
   });
 
   return {

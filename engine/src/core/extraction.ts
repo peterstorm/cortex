@@ -278,10 +278,15 @@ export function parseExtractionResponse(
       return { kind: 'parse_error', raw: response };
     }
 
-    // Validate and filter memory candidates
+    // Validate and filter memory candidates. Mixed-validity output remains
+    // usable, but every dropped item is observable so schema drift cannot
+    // masquerade as a fully successful extraction.
     const validMemories = rawMemories.filter(isValidCandidate);
-    if (validMemories.length === 0 && rawMemories.length > 0) {
-      process.stderr.write(`[cortex:extraction] WARN: 0 valid from ${rawMemories.length} raw candidates\n`);
+    const invalidMemoryCount = rawMemories.length - validMemories.length;
+    if (invalidMemoryCount > 0) {
+      process.stderr.write(
+        `[cortex:extraction] WARN: dropped ${invalidMemoryCount} of ${rawMemories.length} invalid memory candidate(s)\n`
+      );
     }
 
     const memories: readonly MemoryCandidate[] = validMemories.map((c) => ({
@@ -294,9 +299,16 @@ export function parseExtractionResponse(
       tags: Array.isArray(c.tags) ? c.tags.map(String) : [],
     }));
 
-    // Validate and filter entity-fact candidates
-    const entities: readonly EntityFactCandidate[] = rawEntities
-      .filter(isValidEntityFactCandidate)
+    // Validate and filter entity-fact candidates with the same observable
+    // mixed-validity contract as memories.
+    const validEntities = rawEntities.filter(isValidEntityFactCandidate);
+    const invalidEntityCount = rawEntities.length - validEntities.length;
+    if (invalidEntityCount > 0) {
+      process.stderr.write(
+        `[cortex:extraction] WARN: dropped ${invalidEntityCount} of ${rawEntities.length} invalid entity candidate(s)\n`
+      );
+    }
+    const entities: readonly EntityFactCandidate[] = validEntities
       .map((c) => ({
         entity_name: String((c as any).entity_name).trim(),
         entity_type: (c as any).entity_type,

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -13,6 +13,22 @@ vi.mock('node:child_process', () => childProcess);
 import registerCortex from './extension.js';
 
 const originalMarker = process.env.CORTEX_EXTRACTING;
+const originalHome = process.env.HOME;
+const tempDirs: string[] = [];
+
+function tempProject(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'cortex-pi-extension-'));
+  tempDirs.push(dir);
+  return dir;
+}
+
+function fakeChild() {
+  return {
+    stdin: { write: vi.fn(), end: vi.fn(), once: vi.fn() },
+    unref: vi.fn(),
+    once: vi.fn(),
+  };
+}
 
 function registerHandlers(): Map<string, (...args: unknown[]) => unknown> {
   const handlers = new Map<string, (...args: unknown[]) => unknown>();
@@ -27,8 +43,14 @@ function registerHandlers(): Map<string, (...args: unknown[]) => unknown> {
 
 afterEach(() => {
   vi.clearAllMocks();
+  childProcess.execFileSync.mockImplementation(() => '');
   if (originalMarker === undefined) delete process.env.CORTEX_EXTRACTING;
   else process.env.CORTEX_EXTRACTING = originalMarker;
+  if (originalHome === undefined) delete process.env.HOME;
+  else process.env.HOME = originalHome;
+  while (tempDirs.length > 0) {
+    rmSync(tempDirs.pop()!, { recursive: true, force: true });
+  }
 });
 
 describe('Cortex Pi extension shutdown', () => {
@@ -48,19 +70,18 @@ describe('Cortex Pi extension shutdown', () => {
     expect(childProcess.spawn).not.toHaveBeenCalled();
   });
 
-  it('enqueues one detached ingestion worker without awaiting transcript processing', async () => {
-    const stdin = { write: vi.fn(), end: vi.fn() };
-    const unref = vi.fn();
-    childProcess.spawn.mockReturnValue({ stdin, unref } as never);
+  it('enqueues one detached ingestion worker with project-local diagnostics', async () => {
+    const child = fakeChild();
+    childProcess.spawn.mockReturnValue(child as never);
     const handlers = registerHandlers();
-    const tempDir = mkdtempSync(join(tmpdir(), 'cortex-pi-extension-'));
-    const transcriptPath = join(tempDir, 'pi-session.jsonl');
+    const cwd = tempProject();
+    const transcriptPath = join(cwd, 'pi-session.jsonl');
     writeFileSync(transcriptPath, '{"type":"session"}\n');
 
     await handlers.get('session_start')?.(
       { reason: 'startup' },
       {
-        cwd: '/project',
+        cwd,
         model: { provider: 'openai-codex', id: 'gpt-5.6-sol' },
         sessionManager: {
           getSessionFile: () => transcriptPath,
@@ -71,22 +92,23 @@ describe('Cortex Pi extension shutdown', () => {
 
     expect(childProcess.spawn).toHaveBeenCalledWith(
       'bun',
-      [expect.stringMatching(/engine\/src\/cli\.ts$/), 'load-surface', '/project'],
+      [expect.stringMatching(/engine\/src\/cli\.ts$/), 'load-surface', cwd],
       expect.objectContaining({
-        cwd: '/project',
+        cwd,
         detached: true,
-        stdio: ['ignore', 'ignore', 'ignore'],
+        stdio: ['ignore', expect.any(Number), expect.any(Number)],
       }),
     );
+    expect(existsSync(join(cwd, '.memory', 'logs', 'pi-detached.log'))).toBe(true);
     childProcess.spawn.mockClear();
-    stdin.write.mockClear();
-    stdin.end.mockClear();
-    unref.mockClear();
+    child.stdin.write.mockClear();
+    child.stdin.end.mockClear();
+    child.unref.mockClear();
 
     await handlers.get('session_shutdown')?.(
       { reason: 'quit' },
       {
-        cwd: '/project',
+        cwd,
         model: { provider: 'openai-codex', id: 'gpt-5.6-sol' },
         sessionManager: {
           getSessionFile: () => transcriptPath,
@@ -100,22 +122,142 @@ describe('Cortex Pi extension shutdown', () => {
     expect(binary).toBe('bun');
     expect(args).toEqual([expect.stringMatching(/engine\/src\/cli\.ts$/), 'ingest-session']);
     expect(options).toMatchObject({
-      cwd: '/project',
+      cwd,
       detached: true,
-      stdio: ['pipe', 'ignore', 'ignore'],
+      stdio: ['pipe', expect.any(Number), expect.any(Number)],
       env: {
         CORTEX_PI_PROVIDER: 'openai-codex',
         CORTEX_PI_MODEL: 'gpt-5.6-sol',
       },
     });
-    expect(stdin.write).toHaveBeenCalledWith(JSON.stringify({
+    expect(child.stdin.write).toHaveBeenCalledWith(JSON.stringify({
       session_id: 'session-123',
       transcript_path: transcriptPath,
-      cwd: '/project',
+      cwd,
     }));
-    expect(stdin.end).toHaveBeenCalledOnce();
-    expect(unref).toHaveBeenCalledOnce();
+    expect(child.stdin.end).toHaveBeenCalledOnce();
+    expect(child.unref).toHaveBeenCalledOnce();
+  });
 
-    rmSync(tempDir, { recursive: true, force: true });
+  it('falls back to session-start metadata and model when shutdown context omits them', async () => {
+    const child = fakeChild();
+    childProcess.spawn.mockReturnValue(child as never);
+    const handlers = registerHandlers();
+    const cwd = tempProject();
+    const transcriptPath = join(cwd, 'pi-session.jsonl');
+    writeFileSync(transcriptPath, '{}\n');
+
+    await handlers.get('session_start')?.({}, {
+      cwd,
+      model: { provider: 'provider-at-start', id: 'model-at-start' },
+      sessionManager: {
+        getSessionFile: () => transcriptPath,
+        getSessionId: () => 'session-at-start',
+      },
+    });
+    childProcess.spawn.mockClear();
+
+    await handlers.get('session_shutdown')?.({ reason: 'quit' }, {
+      cwd,
+      model: undefined,
+      sessionManager: {
+        getSessionFile: () => undefined,
+        getSessionId: () => undefined,
+      },
+    });
+
+    const [, , options] = childProcess.spawn.mock.calls[0];
+    expect(options.env).toMatchObject({
+      CORTEX_PI_PROVIDER: 'provider-at-start',
+      CORTEX_PI_MODEL: 'model-at-start',
+    });
+    expect(child.stdin.write).toHaveBeenCalledWith(JSON.stringify({
+      session_id: 'session-at-start',
+      transcript_path: transcriptPath,
+      cwd,
+    }));
+  });
+});
+
+describe('Cortex Pi extension diagnostics and surface contract', () => {
+  it('reports synchronous CLI failures instead of presenting them as no data', async () => {
+    const failure = Object.assign(new Error('bun exited'), {
+      status: 2,
+      signal: null,
+      stderr: Buffer.from('database is corrupt'),
+    });
+    childProcess.execFileSync.mockImplementationOnce(() => { throw failure; });
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const handlers = registerHandlers();
+    const cwd = tempProject();
+
+    try {
+      await handlers.get('before_agent_start')?.(
+        { systemPrompt: 'base', prompt: 'remember this' },
+        { cwd },
+      );
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining('status=2'));
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining('database is corrupt'));
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
+  it('reports detached spawn errors without making the handler await the child', async () => {
+    const child = fakeChild();
+    child.once.mockImplementation((event: string, listener: (error: Error) => void) => {
+      if (event === 'error') listener(new Error('spawn EACCES'));
+      return child;
+    });
+    childProcess.spawn.mockReturnValue(child as never);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const handlers = registerHandlers();
+    const cwd = tempProject();
+
+    try {
+      await handlers.get('session_start')?.({}, {
+        cwd,
+        model: undefined,
+        sessionManager: { getSessionFile: () => undefined, getSessionId: () => 's' },
+      });
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining('spawn EACCES'));
+      expect(child.unref).toHaveBeenCalledOnce();
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
+  it('reports an unreadable existing Gemini environment file', () => {
+    const home = tempProject();
+    const envPath = join(home, '.config', 'sops-nix', 'secrets', 'rendered', 'gemini-env');
+    mkdirSync(envPath, { recursive: true });
+    process.env.HOME = home;
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    try {
+      registerHandlers();
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining(`Failed to read Gemini environment file ${envPath}`));
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
+  it('reads only the unified .claude surface and reports read failures', async () => {
+    const cwd = tempProject();
+    const surfacePath = join(cwd, '.claude', 'cortex-memory.local.md');
+    mkdirSync(surfacePath, { recursive: true });
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const handlers = registerHandlers();
+
+    try {
+      await handlers.get('before_agent_start')?.(
+        { systemPrompt: 'base', prompt: '' },
+        { cwd },
+      );
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining(`Failed to read memory surface ${surfacePath}`));
+      expect(stderr).not.toHaveBeenCalledWith(expect.stringContaining('/.pi/cortex-memory.local.md'));
+    } finally {
+      stderr.mockRestore();
+    }
   });
 });

@@ -38,10 +38,14 @@ export interface AiPruneResult {
   readonly error?: string;
 }
 
-interface PruneCandidate {
+export interface PruneCandidate {
   readonly id: string;
   readonly reason: string;
 }
+
+export type PruneParseOutcome =
+  | Readonly<{ kind: 'ok'; candidates: readonly PruneCandidate[] }>
+  | Readonly<{ kind: 'unparseable'; reason: string }>;
 
 // ============================================================================
 // PURE FUNCTIONS
@@ -81,7 +85,7 @@ export function buildPrunePrompt(
   ).join('\n');
 
   return `You are a memory pruner for a developer's persistent memory system.
-Review these memories and return a JSON array of IDs to archive.
+Review these memories and return a JSON object containing the IDs to archive.
 
 ARCHIVE if:
 - Redundant: another memory in the list covers the same information
@@ -99,9 +103,9 @@ NEVER archive:
 Be selective — only archive when clearly justified. When in doubt, keep.
 One per concept: if multiple memories describe the same thing, keep the most comprehensive.
 
-Respond ONLY with a JSON array. No markdown fences, no explanation.
-Format: [{"id": "full-uuid", "reason": "short reason"}]
-If nothing to archive, return [].
+Respond ONLY with a JSON object. No markdown fences, no explanation.
+Format: {"candidates": [{"id": "full-uuid", "reason": "short reason"}]}
+If nothing should be archived, return {"candidates": []}.
 
 MEMORIES:
 ${memoryLines}`;
@@ -109,38 +113,48 @@ ${memoryLines}`;
 
 /**
  * Parse the LLM response into prune candidates (pure).
- * Tolerates markdown fences and whitespace.
+ * Tolerates markdown fences and whitespace, but never turns malformed or
+ * partially invalid output into a successful "archive nothing" decision.
  */
-export function parsePruneResponse(response: string): readonly PruneCandidate[] {
-  // Strip markdown fences if present
+export function parsePruneResponse(response: string): PruneParseOutcome {
   const cleaned = response
     .replace(/```json\s*/gi, '')
     .replace(/```\s*/g, '')
     .trim();
 
   try {
-    const parsed = JSON.parse(cleaned);
-    if (!Array.isArray(parsed)) return [];
+    const parsed: unknown = JSON.parse(cleaned);
+    if (typeof parsed !== 'object' || parsed === null) {
+      return { kind: 'unparseable', reason: 'expected a JSON object envelope' };
+    }
 
-    const valid = parsed.filter(
+    const candidates = (parsed as Record<string, unknown>).candidates;
+    if (!Array.isArray(candidates)) {
+      return { kind: 'unparseable', reason: 'expected a candidates array' };
+    }
+
+    const valid = candidates.filter(
       (item: unknown): item is PruneCandidate =>
         typeof item === 'object' &&
         item !== null &&
         typeof (item as Record<string, unknown>).id === 'string' &&
-        typeof (item as Record<string, unknown>).reason === 'string'
+        (item as Record<string, unknown>).id !== '' &&
+        typeof (item as Record<string, unknown>).reason === 'string' &&
+        (item as Record<string, unknown>).reason !== ''
     );
-    if (valid.length !== parsed.length) {
-      // A partially-garbage response silently requests fewer archives than
-      // the model intended; say how much was discarded.
-      logError(
-        `AI prune response contained ${parsed.length - valid.length} of ${parsed.length} ` +
-          `invalid candidate item(s); they were ignored`
-      );
+    if (valid.length !== candidates.length) {
+      return {
+        kind: 'unparseable',
+        reason: `${candidates.length - valid.length} of ${candidates.length} candidate item(s) were invalid`,
+      };
     }
-    return valid;
-  } catch {
-    logError(`Failed to parse AI prune response: ${cleaned.slice(0, 200)}`);
-    return [];
+
+    return { kind: 'ok', candidates: valid };
+  } catch (err) {
+    return {
+      kind: 'unparseable',
+      reason: `invalid JSON: ${err instanceof Error ? err.message : String(err)}`,
+    };
   }
 }
 
@@ -195,7 +209,27 @@ function resetSessionCounter(telemetryPath: string, activeCount: number): void {
  * back to the headless CLI subprocess (claude -p / pi -p).
  */
 async function callClaudePrune(prompt: string): Promise<string> {
-  const { text } = await runLlmPromptDirect(prompt, AI_PRUNE_TIMEOUT_MS, { jsonMode: true });
+  const { text } = await runLlmPromptDirect(prompt, AI_PRUNE_TIMEOUT_MS, {
+    jsonSchema: {
+      type: 'object',
+      properties: {
+        candidates: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', minLength: 1 },
+              reason: { type: 'string', minLength: 1 },
+            },
+            required: ['id', 'reason'],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ['candidates'],
+      additionalProperties: false,
+    },
+  });
   return text;
 }
 
@@ -313,6 +347,7 @@ export async function runAiPrune(
 
   let totalArchived = 0;
   let successfulBatches = 0;
+  let reviewedMemories = 0;
 
   for (let i = 0; i < batches.length; i++) {
     const batch = batches[i];
@@ -329,10 +364,16 @@ export async function runAiPrune(
       continue; // skip failed batch, try next
     }
 
-    successfulBatches++;
-    const candidates = parsePruneResponse(response);
+    const parsed = parsePruneResponse(response);
+    if (parsed.kind === 'unparseable') {
+      logError(`Batch ${i + 1} response was unparseable: ${parsed.reason}`);
+      continue;
+    }
 
-    for (const candidate of candidates) {
+    successfulBatches++;
+    reviewedMemories += batch.length;
+
+    for (const candidate of parsed.candidates) {
       if (pinnedIds.has(candidate.id)) {
         logInfo(`Skipping pinned memory ${candidate.id.slice(0, 8)}`);
         continue;
@@ -366,26 +407,30 @@ export async function runAiPrune(
     }
   }
 
-  if (successfulBatches === 0) {
-    return {
-      archived: 0,
-      reviewed: allMemories.length,
-      error: `All ${batches.length} AI prune batches failed`,
-    };
-  }
-
-  // Invalidate cached surfaces when memories were archived
+  // Successful batches may already have archived memories even when a sibling
+  // batch failed, so invalidate the surface before returning a partial error.
   if (cwd !== undefined && totalArchived > 0) {
     invalidateSurfaceCache(cwd);
   }
 
+  if (successfulBatches !== totalBatches) {
+    const failedBatches = totalBatches - successfulBatches;
+    return {
+      archived: totalArchived,
+      reviewed: reviewedMemories,
+      error: successfulBatches === 0
+        ? `All ${totalBatches} AI prune batches failed`
+        : `${failedBatches} of ${totalBatches} AI prune batches failed; cadence was not reset`,
+    };
+  }
+
   resetSessionCounter(telemetryPath, allMemories.length - totalArchived);
 
-  logInfo(`AI prune complete: ${totalArchived} archived out of ${allMemories.length} reviewed`);
+  logInfo(`AI prune complete: ${totalArchived} archived out of ${reviewedMemories} reviewed`);
 
   return {
     archived: totalArchived,
-    reviewed: allMemories.length,
+    reviewed: reviewedMemories,
   };
 }
 

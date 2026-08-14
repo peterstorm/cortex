@@ -20,7 +20,7 @@ import {
 } from '../infra/db.js';
 import { truncateTranscript, buildExtractionPrompt, parseExtractionResponse } from '../core/extraction.js';
 import { tokenize, jaccardSimilarity, classifySimilarity } from '../core/similarity.js';
-import { deduplicateCandidates, applyDedupMerges, executeExtract, computeEdgeCandidates } from './extract.js';
+import { deduplicateCandidates, applyDedupMerges, executeExtract, computeEdgeCandidates, computeSimilarityAndCreateEdges } from './extract.js';
 
 // Mock the LLM boundary so executeExtract tests never shell out to `claude`,
 // and the local embedding model so no ONNX weights are loaded. The
@@ -28,6 +28,7 @@ import { deduplicateCandidates, applyDedupMerges, executeExtract, computeEdgeCan
 const mockExtractMemories = vi.fn();
 const mockIsClaudeLlmAvailable = vi.fn();
 const mockResolveEndpoint = vi.fn();
+const mockEnsureModelLoaded = vi.fn();
 vi.mock('../infra/claude-llm.js', () => ({
   isClaudeLlmAvailable: () => mockIsClaudeLlmAvailable(),
   extractMemories: (prompt: string) => mockExtractMemories(prompt),
@@ -36,11 +37,15 @@ vi.mock('../infra/llm-client.js', () => ({
   resolveOpenAiCompatEndpoint: () => mockResolveEndpoint(),
 }));
 vi.mock('../infra/local-embed.ts', () => ({
-  ensureModelLoaded: async () => false,
+  ensureModelLoaded: () => mockEnsureModelLoaded(),
   embedLocal: async () => {
     throw new Error('local embedding model disabled in tests');
   },
 }));
+
+beforeEach(() => {
+  mockEnsureModelLoaded.mockReset().mockResolvedValue(false);
+});
 
 describe('extract command - core logic', () => {
   let db: Database;
@@ -707,6 +712,28 @@ describe('executeExtract (mocked LLM)', () => {
     db.close();
   });
 
+  it('includes the model-load error when falling back to Jaccard dedup', async () => {
+    const transcript = '{"role":"user","content":"a durable decision"}\n';
+    const { cwd, transcriptPath } = makeTestProject(transcript);
+    const db = openDatabase(':memory:');
+    mockExtractMemories.mockResolvedValue(memoriesResponse('durable decision about storage'));
+    mockEnsureModelLoaded.mockRejectedValue(new Error('ONNX initialization failed'));
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    try {
+      const result = await executeExtract(
+        { session_id: 's-model-fallback', transcript_path: transcriptPath, cwd }, db
+      );
+      expect(result.success).toBe(true);
+      expect(stderr).toHaveBeenCalledWith(
+        expect.stringContaining('ONNX initialization failed'),
+      );
+    } finally {
+      stderr.mockRestore();
+      db.close();
+    }
+  });
+
   it('resets the cursor when the transcript shrank below the stored cursor', async () => {
     const transcript = '{"role":"user","content":"rewritten short transcript"}\n';
     const { cwd, transcriptPath } = makeTestProject(transcript);
@@ -921,6 +948,29 @@ describe('computeEdgeCandidates', () => {
     expect(edges.length).toBe(1);
     expect(edges[0].status).toBe('active');
     expect(edges[0].score).toBeCloseTo(2 / 6, 5);
+  });
+
+  it('reports non-unique edge insertion failures', async () => {
+    const db = openDatabase(':memory:');
+    const newMem = makeEdgeMemory('new', { ...newMemText, local_embedding: localVecAt(1) });
+    const existing = makeEdgeMemory('existing', { ...existingText(0), local_embedding: localVecAt(0.7) });
+    insertMemory(db, newMem);
+    insertMemory(db, existing);
+    const dbModule = await import('../infra/db.js');
+    const insertSpy = vi.spyOn(dbModule, 'insertEdge')
+      .mockImplementationOnce(() => { throw new Error('SQLITE_BUSY: database is locked'); });
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    try {
+      expect(computeSimilarityAndCreateEdges(db, [newMem], [existing])).toBe(0);
+      expect(stderr).toHaveBeenCalledWith(
+        expect.stringContaining('Failed to create edge new -> existing: SQLITE_BUSY'),
+      );
+    } finally {
+      stderr.mockRestore();
+      insertSpy.mockRestore();
+      db.close();
+    }
   });
 
   it('per-memory edge cap is enforced for Jaccard edges too', () => {

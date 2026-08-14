@@ -75,13 +75,11 @@ export function detectHarness(): "claude" | "pi" {
 }
 
 /**
- * Resolve push surface output file path.
- * Claude Code: .claude/cortex-memory.local.md
- * Pi: .pi/cortex-memory.local.md
+ * Resolve the unified push-surface output path for every harness.
+ * `.pi/cortex-memory.local.md` is a legacy location and is never written.
  */
 export function getSurfaceOutputPath(projectRoot: string): string {
-  const dir = detectHarness() === "pi" ? '.pi' : '.claude';
-  return join(projectRoot, dir, 'cortex-memory.local.md');
+  return join(projectRoot, '.claude', 'cortex-memory.local.md');
 }
 
 /**
@@ -235,8 +233,11 @@ export const AI_PRUNE_BATCH_SIZE = 80;
 export const AI_PRUNE_MIN_AGE_DAYS = 3;
 
 /**
- * Dedup similarity threshold for extraction and remember commands.
- * Candidates scoring above this against existing memories are merged.
+ * Dedup similarity threshold shared by extraction and remember.
+ * Extraction merges existing-memory matches in the interval from this value
+ * up to MERGE_CEILING_THRESHOLD, then skips matches at or above the ceiling as
+ * true duplicates. Remember treats a threshold hit as an existing duplicate
+ * rather than appending content.
  *
  * CALIBRATION NOTE: For 384-dim local embeddings (BGE-small-en-v1.5),
  * same-domain memories about different aspects routinely score 0.6-0.75.
@@ -345,5 +346,6 @@ export const DEFAULT_TRAVERSAL_DEPTH = 2;
 export const GITIGNORE_PATTERNS = [
   '.memory/',
   '.claude/cortex-memory.local.md',
+  // Legacy cleanup only: Cortex no longer reads or writes this Pi-only path.
   '.pi/cortex-memory.local.md',
 ] as const;

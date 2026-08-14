@@ -150,15 +150,22 @@ describe('resolveOpenAiCompatEndpoint', () => {
     warn.mockRestore();
   });
 
-  it('warns when the provider apiKey command resolves empty', () => {
+  it('reports status and stderr when the provider apiKey command fails', () => {
     withEnv({ PI_PROVIDER: 'broken-key', HOME: fixtureHome });
     fs.mkdirSync(nodePath.join(fixtureHome, '.pi', 'agent'), { recursive: true });
     fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'models.json'), JSON.stringify({
-      providers: { 'broken-key': { baseUrl: 'http://x/v1', apiKey: '!exit 3', models: [{ id: 'm' }] } },
+      providers: {
+        'broken-key': {
+          baseUrl: 'http://x/v1',
+          apiKey: '!echo key-resolution-failed >&2; exit 3',
+          models: [{ id: 'm' }],
+        },
+      },
     }));
     const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
 
     expect(resolveOpenAiCompatEndpoint()).toBeNull();
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/status=3.*key-resolution-failed/));
     expect(warn).toHaveBeenCalledWith(expect.stringMatching(/apiKey command resolved empty/));
     warn.mockRestore();
   });

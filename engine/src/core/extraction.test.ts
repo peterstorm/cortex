@@ -3,7 +3,7 @@
  * Includes property-based tests with fast-check.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import * as fc from "fast-check";
 import {
   truncateTranscript,
@@ -653,6 +653,37 @@ describe("parseExtractionResponse", () => {
 
     const result = okParse(parseExtractionResponse(response));
     expect(result.memories).toEqual([]);
+  });
+
+  it("reports every dropped item in a mixed-validity response", () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const response = JSON.stringify({
+      memories: [
+        {
+          content: "Valid memory",
+          summary: "Valid summary",
+          memory_type: "decision",
+          scope: "project",
+          confidence: 0.8,
+          priority: 5,
+        },
+        { content: "Missing required fields" },
+      ],
+      entities: [
+        { entity_name: "Cortex", entity_type: "project", predicate: "uses", object: "SQLite" },
+        { entity_name: "Broken entity" },
+      ],
+    });
+
+    try {
+      const result = okParse(parseExtractionResponse(response));
+      expect(result.memories).toHaveLength(1);
+      expect(result.entities).toHaveLength(1);
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining("dropped 1 of 2 invalid memory candidate"));
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining("dropped 1 of 2 invalid entity candidate"));
+    } finally {
+      stderr.mockRestore();
+    }
   });
 
   // Property-based tests

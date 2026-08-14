@@ -110,7 +110,7 @@ export interface Memory {
   readonly pinned: boolean;
   readonly source_type: SourceType;
   readonly source_session: string;
-  readonly source_context: string; // JSON: branch, commits, files
+  readonly source_context: string; // JSON-serialized SourceContext
   readonly tags: readonly string[];
   readonly access_count: number;
   readonly last_accessed_at: string; // ISO8601
