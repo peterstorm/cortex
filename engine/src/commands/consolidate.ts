@@ -45,13 +45,12 @@ export interface MemoryPair {
  * FR-074: Present pairs with similarity > threshold
  *
  * Uses Jaccard pre-filter to avoid unnecessary cosine computations.
- * Only compares memories with embeddings of the same type (gemini vs local).
  *
  * The duplicate threshold is calibrated PER SIMILARITY SPACE: raw local-BGE
  * cosine runs hot (same-domain pairs score 0.6-0.75), so it uses
- * CONSOLIDATION_LOCAL_COSINE_THRESHOLD (0.8) while Jaccard and Gemini cosine
- * use CONSOLIDATION_SIMILARITY_THRESHOLD (0.5). An explicit `threshold`
- * argument overrides the per-space defaults uniformly.
+ * CONSOLIDATION_LOCAL_COSINE_THRESHOLD (0.8) while Jaccard uses
+ * CONSOLIDATION_SIMILARITY_THRESHOLD (0.5). An explicit `threshold` argument
+ * overrides the per-space defaults uniformly.
  *
  * @param memories - Active memories to compare
  * @param threshold - Optional uniform threshold override (default: per-space)
@@ -72,21 +71,16 @@ export function findSimilarPairs(
   // Pre-tokenize all memories once (summary+content) to avoid O(n^2) re-tokenization
   const tokenSets = memories.map(m => tokenize(`${m.summary} ${m.content}`));
 
-  // Per pair, compare within a common embedding space: gemini-gemini if both
-  // have one, else local-local, else no embeddings (Jaccard fallback).
-  // Picking `embedding ?? local_embedding` per memory independently would
-  // produce cross-type pairs (768d vs 384d) that always fall back to Jaccard.
+  // Per pair, compare within a common embedding space: local-local when both
+  // sides have a vector, else no embeddings (Jaccard fallback).
   const commonEmbeddings = (
     a: Memory,
     b: Memory
   ): {
-    embA: Float64Array | Float32Array | null;
-    embB: Float64Array | Float32Array | null;
+    embA: Float32Array | null;
+    embB: Float32Array | null;
     cosineSpace: SimilaritySpace;
   } => {
-    if (a.embedding && b.embedding) {
-      return { embA: a.embedding, embB: b.embedding, cosineSpace: 'gemini-cosine' };
-    }
     // Local cosine only participates when the active model is the one the
     // consolidation threshold was calibrated against. Consolidation MERGES
     // memories, and an uncalibrated space scores unrelated pairs above the

@@ -36,7 +36,6 @@ import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
 import type { HookInput } from './core/types.js';
 import {
-  getGeminiApiKey,
   getProjectDbPath,
   getGlobalDbPath,
   getSurfaceCacheDir,
@@ -403,7 +402,6 @@ export function parseRecallArgs(
   // Construct immutable RecallOptions
   const options: RecallOptions = {
     query,
-    geminiApiKey: getGeminiApiKey(),
     projectName: getProjectName(cwd),
     limit: limit ?? DEFAULT_SEARCH_LIMIT,
     ...(branch !== undefined && { branch }),
@@ -520,7 +518,6 @@ async function handleIndexCode(args: string[]): Promise<CommandResult> {
       'manual-index',
       projectDb,
       globalDb,
-      getGeminiApiKey(),
       getProjectName(cwd)
     );
 
@@ -977,11 +974,9 @@ async function handleBackfill(args: string[]): Promise<CommandResult> {
 
   const cwd = args[0];
   const [projectDb, globalDb] = initDatabases(cwd);
-  const apiKey = getGeminiApiKey();
-
   try {
-    const projectResult = await backfill(projectDb, getProjectName(cwd), apiKey);
-    const globalResult = await backfill(globalDb, 'global', apiKey);
+    const projectResult = await backfill(projectDb, getProjectName(cwd));
+    const globalResult = await backfill(globalDb, 'global');
 
     const { warnings, ...result } = summarizeBackfillResults(projectResult, globalResult);
     for (const warning of warnings) {
@@ -1270,7 +1265,6 @@ async function handlePromptRecall(): Promise<CommandResult> {
       const memories = await executePromptRecallWithFallback(projectDb, globalDb, {
         prompt,
         surfaceContent,
-        geminiApiKey: getGeminiApiKey(),
         projectName: getProjectName(cwd),
       });
       const output = formatPromptRecall(memories);

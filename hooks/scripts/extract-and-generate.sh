@@ -28,12 +28,26 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CLI_PATH="${PLUGIN_ROOT}/engine/src/cli.ts"
 
-# Source GEMINI_API_KEY for embedding backfill (zsh initContent doesn't apply
-# in hook bash context). Override the default sops-nix location with
-# CORTEX_GEMINI_ENV for non-NixOS setups.
-GEMINI_ENV="${CORTEX_GEMINI_ENV:-$HOME/.config/sops-nix/secrets/rendered/gemini-env}"
-if [[ -f "$GEMINI_ENV" ]]; then
-  source "$GEMINI_ENV"
+# Local embeddings run through onnxruntime-node, whose native library needs
+# libstdc++ at runtime. On NixOS that is not on the default library path, so a
+# hook process finds no libstdc++ and embedding silently degrades. Probe the
+# store unless CORTEX_ONNX_LD_PATH pins it explicitly; a no-op elsewhere.
+if [[ -z "${CORTEX_ONNX_LD_PATH:-}" && -d /nix/store ]]; then
+  for _candidate in /nix/store/*-gcc-*-lib/lib; do
+    _so="${_candidate}/libstdc++.so.6"
+    [[ -e "$_so" ]] || continue
+    # Byte 4 of an ELF header is its class: 2 = 64-bit. The store also holds
+    # 32-bit gcc outputs, and picking one fails at dlopen with
+    # "wrong ELF class: ELFCLASS32" — which surfaces as a generic embedding
+    # failure, so check rather than guess.
+    if [[ "$(od -An -t u1 -j 4 -N 1 "$(readlink -f "$_so")" 2>/dev/null | tr -d " ")" == "2" ]]; then
+      CORTEX_ONNX_LD_PATH="$_candidate"
+      break
+    fi
+  done
+fi
+if [[ -n "${CORTEX_ONNX_LD_PATH:-}" ]]; then
+  export LD_LIBRARY_PATH="${CORTEX_ONNX_LD_PATH}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 
 # Logging helper

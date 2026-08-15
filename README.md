@@ -40,7 +40,7 @@ Seven slash commands let you interact with memory directly: `/remember`, `/recal
 A `SessionEnd` hook detaches a background worker (so nothing blocks the session) that runs the pipeline sequentially:
 
 1. **Extract** — Stream the session transcript (JSONL), project it to what the model actually saw (dropping subagent `details`, tool-result siblings and snapshots — ~96% of bytes on subagent-heavy sessions) and read it in resumable 100KB chunks of that projection, add git context (branch, commits, changed files), and use the configured direct OpenAI-compatible endpoint with thinking disabled, falling back to a headless coding-agent CLI when no direct endpoint is available; each invocation is bounded to five chunks, and the detached ingestion worker retries deferred or transiently failed extraction until the cursor reaches EOF before backfill; global-scoped candidates are routed to the global DB, while entity-only/global-only responses receive a project-local provenance memory so extracted facts are retained
-2. **Backfill** — Compute embeddings for newly extracted memories (Gemini API, or local HuggingFace fallback)
+2. **Backfill** — Compute embeddings for newly extracted memories (local static model, no API)
 3. **Semantic Edges** — Classify similarity-created `relates_to` edges into typed relationships
 4. **Lifecycle** — Decay confidence, archive stale memories, prune old ones
 5. **AI Prune** — When due, the LLM evaluates active memories and archives low-value ones
@@ -58,7 +58,6 @@ Nested extraction LLMs inherit `CORTEX_EXTRACTING=1`; both Pi and Claude Code sh
 
 - [Bun](https://bun.sh) runtime
 - Claude Code CLI (provides `claude` binary on PATH)
-- `GEMINI_API_KEY` environment variable (for embeddings + semantic search; without it, recall falls back to keyword search)
 
 ### Setup (marketplace install)
 
@@ -85,14 +84,7 @@ Then install engine dependencies inside the installed plugin's `engine/` directo
    bun install
    ```
 
-3. Set up the Gemini API key (optional but recommended):
-   ```bash
-   export GEMINI_API_KEY="your-key-here"
-   ```
-
-   Hooks don't inherit your shell profile — they source the key from a file instead. By default they look at the sops-nix path (`~/.config/sops-nix/secrets/rendered/gemini-env`); set `CORTEX_GEMINI_ENV` to point at any file that exports `GEMINI_API_KEY`.
-
-4. Restart Claude Code — the plugin registers automatically via `plugin.json` and `hooks.json`.
+3. Restart Claude Code — the plugin registers automatically via `plugin.json` and `hooks.json`.
 
 ## Commands
 
@@ -168,7 +160,6 @@ Cortex follows a **Functional Core / Imperative Shell** design:
 │  filesystem.ts   PID locking, surface write           │
 │  git-context.ts  Branch, commits, changed files       │
 │  claude-llm.ts   Headless LLM CLI client (claude/pi)  │
-│  gemini-embed.ts Gemini embedding API                 │
 │  local-embed.ts  HuggingFace transformers fallback    │
 └───────────────────────────────────────────────────────┘
                           ↕
@@ -199,7 +190,6 @@ During extraction, candidates the LLM classifies as scope `"global"` are routed 
 |---|---|---|
 | OpenAI-compatible LLM endpoint | Preferred transport for memory extraction, AI pruning, and edge classification; configure `CORTEX_LLM_API_URL`, `CORTEX_LLM_API_KEY`, and `CORTEX_LLM_MODEL`, or a compatible Pi provider | No (falls back to a headless CLI) |
 | Headless agent CLI (`claude -p --model haiku`, or `pi -p` under the Pi agent) | Fallback transport when no direct OpenAI-compatible endpoint is configured | No (required only when the direct endpoint is unavailable; override with `CORTEX_LLM_BINARY`/`CORTEX_LLM_MODEL`) |
-| Gemini Embedding-001 | Semantic embeddings (768-dim) — the only thing `GEMINI_API_KEY` is used for | No (falls back to local) |
 | HuggingFace Transformers | Local embedding (EmbeddingGemma-300M ONNX, 768-dim) | Bundled |
 
 ## Memory Model
@@ -230,7 +220,7 @@ Each memory carries:
 - **Tags** — keyword array for searchability
 - **Pinned** — exempt from decay when true
 - **Status** — `active` → `archived` → `pruned`
-- **Embeddings** — Gemini (768-dim Float64) and/or local (768-dim Float32)
+- **Embeddings** — local static model (512-dim Float32), no API key
 - **Source context** — session ID, git branch, commits, changed files
 
 ## Ranking & Surface Generation
@@ -319,7 +309,7 @@ Each new memory keeps at most its 3 strongest edges (structural guard against ed
 
 **Tier 2: Cosine Similarity** (embeddings)
 
-Used by `/recall` for search ranking and by `/consolidate` for duplicate detection. Consolidation thresholds are per-space: Jaccard and Gemini-768 cosine flag pairs above 0.5; raw local cosine flags pairs above 0.8 — but only when the active local model is the calibrated one, otherwise local cosine is excluded from consolidation entirely.
+Used by `/recall` for search ranking and by `/consolidate` for duplicate detection. Consolidation thresholds are per-space: Jaccard flags pairs above 0.5; raw local cosine flags pairs above 0.8 — but only when the active local model is the calibrated one, otherwise local cosine is excluded from consolidation entirely.
 
 ### Consolidation
 
@@ -329,9 +319,9 @@ Used by `/recall` for search ranking and by `/consolidate` for duplicate detecti
 
 `/recall` supports two search modes:
 
-### Semantic (default, requires `GEMINI_API_KEY`)
+### Semantic (default, always available)
 
-1. Embed query via Gemini: `[query] [project:name] <user query>`
+1. Embed query locally: `[query] [project:name] <user query>`
 2. Cosine similarity against stored embeddings in both databases (archived and superseded memories are excluded)
 3. Merge results (project-scoped first); with `--branch`, the filter is applied before the result limit so branch matches aren't cut off
 4. Enrich with depth-2 graph traversal
@@ -339,7 +329,7 @@ Used by `/recall` for search ranking and by `/consolidate` for duplicate detecti
 
 ### Keyword (fallback, or `--keyword` flag)
 
-FTS5 full-text search on content, summary, and tags. No API key needed, works offline.
+FTS5 full-text search on content, summary, and tags. Useful when an exact term matters more than meaning.
 
 ### Embedding Strategy
 
@@ -347,8 +337,7 @@ Memories are inserted **without** embeddings to avoid blocking extraction. A bac
 
 | Model | Dimensions | Storage Column | When |
 |---|---|---|---|
-| Gemini Embedding-001 | 768 (Float64) | `embedding` | When `GEMINI_API_KEY` available |
-| EmbeddingGemma-300M (local) | 768 (Float32) | `local_embedding` | Local path; cosine dedup gated on calibration |
+| potion-retrieval-32M (local, static) | 512 (Float32) | `local_embedding` | Always — runs on CPU in-process, no API key |
 
 Embedding text format: `[memory_type] [project:name] summary` — enables type-aware and project-aware similarity.
 
@@ -394,8 +383,7 @@ The LLM evaluates active memories in batches and archives low-value ones. Trigge
 
 | Variable | Purpose | Required |
 |---|---|---|
-| `GEMINI_API_KEY` | Embeddings + semantic search (embeddings only — never used for extraction) | No (falls back to keyword search + local embeddings) |
-| `CORTEX_GEMINI_ENV` | Path to a file hooks source to get `GEMINI_API_KEY` (default: sops-nix path) | No |
+| `CORTEX_ONNX_LD_PATH` | Directory holding a 64-bit `libstdc++.so.6` for onnxruntime. Hooks probe the nix store when unset; needed on NixOS, a no-op elsewhere | No |
 | `CORTEX_LLM_API_URL` | Base URL (or `/chat/completions` URL) for an explicit OpenAI-compatible LLM endpoint | No |
 | `CORTEX_LLM_API_KEY` | API key for the explicit OpenAI-compatible LLM endpoint | Required with `CORTEX_LLM_API_URL` |
 | `CORTEX_LLM_BINARY` | Force the headless LLM binary (`claude` or `pi`) | No (auto-detected) |

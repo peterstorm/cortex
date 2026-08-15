@@ -771,57 +771,52 @@ export function getArchivedMemories(db: Database): readonly Memory[] {
 }
 
 /**
- * SQL predicate selecting rows whose embedding of `type` is usable, plus the
- * bound parameters it needs.
+ * SQL predicate selecting rows whose embedding is usable, plus the bound
+ * parameters it needs.
  *
- * Local vectors carry an extra constraint: they must come from the CURRENT
- * model. Vectors from two models share a column but not a vector space, and
- * comparing across them returns plausible-looking scores rather than an error —
- * the failure mode is "semantic search got a bit worse", which is invisible.
+ * Vectors must come from the CURRENT model. Vectors from two models share a
+ * column but not a vector space, and comparing across them returns
+ * plausible-looking scores rather than an error — the failure mode is "semantic
+ * search got a bit worse", which is invisible.
  *
  * Both read paths (all-rows and by-IDs) build their predicate here so the
  * guarantee cannot hold on one and silently lapse on the other.
  */
-function embeddingPredicate(type: 'gemini' | 'local'): {
+function embeddingPredicate(): {
   readonly sql: string;
   readonly params: readonly string[];
 } {
-  return type === 'gemini'
-    ? { sql: `embedding IS NOT NULL`, params: [] }
-    : {
-        sql: `local_embedding IS NOT NULL AND local_embedding_model = ?`,
-        params: [LOCAL_EMBED_MODEL],
-      };
+  return {
+    sql: `local_embedding IS NOT NULL AND local_embedding_model = ?`,
+    params: [LOCAL_EMBED_MODEL],
+  };
 }
 
 /**
- * Fetch all memories with embeddings of a given type.
+ * Fetch all active memories that carry a usable embedding.
  * I/O only — returns raw candidates for pure ranking in core/similarity.ts.
  *
  * @param db - Database instance
- * @param type - 'gemini' (Float64) or 'local' (Float32)
  * @returns Readonly array of {memory, embedding} pairs
  */
 export function getMemoriesWithEmbedding(
-  db: Database,
-  type: 'gemini' | 'local'
-): readonly { memory: Memory; embedding: Float64Array | Float32Array }[] {
-  const column = type === 'gemini' ? 'embedding' : 'local_embedding';
-  const pred = embeddingPredicate(type);
+  db: Database
+): readonly { memory: Memory; embedding: Float32Array }[] {
+  const pred = embeddingPredicate();
   const stmt = db.prepare(
     `SELECT * FROM memories WHERE ${pred.sql} AND status = 'active'`
   );
 
   const rows = stmt.all(...pred.params) as any[];
-  const results: { memory: Memory; embedding: Float64Array | Float32Array }[] = [];
+  const results: { memory: Memory; embedding: Float32Array }[] = [];
 
   for (const row of rows) {
     const memory = rowToMemory(row);
 
-    const memoryEmbedding = type === 'gemini' ? memory.embedding : memory.local_embedding;
+    const memoryEmbedding = memory.local_embedding;
     if (!memoryEmbedding) {
       // Skip corrupt row instead of crashing (#9)
-      console.warn(`[cortex:db] Skipping memory ${memory.id}: ${column} deserialized to null`);
+      console.warn(`[cortex:db] Skipping memory ${memory.id}: local_embedding deserialized to null`);
       continue;
     }
 
@@ -943,26 +938,24 @@ function searchByKeywordWithJoiner(
  */
 export function getMemoriesWithEmbeddingByIds(
   db: Database,
-  ids: readonly string[],
-  type: 'gemini' | 'local'
-): readonly { memory: Memory; embedding: Float64Array | Float32Array }[] {
+  ids: readonly string[]
+): readonly { memory: Memory; embedding: Float32Array }[] {
   if (ids.length === 0) return [];
 
-  const column = type === 'gemini' ? 'embedding' : 'local_embedding';
   const placeholders = ids.map(() => '?').join(',');
-  const pred = embeddingPredicate(type);
+  const pred = embeddingPredicate();
   const stmt = db.prepare(`
     SELECT * FROM memories WHERE id IN (${placeholders}) AND ${pred.sql} AND status = 'active'
   `);
 
   const rows = stmt.all(...ids, ...pred.params) as any[];
-  const results: { memory: Memory; embedding: Float64Array | Float32Array }[] = [];
+  const results: { memory: Memory; embedding: Float32Array }[] = [];
 
   for (const row of rows) {
     const memory = rowToMemory(row);
-    const memoryEmbedding = type === 'gemini' ? memory.embedding : memory.local_embedding;
+    const memoryEmbedding = memory.local_embedding;
     if (!memoryEmbedding) {
-      console.warn(`[cortex:db] Skipping memory ${memory.id}: ${column} deserialized to null`);
+      console.warn(`[cortex:db] Skipping memory ${memory.id}: local_embedding deserialized to null`);
       continue;
     }
     results.push({ memory, embedding: memoryEmbedding });

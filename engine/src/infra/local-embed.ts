@@ -1,54 +1,74 @@
 /**
  * Local embedding via Hugging Face transformers.js, on CPU.
  *
- * Model, dimensionality, and task prefixes all come from config
- * (LOCAL_EMBED_MODEL, LOCAL_EMBEDDING_DIMENSIONS, LOCAL_EMBED_*_PREFIX) rather
- * than being inlined here — the previous implementation hardcoded both the
- * model id and a `!== 384` dimension check, which pinned the module to one
- * model and would have thrown on every call after a swap.
+ * This is cortex's ONLY embedding provider. It must therefore be cheap enough
+ * to run in a cold process, because the prompt-recall hook spawns a fresh `bun`
+ * per user prompt — a model that takes seconds to load is unusable there no
+ * matter how good its vectors are.
  *
- * Retrieval is asymmetric: queries and documents must carry different
- * prefixes to land in the same space. Callers pick a side via embedLocalQuery
- * or embedLocalDocument; embedLocal defaults to the document side, which is
- * what stored memories are.
+ * That constraint selects a STATIC embedding model (model2vec / potion). Rather
+ * than running a transformer, model2vec stores one vector per token and averages
+ * them, which is why load and inference are ~1000x cheaper than a transformer of
+ * comparable quality. Measured on this machine against EmbeddingGemma-300M:
  *
- * Requirements:
- * - FR-110: Support fallback to local embedding model
- * - NFR-014: Support keyword search when embedding API unavailable
+ *   load        12,026 ms -> 422 ms
+ *   warm embed     132 ms -> 0.15 ms
+ *   resident      1604 MB -> 300 MB
+ *
+ * Consequences of the static architecture that matter here:
+ *
+ * - There is NO query/document asymmetry. A transformer encodes the whole
+ *   string in context, so instruction prefixes shift the result; model2vec just
+ *   averages token vectors, so a prefix only dilutes the average with the
+ *   prefix's own tokens. Queries and documents are embedded identically.
+ * - The ONNX export is an EmbeddingBag graph taking `input_ids` (flat, all
+ *   tokens concatenated) plus `offsets` (start index per sequence). The
+ *   `pipeline('feature-extraction')` helper supplies neither, and fails with
+ *   "Missing the following inputs: offsets" — hence the explicit
+ *   AutoModel/AutoTokenizer path below.
+ *
+ * Model and dimensionality come from config, never inlined: an earlier version
+ * hardcoded both the model id and a `!== 384` check, which pinned the module to
+ * one model and would have thrown on every call after a swap.
  */
 
-import {
-  LOCAL_EMBED_MODEL,
-  LOCAL_EMBEDDING_DIMENSIONS,
-  LOCAL_EMBED_QUERY_PREFIX,
-  LOCAL_EMBED_DOCUMENT_PREFIX,
-} from '../config.js';
+import { LOCAL_EMBED_MODEL, LOCAL_EMBEDDING_DIMENSIONS } from '../config.js';
 
 // Functional Core: Pure types
 type ModelAvailabilityResult =
   | { ok: true }
   | { ok: false; error: string };
 
-/** The tensor shape transformers.js returns from a feature-extraction call. */
-interface FeatureExtractionOutput {
-  tolist(): number[][];
+/** Minimal shape of a transformers.js tensor this module reads. */
+interface OnnxTensor {
+  readonly data: ArrayLike<number>;
+}
+
+/** Tokenizer output — only `input_ids` is used. */
+interface TokenizerOutput {
+  readonly input_ids: number[] | number[][];
 }
 
 /**
- * Structural type for the loaded pipeline — only what this module calls.
- * Narrower than the library's exported type on purpose: it documents the exact
- * contract relied on, so a breaking change upstream surfaces here rather than
- * as an `any` that silently accepts anything.
+ * Structural types for the loaded model and tokenizer — only what this module
+ * calls. Narrower than the library's exported types on purpose: they document
+ * the exact contract relied on, so a breaking change upstream surfaces here
+ * rather than as an `any` that silently accepts anything.
  *
- * `dispose` belongs to that contract: disposeLocalModel() must release the ONNX
+ * `dispose` belongs to the contract: disposeLocalModel() must release the ONNX
  * native handles before process exit or Bun crashes during C++ teardown.
  */
-type FeatureExtractionPipeline = ((
-  text: string,
-  options: { pooling: 'mean'; normalize: boolean }
-) => Promise<FeatureExtractionOutput>) & {
+type EmbeddingBagModel = ((inputs: {
+  input_ids: unknown;
+  offsets: unknown;
+}) => Promise<Record<string, OnnxTensor>>) & {
   dispose(): Promise<void>;
 };
+
+type StaticTokenizer = (
+  text: string,
+  options: { add_special_tokens: boolean; return_tensor: boolean }
+) => Promise<TokenizerOutput>;
 
 // Dynamic import with error handling
 let transformersModule: typeof import('@huggingface/transformers') | null = null;
@@ -68,28 +88,31 @@ async function getTransformers() {
 }
 
 // Imperative Shell: Cached state
-let cachedPipeline: FeatureExtractionPipeline | null = null;
+let cachedModel: EmbeddingBagModel | null = null;
+let cachedTokenizer: StaticTokenizer | null = null;
 let modelAvailabilityCache: ModelAvailabilityResult | null = null;
 
 /**
  * Load the local embedding model (lazy initialization).
- * Caches the pipeline for reuse.
+ * Caches model and tokenizer for reuse.
  */
 async function loadModel(): Promise<ModelAvailabilityResult> {
-  if (cachedPipeline) {
+  if (cachedModel && cachedTokenizer) {
     return { ok: true };
   }
 
   try {
-    const { pipeline } = await getTransformers();
-    // transformers.js overloads `pipeline()` across every task, so its return
-    // type is a union large enough that TypeScript gives up on it (TS2590)
-    // before it can be narrowed. Cast once, here, to the contract this module
-    // actually uses — every call site downstream stays fully checked against
-    // FeatureExtractionPipeline, which is where the type earns its keep.
-    cachedPipeline = (await pipeline('feature-extraction', LOCAL_EMBED_MODEL, {
-      dtype: 'q8',
-    })) as unknown as FeatureExtractionPipeline;
+    const { AutoModel, AutoTokenizer } = await getTransformers();
+    // transformers.js overloads these factories across every task, producing
+    // union types large enough that TypeScript gives up (TS2590) before they
+    // can be narrowed. Cast once, here, to the contract this module actually
+    // uses — every call site downstream stays fully checked.
+    cachedTokenizer = (await AutoTokenizer.from_pretrained(
+      LOCAL_EMBED_MODEL
+    )) as unknown as StaticTokenizer;
+    cachedModel = (await AutoModel.from_pretrained(
+      LOCAL_EMBED_MODEL
+    )) as unknown as EmbeddingBagModel;
     return { ok: true };
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
@@ -166,36 +189,17 @@ export async function ensureModelLoaded(): Promise<boolean> {
 }
 
 /**
- * Embed text using local transformer model.
- * Returns Float32Array of 384 dimensions.
+ * Embed text with the local static model, L2-normalized so cosine similarity is
+ * a plain dot product.
  *
- * Throws if model unavailable or embedding fails.
+ * The same function serves queries and stored memories: model2vec averages
+ * per-token vectors, so there is no context in which a query would be encoded
+ * differently from a document, and an instruction prefix would only dilute the
+ * average with its own tokens.
+ *
+ * Throws if the model is unavailable or embedding fails.
  */
 export async function embedLocal(text: string): Promise<Float32Array> {
-  return embedWithPrefix(text, LOCAL_EMBED_DOCUMENT_PREFIX);
-}
-
-/**
- * Embed a stored memory (the document side of retrieval).
- * Explicit alias for embedLocal — prefer it at call sites so the asymmetry is
- * visible in the code rather than implied by a default.
- */
-export async function embedLocalDocument(text: string): Promise<Float32Array> {
-  return embedWithPrefix(text, LOCAL_EMBED_DOCUMENT_PREFIX);
-}
-
-/**
- * Embed a search query (the query side of retrieval).
- *
- * Must be used for queries. Embedding a query with the document prefix places
- * it in the wrong region of the space, and the only symptom is quietly worse
- * recall — no error is raised anywhere.
- */
-export async function embedLocalQuery(text: string): Promise<Float32Array> {
-  return embedWithPrefix(text, LOCAL_EMBED_QUERY_PREFIX);
-}
-
-async function embedWithPrefix(text: string, prefix: string): Promise<Float32Array> {
   // Validate input
   const trimmed = text.trim();
   if (trimmed === '') {
@@ -208,20 +212,40 @@ async function embedWithPrefix(text: string, prefix: string): Promise<Float32Arr
     throw new Error(loadResult.error);
   }
 
-  if (!cachedPipeline) {
-    throw new Error('Model loaded but pipeline is null (unexpected state)');
+  if (!cachedModel || !cachedTokenizer) {
+    throw new Error('Model loaded but model/tokenizer is null (unexpected state)');
   }
 
   try {
-    // Mean pooling + L2 normalization, so cosine similarity is a dot product.
-    const output = await cachedPipeline(prefix + trimmed, {
-      pooling: 'mean',
-      normalize: true,
+    const { Tensor } = await getTransformers();
+
+    // No special tokens: they carry no meaning in a static average and would
+    // pull every embedding toward a common point.
+    const encoded = await cachedTokenizer(trimmed, {
+      add_special_tokens: false,
+      return_tensor: false,
+    });
+    const raw = encoded.input_ids;
+    const flat: number[] = Array.isArray(raw[0]) ? (raw[0] as number[]) : (raw as number[]);
+
+    // A string that tokenizes to nothing (punctuation, an unknown script) would
+    // otherwise hand EmbeddingBag an empty bag and produce NaNs downstream.
+    if (flat.length === 0) {
+      throw new Error(`text produced no tokens: ${JSON.stringify(trimmed.slice(0, 40))}`);
+    }
+
+    // EmbeddingBag contract: all token ids concatenated, plus the start offset
+    // of each sequence. One sequence here, so a single offset of 0.
+    const output = await cachedModel({
+      input_ids: new Tensor('int64', BigInt64Array.from(flat.map((id) => BigInt(id))), [flat.length]),
+      offsets: new Tensor('int64', BigInt64Array.from([0n]), [1]),
     });
 
-    // Extract embedding (already pooled + normalized by pipeline)
-    const rawEmbedding = output.tolist();
-    const embedding = new Float32Array(rawEmbedding[0]);
+    const tensor = Object.values(output)[0];
+    if (!tensor?.data) {
+      throw new Error('Model returned no output tensor');
+    }
+    const embedding = Float32Array.from(tensor.data);
 
     // Validate against the configured dimensionality, never a literal: a
     // hardcoded number silently pins this module to one model.
@@ -230,6 +254,16 @@ async function embedWithPrefix(text: string, prefix: string): Promise<Float32Arr
         `Expected ${LOCAL_EMBEDDING_DIMENSIONS} dimensions from ${LOCAL_EMBED_MODEL}, got ${embedding.length}`
       );
     }
+
+    // The graph pools but does not normalize; every consumer treats cosine as a
+    // dot product, so normalize here rather than at each call site.
+    let norm = 0;
+    for (const value of embedding) norm += value * value;
+    norm = Math.sqrt(norm);
+    if (norm === 0 || !Number.isFinite(norm)) {
+      throw new Error('Model returned a zero or non-finite vector');
+    }
+    for (let i = 0; i < embedding.length; i++) embedding[i] /= norm;
 
     return embedding;
   } catch (err) {
@@ -244,14 +278,17 @@ async function embedWithPrefix(text: string, prefix: string): Promise<Float32Arr
  * Safe to call even if no model is loaded.
  */
 export async function disposeLocalModel(): Promise<void> {
-  if (cachedPipeline) {
+  if (cachedModel) {
     try {
-      await cachedPipeline.dispose();
+      await cachedModel.dispose();
     } catch {
       // Best-effort — ignore errors during disposal
     }
-    cachedPipeline = null;
+    cachedModel = null;
   }
+  // The tokenizer holds no native handles, but clearing it keeps the "both set
+  // or both null" invariant loadModel() checks.
+  cachedTokenizer = null;
 }
 
 /**

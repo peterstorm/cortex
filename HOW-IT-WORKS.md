@@ -66,7 +66,7 @@ When your session ends, the hook detaches a background worker (so nothing blocks
 3. **Send to the LLM** — prefer the configured direct OpenAI-compatible endpoint with thinking disabled; fall back to `claude -p --model haiku`, or `pi -p --thinking off` under the pi agent
 4. **Parse response** — validate each memory/entity candidate (type, confidence, priority); an all-invalid non-empty candidate array is a retryable parse failure, while global-scoped memories go to the global DB
 5. **Store in DB** — insert memories, retain the chunk checkpoint on any memory/fact write failure, and compute similarity edges; entity-only or global-only responses get a deterministic project-local provenance memory so facts always have a valid source
-6. **Backfill embeddings** — embed newly stored memories (Gemini, or local fallback)
+6. **Backfill embeddings** — embed newly stored memories with the local static model
 7. **Maintenance (sequential)** — semantic edge classification, then lifecycle (decay/archive/prune), then AI prune. These used to be concurrent detached spawns, but SQLite allows one writer and lifecycle + AI prune both read-modify-write telemetry — so they now run one after another.
 8. **Regenerate surface LAST** — after all archival, so the surface never contains memories archived earlier in the same pipeline; the next session starts fresh
 
@@ -165,7 +165,7 @@ Each new memory keeps at most its 3 strongest edges — a structural guard again
 
 ### Tier 2: Cosine Similarity on Embeddings (wired)
 
-`cosineSimilarity()` in `core/similarity.ts` is used throughout: `/recall` and the prompt-recall hook rank results by cosine similarity, and `/consolidate` detects duplicate pairs via hybrid similarity (Jaccard + cosine) with per-space thresholds — 0.5 for Jaccard and Gemini-768 cosine, 0.8 for raw local cosine when the calibrated model is active (otherwise local cosine is excluded).
+`cosineSimilarity()` in `core/similarity.ts` is used throughout: `/recall` and the prompt-recall hook rank results by cosine similarity, and `/consolidate` detects duplicate pairs via hybrid similarity (Jaccard + cosine) with per-space thresholds — 0.5 for Jaccard, 0.8 for raw local cosine when the calibrated model is active (otherwise local cosine is excluded).
 
 ### Semantic Edge Classification
 
@@ -207,8 +207,8 @@ On top of decay, an AI prune pass has the LLM review active memories in batches 
 
 `/recall <query>` searches using two methods:
 
-### Semantic (default, requires `GEMINI_API_KEY`)
-1. Embed the query via Gemini Embedding API (`gemini-embedding-001`)
+### Semantic (default, always available)
+1. Embed the query with the local static model (`minishlab/potion-retrieval-32M`)
 2. Query is prefixed: `[query] [project:name] <your query>`
 3. Memories are prefixed: `[memory_type] [project:name] <summary>`
 4. Cosine similarity search against stored embeddings in both DBs (archived and superseded memories are excluded)
@@ -263,8 +263,7 @@ Memories are inserted without embeddings (to avoid blocking extraction). A backg
 
 | Variable | Purpose | Required |
 |---|---|---|
-| `GEMINI_API_KEY` | Embedding backfill + semantic search (embeddings only — never used for extraction) | Yes (for embeddings + semantic recall) |
-| `CORTEX_GEMINI_ENV` | Path to a file the hooks source to get `GEMINI_API_KEY` (defaults to the sops-nix path `~/.config/sops-nix/secrets/rendered/gemini-env`) | No |
+| `CORTEX_ONNX_LD_PATH` | Directory holding a 64-bit `libstdc++.so.6` for onnxruntime. Hooks probe the nix store when unset; needed on NixOS, a no-op elsewhere | No |
 | `CORTEX_LLM_API_URL` | Base URL (or `/chat/completions` URL) for an explicit OpenAI-compatible LLM endpoint | No |
 | `CORTEX_LLM_API_KEY` | API key for the explicit OpenAI-compatible LLM endpoint | Required with `CORTEX_LLM_API_URL` |
 | `CORTEX_LLM_BINARY` | Force the headless LLM binary (`claude` or `pi`) | No (auto-detected) |
@@ -273,4 +272,4 @@ Memories are inserted without embeddings (to avoid blocking extraction). A backg
 
 Extraction, AI pruning, and edge classification prefer a configured direct OpenAI-compatible endpoint. The fallback is a headless coding-agent CLI: `claude -p --model haiku` by default (must be on PATH — it is when running inside Claude Code hooks), or `pi -p --thinking off` when running under the pi agent. The Pi fallback selects a provider-specific inexpensive extraction model when known and otherwise uses the configured provider/default model. No separate API key is needed for the CLI fallback.
 
-Without `GEMINI_API_KEY`, Gemini embeddings are skipped (the bundled local EmbeddingGemma model still embeds) and recall falls back accordingly. Extraction still works via the LLM CLI. Because hooks don't inherit your shell profile, they source the key from the `CORTEX_GEMINI_ENV` file.
+Embeddings need no API key: the model is bundled and runs on CPU in-process. If onnxruntime cannot load its native library, embedding fails loudly with the remedy in the message and recall degrades to keyword search; extraction is unaffected.

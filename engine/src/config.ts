@@ -13,14 +13,6 @@ import type { SimilaritySpace } from './core/types.js';
 // ============================================================================
 
 /**
- * Get Gemini API key from environment
- * Returns undefined if not set
- */
-export function getGeminiApiKey(): string | undefined {
-  return Bun.env.GEMINI_API_KEY;
-}
-
-/**
  * Get plugin root directory from environment.
  * Supports both Claude Code (CLAUDE_PLUGIN_ROOT) and pi (CORTEX_PLUGIN_ROOT).
  * Returns undefined if not set.
@@ -180,19 +172,27 @@ export const UNTRUSTED_MEMORY_WARNING =
 // ============================================================================
 
 /**
- * Local embedding model, run on CPU through transformers.js.
+ * The embedding model. Local, static, CPU-only — cortex has no remote provider.
  *
- * EmbeddingGemma-300M (Gemma 3 derived, official ONNX build): 308M parameters,
- * under ~200 MB resident quantized, multilingual across 100+ languages, and
- * 768-dimensional to match the Gemini column's shape.
+ * Selected by the invocation model rather than by benchmark score: the
+ * prompt-recall hook spawns a fresh `bun` process per user prompt, so load time
+ * is paid on EVERY prompt. Measured on this machine:
  *
- * It replaces BGE-small-en-v1.5, which was English-only and never actually ran
- * (zero rows carried a local embedding), so there is no legacy local corpus to
- * migrate — which is exactly why the model id and dimension are recorded per
- * row from here on. Changing the model later without that record would leave
- * incompatible vectors silently sharing one column.
+ *   model                  load       warm embed   resident
+ *   EmbeddingGemma-300M    12,026 ms  132 ms       1604 MB
+ *   potion-retrieval-32M      422 ms  0.15 ms       300 MB
+ *
+ * A transformer is simply not viable in a cold process; a static model is.
+ * potion-retrieval-32M (model2vec, retrieval-tuned) also produces a
+ * better-spread similarity space than EmbeddingGemma did — measured over 1770
+ * pairs from real memories, p50 0.278 and min -0.018, versus EmbeddingGemma's
+ * compressed p50 0.646 / min 0.491 which made every absolute threshold
+ * meaningless.
+ *
+ * The model id and dimension are recorded per row (local_embedding_model), so a
+ * future swap cannot leave incompatible vectors silently sharing one column.
  */
-export const LOCAL_EMBED_MODEL = 'onnx-community/embeddinggemma-300m-ONNX';
+export const LOCAL_EMBED_MODEL = 'minishlab/potion-retrieval-32M';
 
 /**
  * Dimensionality of LOCAL_EMBED_MODEL output.
@@ -201,23 +201,11 @@ export const LOCAL_EMBED_MODEL = 'onnx-community/embeddinggemma-300m-ONNX';
  * implementation hardcoded `!== 384`, which silently pinned the module to one
  * model and would have thrown on every embed after a swap.
  *
- * EmbeddingGemma is Matryoshka-trained, so 768 can be truncated to 512/256/128
- * if storage ever matters more than recall. Truncation must bump the model
- * record, since truncated vectors are not comparable with full-width ones.
+ * Changing it requires re-embedding: vectors of different widths are not
+ * comparable, and the per-row model tag is what keeps the old ones out of the
+ * comparison rather than silently mixing them in.
  */
-export const LOCAL_EMBEDDING_DIMENSIONS = 768;
-
-/**
- * Task prefixes required by EmbeddingGemma for asymmetric retrieval.
- *
- * Queries and documents are embedded into the same space only when each is
- * prefixed for its role. Omitting these — or using one prefix for both — costs
- * real retrieval quality, and does so invisibly: recall simply gets worse with
- * no error anywhere. Both live here so the query and document sides can never
- * drift apart.
- */
-export const LOCAL_EMBED_QUERY_PREFIX = 'task: search result | query: ';
-export const LOCAL_EMBED_DOCUMENT_PREFIX = 'title: none | text: ';
+export const LOCAL_EMBEDDING_DIMENSIONS = 512;
 
 /**
  * The local model whose cosine space the thresholds further down were
@@ -378,8 +366,8 @@ export const INTRA_BATCH_DEDUP_THRESHOLD = 0.75;
 
 /**
  * Consolidation similarity threshold for detecting duplicate memory pairs
- * in WELL-SEPARATED similarity spaces (Jaccard token overlap, Gemini 768-dim
- * cosine). Pairs scoring above this are flagged for merge review.
+ * in the WELL-SEPARATED Jaccard token-overlap space. Pairs scoring above this
+ * are flagged for merge review.
  */
 export const CONSOLIDATION_SIMILARITY_THRESHOLD = 0.5;
 
@@ -442,8 +430,24 @@ export const SEMANTIC_PRE_FILTER_LIMIT = 100;
 /**
  * Minimum cosine similarity score for semantic search results.
  * Results below this threshold are noise and filtered out before ranking.
+ *
+ * Calibrated against LOCAL_EMBED_MODEL over the real 599-memory loom corpus,
+ * comparing on-topic queries against deliberately off-topic ones:
+ *
+ *   query       top1          top5          p50
+ *   on-topic    0.577-0.749   0.544-0.604   ~0.32
+ *   off-topic   0.446-0.514   0.377-0.448   ~0.23
+ *
+ * 0.45 sits above every off-topic top5 and below every on-topic top5, so an
+ * unrelated query returns a short list rather than a full page of noise. The
+ * previous 0.25 was inherited from Gemini's space and sits below even the
+ * off-topic median here — it filtered nothing at all.
+ *
+ * Honest limit: the bands overlap at the very top (an off-topic top1 reaches
+ * 0.51), so no floor makes an unrelated query return empty without also
+ * dropping weak on-topic hits. This bounds the noise; it does not remove it.
  */
-export const MIN_COSINE_SCORE = 0.25;
+export const MIN_COSINE_SCORE = 0.45;
 
 /**
  * Weight for keyword overlap boost in fused ranking.

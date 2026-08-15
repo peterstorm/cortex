@@ -50,7 +50,7 @@ JSON printed to stdout with these fields (combined across project + global DBs):
 Total number of edges across both databases.
 
 ### `embedding_queue_size`
-Active memories with no embedding yet (neither Gemini nor local) — the backfill queue.
+Active memories with no embedding yet — the backfill queue.
 
 ### `cache_staleness`
 - **exists:** Whether the surface cache directory exists

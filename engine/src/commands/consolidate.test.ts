@@ -119,41 +119,29 @@ describe('findSimilarPairs', () => {
 
   test('uses cosine similarity when embeddings available', () => {
     // Create identical embeddings (similarity = 1.0)
-    const embedding = new Float64Array([0.1, 0.2, 0.3, 0.4, 0.5]);
-
     const memoryA = createTestMemory({
       summary: 'Different summary A',
-      embedding: embedding,
+      local_embedding: new Float32Array([0.1, 0.2, 0.3, 0.4, 0.5]),
     });
 
     const memoryB = createTestMemory({
       summary: 'Different summary B',
-      embedding: new Float64Array([0.1, 0.2, 0.3, 0.4, 0.5]),
+      local_embedding: new Float32Array([0.1, 0.2, 0.3, 0.4, 0.5]),
     });
 
-    const pairs = findSimilarPairs([memoryA, memoryB], 0.5);
+    const pairs = findSimilarPairs([memoryA, memoryB], 0.5, true);
 
     expect(pairs.length).toBe(1);
     expect(pairs[0].similarity).toBeCloseTo(1.0, 2);
   });
 
-  test('prefers gemini embeddings over local embeddings', () => {
-    const geminiEmbedding = new Float64Array([0.1, 0.2, 0.3]);
-    const localEmbedding = new Float32Array([0.5, 0.5, 0.5]);
+  test('uses local embeddings when both sides carry one', () => {
+    const memoryA = createTestMemory({ local_embedding: new Float32Array([0.5, 0.5, 0.5]) });
+    const memoryB = createTestMemory({ local_embedding: new Float32Array([0.5, 0.5, 0.5]) });
 
-    const memoryA = createTestMemory({
-      embedding: geminiEmbedding,
-      local_embedding: localEmbedding,
-    });
+    const pairs = findSimilarPairs([memoryA, memoryB], 0.5, true);
 
-    const memoryB = createTestMemory({
-      embedding: new Float64Array([0.1, 0.2, 0.3]),
-      local_embedding: new Float32Array([0.9, 0.9, 0.9]),
-    });
-
-    const pairs = findSimilarPairs([memoryA, memoryB], 0.5);
-
-    // Should use gemini embeddings (identical = 1.0 similarity)
+    // Identical vectors = 1.0 similarity
     expect(pairs.length).toBe(1);
     expect(pairs[0].similarity).toBeCloseTo(1.0, 2);
   });
@@ -188,7 +176,7 @@ describe('findSimilarPairs', () => {
   test('handles mixed embedding dimensions with fallback to Jaccard', () => {
     const memoryA = createTestMemory({
       summary: 'similar text content here',
-      embedding: new Float64Array([0.1, 0.2]), // 2D
+      local_embedding: new Float32Array([0.1, 0.2]), // 2D
     });
 
     const memoryB = createTestMemory({
@@ -210,17 +198,13 @@ describe('findSimilarPairs - embedding type selection', () => {
   const contentA = { content: 'alpha bravo charlie delta', summary: 'alpha bravo' };
   const contentB = { content: 'echo foxtrot golf hotel', summary: 'echo foxtrot' };
 
-  test('falls back to local-local when gemini embeddings are not on both sides', () => {
-    // A has gemini + local; B has local only. Naive per-memory selection
-    // would pair 3d-gemini vs 3d-local... use different dims to be strict:
+  test('compares local-local when both sides carry a vector', () => {
     const memoryA = createTestMemory({
       ...contentA,
-      embedding: new Float64Array([1, 0, 0, 0]),          // 4d gemini
-      local_embedding: new Float32Array([1, 0, 0]),       // 3d local
+      local_embedding: new Float32Array([1, 0, 0]),
     });
     const memoryB = createTestMemory({
       ...contentB,
-      embedding: null,
       local_embedding: new Float32Array([1, 0, 0]),       // identical local vector
     });
 
@@ -233,22 +217,6 @@ describe('findSimilarPairs - embedding type selection', () => {
     expect(pairs[0].similarity).toBeCloseTo(1.0);
   });
 
-  test('uses gemini-gemini when both sides have gemini embeddings', () => {
-    const memoryA = createTestMemory({
-      ...contentA,
-      embedding: new Float64Array([0, 1, 0]),
-      local_embedding: new Float32Array([1, 0, 0]),
-    });
-    const memoryB = createTestMemory({
-      ...contentB,
-      embedding: new Float64Array([0, 1, 0]),
-      local_embedding: new Float32Array([0, 1, 0]), // orthogonal local — must not be used
-    });
-
-    const pairs = findSimilarPairs([memoryA, memoryB], 0.9);
-    expect(pairs.length).toBe(1);
-    expect(pairs[0].similarity).toBeCloseTo(1.0);
-  });
 });
 
 describe('findSimilarPairs - per-space default thresholds (calibration regression)', () => {
@@ -301,18 +269,6 @@ describe('findSimilarPairs - per-space default thresholds (calibration regressio
     expect(pairs[0].similarity).toBeCloseTo(6 / 11, 5);
   });
 
-  test('Gemini cosine 0.55 is flagged by default (well-separated space keeps 0.5)', () => {
-    const c = 0.55;
-    const memoryA = createTestMemory({ ...contentA, embedding: new Float64Array([1, 0]) });
-    const memoryB = createTestMemory({
-      ...contentB,
-      embedding: new Float64Array([c, Math.sqrt(1 - c * c)]),
-    });
-
-    const pairs = findSimilarPairs([memoryA, memoryB]);
-    expect(pairs.length).toBe(1);
-    expect(pairs[0].similarity).toBeCloseTo(0.55, 5);
-  });
 
   test('explicit threshold overrides the per-space defaults uniformly', () => {
     expect(findSimilarPairs(localPairAt(0.7), 0.6, true).length).toBe(1);
@@ -495,18 +451,10 @@ describe('buildMergedMemory', () => {
   test('nulls embeddings so backfill re-embeds the merged content', () => {
     // Merged content is new text — carrying over either source embedding
     // would leave a stale vector that backfill (null-only) never repairs.
-    const geminiEmbedding = new Float64Array([0.1, 0.2, 0.3]);
     const localEmbedding = new Float32Array([0.4, 0.5, 0.6]);
 
-    const memoryA = createTestMemory({
-      embedding: geminiEmbedding,
-      local_embedding: null,
-    });
-
-    const memoryB = createTestMemory({
-      embedding: null,
-      local_embedding: localEmbedding,
-    });
+    const memoryA = createTestMemory({ local_embedding: null });
+    const memoryB = createTestMemory({ local_embedding: localEmbedding });
 
     const pair: MemoryPair = {
       memoryA,

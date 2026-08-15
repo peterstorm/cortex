@@ -146,7 +146,7 @@ export function jaccardSimilarity(tokensA: ReadonlySet<string>, tokensB: Readonl
  * produced O(n²) relates_to edges (nearly every same-project pair landed in
  * consolidate/suggest).
  *
- * Jaccard / Gemini-cosine bands (FR-059, well-separated spaces):
+ * Jaccard bands (FR-059, a well-separated space):
  * - < 0.1: ignore (unrelated)
  * - 0.1-0.4: relate (create relates_to edge)
  * - 0.4-0.5: suggest (create suggested edge for review)
@@ -183,7 +183,7 @@ export function classifySimilarity(
     return { action: 'consolidate' };
   }
 
-  // 'jaccard' and 'gemini-cosine': well-separated spaces share the FR-059 bands
+  // 'jaccard': a well-separated space, using the FR-059 bands
   if (score < 0.1) {
     return { action: 'ignore' };
   }
@@ -219,8 +219,8 @@ export function jaccardPreFilter(score: number): JaccardPreFilter {
 /**
  * Result of a hybrid similarity computation, tagged with the method that
  * actually produced the score. Callers that know WHICH embedding space fed
- * the cosine (local vs Gemini) combine `method` with that knowledge to pick
- * calibrated thresholds/bands.
+ * the cosine combine `method` with that knowledge to pick calibrated
+ * thresholds/bands.
  */
 export type HybridSimilarityResult = {
   readonly score: number;

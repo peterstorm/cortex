@@ -6,19 +6,14 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { openDatabase, insertMemory, getMemory } from '../infra/db.ts';
 import { backfill } from './backfill.ts';
 import { createMemory } from '../core/types.ts';
-import * as geminiEmbed from '../infra/gemini-embed.ts';
 import * as localEmbed from '../infra/local-embed.ts';
 
 describe('backfill', () => {
-  let isGeminiAvailableSpy: ReturnType<typeof vi.spyOn>;
-  let embedTextsSpy: ReturnType<typeof vi.spyOn>;
   let ensureModelLoadedSpy: ReturnType<typeof vi.spyOn>;
   let embedLocalSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     // Setup spies with default implementations
-    isGeminiAvailableSpy = vi.spyOn(geminiEmbed, 'isGeminiAvailable');
-    embedTextsSpy = vi.spyOn(geminiEmbed, 'embedTexts');
     ensureModelLoadedSpy = vi.spyOn(localEmbed, 'ensureModelLoaded');
     embedLocalSpy = vi.spyOn(localEmbed, 'embedLocal');
   });
@@ -50,194 +45,37 @@ describe('backfill', () => {
 
       insertMemory(db, memory);
 
-      const result = await backfill(db, 'test-project', 'fake-api-key', true);
+      const result = await backfill(db, 'test-project');
 
       expect(result).toEqual({
         ok: true,
         processed: 0,
         failed: 0,
         errors: [],
-        method: 'gemini',
+        method: 'local',
       });
     });
 
     it('returns zero when database is empty', async () => {
       const db = openDatabase(':memory:');
 
-      const result = await backfill(db, 'test-project', 'fake-api-key', true);
+      const result = await backfill(db, 'test-project');
 
       expect(result).toEqual({
         ok: true,
         processed: 0,
         failed: 0,
         errors: [],
-        method: 'gemini',
+        method: 'local',
       });
     });
   });
 
-  describe('when Gemini API is available', () => {
-    it('processes memories via Gemini and updates embeddings', async () => {
+  describe('local embedding', () => {
+    it('embeds memories that lack a vector', async () => {
       const db = openDatabase(':memory:');
 
       // Setup mocks
-isGeminiAvailableSpy.mockReturnValue(true);
-embedTextsSpy.mockResolvedValue([
-        new Float64Array(768).fill(0.5),
-        new Float64Array(768).fill(0.7),
-      ]);
-      // Local backfill also runs for memories without local_embedding
-      ensureModelLoadedSpy.mockResolvedValue(true);
-      embedLocalSpy.mockResolvedValue(new Float32Array(384).fill(0.1));
-
-      // Insert memories without embeddings
-      const memory1 = createMemory({
-        id: 'mem-1',
-        content: 'Decision about architecture',
-        summary: 'Chose microservices',
-        memory_type: 'decision',
-        scope: 'project',
-        confidence: 0.9,
-        priority: 8,
-        source_type: 'extraction',
-        source_session: 'session-1',
-        source_context: JSON.stringify({ branch: 'main' }),
-      });
-
-      const memory2 = createMemory({
-        id: 'mem-2',
-        content: 'Pattern for error handling',
-        summary: 'Use Either type',
-        memory_type: 'pattern',
-        scope: 'global',
-        confidence: 0.85,
-        priority: 7,
-        source_type: 'extraction',
-        source_session: 'session-1',
-        source_context: JSON.stringify({ branch: 'main' }),
-      });
-
-      insertMemory(db, memory1);
-      insertMemory(db, memory2);
-
-      const result = await backfill(db, 'test-project', 'fake-api-key', true);
-
-      // Processed count includes both Gemini (2) and local (2)
-      expect(result).toEqual({
-        ok: true,
-        processed: 4,
-        failed: 0,
-        errors: [],
-        method: 'gemini',
-      });
-
-      expect(isGeminiAvailableSpy).toHaveBeenCalledWith('fake-api-key');
-      expect(embedTextsSpy).toHaveBeenCalledWith(
-        [
-          '[decision] [project:test-project] Chose microservices',
-          '[pattern] [project:test-project] Use Either type',
-        ],
-        'fake-api-key'
-      );
-    });
-
-    it('batches large sets of memories', async () => {
-      const db = openDatabase(':memory:');
-
-      // Setup mocks
-isGeminiAvailableSpy.mockReturnValue(true);
-      // Local backfill also runs
-      ensureModelLoadedSpy.mockResolvedValue(true);
-      embedLocalSpy.mockResolvedValue(new Float32Array(384).fill(0.1));
-
-      // Create 150 memories (exceeds batch size of 100, will create 2 batches)
-      const memories = Array.from({ length: 150 }, (_, i) =>
-        createMemory({
-          id: `mem-${i}`,
-          content: `Content ${i}`,
-          summary: `Summary ${i}`,
-          memory_type: 'context',
-          scope: 'project',
-          confidence: 0.7,
-          priority: 5,
-          source_type: 'extraction',
-          source_session: 'session-1',
-          source_context: JSON.stringify({ branch: 'main' }),
-        })
-      );
-
-      memories.forEach((m) => insertMemory(db, m));
-
-      // Mock embedTexts to return appropriate size arrays
-embedTextsSpy
-        .mockResolvedValueOnce(
-          Array.from({ length: 100 }, () => new Float64Array(768))
-        )
-        .mockResolvedValueOnce(
-          Array.from({ length: 50 }, () => new Float64Array(768))
-        );
-
-      const result = await backfill(db, 'test-project', 'fake-api-key', true);
-
-      // 150 Gemini + 150 local = 300
-      expect(result).toEqual({
-        ok: true,
-        processed: 300,
-        failed: 0,
-        errors: [],
-        method: 'gemini',
-      });
-
-      // Should have called embedTexts twice (two batches)
-      expect(embedTextsSpy).toHaveBeenCalledTimes(2);
-    });
-
-    it('handles batch API failures gracefully', async () => {
-      const db = openDatabase(':memory:');
-
-      // Setup mocks - simulate Gemini API failure
-isGeminiAvailableSpy.mockReturnValue(true);
-embedTextsSpy.mockRejectedValueOnce(new Error('API error'));
-      // Local backfill succeeds
-      ensureModelLoadedSpy.mockResolvedValue(true);
-      embedLocalSpy.mockResolvedValue(new Float32Array(384).fill(0.1));
-
-      // Insert memory
-      const memory = createMemory({
-        id: 'mem-1',
-        content: 'First memory',
-        summary: 'First',
-        memory_type: 'decision',
-        scope: 'project',
-        confidence: 0.9,
-        priority: 8,
-        source_type: 'extraction',
-        source_session: 'session-1',
-        source_context: JSON.stringify({ branch: 'main' }),
-      });
-
-      insertMemory(db, memory);
-
-      const result = await backfill(db, 'test-project', 'fake-api-key', true);
-
-      // Gemini failed (1 failed), but local succeeded (1 processed)
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        expect(result.processed).toBe(1);
-        expect(result.failed).toBe(1);
-        expect(result.method).toBe('gemini');
-        expect(result.errors.length).toBeGreaterThan(0);
-        expect(result.errors[0]).toContain('Failed to embed batch');
-      }
-    });
-  });
-
-  describe('when Gemini API is unavailable', () => {
-    it('falls back to local embeddings', async () => {
-      const db = openDatabase(':memory:');
-
-      // Setup mocks
-isGeminiAvailableSpy.mockReturnValue(false);
 ensureModelLoadedSpy.mockResolvedValue(true);
 embedLocalSpy
         .mockResolvedValueOnce(new Float32Array(384).fill(0.3))
@@ -273,7 +111,7 @@ embedLocalSpy
       insertMemory(db, memory1);
       insertMemory(db, memory2);
 
-      const result = await backfill(db, 'test-project', undefined, true);
+      const result = await backfill(db, 'test-project');
 
       expect(result).toEqual({
         ok: true,
@@ -293,50 +131,10 @@ embedLocalSpy
       );
     });
 
-    it('skips local embedding entirely when local cosine is disabled', async () => {
-      // local_embedding exists solely to be a same-dimension partner for cosine
-      // dedup / edge creation / consolidation. When those fall back to Jaccard
-      // there is no reader, so producing the vectors is pure cost: a model load
-      // (~12s cold, ~1.6 GB resident) plus ~130 ms per memory, per backfill.
-      const db = openDatabase(':memory:');
-
-      isGeminiAvailableSpy.mockReturnValue(false);
-
-      const memory = createMemory({
-        id: 'mem-gated',
-        content: 'Chose microservices',
-        summary: 'Chose microservices',
-        memory_type: 'decision',
-        scope: 'project',
-        confidence: 0.9,
-        priority: 8,
-        source_type: 'extraction',
-        source_session: 'session-1',
-        source_context: JSON.stringify({ branch: 'main' }),
-      });
-      insertMemory(db, memory);
-
-      const result = await backfill(db, 'test-project', undefined, false);
-
-      expect(result.ok).toBe(true);
-      // Nothing embedded — and crucially the model was never even loaded.
-      expect(ensureModelLoadedSpy).not.toHaveBeenCalled();
-      expect(embedLocalSpy).not.toHaveBeenCalled();
-      if (result.ok) expect(result.processed).toBe(0);
-
-      // The memory is left genuinely unembedded rather than carrying a vector
-      // no consumer would compare.
-      const stored = getMemory(db, memory.id);
-      expect(stored?.local_embedding).toBeNull();
-
-      db.close();
-    });
-
     it('handles local model unavailable', async () => {
       const db = openDatabase(':memory:');
 
       // Setup mocks
-isGeminiAvailableSpy.mockReturnValue(false);
 ensureModelLoadedSpy.mockResolvedValue(false);
 
       // Insert memory without embeddings
@@ -355,7 +153,7 @@ ensureModelLoadedSpy.mockResolvedValue(false);
 
       insertMemory(db, memory);
 
-      const result = await backfill(db, 'test-project', undefined, true);
+      const result = await backfill(db, 'test-project');
 
       expect(result.ok).toBe(true);
       if (result.ok) {
@@ -371,7 +169,6 @@ ensureModelLoadedSpy.mockResolvedValue(false);
       const db = openDatabase(':memory:');
 
       // Setup mocks
-isGeminiAvailableSpy.mockReturnValue(false);
 ensureModelLoadedSpy.mockResolvedValue(true);
 embedLocalSpy
         .mockResolvedValueOnce(new Float32Array(384).fill(0.3))
@@ -407,7 +204,7 @@ embedLocalSpy
       insertMemory(db, memory1);
       insertMemory(db, memory2);
 
-      const result = await backfill(db, 'test-project', undefined, true);
+      const result = await backfill(db, 'test-project');
 
       expect(result.ok).toBe(true);
       if (result.ok) {
@@ -421,11 +218,9 @@ embedLocalSpy
   });
 
   describe('code memories (FR-053)', () => {
-    it('never embeds code memories, via Gemini or locally', async () => {
+    it('never embeds code memories', async () => {
       const db = openDatabase(':memory:');
 
-      isGeminiAvailableSpy.mockReturnValue(true);
-      embedTextsSpy.mockResolvedValue([new Float64Array(768).fill(0.5)]);
       ensureModelLoadedSpy.mockResolvedValue(true);
       embedLocalSpy.mockResolvedValue(new Float32Array(384).fill(0.1));
 
@@ -460,23 +255,18 @@ embedLocalSpy
       insertMemory(db, codeMemory);
       insertMemory(db, proseMemory);
 
-      const result = await backfill(db, 'test-project', 'fake-api-key', true);
+      const result = await backfill(db, 'test-project');
 
-      // Only the prose memory processed (once for Gemini, once for local)
+      // Only the prose memory is embedded; the code memory never is.
       expect(result).toEqual({
         ok: true,
-        processed: 2,
+        processed: 1,
         failed: 0,
         errors: [],
-        method: 'gemini',
+        method: 'local',
       });
 
-      // Gemini batch contains only the prose text — never raw code
-      expect(embedTextsSpy).toHaveBeenCalledTimes(1);
-      expect(embedTextsSpy.mock.calls[0][0]).toEqual([
-        '[code_description] [project:test-project] foo returns the answer',
-      ]);
-      // Local embed called only for the prose memory
+      // The embedded text is the prose summary only — never raw code
       expect(embedLocalSpy).toHaveBeenCalledTimes(1);
       expect(embedLocalSpy).toHaveBeenCalledWith(
         '[code_description] [project:test-project] foo returns the answer'
@@ -485,15 +275,10 @@ embedLocalSpy
   });
 
   describe('edge cases', () => {
-    it('backfills both embedding types for memories missing each', async () => {
+    it('embeds only the memories missing a vector', async () => {
       const db = openDatabase(':memory:');
 
       // Setup mocks
-isGeminiAvailableSpy.mockReturnValue(true);
-embedTextsSpy.mockResolvedValue([
-        new Float64Array(768).fill(0.5),
-        new Float64Array(768).fill(0.6),
-      ]);
       ensureModelLoadedSpy.mockResolvedValue(true);
       embedLocalSpy.mockResolvedValue(new Float32Array(384).fill(0.1));
 
@@ -511,20 +296,6 @@ embedTextsSpy.mockResolvedValue([
         source_context: JSON.stringify({ branch: 'main' }),
       });
 
-      const memoryWithGemini = createMemory({
-        id: 'mem-with-gemini',
-        content: 'Has gemini embedding',
-        summary: 'Has gemini',
-        memory_type: 'pattern',
-        scope: 'project',
-        confidence: 0.8,
-        priority: 7,
-        source_type: 'extraction',
-        source_session: 'session-1',
-        source_context: JSON.stringify({ branch: 'main' }),
-        embedding: new Float64Array(768),
-      });
-
       const memoryWithLocal = createMemory({
         id: 'mem-with-local',
         content: 'Has local embedding',
@@ -540,33 +311,26 @@ embedTextsSpy.mockResolvedValue([
       });
 
       insertMemory(db, memoryNoEmbeddings);
-      insertMemory(db, memoryWithGemini);
       insertMemory(db, memoryWithLocal);
 
-      const result = await backfill(db, 'test-project', 'fake-api-key', true);
+      const result = await backfill(db, 'test-project');
 
-      // Gemini: processes mem-no-embed + mem-with-local (both missing Gemini) = 2
-      // Local: processes mem-no-embed + mem-with-gemini (both missing local) = 2
-      // Total processed = 4
+      // Only mem-no-embed lacks a vector; mem-with-local already has one.
       expect(result).toEqual({
         ok: true,
-        processed: 4,
+        processed: 1,
         failed: 0,
         errors: [],
-        method: 'gemini',
+        method: 'local',
       });
 
-      // Gemini called with 2 memories missing Gemini embedding
-      expect(embedTextsSpy).toHaveBeenCalledTimes(1);
-      expect(embedTextsSpy.mock.calls[0][0]).toHaveLength(2);
-      // Local called with 2 memories missing local embedding
-      expect(embedLocalSpy).toHaveBeenCalledTimes(2);
+      expect(embedLocalSpy).toHaveBeenCalledTimes(1);
     });
 
     it('handles unexpected errors gracefully', async () => {
       const db = openDatabase(':memory:');
 
-      // Insert memory to ensure we reach the isGeminiAvailable call
+      // Insert memory to ensure the embedding step is reached
       const memory = createMemory({
         id: 'mem-1',
         content: 'Test content',
@@ -582,11 +346,11 @@ embedTextsSpy.mockResolvedValue([
       insertMemory(db, memory);
 
       // Setup mocks - simulate catastrophic failure
-isGeminiAvailableSpy.mockImplementation(() => {
+      ensureModelLoadedSpy.mockImplementation(() => {
         throw new Error('Unexpected error');
       });
 
-      const result = await backfill(db, 'test-project', 'fake-api-key', true);
+      const result = await backfill(db, 'test-project');
 
       expect(result.ok).toBe(false);
       if (!result.ok) {

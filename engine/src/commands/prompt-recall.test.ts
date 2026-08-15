@@ -21,13 +21,11 @@ import {
 } from './prompt-recall.js';
 import { RECALL_MAX_BLOCK_BYTES } from '../config.js';
 
-// Mock gemini-embed at module level so the fallback path doesn't call out.
-// Each test sets the desired behavior via the exposed mockEmbedTexts.
-const mockEmbedTexts = vi.fn();
-vi.mock('../infra/gemini-embed.ts', () => ({
-  isGeminiAvailable: (key: string | undefined) =>
-    typeof key === 'string' && key.trim().length > 0,
-  embedTexts: (texts: string[], key: string) => mockEmbedTexts(texts, key),
+// Mock the local embedder at module level so the fallback path never loads a
+// real model. Each test sets the desired behavior via mockEmbedLocal.
+const mockEmbedLocal = vi.fn();
+vi.mock('../infra/local-embed.ts', () => ({
+  embedLocal: (text: string) => mockEmbedLocal(text),
 }));
 
 // Helper: create in-memory test DBs
@@ -430,7 +428,7 @@ describe('extractUnigrams', () => {
 
 describe('executePromptRecallWithFallback — gates', () => {
   beforeEach(() => {
-    mockEmbedTexts.mockReset();
+    mockEmbedLocal.mockReset();
   });
 
   test('returns keyword results without calling embed when keyword non-empty', async () => {
@@ -444,11 +442,10 @@ describe('executePromptRecallWithFallback — gates', () => {
     const results = await executePromptRecallWithFallback(projectDb, globalDb, {
       prompt: 'extraction pipeline transcripts running',
       surfaceContent: '',
-      geminiApiKey: 'test-key',
     });
 
     expect(results.length).toBeGreaterThan(0);
-    expect(mockEmbedTexts).not.toHaveBeenCalled();
+    expect(mockEmbedLocal).not.toHaveBeenCalled();
 
     projectDb.close();
     globalDb.close();
@@ -460,32 +457,16 @@ describe('executePromptRecallWithFallback — gates', () => {
     const results = await executePromptRecallWithFallback(projectDb, globalDb, {
       prompt: 'completely unmatched zxqdpr',
       surfaceContent: '',
-      geminiApiKey: 'test-key',
     });
 
     expect(results.length).toBe(0);
-    expect(mockEmbedTexts).not.toHaveBeenCalled();
+    expect(mockEmbedLocal).not.toHaveBeenCalled();
 
     projectDb.close();
     globalDb.close();
   });
 
-  test('skips fallback when API key missing', async () => {
-    const { projectDb, globalDb } = setupTestDbs();
-    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
-      prompt: 'truly novel xyzzy plugh frobnicate quux blorpify',
-      surfaceContent: '',
-      geminiApiKey: '',
-    });
-
-    expect(results.length).toBe(0);
-    expect(mockEmbedTexts).not.toHaveBeenCalled();
-
-    projectDb.close();
-    globalDb.close();
-  });
-
-  test('keyword path runs without API key when keyword has results', async () => {
+  test('keyword path runs without embedding when keyword has results', async () => {
     const { projectDb, globalDb } = setupTestDbs();
     insertMemory(projectDb, createTestMemory({
       id: 'mem-1',
@@ -496,11 +477,10 @@ describe('executePromptRecallWithFallback — gates', () => {
     const results = await executePromptRecallWithFallback(projectDb, globalDb, {
       prompt: 'extraction pipeline content keywords',
       surfaceContent: '',
-      // no geminiApiKey
     });
 
     expect(results.length).toBeGreaterThan(0);
-    expect(mockEmbedTexts).not.toHaveBeenCalled();
+    expect(mockEmbedLocal).not.toHaveBeenCalled();
 
     projectDb.close();
     globalDb.close();
@@ -509,31 +489,30 @@ describe('executePromptRecallWithFallback — gates', () => {
 
 describe('executePromptRecallWithFallback — semantic firing', () => {
   beforeEach(() => {
-    mockEmbedTexts.mockReset();
+    mockEmbedLocal.mockReset();
   });
 
   test('fires semantic fallback when keyword empty + gates pass', async () => {
     const { projectDb, globalDb } = setupTestDbs();
     // Memory with content/summary that has zero overlap with the query tokens
     // Embedding [1, 0, 0, ...] gives cosine 1.0 against the same query embedding
-    const embedding = new Float64Array(768);
+    const embedding = new Float32Array(512);
     embedding[0] = 1.0;
     insertMemory(projectDb, createTestMemory({
       id: 'mem-semantic',
       content: 'Anchor content',
       summary: 'Anchor summary',
-      embedding,
+      local_embedding: embedding,
     }));
 
-    mockEmbedTexts.mockResolvedValue([embedding]);
+    mockEmbedLocal.mockResolvedValue(embedding);
 
     const results = await executePromptRecallWithFallback(projectDb, globalDb, {
       prompt: 'truly novel xyzzy plugh frobnicate quux blorpify',
       surfaceContent: '',
-      geminiApiKey: 'test-key',
     });
 
-    expect(mockEmbedTexts).toHaveBeenCalledOnce();
+    expect(mockEmbedLocal).toHaveBeenCalledOnce();
     expect(results.length).toBe(1);
     expect(results[0].id).toBe('mem-semantic');
 
@@ -544,23 +523,22 @@ describe('executePromptRecallWithFallback — semantic firing', () => {
   test('filters out memories below cosine floor', async () => {
     const { projectDb, globalDb } = setupTestDbs();
     // Below-floor memory: orthogonal embedding gives cosine 0
-    const memEmbedding = new Float64Array(768);
+    const memEmbedding = new Float32Array(512);
     memEmbedding[1] = 1.0;
     insertMemory(projectDb, createTestMemory({
       id: 'mem-orthogonal',
       content: 'Orthogonal content',
       summary: 'Orthogonal summary',
-      embedding: memEmbedding,
+      local_embedding: memEmbedding,
     }));
 
-    const queryEmbedding = new Float64Array(768);
+    const queryEmbedding = new Float32Array(512);
     queryEmbedding[0] = 1.0;
-    mockEmbedTexts.mockResolvedValue([queryEmbedding]);
+    mockEmbedLocal.mockResolvedValue(queryEmbedding);
 
     const results = await executePromptRecallWithFallback(projectDb, globalDb, {
       prompt: 'truly novel xyzzy plugh frobnicate quux blorpify',
       surfaceContent: '',
-      geminiApiKey: 'test-key',
     });
 
     expect(results.length).toBe(0);
@@ -571,12 +549,11 @@ describe('executePromptRecallWithFallback — semantic firing', () => {
 
   test('returns empty when embed call throws', async () => {
     const { projectDb, globalDb } = setupTestDbs();
-    mockEmbedTexts.mockRejectedValue(new Error('Network failure'));
+    mockEmbedLocal.mockRejectedValue(new Error('Network failure'));
 
     const results = await executePromptRecallWithFallback(projectDb, globalDb, {
       prompt: 'truly novel xyzzy plugh frobnicate quux blorpify',
       surfaceContent: '',
-      geminiApiKey: 'test-key',
     });
 
     expect(results.length).toBe(0);
@@ -587,21 +564,20 @@ describe('executePromptRecallWithFallback — semantic firing', () => {
 
   test('respects surface dedup in semantic fallback', async () => {
     const { projectDb, globalDb } = setupTestDbs();
-    const embedding = new Float64Array(768);
+    const embedding = new Float32Array(512);
     embedding[0] = 1.0;
     insertMemory(projectDb, createTestMemory({
       id: 'mem-dup',
       content: 'Duplicated anchor content',
       summary: 'Already in surface',
-      embedding,
+      local_embedding: embedding,
     }));
 
-    mockEmbedTexts.mockResolvedValue([embedding]);
+    mockEmbedLocal.mockResolvedValue(embedding);
 
     const results = await executePromptRecallWithFallback(projectDb, globalDb, {
       prompt: 'truly novel xyzzy plugh frobnicate quux blorpify',
       surfaceContent: 'Already in surface',
-      geminiApiKey: 'test-key',
     });
 
     expect(results.length).toBe(0);

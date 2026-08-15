@@ -14,7 +14,7 @@ import {
 } from './recall.js';
 import { openDatabase, insertMemory, insertEdge } from '../infra/db.js';
 import { createMemory, createEdge } from '../core/types.js';
-import * as geminiEmbed from '../infra/gemini-embed.ts';
+import * as localEmbed from '../infra/local-embed.ts';
 
 // Setup test databases
 function setupTestDbs(): { projectDb: Database; globalDb: Database } {
@@ -32,8 +32,7 @@ function createTestMemory(overrides: Partial<Parameters<typeof createMemory>[0]>
     summary: overrides.summary ?? 'Test summary',
     memory_type: overrides.memory_type ?? 'decision',
     scope: overrides.scope ?? 'project',
-    embedding: overrides.embedding ?? new Float64Array(768).fill(0.5),
-    local_embedding: overrides.local_embedding ?? null,
+    local_embedding: overrides.local_embedding ?? new Float32Array(512).fill(0.5),
     confidence: overrides.confidence ?? 0.8,
     priority: overrides.priority ?? 5,
     pinned: overrides.pinned ?? false,
@@ -50,28 +49,22 @@ function createTestMemory(overrides: Partial<Parameters<typeof createMemory>[0]>
 }
 
 describe('recall command', () => {
-  let embedTextsSpy: any;
-  let isGeminiAvailableSpy: any;
+  let embedLocalSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     // Reset and recreate mocks for each test
-    embedTextsSpy = vi.spyOn(geminiEmbed, 'embedTexts').mockImplementation(async (texts: readonly string[]) => {
-      // Return mock embeddings (768 dimensions for gemini)
-      return texts.map(() => new Float64Array(768).fill(0.5));
+    embedLocalSpy = vi.spyOn(localEmbed, 'embedLocal').mockImplementation(async () => {
+      return new Float32Array(512).fill(0.5);
     });
 
-    isGeminiAvailableSpy = vi.spyOn(geminiEmbed, 'isGeminiAvailable').mockImplementation((apiKey: string | undefined) => {
-      return typeof apiKey === 'string' && apiKey.trim().length > 0;
-    });
   });
 
   afterEach(() => {
     // Restore original implementations
-    embedTextsSpy?.mockRestore();
-    isGeminiAvailableSpy?.mockRestore();
+    embedLocalSpy?.mockRestore();
   });
 
-  test('semantic search with Gemini (project + global merge)', async () => {
+  test('semantic search (project + global merge)', async () => {
     const { projectDb, globalDb } = setupTestDbs();
 
     // Insert test memories
@@ -84,7 +77,6 @@ describe('recall command', () => {
     const options: RecallOptions = {
       query: 'test query',
       limit: 10,
-      geminiApiKey: 'test-key',
     };
 
     const result = await executeRecall(projectDb, globalDb, options);
@@ -95,8 +87,8 @@ describe('recall command', () => {
     expect(result.result.method).toBe('semantic');
     expect(result.result.results.length).toBeGreaterThan(0);
 
-    // Should have called Gemini API
-    expect(geminiEmbed.embedTexts).toHaveBeenCalledTimes(1);
+    // Should have embedded the query
+    expect(localEmbed.embedLocal).toHaveBeenCalledTimes(1);
   });
 
   test('prefixes query with project name for aligned search (FR-039)', async () => {
@@ -107,20 +99,18 @@ describe('recall command', () => {
 
     const options: RecallOptions = {
       query: 'test query',
-      geminiApiKey: 'test-key',
       projectName: 'my-project',
     };
 
     await executeRecall(projectDb, globalDb, options);
 
-    // embedTexts should receive prefixed query
-    expect(geminiEmbed.embedTexts).toHaveBeenCalledWith(
-      ['[query] [project:my-project] test query'],
-      'test-key'
+    // the embedder should receive the prefixed query
+    expect(localEmbed.embedLocal).toHaveBeenCalledWith(
+      '[query] [project:my-project] test query'
     );
   });
 
-  test('keyword search fallback (no Gemini key)', async () => {
+  test('keyword search fallback when forced', async () => {
     const { projectDb, globalDb } = setupTestDbs();
 
     // Insert test memories
@@ -130,7 +120,7 @@ describe('recall command', () => {
     const options: RecallOptions = {
       query: 'API design',
       limit: 10,
-      // No geminiApiKey
+      keyword: true, // semantic is always available; force the keyword path
     };
 
     const result = await executeRecall(projectDb, globalDb, options);
@@ -141,8 +131,8 @@ describe('recall command', () => {
     expect(result.result.method).toBe('keyword');
     expect(result.result.results.length).toBeGreaterThan(0);
 
-    // Should NOT have called Gemini API
-    expect(geminiEmbed.embedTexts).not.toHaveBeenCalled();
+    // Should NOT have embedded anything
+    expect(localEmbed.embedLocal).not.toHaveBeenCalled();
   });
 
   test('keyword search with --keyword flag', async () => {
@@ -154,7 +144,6 @@ describe('recall command', () => {
     const options: RecallOptions = {
       query: 'keyword',
       keyword: true, // Force keyword search
-      geminiApiKey: 'test-key', // Even with key, should use keyword
     };
 
     const result = await executeRecall(projectDb, globalDb, options);
@@ -163,7 +152,7 @@ describe('recall command', () => {
     if (!result.success) return;
 
     expect(result.result.method).toBe('keyword');
-    expect(geminiEmbed.embedTexts).not.toHaveBeenCalled();
+    expect(localEmbed.embedLocal).not.toHaveBeenCalled();
   });
 
   test('keyword search finds raw code content via FTS5 (US3-2)', async () => {
@@ -174,13 +163,13 @@ describe('recall command', () => {
       memory_type: 'code',
       content: 'export function verifyAuth(token: string) {\n  return jwt.verify(token, secret);\n}',
       summary: 'Authentication verification function',
-      embedding: null, // No embedding — forces keyword path
+      local_embedding: null,
     });
     insertMemory(projectDb, codeMem);
 
     const options: RecallOptions = {
       query: 'jwt',
-      // No geminiApiKey — forces keyword search
+      keyword: true, // force the keyword path
     };
 
     const result = await executeRecall(projectDb, globalDb, options);
@@ -214,7 +203,6 @@ describe('recall command', () => {
     const options: RecallOptions = {
       query: 'test',
       branch: 'main', // Filter for main branch
-      geminiApiKey: 'test-key',
     };
 
     const result = await executeRecall(projectDb, globalDb, options);
@@ -260,7 +248,6 @@ describe('recall command', () => {
 
     const options: RecallOptions = {
       query: 'prose',
-      geminiApiKey: 'test-key',
     };
 
     const result = await executeRecall(projectDb, globalDb, options);
@@ -315,7 +302,6 @@ describe('recall command', () => {
 
     const options: RecallOptions = {
       query: 'test',
-      geminiApiKey: 'test-key',
     };
 
     const result = await executeRecall(projectDb, globalDb, options);
@@ -343,7 +329,6 @@ describe('recall command', () => {
 
     const options: RecallOptions = {
       query: 'test',
-      geminiApiKey: 'test-key',
     };
 
     await executeRecall(projectDb, globalDb, options);
@@ -360,7 +345,6 @@ describe('recall command', () => {
 
     const options: RecallOptions = {
       query: '', // Empty query
-      geminiApiKey: 'test-key',
     };
 
     const result = await executeRecall(projectDb, globalDb, options);
@@ -381,7 +365,6 @@ describe('recall command', () => {
 
     const options: RecallOptions = {
       query: 'shared',
-      geminiApiKey: 'test-key',
     };
 
     const result = await executeRecall(projectDb, globalDb, options);
@@ -408,7 +391,6 @@ describe('recall command', () => {
     const options: RecallOptions = {
       query: 'memory',
       limit: 5, // Limit to 5 results
-      geminiApiKey: 'test-key',
     };
 
     const result = await executeRecall(projectDb, globalDb, options);

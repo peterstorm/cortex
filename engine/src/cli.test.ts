@@ -226,7 +226,6 @@ describe('cli - parseRecallArgs', () => {
       // Type system should enforce readonly, but verify returned object structure
       expect(result.options).toHaveProperty('query');
       expect(result.options).toHaveProperty('limit');
-      expect(result.options).toHaveProperty('geminiApiKey');
       expect(result.options).toHaveProperty('projectName');
     }
   });

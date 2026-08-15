@@ -1,11 +1,11 @@
 /**
- * Recall command - Semantic search via Gemini embeddings OR FTS5 fallback
+ * Recall command - Semantic search via local embeddings OR FTS5 fallback
  * Orchestrates search across project+global DBs, follows graph edges, updates access stats
  */
 
 import type { Database } from 'bun:sqlite';
 import type { SearchResult, Memory, Edge } from '../core/types.js';
-import { isGeminiAvailable, embedTexts } from '../infra/gemini-embed.ts';
+import { embedLocal } from '../infra/local-embed.ts';
 import {
   getMemoriesWithEmbedding,
   getMemoriesWithEmbeddingByIds,
@@ -30,7 +30,6 @@ export type RecallOptions = {
   readonly branch?: string; // Optional branch filter
   readonly limit?: number; // Default 10
   readonly keyword?: boolean; // Force keyword search (default false)
-  readonly geminiApiKey?: string; // Gemini API key
   readonly projectName?: string; // Project name for embedding prefix (FR-039)
 };
 
@@ -233,30 +232,19 @@ export async function executeRecall(
   let globalSearchResults: SearchResult[];
   let searchMethod: 'semantic' | 'keyword';
 
-  // Determine search method
-  const useSemantic =
-    !forceKeyword && isGeminiAvailable(options.geminiApiKey);
+  // Semantic search is always available now that the embedder is local and
+  // static: there is no API key to be missing and no network call to fail.
+  const useSemantic = !forceKeyword;
 
   if (useSemantic) {
-    // Semantic search via Gemini embeddings
-    process.stderr.write(`[cortex:recall] INFO: Using Gemini semantic search\n`);
+    process.stderr.write(`[cortex:recall] INFO: Using local semantic search\n`);
     try {
       // Build embedding text with project prefix (FR-039)
       const embeddingText = buildQueryEmbeddingText(query, options.projectName);
 
-      // I/O: Embed query via Gemini
-      const embeddings = await embedTexts(
-        [embeddingText],
-        options.geminiApiKey!
-      );
-
-      const queryEmbedding = embeddings[0];
-      if (!queryEmbedding) {
-        throw new Error('No embedding returned');
-      }
-
-      // I/O: Pre-filter via FTS5, then cosine rank the subset
-      const embType = queryEmbedding instanceof Float64Array ? 'gemini' : 'local' as const;
+      // I/O: Embed the query locally. The same function embeds stored
+      // memories — a static model has no query/document asymmetry to respect.
+      const queryEmbedding = await embedLocal(embeddingText);
 
       // Split query into tokens for OR search
       const queryTokens = query.split(/\s+/).filter(t => t.length > 0);
@@ -278,10 +266,10 @@ export async function executeRecall(
         ftsHits: readonly { id: string }[]
       ): readonly { memory: Memory; embedding: Float64Array | Float32Array }[] => {
         if (ftsHits.length > 0) {
-          const byIds = getMemoriesWithEmbeddingByIds(db, ftsHits.map(m => m.id), embType);
+          const byIds = getMemoriesWithEmbeddingByIds(db, ftsHits.map(m => m.id));
           if (byIds.length > 0) return byIds;
         }
-        return getMemoriesWithEmbedding(db, embType);
+        return getMemoriesWithEmbedding(db);
       };
       const projectCandidates = candidatesFor(projectDb, projectFts);
       const globalCandidates = candidatesFor(globalDb, globalFts);
@@ -322,7 +310,7 @@ export async function executeRecall(
     }
   } else {
     // Keyword search via FTS5
-    const reason = forceKeyword ? 'forced via --keyword flag' : 'Gemini unavailable';
+    const reason = forceKeyword ? 'forced via --keyword flag' : 'local embedding unavailable';
     process.stderr.write(`[cortex:recall] INFO: Using keyword search (${reason})\n`);
     try {
       const projectKw = tieredKeywordSearch(projectDb, query, fetchLimit);

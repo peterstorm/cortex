@@ -640,7 +640,6 @@ function candidateToMemory(
     source_session: sessionId,
     source_context: sourceContext,
     tags: candidate.tags,
-    embedding: null, // Queue Gemini for backfill
     local_embedding: localEmbedding, // Store if generated (saves backfill step)
     access_count: 0,
     last_accessed_at: now,
@@ -878,7 +877,7 @@ export function computeEdgeCandidates(
 ): readonly EdgeCandidate[] {
   const newTokens = tokenize(`${newMem.summary} ${newMem.content}`);
   // Only use local_embedding (384-dim) for cosine comparison — avoids dimension
-  // mismatch with Gemini embeddings (768-dim). Matches dedup strategy.
+  // Matches the dedup strategy.
   const newEmbedding = newMem.local_embedding ?? null;
 
   const candidates: EdgeCandidate[] = [];

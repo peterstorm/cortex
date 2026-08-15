@@ -39,7 +39,7 @@ bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts consolidate <cwd> --merge \
 - `<cwd>` - Project working directory (consolidate operates on the project DB only)
 
 **Optional (list mode):**
-- `--threshold=N` - Uniform similarity threshold in (0, 1]. Default is per similarity space: 0.5 for Jaccard/Gemini-cosine pairs, 0.8 for raw local-embedding cosine (which scores same-domain pairs 0.6-0.75 even when they are not duplicates)
+- `--threshold=N` - Uniform similarity threshold in (0, 1]. Default is per similarity space: 0.5 for Jaccard, 0.8 for raw local-embedding cosine (which scores same-domain pairs 0.6-0.75 even when they are not duplicates)
 
 **Required (merge mode):**
 - `--merge` - Switch to merge mode
@@ -66,9 +66,9 @@ bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts consolidate <cwd> --merge \
 
 ## How Detection Works
 
-1. **Embedding similarity:** Cosine similarity on stored embeddings when both sides have the same type (Gemini-Gemini or local-local)
+1. **Embedding similarity:** Cosine similarity on stored embeddings when both sides have one
 2. **Jaccard fallback:** Token-overlap similarity when embeddings are unavailable or mismatched
-3. **Per-space threshold:** Pairs scoring above their space's threshold (0.5 Jaccard/Gemini, 0.8 local cosine) are reported
+3. **Per-space threshold:** Pairs scoring above their space's threshold (0.5 Jaccard, 0.8 local cosine) are reported
 
 Rough interpretation of local-cosine scores (the common case):
 - 0.6-0.75: Same domain, usually different aspects — routinely NOT duplicates

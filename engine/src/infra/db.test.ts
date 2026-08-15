@@ -542,7 +542,7 @@ describe('Database Layer', () => {
         source_type: 'extraction',
         source_session: 'session-6',
         source_context: '{}',
-        embedding: new Float64Array([1, 0, 0, 0]),
+        local_embedding: new Float32Array([1, 0, 0, 0]),
       });
 
       const mem2 = createMemory({
@@ -556,7 +556,7 @@ describe('Database Layer', () => {
         source_type: 'extraction',
         source_session: 'session-6',
         source_context: '{}',
-        embedding: new Float64Array([0.9, 0.1, 0, 0]),
+        local_embedding: new Float32Array([0.9, 0.1, 0, 0]),
       });
 
       const mem3 = createMemory({
@@ -570,7 +570,7 @@ describe('Database Layer', () => {
         source_type: 'extraction',
         source_session: 'session-6',
         source_context: '{}',
-        embedding: new Float64Array([0, 1, 0, 0]),
+        local_embedding: new Float32Array([0, 1, 0, 0]),
       });
 
       insertMemory(db, mem1);
@@ -583,13 +583,12 @@ describe('Database Layer', () => {
       // memories would resurface in semantic recall.
       updateMemory(db, 'mem-emb-2', { status: 'archived' });
 
-      const candidates = getMemoriesWithEmbedding(db, 'gemini');
+      const candidates = getMemoriesWithEmbedding(db);
       expect(candidates.map((c) => c.memory.id).sort()).toEqual(['mem-emb-1', 'mem-emb-3']);
 
       const byIds = getMemoriesWithEmbeddingByIds(
         db,
-        ['mem-emb-1', 'mem-emb-2', 'mem-emb-3'],
-        'gemini'
+        ['mem-emb-1', 'mem-emb-2', 'mem-emb-3']
       );
       expect(byIds.map((c) => c.memory.id).sort()).toEqual(['mem-emb-1', 'mem-emb-3']);
 
@@ -620,14 +619,14 @@ describe('Database Layer', () => {
         .get('mem-local-1') as { local_embedding_model: string | null };
       expect(tagged.local_embedding_model).toBe(LOCAL_EMBED_MODEL);
 
-      expect(getMemoriesWithEmbedding(db, 'local').map(c => c.memory.id)).toContain('mem-local-1');
+      expect(getMemoriesWithEmbedding(db).map(c => c.memory.id)).toContain('mem-local-1');
 
       // A vector produced by some other model must not be returned.
       db.run('UPDATE memories SET local_embedding_model = ? WHERE id = ?', [
         'some/other-model',
         'mem-local-1',
       ]);
-      expect(getMemoriesWithEmbedding(db, 'local').map(c => c.memory.id)).not.toContain(
+      expect(getMemoriesWithEmbedding(db).map(c => c.memory.id)).not.toContain(
         'mem-local-1'
       );
     });
@@ -652,11 +651,11 @@ describe('Database Layer', () => {
       });
       insertMemory(db, m);
 
-      expect(getMemoriesWithEmbedding(db, 'local').map(c => c.memory.id)).toContain(
+      expect(getMemoriesWithEmbedding(db).map(c => c.memory.id)).toContain(
         'mem-local-both'
       );
       expect(
-        getMemoriesWithEmbeddingByIds(db, ['mem-local-both'], 'local').map(c => c.memory.id)
+        getMemoriesWithEmbeddingByIds(db, ['mem-local-both']).map(c => c.memory.id)
       ).toContain('mem-local-both');
 
       db.run('UPDATE memories SET local_embedding_model = ? WHERE id = ?', [
@@ -664,8 +663,11 @@ describe('Database Layer', () => {
         'mem-local-both',
       ]);
 
-      expect(getMemoriesWithEmbedding(db, 'local')).toHaveLength(0);
-      expect(getMemoriesWithEmbeddingByIds(db, ['mem-local-both'], 'local')).toHaveLength(0);
+      // Assert on the retagged row specifically: the fixtures in beforeEach also
+      // carry vectors, so a total-count assertion would be about them, not
+      // about the model filter under test.
+      expect(getMemoriesWithEmbedding(db).map(c => c.memory.id)).not.toContain('mem-local-both');
+      expect(getMemoriesWithEmbeddingByIds(db, ['mem-local-both'])).toHaveLength(0);
     });
 
     it('excludes legacy local vectors that carry no model tag', () => {
@@ -685,21 +687,21 @@ describe('Database Layer', () => {
       insertMemory(db, legacy);
       db.run('UPDATE memories SET local_embedding_model = NULL WHERE id = ?', ['mem-local-legacy']);
 
-      expect(getMemoriesWithEmbedding(db, 'local').map(c => c.memory.id)).not.toContain(
+      expect(getMemoriesWithEmbedding(db).map(c => c.memory.id)).not.toContain(
         'mem-local-legacy'
       );
     });
 
     it('warns when an ID-filtered non-null embedding cannot be deserialized', () => {
-      db.run('UPDATE memories SET embedding = 0 WHERE id = ?', ['mem-emb-1']);
+      db.run('UPDATE memories SET local_embedding = 0 WHERE id = ?', ['mem-emb-1']);
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 
       try {
-        const candidates = getMemoriesWithEmbeddingByIds(db, ['mem-emb-1'], 'gemini');
+        const candidates = getMemoriesWithEmbeddingByIds(db, ['mem-emb-1']);
 
         expect(candidates).toEqual([]);
         expect(warn).toHaveBeenCalledWith(
-          '[cortex:db] Skipping memory mem-emb-1: embedding deserialized to null'
+          '[cortex:db] Skipping memory mem-emb-1: local_embedding deserialized to null'
         );
       } finally {
         warn.mockRestore();
@@ -707,10 +709,10 @@ describe('Database Layer', () => {
       }
     });
 
-    it('fetches and ranks by gemini embedding similarity', () => {
+    it('fetches and ranks by embedding similarity', () => {
       const queryEmbedding = new Float64Array([1, 0, 0, 0]);
 
-      const candidates = getMemoriesWithEmbedding(db, 'gemini');
+      const candidates = getMemoriesWithEmbedding(db);
       const results = rankBySimilarity(candidates, queryEmbedding, 10);
       expect(results.length).toBe(3);
 
@@ -728,7 +730,7 @@ describe('Database Layer', () => {
     it('respects limit parameter', () => {
       const queryEmbedding = new Float64Array([1, 0, 0, 0]);
 
-      const candidates = getMemoriesWithEmbedding(db, 'gemini');
+      const candidates = getMemoriesWithEmbedding(db);
       const results = rankBySimilarity(candidates, queryEmbedding, 2);
       expect(results).toHaveLength(2);
       expect(results[0].memory.id).toBe('mem-emb-1');
@@ -757,7 +759,7 @@ describe('Database Layer', () => {
       insertMemory(db2, mem);
 
       const queryEmbedding = new Float32Array([0.95, 0.05, 0]);
-      const candidates = getMemoriesWithEmbedding(db2, 'local');
+      const candidates = getMemoriesWithEmbedding(db2);
       const results = rankBySimilarity(candidates, queryEmbedding, 10);
 
       expect(results).toHaveLength(1);

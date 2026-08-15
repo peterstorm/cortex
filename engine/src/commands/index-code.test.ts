@@ -273,7 +273,7 @@ describe('buildProseMemory', () => {
       sessionId: 'session-123',
     };
 
-    const embedding = new Float64Array([0.1, 0.2, 0.3]);
+    const embedding = new Float32Array([0.1, 0.2, 0.3]);
     const memory = buildProseMemory(args, embedding, 'test-prose-id', '2026-01-01T00:00:00.000Z');
 
     expect(memory.memory_type).toBe('code_description');
@@ -284,8 +284,8 @@ describe('buildProseMemory', () => {
     expect(memory.priority).toBe(7);
     expect(memory.source_type).toBe('code_index');
     expect(memory.tags).toEqual(['utils', 'fp']);
-    expect(memory.embedding).toBe(embedding);
-    expect(memory.local_embedding).toBeNull();
+    expect(memory.local_embedding).toBe(embedding);
+    expect(memory.embedding).toBeNull();
     expect(memory.status).toBe('active');
 
     const context = JSON.parse(memory.source_context);

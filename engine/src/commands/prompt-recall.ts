@@ -3,9 +3,9 @@
  *
  * Extracts keywords from the user's prompt, runs FTS5 OR search across
  * both project and global DBs, deduplicates against the static surface.
- * If the keyword path returns nothing AND the prompt has enough unigrams AND
- * Gemini is configured, falls back to a single-shot semantic search with a
- * conservative cosine floor. Outputs compact markdown for context injection.
+ * If the keyword path returns nothing AND the prompt has enough unigrams,
+ * falls back to a single-shot local semantic search with a conservative cosine
+ * floor. Outputs compact markdown for context injection.
  *
  * Design: Pure functions (extractUnigrams, extractKeywords, formatPromptRecall)
  * + sync I/O boundary (executePromptRecall) + async I/O wrapper
@@ -15,7 +15,7 @@
 import type { Database } from 'bun:sqlite';
 import type { Memory } from '../core/types.js';
 import { searchByKeywordOr, searchByKeywordAnd, getMemoriesWithEmbedding } from '../infra/db.js';
-import { embedTexts, isGeminiAvailable } from '../infra/gemini-embed.ts';
+import { embedLocal } from '../infra/local-embed.ts';
 import { rankBySimilarity, STOP_WORDS, extractUnigrams } from '../core/similarity.js';
 import { buildQueryEmbeddingText } from './recall.js';
 import { sanitizeSurfaceText } from '../core/surface.js';
@@ -43,7 +43,16 @@ export const PROMPT_RECALL_LIMIT = 5;
 /** Minimum unigram count required to attempt semantic fallback when keyword path is empty */
 export const SEMANTIC_FALLBACK_MIN_UNIGRAMS = 4;
 
-/** Cosine similarity floor for semantic fallback — keeps noisy 0.5-range hits out of auto-recall */
+/**
+ * Cosine floor for the semantic fallback, deliberately stricter than
+ * MIN_COSINE_SCORE (0.45).
+ *
+ * This path injects into EVERY prompt without being asked, so a false positive
+ * costs context on every turn while a false negative costs nothing — the user
+ * can still run /recall. Measured on the real corpus, on-topic queries reach
+ * top1 0.577-0.749 while off-topic top1 tops out at 0.514, so 0.65 admits only
+ * strong matches and rejects every off-topic query outright.
+ */
 export const SEMANTIC_FALLBACK_COSINE_FLOOR = 0.65;
 
 /** Max results from semantic fallback (intentionally smaller than keyword limit — fallback noise tolerance is lower) */
@@ -210,19 +219,18 @@ export function executePromptRecall(
  *   1. Keyword path returned 0 results
  *   2. Prompt has >= SEMANTIC_FALLBACK_MIN_UNIGRAMS distinct unigrams
  *      (bigrams are excluded from the count — short metaphor prompts shouldn't qualify)
- *   3. Gemini API key is present
  *
  * Errors during embedding never propagate — fallback is best-effort.
  *
  * @param projectDb - Project-scoped database (or null if unavailable)
  * @param globalDb - Global database (or null if unavailable)
- * @param options - Prompt text, surface content for dedup, optional limit, gemini key
+ * @param options - Prompt text, surface content for dedup, optional limit
  * @returns Deduplicated array of relevant memories (keyword OR semantic fallback)
  */
 export async function executePromptRecallWithFallback(
   projectDb: Database | null,
   globalDb: Database | null,
-  options: PromptRecallOptions & { readonly geminiApiKey?: string },
+  options: PromptRecallOptions,
 ): Promise<readonly Memory[]> {
   const keywordResults = executePromptRecall(projectDb, globalDb, options);
 
@@ -235,29 +243,18 @@ export async function executePromptRecallWithFallback(
   if (unigrams.length < SEMANTIC_FALLBACK_MIN_UNIGRAMS) {
     return keywordResults;
   }
-  if (!isGeminiAvailable(options.geminiApiKey)) {
-    return keywordResults;
-  }
-
   try {
     // Same [query] [project:name] prefix as recall.ts — memories were
     // embedded with a metadata prefix, so an unprefixed query lands in a
     // slightly different embedding space and degrades ranking.
-    const embeddings = await embedTexts(
-      [buildQueryEmbeddingText(options.prompt, options.projectName)],
-      options.geminiApiKey!,
+    const queryEmbedding = await embedLocal(
+      buildQueryEmbeddingText(options.prompt, options.projectName),
     );
-    const queryEmbedding = embeddings[0];
-    if (!queryEmbedding) {
-      return keywordResults;
-    }
-
-    const embType = queryEmbedding instanceof Float64Array ? 'gemini' : 'local';
     const projectCandidates = projectDb
-      ? getMemoriesWithEmbedding(projectDb, embType)
+      ? getMemoriesWithEmbedding(projectDb)
       : [];
     const globalCandidates = globalDb
-      ? getMemoriesWithEmbedding(globalDb, embType)
+      ? getMemoriesWithEmbedding(globalDb)
       : [];
 
     const ranked = rankBySimilarity(

@@ -16,10 +16,6 @@ export const MemoryId = (s: string): MemoryId => s as MemoryId;
 export type EdgeId = string & { readonly __brand: 'EdgeId' };
 export const EdgeId = (s: string): EdgeId => s as EdgeId;
 
-/** Branded type for Gemini embeddings (Float64, 768-dim) */
-export type GeminiEmbedding = Float64Array & { readonly __brand: 'GeminiEmbedding' };
-export const GeminiEmbedding = (a: Float64Array): GeminiEmbedding => a as GeminiEmbedding;
-
 /** Branded type for local embeddings (Float32; width set by LOCAL_EMBEDDING_DIMENSIONS) */
 export type LocalEmbedding = Float32Array & { readonly __brand: 'LocalEmbedding' };
 export const LocalEmbedding = (a: Float32Array): LocalEmbedding => a as LocalEmbedding;
@@ -230,14 +226,14 @@ export interface MemoryCandidate {
  * Similarity space a score was computed in. Scores are NOT comparable across
  * spaces: raw cosine on local BGE-small-en-v1.5 embeddings runs "hot"
  * (same-domain memories about different aspects routinely score 0.6-0.75),
- * while Jaccard and Gemini-768 cosine are much better separated. Thresholds and
- * classification bands must be calibrated per space.
+ * while Jaccard is much better separated. Thresholds and classification bands
+ * must be calibrated per space.
  *
  * A space is also per MODEL, not merely per family: the 'local-cosine' bands
  * belong to BGE-small-en-v1.5 specifically. See LOCAL_COSINE_CALIBRATED, which
  * keeps an uncalibrated local model out of destructive comparisons entirely.
  */
-export type SimilaritySpace = 'jaccard' | 'local-cosine' | 'gemini-cosine';
+export type SimilaritySpace = 'jaccard' | 'local-cosine';
 
 // Similarity Action (discriminated union)
 export type SimilarityAction =

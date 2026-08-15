@@ -22,7 +22,7 @@ import type { Memory } from '../core/types.js';
 import { createMemory, serializeSourceContext } from '../core/types.js';
 import { buildEmbeddingText } from '../core/extraction.js';
 import { insertMemory, insertEdge, updateMemory, deleteEdgesForMemory, routeToDatabase, getActiveCodeMemoriesByFilePath, getActiveProseMemoriesByFilePath } from '../infra/db.js';
-import { embedTexts, isGeminiAvailable } from '../infra/gemini-embed.ts';
+import { embedLocal } from '../infra/local-embed.ts';
 import { readFileSync } from 'fs';
 
 // ============================================================================
@@ -209,7 +209,7 @@ export function buildCodeSourceContext(
  */
 export function buildProseMemory(
   args: IndexCodeArgs,
-  embedding: Float64Array | null,
+  embedding: Float32Array | null,
   id: string,
   now: string
 ): Memory {
@@ -227,8 +227,7 @@ export function buildProseMemory(
     source_session: args.sessionId,
     source_context: buildCodeSourceContext(args.filePath, args.startLine, args.endLine, args.sessionId),
     tags: args.tags,
-    embedding: embedding,
-    local_embedding: null, // Only Gemini for now
+    local_embedding: embedding,
     access_count: 0,
     last_accessed_at: now,
     created_at: now,
@@ -335,7 +334,7 @@ export function formatErrorResult(error: string): IndexCodeError {
  * 1. Parse args (pure)
  * 2. Read file content (I/O)
  * 3. Extract line range (pure)
- * 4. Embed prose summary via Gemini (I/O) - NOT raw code (FR-053)
+ * 4. Embed prose summary locally (I/O) - NOT raw code (FR-053)
  * 5. Check for existing code memories at same file_path (I/O)
  * 6. Mark existing as superseded (I/O)
  * 7. Insert prose memory (I/O)
@@ -346,7 +345,6 @@ export function formatErrorResult(error: string): IndexCodeError {
  * @param sessionId - Current session ID
  * @param projectDb - Project database instance
  * @param globalDb - Global database instance
- * @param geminiApiKey - Gemini API key (optional)
  * @param projectName - Project name for embedding metadata
  * @returns JSON result object
  */
@@ -355,7 +353,6 @@ export async function executeIndexCode(
   sessionId: string,
   projectDb: Database,
   globalDb: Database,
-  geminiApiKey: string | undefined,
   projectName: string
 ): Promise<IndexCodeResult | IndexCodeError> {
   // Parse args (pure)
@@ -383,11 +380,10 @@ export async function executeIndexCode(
     return formatErrorResult('extracted code is empty');
   }
 
-  // Embed prose summary via Gemini (I/O) - FR-053: ONLY prose, NOT code
-  let proseEmbedding: Float64Array | null = null;
+  // Embed prose summary locally (I/O) - FR-053: ONLY prose, NOT code
+  let proseEmbedding: Float32Array | null = null;
 
-  if (isGeminiAvailable(geminiApiKey)) {
-    process.stderr.write(`[cortex:index-code] INFO: Using Gemini to embed prose summary\n`);
+  {
     try {
       // Build embedding text with metadata prefix
       const embeddingText = buildEmbeddingText(
@@ -404,15 +400,12 @@ export async function executeIndexCode(
       );
 
       // Embed only the prose summary
-      const embeddings = await embedTexts([embeddingText], geminiApiKey!);
-      proseEmbedding = embeddings[0];
+      proseEmbedding = await embedLocal(embeddingText);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       // Non-fatal: queue embedding for backfill
       console.error(`Warning: failed to embed prose, will queue for backfill: ${message}`);
     }
-  } else {
-    process.stderr.write(`[cortex:index-code] INFO: Gemini unavailable — prose embedding queued for backfill\n`);
   }
 
   // Build memories (pure — ids and timestamps generated at I/O boundary)
