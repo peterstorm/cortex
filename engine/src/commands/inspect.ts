@@ -191,7 +191,16 @@ function getCacheStaleness(cachePath: string): { exists: boolean; age_hours?: nu
       }
     }
 
-    const ageMs = Date.now() - mostRecentMtime;
+    // Clamp at zero: age is a duration, and a negative one is not representable
+    // in this domain. Two things produce negatives here, both real:
+    //  - `mtimeMs` carries sub-millisecond precision while `Date.now()` is
+    //    truncated to whole milliseconds, so a file written moments ago can sit
+    //    fractionally *ahead* of the clock reading;
+    //  - a file restored or copied with a future timestamp, or a clock stepped
+    //    backwards by NTP.
+    // "-0.0000002 hours stale" is meaningless to every caller, and it made the
+    // staleness test fail intermittently rather than never.
+    const ageMs = Math.max(0, Date.now() - mostRecentMtime);
     const ageHours = ageMs / (1000 * 60 * 60);
 
     return { exists: true, age_hours: ageHours };
@@ -260,5 +269,7 @@ export function runInspect(
 ): void {
   const telemetry = collectTelemetry(projectDb, globalDb, telemetryPath, cachePath);
   const output = formatTelemetry(telemetry);
-  console.log(output);
+  // stdout write rather than console.log, matching cli.ts and the rest of the
+  // codebase: this is the command's result, not a diagnostic.
+  process.stdout.write(output + '\n');
 }

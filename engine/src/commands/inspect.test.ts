@@ -666,6 +666,25 @@ describe('collectTelemetry', () => {
     expect(result.cache_staleness?.age_hours!).toBeLessThan(1);
   });
 
+  test('reports zero, never a negative age, for a future mtime', () => {
+    // Deterministic version of the race that made the test above flaky: mtimeMs
+    // carries sub-millisecond precision while Date.now() is truncated, so a
+    // just-written file can sit fractionally ahead of the clock. A restored
+    // file or a backwards NTP step does the same thing, larger. Age is a
+    // duration and must never come back negative.
+    fs.mkdirSync(cachePath, { recursive: true });
+    const cacheFile = path.join(cachePath, 'future-cache.json');
+    fs.writeFileSync(cacheFile, '{}', 'utf8');
+
+    const oneHourAhead = new Date(Date.now() + 60 * 60 * 1000);
+    fs.utimesSync(cacheFile, oneHourAhead, oneHourAhead);
+
+    const result = collectTelemetry(projectDb, globalDb, telemetryPath, cachePath);
+
+    expect(result.cache_staleness?.exists).toBe(true);
+    expect(result.cache_staleness?.age_hours).toBe(0);
+  });
+
   test('handles missing cache', () => {
     const result = collectTelemetry(projectDb, globalDb, telemetryPath, cachePath);
 
