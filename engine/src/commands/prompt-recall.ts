@@ -19,6 +19,11 @@ import { embedTexts, isGeminiAvailable } from '../infra/gemini-embed.ts';
 import { rankBySimilarity, STOP_WORDS, extractUnigrams } from '../core/similarity.js';
 import { buildQueryEmbeddingText } from './recall.js';
 import { sanitizeSurfaceText } from '../core/surface.js';
+import {
+  RECALL_MAX_BLOCK_BYTES,
+  SUMMARY_MAX_CHARS,
+  UNTRUSTED_MEMORY_WARNING,
+} from '../config.js';
 
 // ============================================================================
 // CONSTANTS
@@ -92,15 +97,36 @@ export function isTagOnlyMatch(memory: Memory, tokens: readonly string[]): boole
 export function formatPromptRecall(memories: readonly Memory[]): string {
   if (memories.length === 0) return '';
 
-  const lines = memories.map(m => `- [${m.memory_type}] ${sanitizeSurfaceText(m.summary)}`);
-
-  return [
+  const header = [
     '<!-- CORTEX_RECALL_START -->',
     '## Prompt-Relevant Memories',
     '',
-    ...lines,
-    '<!-- CORTEX_RECALL_END -->',
-  ].join('\n');
+    UNTRUSTED_MEMORY_WARNING,
+    '',
+  ];
+  const footer = ['<!-- CORTEX_RECALL_END -->'];
+
+  // Byte budget: the block is injected on every prompt, so it is bounded by
+  // construction. Overflow drops whole memories from the tail — never a
+  // partial line, because a truncated sentence still reads as a full claim.
+  const overhead = Buffer.byteLength([...header, ...footer].join('\n'), 'utf8');
+  let used = overhead;
+
+  const lines: string[] = [];
+  for (const m of memories) {
+    const summary = sanitizeSurfaceText(m.summary, SUMMARY_MAX_CHARS);
+    if (!summary) continue; // fail closed: unrenderable memory is dropped
+    const type = sanitizeSurfaceText(m.memory_type, 40);
+    const line = `- [${type}] ${summary}`;
+    const cost = Buffer.byteLength(line, 'utf8') + 1; // +1 for the join newline
+    if (used + cost > RECALL_MAX_BLOCK_BYTES) break;
+    lines.push(line);
+    used += cost;
+  }
+
+  if (lines.length === 0) return '';
+
+  return [...header, ...lines, ...footer].join('\n');
 }
 
 // ============================================================================

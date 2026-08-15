@@ -4,6 +4,7 @@
 import type { Memory, MemoryType } from './types.js';
 import { isMemoryType } from './types.js';
 import type { EntityProfile } from './entities.js';
+import { SUMMARY_MAX_CHARS, UNTRUSTED_MEMORY_WARNING } from '../config.js';
 
 // Ranked memory - memory with rank attached by ranking module
 export type RankedMemory = Memory & { readonly rank: number };
@@ -60,12 +61,14 @@ export function generateSurface(
   // Header
   sections.push(`# Cortex Memory Surface`);
   sections.push('');
-  sections.push(`**Branch:** ${branch}`);
+  sections.push(`**Branch:** ${sanitizeSurfaceText(branch, 200)}`);
 
   if (staleness && staleness.stale) {
     sections.push(`**Warning:** Surface is ${Math.round(staleness.age_hours)}h old. May be stale.`);
   }
 
+  sections.push('');
+  sections.push(UNTRUSTED_MEMORY_WARNING);
   sections.push('');
 
   // Render entity profiles section early — compact and high-value, survives truncation
@@ -84,10 +87,16 @@ export function generateSurface(
 
     for (const mem of mems) {
       // Sanitize at render time: summaries are LLM/user-supplied and must not
-      // be able to inject surface markers or break the markdown structure.
-      sections.push(`- ${sanitizeSurfaceText(mem.summary)}`);
+      // be able to inject surface markers, forge framing tags, or break the
+      // markdown structure. The cap is enforced here as well as at extraction
+      // parse time — a row written by an older version, or edited directly, is
+      // still bounded on the way out.
+      const summary = sanitizeSurfaceText(mem.summary, SUMMARY_MAX_CHARS);
+      if (!summary) continue; // fail closed: unrenderable memory is dropped
+      sections.push(`- ${summary}`);
       if (mem.tags.length > 0) {
-        sections.push(`  *Tags: ${sanitizeSurfaceText(mem.tags.join(', '))}*`);
+        const tags = sanitizeSurfaceText(mem.tags.join(', '), SUMMARY_MAX_CHARS);
+        if (tags) sections.push(`  *Tags: ${tags}*`);
       }
     }
 
@@ -109,21 +118,52 @@ export function generateSurface(
 /**
  * Sanitize memory-derived text for surface rendering. Pure function.
  *
- * Defends the surface structure against adversarial or accidental content:
+ * This is the single choke point for untrusted text entering a model's
+ * context. Memory content is distilled from session transcripts, which carry
+ * text this system does not control: fetched web pages, files read out of any
+ * repository, dependency source, tool stderr, and subagent output. Anything
+ * summarized into a memory is injected verbatim into EVERY later session, in
+ * both harnesses — so the defence has to live here, not at each call site.
+ *
+ * Defences, in application order:
+ * - Non-string input yields '' rather than throwing. A corrupt row must not be
+ *   able to abort surface rendering (fail closed: drop the text, keep going).
  * - Strips CORTEX_* HTML-comment markers — a summary containing
  *   CORTEX_MEMORY_START/END would corrupt the replace-between-markers splice
  *   AND defeat stripInjectedMemorySurface's non-greedy strip in extraction
- *   (leaking surface text back into extraction: a feedback loop).
+ *   (leaking surface text back into extraction: a feedback loop). This runs
+ *   BEFORE escaping, because the markers themselves contain '<'.
+ * - Escapes '<' as '&lt;'. Marker stripping alone blocks marker forgery but
+ *   not tag forgery: stored text reading '</system-reminder>...' would
+ *   otherwise reach the model as a well-formed framing tag and could close a
+ *   real one. A tag requires '<', so escaping it is sufficient; '>' is
+ *   deliberately left alone because escaping it mangles ordinary prose
+ *   ('a -> b', 'x > y') while adding no protection.
  * - Collapses newlines to a single space so a summary stays one list item.
  * - Neutralizes leading markdown heading syntax so a summary can't fork the
  *   surface's section structure.
+ * - Optionally clamps to maxChars, without splitting a trailing '&lt;' entity.
+ *
+ * @param text - Untrusted memory-derived text
+ * @param maxChars - Optional hard character cap applied after sanitization
  */
-export function sanitizeSurfaceText(text: string): string {
-  return text
+export function sanitizeSurfaceText(text: string, maxChars?: number): string {
+  if (typeof text !== 'string') return '';
+
+  const sanitized = text
     .replace(/<!--\s*CORTEX_[A-Z_]*\s*-->/g, '')
+    .replace(/</g, '&lt;')
     .replace(/\s*[\r\n]+\s*/g, ' ')
     .replace(/^\s*#+\s*/, '')
     .trim();
+
+  if (maxChars === undefined || sanitized.length <= maxChars) {
+    return sanitized;
+  }
+
+  // Clamp, then drop a trailing partial HTML entity so the cut cannot leave a
+  // dangling '&l' that re-reads as literal text.
+  return sanitized.slice(0, maxChars).replace(/&[a-z]*$/i, '').trimEnd() + '…';
 }
 
 /**
@@ -342,9 +382,13 @@ export function renderEntitySection(
   for (const profile of selected) {
     const facts = profile.currentFacts
       .slice(0, maxFactsPerEntity)
-      .map(f => sanitizeSurfaceText(`${f.predicate}: ${f.object}`))
+      .map(f => sanitizeSurfaceText(`${f.predicate}: ${f.object}`, SUMMARY_MAX_CHARS))
+      .filter(f => f.length > 0)
       .join('; ');
-    lines.push(`- **${sanitizeSurfaceText(profile.entity.name)}** (${profile.entity.entity_type}): ${facts}`);
+    const name = sanitizeSurfaceText(profile.entity.name, 200);
+    if (!name) continue; // fail closed
+    const type = sanitizeSurfaceText(profile.entity.entity_type, 100);
+    lines.push(`- **${name}** (${type}): ${facts}`);
   }
 
   lines.push('');

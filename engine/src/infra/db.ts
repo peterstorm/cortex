@@ -19,6 +19,7 @@ import type {
 import { createMemory, createEdge, createExtractionCheckpoint, isEdgeRelation, isMemoryType, isMemoryStatus, isMemoryScope } from '../core/types.js';
 import type { Entity, Fact, EntityType } from '../core/entities.js';
 import { createEntity, createFact, isEntityType } from '../core/entities.js';
+import { LOCAL_EMBED_MODEL } from '../config.js';
 
 // ============================================================================
 // SCHEMA INITIALIZATION
@@ -34,6 +35,7 @@ CREATE TABLE IF NOT EXISTS memories (
   scope TEXT NOT NULL,
   embedding BLOB,
   local_embedding BLOB,
+  local_embedding_model TEXT,
   confidence REAL NOT NULL,
   priority INTEGER NOT NULL,
   pinned INTEGER NOT NULL DEFAULT 0,
@@ -72,7 +74,8 @@ CREATE TABLE IF NOT EXISTS extraction_checkpoints (
   session_id TEXT NOT NULL,
   cursor_position INTEGER NOT NULL,
   extracted_at TEXT NOT NULL,
-  transcript_length INTEGER
+  transcript_length INTEGER,
+  projection_version INTEGER
 );
 
 -- FTS5 virtual table for keyword search (FR-101)
@@ -209,6 +212,8 @@ function initializeSchema(db: Database): void {
   migrateCheckpointUniqueness(db);
   migrateArchivedAt(db);
   migrateCheckpointTranscriptLength(db);
+  migrateCheckpointProjectionVersion(db);
+  migrateLocalEmbeddingModel(db);
   migrateEdgeClassifiedAt(db);
 
   if (schemaVersion < CURRENT_SCHEMA_VERSION) {
@@ -257,6 +262,40 @@ function migrateCheckpointTranscriptLength(db: Database): void {
   const columns = db.prepare(`PRAGMA table_info(extraction_checkpoints)`).all() as { name: string }[];
   if (columns.some((c) => c.name === 'transcript_length')) return;
   db.run(`ALTER TABLE extraction_checkpoints ADD COLUMN transcript_length INTEGER`);
+}
+
+/**
+ * Idempotent migration: add extraction_checkpoints.projection_version.
+ *
+ * A cursor is an offset into projected transcript text, so it is only valid
+ * under the projection that produced it. Existing rows stay NULL, which reads
+ * as "legacy" and forces a reset to 0 on next load: the transcript is
+ * re-extracted and dedup absorbs the duplicates. Backfilling a version here
+ * would assert a compatibility that does not hold — the legacy cursor was a
+ * character offset into the raw file, not a byte offset.
+ */
+function migrateCheckpointProjectionVersion(db: Database): void {
+  const columns = db.prepare(`PRAGMA table_info(extraction_checkpoints)`).all() as { name: string }[];
+  if (columns.some((c) => c.name === 'projection_version')) return;
+  db.run(`ALTER TABLE extraction_checkpoints ADD COLUMN projection_version INTEGER`);
+}
+
+/**
+ * Idempotent migration: add memories.local_embedding_model.
+ *
+ * Vectors from different embedding models are not comparable, and mixing them
+ * in one column produces no error — only quietly wrong similarity scores. This
+ * column tags each local vector with the model that produced it so reads can
+ * filter to one model, making a future model swap safe.
+ *
+ * Existing rows are left NULL, which excludes them from local similarity
+ * search until re-embedded. At the time this landed no row in any database
+ * carried a local embedding, so nothing is actually excluded.
+ */
+function migrateLocalEmbeddingModel(db: Database): void {
+  const columns = db.prepare(`PRAGMA table_info(memories)`).all() as { name: string }[];
+  if (columns.some((c) => c.name === 'local_embedding_model')) return;
+  db.run(`ALTER TABLE memories ADD COLUMN local_embedding_model TEXT`);
 }
 
 /**
@@ -403,12 +442,12 @@ export function insertMemory(db: Database, memory: Memory): string {
   const stmt = db.prepare(`
     INSERT INTO memories (
       id, content, summary, memory_type, scope,
-      embedding, local_embedding,
+      embedding, local_embedding, local_embedding_model,
       confidence, priority, pinned,
       source_type, source_session, source_context,
       tags, access_count, last_accessed_at,
       created_at, updated_at, status, archived_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   stmt.run(
@@ -419,6 +458,8 @@ export function insertMemory(db: Database, memory: Memory): string {
     memory.scope,
     memory.embedding ? serializeEmbedding(memory.embedding) : null,
     memory.local_embedding ? serializeEmbedding(memory.local_embedding) : null,
+    // Tag the producing model alongside the vector — see migrateLocalEmbeddingModel.
+    memory.local_embedding ? LOCAL_EMBED_MODEL : null,
     memory.confidence,
     memory.priority,
     memory.pinned ? 1 : 0,
@@ -534,6 +575,10 @@ export function updateMemory(db: Database, id: string, fields: Partial<Memory>):
   if (fields.local_embedding !== undefined) {
     updates.push('local_embedding = ?');
     values.push(fields.local_embedding ? serializeEmbedding(fields.local_embedding) : null);
+    // The model tag is written with the vector, never separately — otherwise a
+    // vector could outlive the record of what produced it.
+    updates.push('local_embedding_model = ?');
+    values.push(fields.local_embedding ? LOCAL_EMBED_MODEL : null);
   }
   if (fields.confidence !== undefined) {
     updates.push('confidence = ?');
@@ -726,6 +771,30 @@ export function getArchivedMemories(db: Database): readonly Memory[] {
 }
 
 /**
+ * SQL predicate selecting rows whose embedding of `type` is usable, plus the
+ * bound parameters it needs.
+ *
+ * Local vectors carry an extra constraint: they must come from the CURRENT
+ * model. Vectors from two models share a column but not a vector space, and
+ * comparing across them returns plausible-looking scores rather than an error —
+ * the failure mode is "semantic search got a bit worse", which is invisible.
+ *
+ * Both read paths (all-rows and by-IDs) build their predicate here so the
+ * guarantee cannot hold on one and silently lapse on the other.
+ */
+function embeddingPredicate(type: 'gemini' | 'local'): {
+  readonly sql: string;
+  readonly params: readonly string[];
+} {
+  return type === 'gemini'
+    ? { sql: `embedding IS NOT NULL`, params: [] }
+    : {
+        sql: `local_embedding IS NOT NULL AND local_embedding_model = ?`,
+        params: [LOCAL_EMBED_MODEL],
+      };
+}
+
+/**
  * Fetch all memories with embeddings of a given type.
  * I/O only — returns raw candidates for pure ranking in core/similarity.ts.
  *
@@ -738,11 +807,12 @@ export function getMemoriesWithEmbedding(
   type: 'gemini' | 'local'
 ): readonly { memory: Memory; embedding: Float64Array | Float32Array }[] {
   const column = type === 'gemini' ? 'embedding' : 'local_embedding';
-  const stmt = db.prepare(`
-    SELECT * FROM memories WHERE ${column} IS NOT NULL AND status = 'active'
-  `);
+  const pred = embeddingPredicate(type);
+  const stmt = db.prepare(
+    `SELECT * FROM memories WHERE ${pred.sql} AND status = 'active'`
+  );
 
-  const rows = stmt.all() as any[];
+  const rows = stmt.all(...pred.params) as any[];
   const results: { memory: Memory; embedding: Float64Array | Float32Array }[] = [];
 
   for (const row of rows) {
@@ -880,11 +950,12 @@ export function getMemoriesWithEmbeddingByIds(
 
   const column = type === 'gemini' ? 'embedding' : 'local_embedding';
   const placeholders = ids.map(() => '?').join(',');
+  const pred = embeddingPredicate(type);
   const stmt = db.prepare(`
-    SELECT * FROM memories WHERE id IN (${placeholders}) AND ${column} IS NOT NULL AND status = 'active'
+    SELECT * FROM memories WHERE id IN (${placeholders}) AND ${pred.sql} AND status = 'active'
   `);
 
-  const rows = stmt.all(...ids) as any[];
+  const rows = stmt.all(...ids, ...pred.params) as any[];
   const results: { memory: Memory; embedding: Float64Array | Float32Array }[] = [];
 
   for (const row of rows) {
@@ -1348,6 +1419,7 @@ export function getExtractionCheckpoint(
     cursor_position: row.cursor_position,
     extracted_at: row.extracted_at,
     transcript_length: row.transcript_length ?? null,
+    projection_version: row.projection_version ?? null,
   });
 }
 
@@ -1360,8 +1432,9 @@ export function getExtractionCheckpoint(
  */
 export function saveExtractionCheckpoint(
   db: Database,
-  checkpoint: Omit<ExtractionCheckpoint, 'id' | 'transcript_length'> & {
+  checkpoint: Omit<ExtractionCheckpoint, 'id' | 'transcript_length' | 'projection_version'> & {
     readonly transcript_length?: number | null;
+    readonly projection_version?: number | null;
   }
 ): void {
   // Respect caller's extracted_at if provided, otherwise use current timestamp
@@ -1373,17 +1446,19 @@ export function saveExtractionCheckpoint(
     cursor_position: checkpoint.cursor_position,
     extracted_at,
     transcript_length: checkpoint.transcript_length ?? null,
+    projection_version: checkpoint.projection_version ?? null,
   });
 
   // Atomic UPSERT — a check-then-insert would let two concurrent workers
   // both observe "no checkpoint" and insert duplicate rows.
   const stmt = db.prepare(`
-    INSERT INTO extraction_checkpoints (id, session_id, cursor_position, extracted_at, transcript_length)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO extraction_checkpoints (id, session_id, cursor_position, extracted_at, transcript_length, projection_version)
+    VALUES (?, ?, ?, ?, ?, ?)
     ON CONFLICT(session_id) DO UPDATE SET
       cursor_position = excluded.cursor_position,
       extracted_at = excluded.extracted_at,
-      transcript_length = excluded.transcript_length
+      transcript_length = excluded.transcript_length,
+      projection_version = excluded.projection_version
   `);
 
   stmt.run(
@@ -1391,7 +1466,8 @@ export function saveExtractionCheckpoint(
     validated.session_id,
     validated.cursor_position,
     validated.extracted_at,
-    validated.transcript_length
+    validated.transcript_length,
+    validated.projection_version
   );
 }
 

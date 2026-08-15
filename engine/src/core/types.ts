@@ -170,14 +170,31 @@ export interface Edge {
 export interface ExtractionCheckpoint {
   readonly id: string;
   readonly session_id: string;
+  /**
+   * Resume position. Under projection_version >= 1 this is a RAW BYTE offset
+   * into the transcript file, always on a line boundary. Legacy checkpoints
+   * (projection_version null) held a character offset into the entire file
+   * read as one string; the two are not comparable, so legacy rows are reset
+   * on load.
+   */
   readonly cursor_position: number;
   readonly extracted_at: string; // ISO8601
   /**
-   * Transcript content length (characters) when the checkpoint was saved.
-   * Null for legacy checkpoints. Used to detect a rewritten/shrunken
-   * transcript so the cursor can be reset instead of pointing past EOF.
+   * Transcript size when the checkpoint was saved. Under projection_version
+   * >= 1 this is the raw file size in BYTES; legacy rows held content length
+   * in characters. Used to detect a rewritten/shrunken transcript so the
+   * cursor can be reset instead of pointing past EOF.
    */
   readonly transcript_length: number | null;
+  /**
+   * Projection contract the cursor was produced under. Null for legacy
+   * checkpoints written before projection existed. A mismatch against the
+   * current PROJECTION_VERSION forces the cursor back to 0 — an offset is only
+   * meaningful under the projection that produced it, and reusing one across
+   * versions would silently skip transcript. Re-extraction is safe: dedup
+   * absorbs it.
+   */
+  readonly projection_version: number | null;
 }
 
 // Hook Input
@@ -412,6 +429,7 @@ export function createExtractionCheckpoint(input: {
   cursor_position: number;
   extracted_at?: string;
   transcript_length?: number | null;
+  projection_version?: number | null;
 }): ExtractionCheckpoint {
   // Validate cursor_position >= 0
   if (Number.isNaN(input.cursor_position) || input.cursor_position < 0) {
@@ -428,12 +446,24 @@ export function createExtractionCheckpoint(input: {
     );
   }
 
+  // Validate projection_version >= 0 when provided
+  const projection_version = input.projection_version ?? null;
+  if (
+    projection_version !== null &&
+    (Number.isNaN(projection_version) || projection_version < 0)
+  ) {
+    throw new Error(
+      `projection_version must be >= 0 or null, got ${projection_version}`
+    );
+  }
+
   return {
     id: input.id,
     session_id: input.session_id,
     cursor_position: input.cursor_position,
     extracted_at: input.extracted_at ?? new Date().toISOString(),
     transcript_length,
+    projection_version,
   };
 }
 

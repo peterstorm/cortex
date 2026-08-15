@@ -24,6 +24,7 @@ import {
 } from './db.js';
 import { rankBySimilarity } from '../core/similarity.js';
 import { createMemory, createEdge } from '../core/types.js';
+import { LOCAL_EMBED_MODEL } from '../config.js';
 import type { Memory, Edge, MemoryScope, MemoryType, MemoryStatus } from '../core/types.js';
 
 describe('Database Layer', () => {
@@ -595,6 +596,100 @@ describe('Database Layer', () => {
       db.close();
     });
 
+    it('tags local embeddings with the producing model and filters reads to it', () => {
+      // Vectors from two models share a column but not a space. Comparing
+      // across them yields plausible scores rather than an error, so reads are
+      // filtered to the current model.
+      const withLocal = createMemory({
+        id: 'mem-local-1',
+        content: 'local vector memory',
+        summary: 'local vector memory',
+        memory_type: 'context',
+        scope: 'project',
+        confidence: 0.8,
+        priority: 5,
+        source_type: 'extraction',
+        source_session: 'session-local',
+        source_context: '{}',
+        local_embedding: new Float32Array([0.1, 0.2, 0.3]),
+      });
+      insertMemory(db, withLocal);
+
+      const tagged = db
+        .prepare('SELECT local_embedding_model FROM memories WHERE id = ?')
+        .get('mem-local-1') as { local_embedding_model: string | null };
+      expect(tagged.local_embedding_model).toBe(LOCAL_EMBED_MODEL);
+
+      expect(getMemoriesWithEmbedding(db, 'local').map(c => c.memory.id)).toContain('mem-local-1');
+
+      // A vector produced by some other model must not be returned.
+      db.run('UPDATE memories SET local_embedding_model = ? WHERE id = ?', [
+        'some/other-model',
+        'mem-local-1',
+      ]);
+      expect(getMemoriesWithEmbedding(db, 'local').map(c => c.memory.id)).not.toContain(
+        'mem-local-1'
+      );
+    });
+
+    it('applies the model filter on BOTH read paths, not just the all-rows one', () => {
+      // recall.ts uses getMemoriesWithEmbeddingByIds for FTS-prefiltered hits
+      // and getMemoriesWithEmbedding otherwise. If only one filtered by model,
+      // the same query would silently compare across vector spaces depending
+      // on which branch it took.
+      const m = createMemory({
+        id: 'mem-local-both',
+        content: 'both paths',
+        summary: 'both paths',
+        memory_type: 'context',
+        scope: 'project',
+        confidence: 0.8,
+        priority: 5,
+        source_type: 'extraction',
+        source_session: 'session-local',
+        source_context: '{}',
+        local_embedding: new Float32Array([0.7, 0.8, 0.9]),
+      });
+      insertMemory(db, m);
+
+      expect(getMemoriesWithEmbedding(db, 'local').map(c => c.memory.id)).toContain(
+        'mem-local-both'
+      );
+      expect(
+        getMemoriesWithEmbeddingByIds(db, ['mem-local-both'], 'local').map(c => c.memory.id)
+      ).toContain('mem-local-both');
+
+      db.run('UPDATE memories SET local_embedding_model = ? WHERE id = ?', [
+        'foreign/model',
+        'mem-local-both',
+      ]);
+
+      expect(getMemoriesWithEmbedding(db, 'local')).toHaveLength(0);
+      expect(getMemoriesWithEmbeddingByIds(db, ['mem-local-both'], 'local')).toHaveLength(0);
+    });
+
+    it('excludes legacy local vectors that carry no model tag', () => {
+      const legacy = createMemory({
+        id: 'mem-local-legacy',
+        content: 'legacy local vector',
+        summary: 'legacy local vector',
+        memory_type: 'context',
+        scope: 'project',
+        confidence: 0.8,
+        priority: 5,
+        source_type: 'extraction',
+        source_session: 'session-local',
+        source_context: '{}',
+        local_embedding: new Float32Array([0.4, 0.5, 0.6]),
+      });
+      insertMemory(db, legacy);
+      db.run('UPDATE memories SET local_embedding_model = NULL WHERE id = ?', ['mem-local-legacy']);
+
+      expect(getMemoriesWithEmbedding(db, 'local').map(c => c.memory.id)).not.toContain(
+        'mem-local-legacy'
+      );
+    });
+
     it('warns when an ID-filtered non-null embedding cannot be deserialized', () => {
       db.run('UPDATE memories SET embedding = 0 WHERE id = ?', ['mem-emb-1']);
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
@@ -1133,11 +1228,20 @@ describe('Database Layer', () => {
       const checkpointCols = (db.prepare(`PRAGMA table_info(extraction_checkpoints)`).all() as { name: string }[]).map(c => c.name);
       expect(memoryCols).toContain('archived_at');
       expect(checkpointCols).toContain('transcript_length');
+      expect(memoryCols).toContain('local_embedding_model');
+      expect(checkpointCols).toContain('projection_version');
 
       // Legacy row readable, archived_at defaults to null
       const legacyMemory = getMemory(db, 'legacy-1');
       expect(legacyMemory).not.toBeNull();
       expect(legacyMemory!.archived_at).toBeNull();
+
+      // A legacy row predates both new columns, so they read as "unknown"
+      // rather than as a false claim about which model or projection produced it.
+      const legacyRow = db
+        .prepare(`SELECT local_embedding_model FROM memories WHERE id = 'legacy-1'`)
+        .get() as { local_embedding_model: string | null };
+      expect(legacyRow.local_embedding_model).toBeNull();
       db.close();
 
       // Idempotent: re-opening must not throw (duplicate column)

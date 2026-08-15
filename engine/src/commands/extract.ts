@@ -24,18 +24,21 @@
  * 10. Run lifecycle
  */
 
-import { readFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { basename, join } from 'node:path';
 import type { Database } from 'bun:sqlite';
 import type { GitContext, HookInput, Memory, MemoryCandidate } from '../core/types.js';
 import { createMemory, serializeSourceContext } from '../core/types.js';
 import {
-  truncateTranscript,
   buildExtractionPrompt,
   parseExtractionResponse,
   buildEmbeddingText,
 } from '../core/extraction.js';
+import { PROJECTION_VERSION } from '../core/transcript-projection.js';
+import {
+  readProjectedChunks,
+  type ReadProjectedResult,
+} from '../infra/transcript-reader.js';
 import type { EntityFactCandidate, EntityProfile } from '../core/entities.js';
 import {
   tokenize,
@@ -70,6 +73,7 @@ import {
   INTRA_BATCH_DEDUP_THRESHOLD,
   EXTRACT_MAX_CHUNKS_PER_RUN,
   MAX_EDGES_PER_MEMORY,
+  MAX_TRANSCRIPT_BYTES,
   getLockDir,
 } from '../config.js';
 
@@ -153,10 +157,58 @@ export async function executeExtract(
       };
     }
 
-    // I/O: Read transcript file
-    let transcriptContent: string;
+    // I/O: Get extraction checkpoint for resumable extraction (FR-004)
+    const checkpoint = getExtractionCheckpoint(projectDb, input.session_id);
+    let cursor = checkpoint?.cursor_position ?? 0;
+
+    // Projection-version invalidation. The cursor is a raw byte offset that is
+    // only meaningful under the projection that produced it; a legacy row
+    // (null) held a character offset into the whole file. Reusing either across
+    // versions would resume mid-content and skip transcript permanently.
+    // Dedup absorbs the re-extraction.
+    if (cursor > 0 && checkpoint?.projection_version !== PROJECTION_VERSION) {
+      logInfo(
+        `Checkpoint projection_version=${checkpoint?.projection_version ?? 'legacy'} != ${PROJECTION_VERSION} — resetting cursor to 0`
+      );
+      cursor = 0;
+    }
+
+    // I/O: Read and project a bounded window of the transcript. Projection
+    // drops everything no model saw (pi `message.details`, Claude Code
+    // `toolUseResult`/snapshots) — measured at 96% of session bytes — and the
+    // reader streams from the cursor, so cost is O(new bytes), not O(session).
+    // Both the initial read and any post-shrink re-read go through here, so a
+    // read failure is classified identically wherever it happens.
+    const readWindow = (startByte: number): Promise<ReadProjectedResult> =>
+      readProjectedChunks(input.transcript_path, {
+        startByte,
+        maxChunkBytes: MAX_TRANSCRIPT_BYTES,
+        maxChunks: EXTRACT_MAX_CHUNKS_PER_RUN,
+      });
+
+    let read: ReadProjectedResult;
     try {
-      transcriptContent = readFileSync(input.transcript_path, 'utf-8');
+      read = await readWindow(cursor);
+
+      // Checkpoint invalidation: if the transcript was rewritten shorter
+      // (compaction/resume), a stale cursor points past EOF and extraction
+      // stays dead forever. Re-read from 0 — dedup absorbs any re-extraction.
+      //
+      // Guarded on cursor > 0: when the cursor is already 0 the window began at
+      // the start, so there is nothing to correct and a re-read would just
+      // repeat the same work. That matters for legacy checkpoints, whose
+      // transcript_length was recorded in characters and is not comparable with
+      // a byte size — they would otherwise trigger a redundant second read.
+      const shrank =
+        cursor > read.rawSize ||
+        (checkpoint?.transcript_length != null && checkpoint.transcript_length > read.rawSize);
+      if (shrank && cursor > 0) {
+        logInfo(
+          `Transcript shrank (cursor=${cursor}, stored_length=${checkpoint?.transcript_length ?? 'n/a'}, current_size=${read.rawSize}) — resetting cursor to 0`
+        );
+        cursor = 0;
+        read = await readWindow(0);
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logError(`Failed to read transcript: ${message}`);
@@ -168,24 +220,6 @@ export async function executeExtract(
         cursor_position: 0,
         error: `Failed to read transcript: ${message}`,
       };
-    }
-
-    // I/O: Get extraction checkpoint for resumable extraction (FR-004)
-    const checkpoint = getExtractionCheckpoint(projectDb, input.session_id);
-    let cursor = checkpoint?.cursor_position ?? 0;
-
-    // Checkpoint invalidation: if the transcript file was rewritten shorter
-    // (compaction/resume), a stale cursor points past EOF and extraction
-    // stays dead forever. Reset to 0 — dedup absorbs any re-extraction.
-    if (
-      cursor > transcriptContent.length ||
-      (checkpoint?.transcript_length != null &&
-        checkpoint.transcript_length > transcriptContent.length)
-    ) {
-      logInfo(
-        `Transcript shrank (cursor=${cursor}, stored_length=${checkpoint?.transcript_length ?? 'n/a'}, current_length=${transcriptContent.length}) — resetting cursor to 0`
-      );
-      cursor = 0;
     }
 
     // I/O: chunk-invariant context, fetched once per run
@@ -218,16 +252,27 @@ export async function executeExtract(
       error,
     });
 
+    // The reader consumed lines that projected to nothing (subagent details,
+    // file-history snapshots). That is durable progress: persist it, or every
+    // later run re-reads the same skipped bytes.
+    if (read.chunks.length === 0 && read.finalByte > cursor) {
+      saveExtractionCheckpoint(projectDb, {
+        session_id: input.session_id,
+        cursor_position: read.finalByte,
+        extracted_at: new Date().toISOString(),
+        transcript_length: read.rawSize,
+        projection_version: PROJECTION_VERSION,
+      });
+      cursor = read.finalByte;
+    }
+
     // FR-012: process 100KB chunks until the transcript is drained. The hook
     // fires once per session end, so a single chunk per run would leave most
     // of a long session unextracted. Capped to bound worst-case runtime.
-    for (
-      let chunkIndex = 0;
-      chunkIndex < EXTRACT_MAX_CHUNKS_PER_RUN && cursor < transcriptContent.length;
-      chunkIndex++
-    ) {
-      // Pure: Truncate transcript if >100KB (FR-012)
-      const { truncated, newCursor } = truncateTranscript(transcriptContent, 100_000, cursor);
+    for (let chunkIndex = 0; chunkIndex < read.chunks.length; chunkIndex++) {
+      const chunk = read.chunks[chunkIndex];
+      const truncated = chunk.text;
+      const newCursor = chunk.endByte;
 
       // A whitespace-only window still represents durable progress. Persist it
       // before continuing so a retry cannot reload the old cursor and stall on
@@ -237,7 +282,8 @@ export async function executeExtract(
           session_id: input.session_id,
           cursor_position: newCursor,
           extracted_at: new Date().toISOString(),
-          transcript_length: transcriptContent.length,
+          transcript_length: read.rawSize,
+          projection_version: PROJECTION_VERSION,
         });
         cursor = newCursor;
         continue;
@@ -278,7 +324,8 @@ export async function executeExtract(
           session_id: input.session_id,
           cursor_position: newCursor,
           extracted_at: new Date().toISOString(),
-          transcript_length: transcriptContent.length,
+          transcript_length: read.rawSize,
+          projection_version: PROJECTION_VERSION,
         });
         cursor = newCursor;
         continue;
@@ -466,15 +513,16 @@ export async function executeExtract(
         session_id: input.session_id,
         cursor_position: newCursor,
         extracted_at: new Date().toISOString(),
-        transcript_length: transcriptContent.length,
+        transcript_length: read.rawSize,
+        projection_version: PROJECTION_VERSION,
       });
       cursor = newCursor;
     }
 
-    if (cursor < transcriptContent.length) {
+    if (!read.reachedEnd) {
       return {
         kind: 'deferred',
-        reason: `Extraction chunk budget exhausted at cursor ${cursor} of ${transcriptContent.length}; retry required`,
+        reason: `Extraction chunk budget exhausted at cursor ${cursor} of ${read.rawSize}; retry required`,
         extracted_count: totalInserted,
         edge_count: edgeCount,
         cursor_position: cursor,

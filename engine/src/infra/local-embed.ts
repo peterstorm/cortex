@@ -1,18 +1,54 @@
 /**
- * Local embedding fallback using Hugging Face transformers.
+ * Local embedding via Hugging Face transformers.js, on CPU.
  *
- * Provides local embedding when Gemini unavailable.
- * Uses BGE-small-en-v1.5 model (384 dimensions, Float32Array).
+ * Model, dimensionality, and task prefixes all come from config
+ * (LOCAL_EMBED_MODEL, LOCAL_EMBEDDING_DIMENSIONS, LOCAL_EMBED_*_PREFIX) rather
+ * than being inlined here — the previous implementation hardcoded both the
+ * model id and a `!== 384` dimension check, which pinned the module to one
+ * model and would have thrown on every call after a swap.
+ *
+ * Retrieval is asymmetric: queries and documents must carry different
+ * prefixes to land in the same space. Callers pick a side via embedLocalQuery
+ * or embedLocalDocument; embedLocal defaults to the document side, which is
+ * what stored memories are.
  *
  * Requirements:
  * - FR-110: Support fallback to local embedding model
  * - NFR-014: Support keyword search when embedding API unavailable
  */
 
+import {
+  LOCAL_EMBED_MODEL,
+  LOCAL_EMBEDDING_DIMENSIONS,
+  LOCAL_EMBED_QUERY_PREFIX,
+  LOCAL_EMBED_DOCUMENT_PREFIX,
+} from '../config.js';
+
 // Functional Core: Pure types
 type ModelAvailabilityResult =
   | { ok: true }
   | { ok: false; error: string };
+
+/** The tensor shape transformers.js returns from a feature-extraction call. */
+interface FeatureExtractionOutput {
+  tolist(): number[][];
+}
+
+/**
+ * Structural type for the loaded pipeline — only what this module calls.
+ * Narrower than the library's exported type on purpose: it documents the exact
+ * contract relied on, so a breaking change upstream surfaces here rather than
+ * as an `any` that silently accepts anything.
+ *
+ * `dispose` belongs to that contract: disposeLocalModel() must release the ONNX
+ * native handles before process exit or Bun crashes during C++ teardown.
+ */
+type FeatureExtractionPipeline = ((
+  text: string,
+  options: { pooling: 'mean'; normalize: boolean }
+) => Promise<FeatureExtractionOutput>) & {
+  dispose(): Promise<void>;
+};
 
 // Dynamic import with error handling
 let transformersModule: typeof import('@huggingface/transformers') | null = null;
@@ -32,7 +68,7 @@ async function getTransformers() {
 }
 
 // Imperative Shell: Cached state
-let cachedPipeline: any | null = null;
+let cachedPipeline: FeatureExtractionPipeline | null = null;
 let modelAvailabilityCache: ModelAvailabilityResult | null = null;
 
 /**
@@ -46,16 +82,48 @@ async function loadModel(): Promise<ModelAvailabilityResult> {
 
   try {
     const { pipeline } = await getTransformers();
-    cachedPipeline = await pipeline(
-      'feature-extraction',
-      'Xenova/bge-small-en-v1.5',
-      { quantized: true }
-    );
+    // transformers.js overloads `pipeline()` across every task, so its return
+    // type is a union large enough that TypeScript gives up on it (TS2590)
+    // before it can be narrowed. Cast once, here, to the contract this module
+    // actually uses — every call site downstream stays fully checked against
+    // FeatureExtractionPipeline, which is where the type earns its keep.
+    cachedPipeline = (await pipeline('feature-extraction', LOCAL_EMBED_MODEL, {
+      dtype: 'q8',
+    })) as unknown as FeatureExtractionPipeline;
     return { ok: true };
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
-    return { ok: false, error: `Failed to load local embedding model: ${errorMsg}` };
+    return { ok: false, error: `Failed to load local embedding model: ${errorMsg}${remedyFor(errorMsg)}` };
   }
+}
+
+/**
+ * Map a known load failure to its one correct fix, appended at the point of
+ * failure.
+ *
+ * Callers degrade to Jaccard-only similarity when the model will not load, and
+ * that fallback is quiet by design — so a bare cause like
+ * "libstdc++.so.6: cannot open shared object file" surfaces once in a log line
+ * nobody reads, and local embeddings simply never work. Stating the fix where
+ * the failure happens is the difference between a silent degradation and an
+ * actionable one.
+ */
+function remedyFor(errorMsg: string): string {
+  if (errorMsg.includes('libstdc++')) {
+    return (
+      ' — onnxruntime-node needs libstdc++ at runtime, which is not on the default' +
+      ' library path on NixOS. Set LD_LIBRARY_PATH to a gcc lib output' +
+      ' (e.g. `nix-build \'<nixpkgs>\' -A stdenv.cc.cc.lib --no-out-link`/lib)' +
+      ' for the process that runs extraction.'
+    );
+  }
+  if (/ENOTFOUND|EAI_AGAIN|fetch failed|network/i.test(errorMsg)) {
+    return (
+      ` — the model is downloaded from Hugging Face on first use (${LOCAL_EMBED_MODEL}).` +
+      ' Run once with network access to populate the cache, or pre-seed it.'
+    );
+  }
+  return '';
 }
 
 /**
@@ -104,6 +172,30 @@ export async function ensureModelLoaded(): Promise<boolean> {
  * Throws if model unavailable or embedding fails.
  */
 export async function embedLocal(text: string): Promise<Float32Array> {
+  return embedWithPrefix(text, LOCAL_EMBED_DOCUMENT_PREFIX);
+}
+
+/**
+ * Embed a stored memory (the document side of retrieval).
+ * Explicit alias for embedLocal — prefer it at call sites so the asymmetry is
+ * visible in the code rather than implied by a default.
+ */
+export async function embedLocalDocument(text: string): Promise<Float32Array> {
+  return embedWithPrefix(text, LOCAL_EMBED_DOCUMENT_PREFIX);
+}
+
+/**
+ * Embed a search query (the query side of retrieval).
+ *
+ * Must be used for queries. Embedding a query with the document prefix places
+ * it in the wrong region of the space, and the only symptom is quietly worse
+ * recall — no error is raised anywhere.
+ */
+export async function embedLocalQuery(text: string): Promise<Float32Array> {
+  return embedWithPrefix(text, LOCAL_EMBED_QUERY_PREFIX);
+}
+
+async function embedWithPrefix(text: string, prefix: string): Promise<Float32Array> {
   // Validate input
   const trimmed = text.trim();
   if (trimmed === '') {
@@ -121,19 +213,22 @@ export async function embedLocal(text: string): Promise<Float32Array> {
   }
 
   try {
-    // Generate embeddings with BGE's recommended pooling + normalization
-    const output = await cachedPipeline(trimmed, {
+    // Mean pooling + L2 normalization, so cosine similarity is a dot product.
+    const output = await cachedPipeline(prefix + trimmed, {
       pooling: 'mean',
       normalize: true,
     });
 
     // Extract embedding (already pooled + normalized by pipeline)
-    const rawEmbedding = output.tolist() as number[][];
+    const rawEmbedding = output.tolist();
     const embedding = new Float32Array(rawEmbedding[0]);
 
-    // Validate dimensions
-    if (embedding.length !== 384) {
-      throw new Error(`Expected 384 dimensions, got ${embedding.length}`);
+    // Validate against the configured dimensionality, never a literal: a
+    // hardcoded number silently pins this module to one model.
+    if (embedding.length !== LOCAL_EMBEDDING_DIMENSIONS) {
+      throw new Error(
+        `Expected ${LOCAL_EMBEDDING_DIMENSIONS} dimensions from ${LOCAL_EMBED_MODEL}, got ${embedding.length}`
+      );
     }
 
     return embedding;
