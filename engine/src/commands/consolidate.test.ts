@@ -224,7 +224,9 @@ describe('findSimilarPairs - embedding type selection', () => {
       local_embedding: new Float32Array([1, 0, 0]),       // identical local vector
     });
 
-    const pairs = findSimilarPairs([memoryA, memoryB], 0.9);
+    // allowLocalCosine: true — local cosine is only a comparison space when the
+    // active model matches the one the thresholds were calibrated against.
+    const pairs = findSimilarPairs([memoryA, memoryB], 0.9, true);
     // Identical local vectors → cosine 1.0. Cross-type selection would have
     // hit a dimension mismatch and fallen back to Jaccard (~0, no pair).
     expect(pairs.length).toBe(1);
@@ -260,18 +262,28 @@ describe('findSimilarPairs - per-space default thresholds (calibration regressio
     createTestMemory({ ...contentB, local_embedding: new Float32Array([c, Math.sqrt(1 - c * c)]) }),
   ];
 
-  test('local-cosine 0.7 (same-domain-different-aspect band) is NOT flagged by default', () => {
+  test('local-cosine 0.7 (same-domain-different-aspect band) is NOT flagged when calibrated', () => {
     // Raw 384-dim BGE cosine runs hot: 0.6-0.75 is routine for unrelated
     // aspects of the same project. Under the old uniform 0.5 threshold this
     // produced O(n²) false "duplicate" pairs.
-    const pairs = findSimilarPairs(localPairAt(0.7));
+    const pairs = findSimilarPairs(localPairAt(0.7), undefined, true);
     expect(pairs.length).toBe(0);
   });
 
-  test('local-cosine 0.85 (true-duplicate band) IS flagged by default', () => {
-    const pairs = findSimilarPairs(localPairAt(0.85));
+  test('local-cosine 0.85 (true-duplicate band) IS flagged when calibrated', () => {
+    const pairs = findSimilarPairs(localPairAt(0.85), undefined, true);
     expect(pairs.length).toBe(1);
     expect(pairs[0].similarity).toBeCloseTo(0.85, 5);
+  });
+
+  test('local cosine is ignored entirely when the model is not calibrated', () => {
+    // These bands are a property of BGE-small-en-v1.5's distribution, not of
+    // "local embeddings" generally. Measured on EmbeddingGemma, wholly
+    // unrelated memory pairs reach cosine 0.899 — so under an uncalibrated
+    // model a 0.85 must carry no duplicate signal at all. The pair falls
+    // through to Jaccard, which scores these disjoint summaries near zero.
+    const pairs = findSimilarPairs(localPairAt(0.85), undefined, false);
+    expect(pairs.length).toBe(0);
   });
 
   test('Jaccard 0.55 is flagged by default (well-separated space keeps 0.5)', () => {
@@ -303,8 +315,8 @@ describe('findSimilarPairs - per-space default thresholds (calibration regressio
   });
 
   test('explicit threshold overrides the per-space defaults uniformly', () => {
-    expect(findSimilarPairs(localPairAt(0.7), 0.6).length).toBe(1);
-    expect(findSimilarPairs(localPairAt(0.7), 0.75).length).toBe(0);
+    expect(findSimilarPairs(localPairAt(0.7), 0.6, true).length).toBe(1);
+    expect(findSimilarPairs(localPairAt(0.7), 0.75, true).length).toBe(0);
   });
 
   test('dimension-mismatch fallback uses the jaccard threshold, not the cosine one', () => {

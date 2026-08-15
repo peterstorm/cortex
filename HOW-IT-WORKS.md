@@ -62,7 +62,7 @@ There's also an `entity-query` CLI command for entity-first temporal retrieval (
 When your session ends, the hook detaches a background worker (so nothing blocks the session) that runs the pipeline sequentially:
 
 1. **Read transcript** — the JSONL file Claude Code writes during the session
-2. **Resume from checkpoint** — extraction advances in 100KB chunks and picks up where it left off; an invocation processes at most five chunks, then the detached ingestion worker retries deferred or transiently failed extraction until it reaches EOF
+2. **Resume from checkpoint** — the transcript is first projected to what the model actually saw (message role/content plus compaction summaries; subagent `details`, tool-result siblings and file-history snapshots are dropped, ~96% of bytes on subagent-heavy sessions). Extraction then advances in 100KB chunks OF THAT PROJECTION, streaming from a stored raw byte offset so cost is proportional to new bytes, and picks up where it left off; an invocation processes at most five chunks, then the detached ingestion worker retries deferred or transiently failed extraction until it reaches EOF
 3. **Send to the LLM** — prefer the configured direct OpenAI-compatible endpoint with thinking disabled; fall back to `claude -p --model haiku`, or `pi -p --thinking off` under the pi agent
 4. **Parse response** — validate each memory/entity candidate (type, confidence, priority); an all-invalid non-empty candidate array is a retryable parse failure, while global-scoped memories go to the global DB
 5. **Store in DB** — insert memories, retain the chunk checkpoint on any memory/fact write failure, and compute similarity edges; entity-only or global-only responses get a deterministic project-local provenance memory so facts always have a valid source
@@ -78,7 +78,7 @@ The Claude Code hook logs to PID-scoped files under `/tmp` (`cortex-extract`, `c
 
 ## What Gets Extracted (The Extraction Prompt)
 
-The LLM receives your full session transcript (or 100KB chunk) along with git context (branch, recent commits, changed files). It's asked to extract memories in 8 categories:
+The LLM receives the projected session transcript (or a 100KB chunk of it) along with git context (branch, recent commits, changed files). It's asked to extract memories in 8 categories:
 
 | Type | What it captures | Example |
 |---|---|---|
@@ -152,7 +152,7 @@ When new memories are inserted, they're compared to all existing active memories
 
 ### Tier 1: Edge classification (at insertion time)
 
-Hybrid similarity per pair — cosine on local embeddings when both sides have one, Jaccard token overlap otherwise. Classification bands are calibrated PER SIMILARITY SPACE, because raw 384-dim local (BGE) cosine runs "hot": same-domain memories about different aspects routinely score 0.6-0.75, while Jaccard is much better separated:
+Hybrid similarity per pair — cosine on local embeddings when both sides have one, Jaccard token overlap otherwise. Classification bands are calibrated PER SIMILARITY SPACE, because raw local cosine on BGE-small-en-v1.5 runs "hot": same-domain memories about different aspects routinely score 0.6-0.75, while Jaccard is much better separated. The bands below belong to that model specifically — a different local model disables them rather than inheriting them (see `LOCAL_COSINE_CALIBRATED`):
 
 | Band | Jaccard score | Local cosine score | Action |
 |---|---|---|---|
@@ -165,7 +165,7 @@ Each new memory keeps at most its 3 strongest edges — a structural guard again
 
 ### Tier 2: Cosine Similarity on Embeddings (wired)
 
-`cosineSimilarity()` in `core/similarity.ts` is used throughout: `/recall` and the prompt-recall hook rank results by cosine similarity, and `/consolidate` detects duplicate pairs via hybrid similarity (Jaccard + cosine) with per-space thresholds — 0.5 for Jaccard and Gemini-768 cosine, 0.8 for raw local-BGE cosine.
+`cosineSimilarity()` in `core/similarity.ts` is used throughout: `/recall` and the prompt-recall hook rank results by cosine similarity, and `/consolidate` detects duplicate pairs via hybrid similarity (Jaccard + cosine) with per-space thresholds — 0.5 for Jaccard and Gemini-768 cosine, 0.8 for raw local cosine when the calibrated model is active (otherwise local cosine is excluded).
 
 ### Semantic Edge Classification
 
@@ -273,4 +273,4 @@ Memories are inserted without embeddings (to avoid blocking extraction). A backg
 
 Extraction, AI pruning, and edge classification prefer a configured direct OpenAI-compatible endpoint. The fallback is a headless coding-agent CLI: `claude -p --model haiku` by default (must be on PATH — it is when running inside Claude Code hooks), or `pi -p --thinking off` when running under the pi agent. The Pi fallback selects a provider-specific inexpensive extraction model when known and otherwise uses the configured provider/default model. No separate API key is needed for the CLI fallback.
 
-Without `GEMINI_API_KEY`, Gemini embeddings are skipped (the bundled local BGE model still embeds) and recall falls back accordingly. Extraction still works via the LLM CLI. Because hooks don't inherit your shell profile, they source the key from the `CORTEX_GEMINI_ENV` file.
+Without `GEMINI_API_KEY`, Gemini embeddings are skipped (the bundled local EmbeddingGemma model still embeds) and recall falls back accordingly. Extraction still works via the LLM CLI. Because hooks don't inherit your shell profile, they source the key from the `CORTEX_GEMINI_ENV` file.

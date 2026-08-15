@@ -220,6 +220,51 @@ export const LOCAL_EMBED_QUERY_PREFIX = 'task: search result | query: ';
 export const LOCAL_EMBED_DOCUMENT_PREFIX = 'title: none | text: ';
 
 /**
+ * The local model whose cosine space the thresholds further down were
+ * empirically calibrated against.
+ *
+ * Cosine thresholds are a property of a MODEL, not of "local embeddings" in
+ * general. Every band below (DEDUP_SIMILARITY_THRESHOLD, MERGE_CEILING_THRESHOLD,
+ * CONSOLIDATION_LOCAL_COSINE_THRESHOLD, INTRA_BATCH_DEDUP_THRESHOLD, and the
+ * 'local-cosine' bands in core/similarity.ts) was tuned on BGE-small-en-v1.5's
+ * distribution. Pointing LOCAL_EMBED_MODEL at a different model does not
+ * re-tune them, and nothing else in the system would notice.
+ */
+// Annotated `string` rather than left as a literal type: these two are
+// configuration knobs meant to be repointed, and as literals TypeScript
+// narrows the comparison below to "these can never be equal" (TS2367). That
+// happens to be true today — the gate is currently always closed — but it is a
+// fact about the current values, not about the type.
+export const LOCAL_COSINE_CALIBRATED_MODEL: string = 'Xenova/bge-small-en-v1.5';
+
+/**
+ * Whether the active local model's cosine space is the calibrated one.
+ *
+ * WHY THIS GATE EXISTS — measured 2026-08-15 over 1770 pairs drawn from 60 real
+ * memories, embedded with EmbeddingGemma-300M (768d):
+ *
+ *   min 0.491  p10 0.581  p50 0.646  p90 0.727  p99 0.823  max 0.899
+ *
+ * Under the BGE-tuned bands that distribution classifies 73.8% of ALL pairs as
+ * 'relate' and 1.2% as 'consolidate'. The highest-scoring pair scored cos=0.899
+ * with a Jaccard overlap of 0.063 — two memories about entirely different
+ * subjects, above MERGE_CEILING_THRESHOLD (0.85), where a new memory is
+ * silently DISCARDED as a true duplicate. The band from 0.75 to 0.85 merges new
+ * content into an unrelated memory instead.
+ *
+ * That is data loss with no error surfaced anywhere, so destructive paths
+ * (dedup skip/merge, consolidation) fail closed to Jaccard when this is false.
+ * Recall ranking is unaffected: it needs relative order, not absolute cutoffs,
+ * and the swapped model is better at that.
+ *
+ * Re-enabling requires re-deriving every threshold above against the new
+ * model's distribution — note that no cutoff separates the 0.899/0.063 pair, so
+ * recalibration alone may not be sufficient for the dedup use case.
+ */
+export const LOCAL_COSINE_CALIBRATED: boolean =
+  LOCAL_EMBED_MODEL === LOCAL_COSINE_CALIBRATED_MODEL;
+
+/**
  * Recency decay half-life in days for ranking formula.
  * At this age, a memory's recency multiplier = 0.5.
  * 0 days → ×1.0, 7 days → ×0.67, 14 days → ×0.5, 30 days → ×0.31
@@ -308,10 +353,15 @@ export const AI_PRUNE_MIN_AGE_DAYS = 3;
  * true duplicates. Remember treats a threshold hit as an existing duplicate
  * rather than appending content.
  *
- * CALIBRATION NOTE: For 384-dim local embeddings (BGE-small-en-v1.5),
- * same-domain memories about different aspects routinely score 0.6-0.75.
- * A threshold of 0.75 ensures only truly overlapping content triggers merge,
- * not merely related concepts within the same project domain.
+ * CALIBRATION NOTE: tuned against BGE-small-en-v1.5, where same-domain
+ * memories about different aspects routinely score 0.6-0.75. A threshold of
+ * 0.75 ensures only truly overlapping content triggers merge, not merely
+ * related concepts within the same project domain.
+ *
+ * This number is bound to THAT model, and applying it to another local model's
+ * cosine is a data-loss bug rather than an approximation — see
+ * LOCAL_COSINE_CALIBRATED, which is why cosine reaches this threshold only when
+ * the active model is the calibrated one.
  */
 export const DEDUP_SIMILARITY_THRESHOLD = 0.75;
 
@@ -369,8 +419,11 @@ export const MAX_EDGES_PER_MEMORY = 3;
  * are merged into the existing memory rather than skipped.
  * Candidates with score >= MERGE_CEILING_THRESHOLD are true duplicates and skipped.
  *
- * CALIBRATION NOTE: For 384-dim local embeddings, true content duplicates
- * score 0.85+. Same-topic-different-detail pairs score 0.75-0.85.
+ * CALIBRATION NOTE: tuned against BGE-small-en-v1.5, where true content
+ * duplicates score 0.85+ and same-topic-different-detail pairs score 0.75-0.85.
+ * Bound to that model — under EmbeddingGemma, measured pairs with no shared
+ * content reached 0.899, i.e. above this ceiling, where the new memory is
+ * DISCARDED. See LOCAL_COSINE_CALIBRATED.
  */
 export const MERGE_CEILING_THRESHOLD = 0.85;
 

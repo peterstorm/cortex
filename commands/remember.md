@@ -58,7 +58,7 @@ bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts generate <cwd>
 
 ### Store global knowledge
 ```
-/remember "Gemini embeddings are 768d, local BGE embeddings are 384d - never compare across models" --type=gotcha --scope=global --priority=10 --pinned
+/remember "Embedding vectors are only comparable within one model - never compare across models or across providers" --type=gotcha --scope=global --priority=10 --pinned
 ```
 
 ## Memory Types

@@ -23,7 +23,7 @@ import {
 import { tokenize, hybridSimilarityScored } from '../core/similarity.js';
 import { createMemory, serializeSourceContext } from '../core/types.js';
 import type { SimilaritySpace } from '../core/types.js';
-import { consolidationThresholdFor } from '../config.js';
+import { consolidationThresholdFor, LOCAL_COSINE_CALIBRATED } from '../config.js';
 import { invalidateSurfaceCache } from './generate.js';
 
 // ============================================================================
@@ -55,11 +55,17 @@ export interface MemoryPair {
  *
  * @param memories - Active memories to compare
  * @param threshold - Optional uniform threshold override (default: per-space)
+ * @param allowLocalCosine - Whether local-cosine may be used as a comparison
+ *   space. Defaults to LOCAL_COSINE_CALIBRATED, i.e. false whenever the active
+ *   local model is not the one the thresholds were tuned against. Exposed as a
+ *   parameter so the calibrated behaviour stays under test regardless of which
+ *   model is configured.
  * @returns Array of similar pairs sorted by similarity (descending)
  */
 export function findSimilarPairs(
   memories: readonly Memory[],
-  threshold?: number
+  threshold?: number,
+  allowLocalCosine: boolean = LOCAL_COSINE_CALIBRATED
 ): readonly MemoryPair[] {
   const pairs: MemoryPair[] = [];
 
@@ -81,7 +87,12 @@ export function findSimilarPairs(
     if (a.embedding && b.embedding) {
       return { embA: a.embedding, embB: b.embedding, cosineSpace: 'gemini-cosine' };
     }
-    if (a.local_embedding && b.local_embedding) {
+    // Local cosine only participates when the active model is the one the
+    // consolidation threshold was calibrated against. Consolidation MERGES
+    // memories, and an uncalibrated space scores unrelated pairs above the
+    // cutoff — see LOCAL_COSINE_CALIBRATED. Falling through to Jaccard is the
+    // fail-closed choice: it under-merges rather than destroying content.
+    if (allowLocalCosine && a.local_embedding && b.local_embedding) {
       return { embA: a.local_embedding, embB: b.local_embedding, cosineSpace: 'local-cosine' };
     }
     return { embA: null, embB: null, cosineSpace: 'jaccard' };

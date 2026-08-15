@@ -46,6 +46,7 @@ import {
   getProjectName,
   DEFAULT_SEARCH_LIMIT,
   GITIGNORE_PATTERNS,
+  LOCAL_COSINE_CALIBRATED,
 } from './config.js';
 import { openDatabase, openDatabaseReadOnly, getActiveMemories, getMemoriesByIds } from './infra/db.js';
 import { ensureGitignored, writeSurface } from './infra/filesystem.js';
@@ -470,7 +471,14 @@ async function handleRemember(args: string[]): Promise<CommandResult> {
       'manual-session', // Session ID for manual memories
       projectDb,
       globalDb,
-      { embedFn: embedLocal, projectName: getProjectName(cwd), cwd }
+      {
+        // Cosine dedup only when the active local model is the one the
+        // thresholds were calibrated against; otherwise a threshold hit would
+        // drop a genuinely new memory as a duplicate. See LOCAL_COSINE_CALIBRATED.
+        embedFn: LOCAL_COSINE_CALIBRATED ? embedLocal : null,
+        projectName: getProjectName(cwd),
+        cwd,
+      }
     );
 
     return {

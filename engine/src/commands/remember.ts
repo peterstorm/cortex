@@ -346,6 +346,12 @@ export async function executeRemember(
 
   // Embed the candidate for cosine dedup (catches paraphrased duplicates).
   // Degrades to Jaccard-only if the embedder is unavailable or fails.
+  //
+  // Whether cosine dedup is safe at all is a deployment decision, so it is made
+  // at the composition root (cli.ts), which supplies embedFn only when the
+  // active local model matches the calibrated one. A threshold hit here DROPS
+  // the new memory as an existing duplicate, and an uncalibrated space produces
+  // those hits on unrelated content — see LOCAL_COSINE_CALIBRATED.
   let candidateEmbedding: Float64Array | Float32Array | null = null;
   const embedFn = options.embedFn ?? null;
   if (embedFn !== null) {

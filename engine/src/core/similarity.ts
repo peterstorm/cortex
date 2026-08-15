@@ -152,8 +152,11 @@ export function jaccardSimilarity(tokensA: ReadonlySet<string>, tokensB: Readonl
  * - 0.4-0.5: suggest (create suggested edge for review)
  * - > 0.5: consolidate (flag for merge)
  *
- * Local-cosine bands (384-dim BGE, runs hot — consistent with the 0.75
- * dedup threshold and 0.85 merge ceiling in config.ts):
+ * Local-cosine bands (BGE-small-en-v1.5 specifically, which runs hot —
+ * consistent with the 0.75 dedup threshold and 0.85 merge ceiling in
+ * config.ts). These numbers are a property of THAT model's distribution, not
+ * of local embeddings in general; LOCAL_COSINE_CALIBRATED keeps a different
+ * local model out of the destructive paths that use them:
  * - < 0.6: ignore (same-domain background similarity)
  * - 0.6-0.75: relate
  * - 0.75-0.82: suggest
@@ -216,8 +219,8 @@ export function jaccardPreFilter(score: number): JaccardPreFilter {
 /**
  * Result of a hybrid similarity computation, tagged with the method that
  * actually produced the score. Callers that know WHICH embedding space fed
- * the cosine (local 384-dim vs Gemini 768-dim) combine `method` with that
- * knowledge to pick calibrated thresholds/bands.
+ * the cosine (local vs Gemini) combine `method` with that knowledge to pick
+ * calibrated thresholds/bands.
  */
 export type HybridSimilarityResult = {
   readonly score: number;

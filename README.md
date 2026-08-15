@@ -39,7 +39,7 @@ Seven slash commands let you interact with memory directly: `/remember`, `/recal
 
 A `SessionEnd` hook detaches a background worker (so nothing blocks the session) that runs the pipeline sequentially:
 
-1. **Extract** — Read the session transcript (JSONL) in resumable 100KB chunks, add git context (branch, commits, changed files), and use the configured direct OpenAI-compatible endpoint with thinking disabled, falling back to a headless coding-agent CLI when no direct endpoint is available; each invocation is bounded to five chunks, and the detached ingestion worker retries deferred or transiently failed extraction until the cursor reaches EOF before backfill; global-scoped candidates are routed to the global DB, while entity-only/global-only responses receive a project-local provenance memory so extracted facts are retained
+1. **Extract** — Stream the session transcript (JSONL), project it to what the model actually saw (dropping subagent `details`, tool-result siblings and snapshots — ~96% of bytes on subagent-heavy sessions) and read it in resumable 100KB chunks of that projection, add git context (branch, commits, changed files), and use the configured direct OpenAI-compatible endpoint with thinking disabled, falling back to a headless coding-agent CLI when no direct endpoint is available; each invocation is bounded to five chunks, and the detached ingestion worker retries deferred or transiently failed extraction until the cursor reaches EOF before backfill; global-scoped candidates are routed to the global DB, while entity-only/global-only responses receive a project-local provenance memory so extracted facts are retained
 2. **Backfill** — Compute embeddings for newly extracted memories (Gemini API, or local HuggingFace fallback)
 3. **Semantic Edges** — Classify similarity-created `relates_to` edges into typed relationships
 4. **Lifecycle** — Decay confidence, archive stale memories, prune old ones
@@ -151,7 +151,7 @@ Cortex follows a **Functional Core / Imperative Shell** design:
 │  Pure functions. No I/O. No side effects. Testable.   │
 │                                                       │
 │  types.ts       Domain types + validation             │
-│  extraction.ts  Transcript truncation, prompt/parse   │
+│  extraction.ts  Extraction prompt build/parse         │
 │  similarity.ts  Jaccard, cosine, classification       │
 │  graph.ts       BFS traversal, centrality             │
 │  ranking.ts     Composite rank, budget selection      │
@@ -200,7 +200,7 @@ During extraction, candidates the LLM classifies as scope `"global"` are routed 
 | OpenAI-compatible LLM endpoint | Preferred transport for memory extraction, AI pruning, and edge classification; configure `CORTEX_LLM_API_URL`, `CORTEX_LLM_API_KEY`, and `CORTEX_LLM_MODEL`, or a compatible Pi provider | No (falls back to a headless CLI) |
 | Headless agent CLI (`claude -p --model haiku`, or `pi -p` under the Pi agent) | Fallback transport when no direct OpenAI-compatible endpoint is configured | No (required only when the direct endpoint is unavailable; override with `CORTEX_LLM_BINARY`/`CORTEX_LLM_MODEL`) |
 | Gemini Embedding-001 | Semantic embeddings (768-dim) — the only thing `GEMINI_API_KEY` is used for | No (falls back to local) |
-| HuggingFace Transformers | Local embedding fallback (BGE-small-en-v1.5, 384-dim) | Bundled |
+| HuggingFace Transformers | Local embedding (EmbeddingGemma-300M ONNX, 768-dim) | Bundled |
 
 ## Memory Model
 
@@ -230,7 +230,7 @@ Each memory carries:
 - **Tags** — keyword array for searchability
 - **Pinned** — exempt from decay when true
 - **Status** — `active` → `archived` → `pruned`
-- **Embeddings** — Gemini (768-dim Float64) and/or local (384-dim Float32)
+- **Embeddings** — Gemini (768-dim Float64) and/or local (768-dim Float32)
 - **Source context** — session ID, git branch, commits, changed files
 
 ## Ranking & Surface Generation
@@ -306,7 +306,7 @@ Memories are connected through typed edges, forming a knowledge graph.
 
 **Tier 1: Edge classification** (at insertion time)
 
-Hybrid similarity — cosine on local embeddings when both sides have one, Jaccard token overlap otherwise — with bands calibrated per similarity space. Raw 384-dim local cosine runs "hot" (same-domain memories about different aspects routinely score 0.6-0.75), so it uses higher cutoffs:
+Hybrid similarity — cosine on local embeddings when both sides have one, Jaccard token overlap otherwise — with bands calibrated per similarity space. Raw local cosine on BGE-small-en-v1.5 runs "hot" (same-domain memories about different aspects routinely score 0.6-0.75), so it uses higher cutoffs. These bands belong to that specific model; when a different local model is active they are disabled rather than reused (see `LOCAL_COSINE_CALIBRATED`):
 
 | Band | Jaccard score | Local cosine score | Action |
 |---|---|---|---|
@@ -319,7 +319,7 @@ Each new memory keeps at most its 3 strongest edges (structural guard against ed
 
 **Tier 2: Cosine Similarity** (embeddings)
 
-Used by `/recall` for search ranking and by `/consolidate` for duplicate detection. Consolidation thresholds are per-space: Jaccard and Gemini-768 cosine flag pairs above 0.5; raw local-BGE cosine flags pairs above 0.8.
+Used by `/recall` for search ranking and by `/consolidate` for duplicate detection. Consolidation thresholds are per-space: Jaccard and Gemini-768 cosine flag pairs above 0.5; raw local cosine flags pairs above 0.8 — but only when the active local model is the calibrated one, otherwise local cosine is excluded from consolidation entirely.
 
 ### Consolidation
 
@@ -348,7 +348,7 @@ Memories are inserted **without** embeddings to avoid blocking extraction. A bac
 | Model | Dimensions | Storage Column | When |
 |---|---|---|---|
 | Gemini Embedding-001 | 768 (Float64) | `embedding` | When `GEMINI_API_KEY` available |
-| BGE-small-en-v1.5 (local) | 384 (Float32) | `local_embedding` | Fallback when no API key |
+| EmbeddingGemma-300M (local) | 768 (Float32) | `local_embedding` | Local path; cosine dedup gated on calibration |
 
 Embedding text format: `[memory_type] [project:name] summary` — enables type-aware and project-aware similarity.
 
@@ -408,7 +408,7 @@ Extraction, AI pruning, and edge classification prefer a **direct OpenAI-compati
 
 | Constant | Value | Purpose |
 |---|---|---|
-| `MAX_TRANSCRIPT_BYTES` | 100 KB | Trigger resumable extraction |
+| `MAX_TRANSCRIPT_BYTES` | 100 KB | Chunk size of PROJECTED transcript per extraction step |
 | LLM call timeout | 90s | Extraction / edge-classification time budget |
 | `SURFACE_STALE_HOURS` | 24h | Cache expiry |
 | `RECENCY_HALF_LIFE_DAYS` | 14 | Ranking decay half-life |

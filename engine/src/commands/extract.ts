@@ -74,6 +74,9 @@ import {
   EXTRACT_MAX_CHUNKS_PER_RUN,
   MAX_EDGES_PER_MEMORY,
   MAX_TRANSCRIPT_BYTES,
+  LOCAL_COSINE_CALIBRATED,
+  LOCAL_COSINE_CALIBRATED_MODEL,
+  LOCAL_EMBED_MODEL,
   getLockDir,
 } from '../config.js';
 
@@ -889,7 +892,10 @@ export function computeEdgeCandidates(
     const { score, method } = hybridSimilarityScored(
       newTokens, existingTokens, newEmbedding, existingEmbedding
     );
-    // Cosine here always means the local 384-dim space (see above)
+    // Cosine here always means the local space (see above). It is only ever
+    // reached when generateCandidateEmbeddings supplied vectors, which it
+    // declines to do unless LOCAL_COSINE_CALIBRATED — so 'local-cosine' bands
+    // are never applied to a model they were not calibrated for.
     const action = classifySimilarity(score, method === 'cosine' ? 'local-cosine' : 'jaccard');
 
     if (action.action === 'ignore') continue;
@@ -964,9 +970,25 @@ export function computeSimilarityAndCreateEdges(
  */
 async function generateCandidateEmbeddings(
   candidates: readonly MemoryCandidate[],
-  projectName: string
+  projectName: string,
+  allowLocalCosine: boolean = LOCAL_COSINE_CALIBRATED
 ): Promise<Map<number, Float32Array>> {
   const embeddings = new Map<number, Float32Array>();
+
+  // Fail closed when the active local model is not the one the dedup thresholds
+  // were calibrated against. An empty map routes every comparison through
+  // Jaccard, which is the already-tested degraded path. Supplying vectors from
+  // an uncalibrated space would let MERGE_CEILING_THRESHOLD discard genuinely
+  // new memories as duplicates — see LOCAL_COSINE_CALIBRATED for the data.
+  //
+  // Checked before attempting a load: the model costs seconds and ~1.6 GB to
+  // bring up, and none of it would be used.
+  if (!allowLocalCosine) {
+    logInfo(
+      `Local cosine dedup disabled: ${LOCAL_EMBED_MODEL} is not the calibrated model (${LOCAL_COSINE_CALIBRATED_MODEL}) — using Jaccard-only dedup`
+    );
+    return embeddings;
+  }
 
   try {
     const modelReady = await ensureModelLoaded();

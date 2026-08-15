@@ -893,7 +893,13 @@ describe('executeExtract (mocked LLM)', () => {
     secondDb.close();
   });
 
-  it('includes the model-load error when falling back to Jaccard dedup', async () => {
+  it('does not even attempt a model load while local cosine is uncalibrated', async () => {
+    // Cosine dedup is gated on the active local model matching the one the
+    // thresholds were calibrated against (LOCAL_COSINE_CALIBRATED). While it
+    // does not, extraction must fall through to Jaccard WITHOUT paying for a
+    // model load — bringing the embedder up costs seconds and ~1.6 GB, and
+    // none of it would be used. The load-error surfacing this test used to
+    // cover is unreachable until the gate opens.
     const transcript = '{"role":"user","content":"a durable decision"}\n';
     const { cwd, transcriptPath } = makeTestProject(transcript);
     const db = openDatabase(':memory:');
@@ -906,7 +912,11 @@ describe('executeExtract (mocked LLM)', () => {
         { session_id: 's-model-fallback', transcript_path: transcriptPath, cwd }, db
       );
       expect(result.kind).toBe('succeeded');
+      expect(mockEnsureModelLoaded).not.toHaveBeenCalled();
       expect(stderr).toHaveBeenCalledWith(
+        expect.stringContaining('Local cosine dedup disabled'),
+      );
+      expect(stderr).not.toHaveBeenCalledWith(
         expect.stringContaining('ONNX initialization failed'),
       );
     } finally {
