@@ -1236,9 +1236,9 @@ export function markEdgeClassified(
  * Record a FAILED semantic-classification attempt for an edge: the failure
  * timestamp plus the endpoint content hash at failure time, so candidate
  * selection can apply the failure backoff (skip while the content is
- * unchanged and the failure is recent; re-ask immediately when the content
- * changed, since that is new information). Never sets classified_at — a
- * failure must not make the edge look answered.
+ * unchanged and the failure is recent; re-ask once the backoff elapses, and
+ * immediately when the content changed, since that is new information).
+ * Never sets classified_at — a failure must not make the edge look answered.
  */
 export function markEdgeFailed(
   db: Database,

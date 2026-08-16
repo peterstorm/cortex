@@ -14,7 +14,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as nodePath from 'node:path';
 import { createMemory } from '../core/types.js';
-import { openDatabase, insertMemory, insertEdge, getAllEdges } from '../infra/db.js';
+import { openDatabase, insertMemory, insertEdge, getAllEdges, updateMemory } from '../infra/db.js';
 import { acquireLock } from '../infra/lock.js';
 import { executeSemanticEdges, pairContentHash } from './semantic-edges.js';
 
@@ -278,6 +278,49 @@ describe('executeSemanticEdges', () => {
 
     expect(result).toEqual({ ok: true, classified: 0, failed: 0 });
     expect(mockClassifyEdges).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-asks a declined edge after its content-change re-classification failure backoff elapses', async () => {
+    seedMemory('a');
+    seedMemory('b');
+    insertEdge(db, { source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active' });
+
+    // Run 1: the classifier declines (answers relates_to) — the edge stays
+    // relates_to with classified_at + classify_hash set.
+    mockClassifyEdges.mockResolvedValue({
+      kind: 'ok',
+      classifications: [{ source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5 }],
+    });
+    const first = await executeSemanticEdges(db, { limit: 0, lockDir });
+    expect(first).toEqual({ ok: true, classified: 0, failed: 0 });
+
+    // Content changed, so re-classification is due — and the attempt fails.
+    updateMemory(db, 'a', { content: 'changed content a' });
+    mockClassifyEdges.mockRejectedValue(new Error('LLM API returned empty content'));
+    const second = await executeSemanticEdges(db, { limit: 0, lockDir });
+    expect(second).toEqual({ ok: true, classified: 0, failed: 1 });
+
+    // Inside the backoff window the failed re-classification is not
+    // re-asked (no re-hammering of the unhealthy server)...
+    mockClassifyEdges.mockClear();
+    const third = await executeSemanticEdges(db, { limit: 0, lockDir });
+    expect(third).toEqual({ ok: true, classified: 0, failed: 0 });
+    expect(mockClassifyEdges).not.toHaveBeenCalled();
+
+    // ...but a failure is never a decline: once the backoff elapses the
+    // re-classification must be retried (regression: the failure used to
+    // stamp the current content hash and retire the edge forever).
+    db.prepare('UPDATE edges SET last_failed_at = ?')
+      .run(new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString());
+    mockClassifyEdges.mockResolvedValue({
+      kind: 'ok',
+      classifications: [{ source_id: 'a', target_id: 'b', relation_type: 'refines', strength: 0.8 }],
+    });
+    const fourth = await executeSemanticEdges(db, { limit: 0, lockDir });
+    expect(fourth).toEqual({ ok: true, classified: 1, failed: 0 });
+    const typed = getAllEdges(db).find((edge) => edge.relation_type === 'refines')!;
+    // A successful answer clears the failure record.
+    expect(typed.last_failed_at).toBeNull();
   });
 
   it('rejects duplicate unindexed answers as a corrupt batch', async () => {

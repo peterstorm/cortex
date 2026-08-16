@@ -118,13 +118,16 @@ export function pairContentHash(
 /**
  * Build the classification candidate pairs.
  *
- * An edge qualifies when it has never been attempted (classified_at IS NULL)
- * or its endpoint content changed since the last attempt (classify_hash no
- * longer matches). On top of that, a FAILED attempt carries a backoff: an
- * edge whose last failure is younger than backoffMs and whose content is
- * unchanged since the failure is skipped, so an unhealthy server is not
- * re-hammered with the same failed batch on every maintenance run. A content
- * change resets the backoff (new information is worth one more try).
+ * An edge qualifies when it has never been attempted, its endpoint content
+ * changed since the last recorded attempt (classify_hash no longer matches),
+ * or its last attempt FAILED and the backoff has since elapsed with the
+ * content unchanged. A FAILED attempt carries a backoff while the content is
+ * unchanged, so an unhealthy server is not re-hammered with the same failed
+ * batch on every maintenance run — but it never retires the edge the way a
+ * decline does: once the backoff elapses the attempt is re-asked (for
+ * answered edges this covers a failed re-classification after a content
+ * change), and a content change resets the backoff immediately (new
+ * information is worth one more try).
  * Pure function.
  */
 export function selectClassificationCandidates(
@@ -138,9 +141,13 @@ export function selectClassificationCandidates(
   for (const { edge, source, target } of rows) {
     if (candidates.length >= limit && limit > 0) break;
     const hash = pairContentHash(source, target);
-    if (edge.classified_at !== null) {
-      if (hash === edge.classify_hash) continue;
-    } else if (edge.last_failed_at !== null && hash === edge.classify_hash) {
+    if (hash === edge.classify_hash) {
+      // Content unchanged since the edge's last recorded attempt. No failure
+      // on record means the edge was ANSWERED at this content — skip it.
+      if (edge.last_failed_at === null) continue;
+      // A failed attempt at this content (a success would have cleared
+      // last_failed_at) must not retire the edge the way a decline does:
+      // honor the backoff, then re-ask.
       const lastFailedMs = Date.parse(edge.last_failed_at);
       if (!Number.isNaN(lastFailedMs) && now.getTime() - lastFailedMs < backoffMs) continue;
     }
