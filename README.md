@@ -48,7 +48,7 @@ A `SessionEnd` hook detaches a background worker (so nothing blocks the session)
 
 Steps 3-6 run through one per-project-locked `maintenance` command. Simultaneous session shutdowns therefore cannot multiply expensive LLM workers, and a separate AI-prune lock protects manual invocations. Claude Code's detached hook worker writes PID-scoped extraction, backfill, and maintenance logs under `/tmp`.
 
-The Pi extension launches extract → backfill → maintenance as one detached `ingest-session` worker. Its `session_shutdown` handler returns immediately, so `/new` and `/q` do not wait for transcript ingestion.
+The Pi extension launches extract → backfill → maintenance as one detached `ingest-session` worker. Its `session_shutdown` handler returns immediately, so `/new` and `/q` do not wait for transcript ingestion. Ephemeral sessions — subagent spawns run `pi -p --no-session` — have no persisted transcript, so their shutdown spawns **nothing** (no extraction, no maintenance): nothing new entered the store, and running ai-prune/semantic-edges would only spend LLM budget competing with the live agents that spawned the session. The spawning session's own ingestion pipeline maintains the store, and manual `bun engine/src/cli.ts maintenance <cwd>` remains available for catch-up.
 
 Nested extraction LLMs inherit `CORTEX_EXTRACTING=1`; both Pi and Claude Code shutdown handlers treat that marker as a terminal no-op. This invariant prevents a headless extraction process from recursively spawning another maintenance pipeline. All hooks remain non-blocking and never fail the parent session.
 
@@ -189,7 +189,7 @@ During extraction, candidates the LLM classifies as scope `"global"` are routed 
 | Service | Purpose | Required |
 |---|---|---|
 | OpenAI-compatible LLM endpoint | Preferred transport for memory extraction, AI pruning, and edge classification; configure `CORTEX_LLM_API_URL`, `CORTEX_LLM_API_KEY`, and `CORTEX_LLM_MODEL`, or a compatible Pi provider | No (falls back to a headless CLI) |
-| Headless agent CLI (`claude -p --model haiku`, or `pi -p` under the Pi agent) | Fallback transport when no direct OpenAI-compatible endpoint is configured | No (required only when the direct endpoint is unavailable; override with `CORTEX_LLM_BINARY`/`CORTEX_LLM_MODEL`) |
+| Headless agent CLI (`claude -p --model haiku`, or `pi -p` under the Pi agent) | Fallback transport when no direct OpenAI-compatible endpoint is configured, or a single direct call fails | No (required only when the direct endpoint is unavailable; override with `CORTEX_LLM_BINARY`/`CORTEX_LLM_MODEL`. After 3 consecutive direct failures the fallback is suppressed — the server is saturated and escalation would only add load — and the work is deferred to the next run; tune with `CORTEX_LLM_MAX_DIRECT_FAILURES`) |
 | HuggingFace Transformers | Local embedding (EmbeddingGemma-300M ONNX, 768-dim) | Bundled |
 
 ## Memory Model
@@ -388,9 +388,11 @@ The LLM evaluates active memories in batches and archives low-value ones. Trigge
 | `CORTEX_LLM_API_KEY` | API key for the explicit OpenAI-compatible LLM endpoint | Required with `CORTEX_LLM_API_URL` |
 | `CORTEX_LLM_BINARY` | Force the headless LLM binary (`claude` or `pi`) | No (auto-detected) |
 | `CORTEX_LLM_MODEL` | Model for explicit direct endpoint configuration, or override passed to the fallback LLM binary | Required with explicit direct endpoint config; otherwise no (`haiku` for claude; none for pi) |
+| `CORTEX_LLM_MAX_DIRECT_FAILURES` | Consecutive direct-endpoint failures after which the headless-CLI fallback is suppressed (work is deferred instead of escalating load on a saturated server) | No (default 3) |
+| `CORTEX_LLM_MAX_CONCURRENCY` | Max in-flight LLM calls per engine process (extraction, edge classification, AI prune, and any subprocess fallback share the pool) so background work stays a bounded share of a server live agents rely on | No (default 2; 1 is most conservative) |
 | `CLAUDE_PLUGIN_ROOT` | Plugin directory | Auto-set by Claude Code |
 
-Extraction, AI pruning, and edge classification prefer a **direct OpenAI-compatible endpoint** when one is configured: `CORTEX_LLM_API_URL`, `CORTEX_LLM_API_KEY`, and `CORTEX_LLM_MODEL` (or the pi provider config in `~/.pi/agent/models.json` — the active provider's `baseUrl`/`apiKey`/first model). Calls disable model thinking and use schema-guided JSON output where supported. Without a configured endpoint they fall back to a headless coding-agent CLI: `claude -p --model haiku` by default, or `pi -p --thinking off` when running under the pi agent.
+Extraction, AI pruning, and edge classification prefer a **direct OpenAI-compatible endpoint** when one is configured: `CORTEX_LLM_API_URL`, `CORTEX_LLM_API_KEY`, and `CORTEX_LLM_MODEL` (or the pi provider config in `~/.pi/agent/models.json` — the active provider's `baseUrl`/`apiKey`/first model). Calls disable model thinking and use schema-guided JSON output where supported. Without a configured endpoint they fall back to a headless coding-agent CLI: `claude -p --model haiku` by default, or `pi -p --thinking off` when running under the pi agent. A single direct-call failure still falls back, but once failures reach the saturation threshold (default 3, `CORTEX_LLM_MAX_DIRECT_FAILURES`) the fallback is suppressed and the call throws: a saturated local server (empty content, timeouts) would only get worse from full agent-loop subprocesses, so the caller defers the work (unmarked edges, un-advanced checkpoints) and retries on the next run. All LLM calls also draw from a per-process concurrency pool (default 2, `CORTEX_LLM_MAX_CONCURRENCY`), so background work cannot flood a shared server — even when the server merely queues rather than errors.
 
 ### Key Constants
 
