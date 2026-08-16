@@ -243,16 +243,6 @@ export async function runLlmPrompt(prompt: string, timeoutMs: number): Promise<s
   return stdout;
 }
 
-/**
- * Run a prompt through the LLM, preferring the direct OpenAI-compatible
- * endpoint (thinking disabled — ~30x faster on reasoning models) and
- * falling back to the CLI subprocess path when no endpoint is configured
- * or the direct call fails.
- *
- * The `direct` flag tells the caller which transport produced the text:
- * strict parsing is only safe for the direct endpoint's guided decoding;
- * subprocess output is not schema-guided and needs the tolerant parser.
- */
 /** Transport used by the classification call; injectable so tests can drive
  * the strict/tolerant routing without shelling out. */
 export type LlmPromptTransport = (
@@ -286,12 +276,19 @@ export function resetLlmConcurrencyForTests(): void {
  * straggler on a shared server, so the default is small; 1 is the most
  * conservative setting, values below 1 are rejected and fall back to 2.
  */
+/**
+ * Shared env-int parser for the LLM guardrail knobs: a positive integer
+ * wins; absent, non-integer, or below 1 falls back to the default.
+ */
+function envPositiveInt(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const raw = env[name];
+  if (raw === undefined) return fallback;
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed >= 1 ? parsed : fallback;
+}
+
 function maxConcurrentLlmCalls(env: NodeJS.ProcessEnv): number {
-  const parsed = env.CORTEX_LLM_MAX_CONCURRENCY === undefined
-    ? undefined
-    : Number(env.CORTEX_LLM_MAX_CONCURRENCY);
-  if (parsed !== undefined && Number.isInteger(parsed) && parsed >= 1) return parsed;
-  return 2;
+  return envPositiveInt(env, 'CORTEX_LLM_MAX_CONCURRENCY', 2);
 }
 
 async function acquireLlmSlot(): Promise<void> {
@@ -324,11 +321,7 @@ export function resetConsecutiveDirectFailuresForTests(): void {
  * misconfigured and escalation would amplify the outage.
  */
 function getDirectFailureFallbackThreshold(env: NodeJS.ProcessEnv): number {
-  const parsed = env.CORTEX_LLM_MAX_DIRECT_FAILURES === undefined
-    ? undefined
-    : Number(env.CORTEX_LLM_MAX_DIRECT_FAILURES);
-  if (parsed !== undefined && Number.isInteger(parsed) && parsed >= 1) return parsed;
-  return 3;
+  return envPositiveInt(env, 'CORTEX_LLM_MAX_DIRECT_FAILURES', 3);
 }
 
 export async function runLlmPromptDirect(
@@ -347,6 +340,16 @@ export async function runLlmPromptDirect(
   }
 }
 
+/**
+ * Run a prompt through the LLM, preferring the direct OpenAI-compatible
+ * endpoint (thinking disabled — ~30x faster on reasoning models) and
+ * falling back to the CLI subprocess path when no endpoint is configured
+ * or the direct call fails.
+ *
+ * The `direct` flag tells the caller which transport produced the text:
+ * strict parsing is only safe for the direct endpoint's guided decoding;
+ * subprocess output is not schema-guided and needs the tolerant parser.
+ */
 async function runLlmPromptDirectUnbounded(
   prompt: string,
   timeoutMs: number,

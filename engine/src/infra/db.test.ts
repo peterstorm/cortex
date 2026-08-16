@@ -1351,7 +1351,7 @@ describe('Database Layer', () => {
       });
 
       // Both unclassified → both classifiable
-      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 0).map(c => c.edgeId).sort())
+      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 0, new Date()).map(c => c.edgeId).sort())
         .toEqual([e1, e2].sort());
 
       // Attempt with unchanged content → no longer classifiable
@@ -1359,7 +1359,7 @@ describe('Database Layer', () => {
       const e1Row = rows.find(r => r.edge.id === e1)!;
       const e1Hash = pairContentHash(e1Row.source, e1Row.target);
       markEdgeClassified(db, e1, '2026-08-12T10:00:00.000Z', e1Hash);
-      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 0).map(c => c.edgeId))
+      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 0, new Date()).map(c => c.edgeId))
         .toEqual([e2]);
 
       // Typed edges are never classifiable
@@ -1367,16 +1367,16 @@ describe('Database Layer', () => {
         source_id: 'a', target_id: 'c', relation_type: 'refines',
         strength: 0.9, bidirectional: true, status: 'active',
       });
-      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 0).map(c => c.edgeId))
+      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 0, new Date()).map(c => c.edgeId))
         .toEqual([e2]);
 
       // Content change after the attempt → re-qualifies
       updateMemory(db, 'a', { content: 'changed content a' });
-      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 0).map(c => c.edgeId).sort())
+      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 0, new Date()).map(c => c.edgeId).sort())
         .toEqual([e1, e2].sort());
 
       // limit is respected (0 = all)
-      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 1).length).toBe(1);
+      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 1, new Date()).length).toBe(1);
 
       // classified_at / classify_hash round-trip through reads
       const e1Stored = getAllEdges(db).find(e => e.id === e1)!;
@@ -1412,7 +1412,7 @@ describe('Database Layer', () => {
       // Recent failure with unchanged content → not classifiable (backoff)
       const recent = new Date(Date.now() - 60 * 60 * 1000).toISOString();
       markEdgeFailed(db, e1, recent, hash);
-      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 0).map(c => c.edgeId))
+      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 0, new Date()).map(c => c.edgeId))
         .toEqual([]);
 
       // last_failed_at round-trips through reads; a failure is NOT an answer
@@ -1422,7 +1422,7 @@ describe('Database Layer', () => {
 
       // Content change after the failure → immediately re-qualifies
       updateMemory(db, 'a', { content: 'changed content a' });
-      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 0).map(c => c.edgeId))
+      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 0, new Date()).map(c => c.edgeId))
         .toEqual([e1]);
 
       // Re-failed with the new content hash, but the backoff has expired
@@ -1432,7 +1432,7 @@ describe('Database Layer', () => {
       const hashAfter = pairContentHash(rowAfter.source, rowAfter.target);
       const stale = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
       markEdgeFailed(db, e1, stale, hashAfter);
-      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 0).map(c => c.edgeId))
+      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 0, new Date()).map(c => c.edgeId))
         .toEqual([e1]);
 
       // An answered edge clears the failure record: the backoff only applies
@@ -1440,6 +1440,51 @@ describe('Database Layer', () => {
       markEdgeClassified(db, e1, '2026-08-12T10:00:00.000Z', hashAfter);
       const cleared = getAllEdges(db).find(e => e.id === e1)!;
       expect(cleared.last_failed_at).toBeNull();
+      db.close();
+    });
+
+    it('getRelatesToEdges round-trips last_failed_at (a failure is not a decline)', () => {
+      const { getRelatesToEdges, getRelatesToEdgesWithMemories, markEdgeClassified, markEdgeFailed } = require('./db.js');
+      const { pairContentHash } = require('../commands/semantic-edges.js');
+      const db = openDatabase(':memory:');
+
+      function seedMemory(id: string): void {
+        insertMemory(db, createMemory({
+          id, content: `content ${id}`, summary: `summary ${id}`,
+          memory_type: 'context', scope: 'project', confidence: 0.8, priority: 5,
+          source_type: 'manual', source_session: 'sess', source_context: '{}',
+        }));
+      }
+      seedMemory('a');
+      seedMemory('b');
+
+      const e1 = insertEdge(db, {
+        source_id: 'a', target_id: 'b', relation_type: 'relates_to',
+        strength: 0.5, bidirectional: true, status: 'active',
+      });
+
+      // Never attempted → null on both fields
+      const fresh = getRelatesToEdges(db).find((e: { id: string }) => e.id === e1)!;
+      expect(fresh.last_failed_at).toBeNull();
+      expect(fresh.classified_at).toBeNull();
+
+      // Recorded failure → the plain read reports it. null means
+      // "never failed" (the backoff signal), so a mapper that drops the
+      // column here would silently falsify it.
+      const rows = getRelatesToEdgesWithMemories(db);
+      const row = rows.find((r: { edge: { id: string } }) => r.edge.id === e1)!;
+      const hash = pairContentHash(row.source, row.target);
+      const failedAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+      markEdgeFailed(db, e1, failedAt, hash);
+      const failedEdge = getRelatesToEdges(db).find((e: { id: string }) => e.id === e1)!;
+      expect(failedEdge.last_failed_at).toBe(failedAt);
+      expect(failedEdge.classified_at).toBeNull();
+
+      // An answered edge clears the failure record in the plain read too
+      markEdgeClassified(db, e1, '2026-08-12T10:00:00.000Z', hash);
+      const cleared = getRelatesToEdges(db).find((e: { id: string }) => e.id === e1)!;
+      expect(cleared.last_failed_at).toBeNull();
+      expect(cleared.classified_at).toBe('2026-08-12T10:00:00.000Z');
       db.close();
     });
   });

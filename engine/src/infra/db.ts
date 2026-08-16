@@ -1283,6 +1283,7 @@ function edgeRowsToEdges(rows: Array<Record<string, unknown>>): readonly Edge[] 
         created_at: asString(row.created_at),
         classified_at: (row.classified_at ?? null) as string | null,
         classify_hash: (row.classify_hash ?? null) as string | null,
+        last_failed_at: (row.last_failed_at ?? null) as string | null,
       }),
     ];
   });

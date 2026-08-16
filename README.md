@@ -190,7 +190,7 @@ During extraction, candidates the LLM classifies as scope `"global"` are routed 
 |---|---|---|
 | OpenAI-compatible LLM endpoint | Preferred transport for memory extraction, AI pruning, and edge classification; configure `CORTEX_LLM_API_URL`, `CORTEX_LLM_API_KEY`, and `CORTEX_LLM_MODEL`, or a compatible Pi provider | No (falls back to a headless CLI) |
 | Headless agent CLI (`claude -p --model haiku`, or `pi -p` under the Pi agent) | Fallback transport when no direct OpenAI-compatible endpoint is configured, or a single direct call fails | No (required only when the direct endpoint is unavailable; override with `CORTEX_LLM_BINARY`/`CORTEX_LLM_MODEL`. After 3 consecutive direct failures the fallback is suppressed — the server is saturated and escalation would only add load — and the work is deferred to the next run; tune with `CORTEX_LLM_MAX_DIRECT_FAILURES`) |
-| HuggingFace Transformers | Local embedding (EmbeddingGemma-300M ONNX, 768-dim) | Bundled |
+| @huggingface/transformers (model2vec static model) | Local embedding (`minishlab/potion-retrieval-32M`, 512-dim, CPU-only) | Bundled |
 
 ## Memory Model
 
@@ -403,8 +403,10 @@ Extraction, AI pruning, and edge classification prefer a **direct OpenAI-compati
 | `SURFACE_STALE_HOURS` | 24h | Cache expiry |
 | `RECENCY_HALF_LIFE_DAYS` | 14 | Ranking decay half-life |
 | `PRUNE_THRESHOLD_DAYS` | 30 | Archived → pruned transition |
-| `AI_PRUNE_SESSION_INTERVAL` | 5 | Run AI prune every N sessions |
-| `AI_PRUNE_MEMORY_THRESHOLD` | 50 | AI prune trigger count |
+| `AI_PRUNE_MIN_NEW_MEMORIES` | 20 | Run when 20+ active memories were created since the last SUCCESSFUL prune |
+| `AI_PRUNE_MAX_AGE_DAYS` | 7 | Staleness floor: also run when the last successful prune is 7+ days old |
+| `AI_PRUNE_MIN_INTERVAL_HOURS` | 6 | Minimum wall-clock interval between AI prune runs |
+| `AI_PRUNE_MIN_MEMORIES` | 8 | Skip prune below 8 active memories (not enough material to judge) |
 | `DEFAULT_SEARCH_LIMIT` | 10 | Results per `/recall` |
 | `DEFAULT_TRAVERSAL_DEPTH` | 2 | BFS depth for graph walks |
 
