@@ -4,8 +4,18 @@
  * Prefers the direct OpenAI-compatible endpoint (see llm-client.ts — ~30x
  * faster with thinking disabled). Callers request either JSON mode or strict
  * schema-guided decoding as appropriate. Falls back to the `claude -p` /
- * `pi -p` subprocess path when no endpoint is configured or the direct call
- * fails.
+ * `pi -p` subprocess path when no endpoint is configured or a single direct
+ * call fails. Once consecutive direct failures reach the saturation threshold
+ * (default 3, CORTEX_LLM_MAX_DIRECT_FAILURES) the fallback is suppressed and
+ * the call throws instead: a saturated server answers with empty content or
+ * timeouts, and escalating to a full agent-loop subprocess would only consume
+ * more of the same capacity. Callers defer the work (unmarked edges,
+ * un-advanced checkpoints) and retry on the next run.
+ *
+ * Concurrency: every LLM call (direct or subprocess) acquires a slot from a
+ * process-wide pool (default 2, CORTEX_LLM_MAX_CONCURRENCY), so cortex's
+ * background work can never occupy more than a bounded share of a model
+ * server that live agents already rely on.
  *
  * FR-001: Extract memories automatically at session end
  * FR-009: Complete extraction within 30 seconds (p95)
@@ -251,10 +261,93 @@ export type LlmPromptTransport = (
   options?: { jsonMode?: boolean; jsonSchema?: object; maxTokens?: number }
 ) => Promise<{ text: string; direct: boolean }>;
 
+/**
+ * Process-wide LLM slot pool.
+ *
+ * Every LLM consumer (extraction, edge classification, AI pruning, and the
+ * subprocess fallback) funnels through runLlmPromptDirect, so capping slots
+ * here bounds how much of the shared model server cortex's background work
+ * can occupy at once — critical when live agents already hold most of the
+ * server's concurrent slots. Waiters queue in arrival order; a woken waiter
+ * re-checks the limit so a slot taken by a synchronous caller in the gap can
+ * never be double-grabbed (no lost wake credits: each release resolves
+ * exactly one waiter, and a re-queued waiter waits for a later release).
+ */
+const llmSlots = { active: 0, waiters: [] as Array<() => void> };
+
+/** Test hook: reset the per-process LLM slot pool. */
+export function resetLlmConcurrencyForTests(): void {
+  llmSlots.active = 0;
+  llmSlots.waiters = [];
+}
+
+/**
+ * Max in-flight LLM calls per process. Background work must be a polite
+ * straggler on a shared server, so the default is small; 1 is the most
+ * conservative setting, values below 1 are rejected and fall back to 2.
+ */
+function maxConcurrentLlmCalls(env: NodeJS.ProcessEnv): number {
+  const parsed = env.CORTEX_LLM_MAX_CONCURRENCY === undefined
+    ? undefined
+    : Number(env.CORTEX_LLM_MAX_CONCURRENCY);
+  if (parsed !== undefined && Number.isInteger(parsed) && parsed >= 1) return parsed;
+  return 2;
+}
+
+async function acquireLlmSlot(): Promise<void> {
+  const limit = maxConcurrentLlmCalls(process.env);
+  while (llmSlots.active >= limit) {
+    await new Promise<void>((resolve) => llmSlots.waiters.push(resolve));
+  }
+  llmSlots.active++;
+}
+
+function releaseLlmSlot(): void {
+  llmSlots.active--;
+  const next = llmSlots.waiters.shift();
+  if (next) next();
+}
+
 /** Per-process consecutive direct-endpoint failures; gives the operator a recurrence signal. */
 let consecutiveDirectFailures = 0;
 
+/** Test hook: reset the per-process consecutive-failure counter. */
+export function resetConsecutiveDirectFailuresForTests(): void {
+  consecutiveDirectFailures = 0;
+}
+
+/**
+ * Consecutive direct-endpoint failures after which the CLI-subprocess
+ * fallback is suppressed. Below the threshold a transient failure still
+ * falls back, because the subprocess path can genuinely differ (different
+ * model, prompt, timeout); at/above it the server is saturated or
+ * misconfigured and escalation would amplify the outage.
+ */
+function getDirectFailureFallbackThreshold(env: NodeJS.ProcessEnv): number {
+  const parsed = env.CORTEX_LLM_MAX_DIRECT_FAILURES === undefined
+    ? undefined
+    : Number(env.CORTEX_LLM_MAX_DIRECT_FAILURES);
+  if (parsed !== undefined && Number.isInteger(parsed) && parsed >= 1) return parsed;
+  return 3;
+}
+
 export async function runLlmPromptDirect(
+  prompt: string,
+  timeoutMs: number,
+  direct: { jsonMode?: boolean; jsonSchema?: object; maxTokens?: number } = {}
+): Promise<{ text: string; direct: boolean }> {
+  // The slot covers BOTH the direct attempt and any subprocess fallback: a
+  // `claude -p` / `pi -p` agent loop is one background job from the server's
+  // point of view, and it must not stack on top of other in-flight calls.
+  await acquireLlmSlot();
+  try {
+    return await runLlmPromptDirectUnbounded(prompt, timeoutMs, direct);
+  } finally {
+    releaseLlmSlot();
+  }
+}
+
+async function runLlmPromptDirectUnbounded(
   prompt: string,
   timeoutMs: number,
   direct: { jsonMode?: boolean; jsonSchema?: object; maxTokens?: number } = {}
@@ -274,8 +367,27 @@ export async function runLlmPromptDirect(
       consecutiveDirectFailures++;
       const count = consecutiveDirectFailures;
       const recurrence = count === 1 ? '' : ` (${count} consecutive direct-endpoint failures)`;
+      const failureDetail = (err as Error).message ?? err;
+      const threshold = getDirectFailureFallbackThreshold(process.env);
+      if (count >= threshold) {
+        // The direct endpoint keeps failing: the server is saturated or
+        // misconfigured. Spawning `claude -p` / `pi -p` here would start full
+        // agent loops that consume even more of the same saturated capacity,
+        // so fail now and let the caller defer (edges stay unmarked,
+        // checkpoints stay put, the next run retries).
+        process.stderr.write(
+          `[cortex:llm] ERROR: direct LLM call failed (${failureDetail})${recurrence}; ` +
+            `suppressing ${getLlmBinary(process.env)} subprocess fallback after ${threshold} consecutive ` +
+            `failure(s) — deferring work to the next run instead of escalating load ` +
+            `(adjust CORTEX_LLM_MAX_DIRECT_FAILURES to change the threshold)\n`
+        );
+        throw new Error(
+          `direct LLM endpoint saturated: ${count} consecutive failure(s); ` +
+            `subprocess fallback suppressed to avoid escalating server load`
+        );
+      }
       process.stderr.write(
-        `[cortex:llm] WARNING: direct LLM call failed (${(err as Error).message ?? err})${recurrence}; ` +
+        `[cortex:llm] WARNING: direct LLM call failed (${failureDetail})${recurrence}; ` +
           `falling back to ${getLlmBinary(process.env)} subprocess\n`
       );
     }

@@ -13,6 +13,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   classifyEdges,
+  resetConsecutiveDirectFailuresForTests,
   runLlmPromptDirect,
   type LlmPromptTransport,
 } from './claude-llm.js';
@@ -44,6 +45,9 @@ describe('classifyEdges transport routing', () => {
   beforeEach(() => {
     mockResolveOpenAiCompatEndpoint.mockReset();
     mockChatCompletionText.mockReset();
+    // The consecutive-failure counter is per-process module state; tests must
+    // not inherit saturation state from an earlier test in this file.
+    resetConsecutiveDirectFailuresForTests();
   });
 
   afterEach(() => {
@@ -155,5 +159,49 @@ describe('classifyEdges transport routing', () => {
     expect(warn).toHaveBeenNthCalledWith(1, expect.stringMatching(/LLM API 503/));
     expect(warn).toHaveBeenNthCalledWith(2, expect.not.stringMatching(/consecutive/));
     warn.mockRestore();
+  });
+
+  it('suppresses the subprocess fallback once consecutive direct failures reach the threshold', async () => {
+    // A saturated local server (empty content, timeouts) must not escalate
+    // into `claude -p` / `pi -p` agent loops: below the threshold a single
+    // transient failure still falls back, but at the default threshold of 3
+    // the call throws so the caller defers the work to the next run.
+    mockResolveOpenAiCompatEndpoint.mockReturnValue(FAKE_ENDPOINT);
+    mockChatCompletionText.mockRejectedValue(new Error('LLM API returned empty content'));
+    const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const bunGlobal = (globalThis as { Bun?: { which: (bin: string) => string | null } }).Bun;
+    const originalWhich = bunGlobal!.which;
+    bunGlobal!.which = () => null;
+    try {
+      await expect(runLlmPromptDirect('prompt', 1000)).rejects.toThrow(/CLI not found/);
+      await expect(runLlmPromptDirect('prompt', 1000)).rejects.toThrow(/CLI not found/);
+      await expect(runLlmPromptDirect('prompt', 1000))
+        .rejects.toThrow(/direct LLM endpoint saturated: 3 consecutive failure/);
+    } finally {
+      bunGlobal!.which = originalWhich;
+    }
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringMatching(/suppressing \S+ subprocess fallback after 3 consecutive failure\(s\)/),
+    );
+    warn.mockRestore();
+  });
+
+  it('honors CORTEX_LLM_MAX_DIRECT_FAILURES to tighten the suppression threshold', async () => {
+    mockResolveOpenAiCompatEndpoint.mockReturnValue(FAKE_ENDPOINT);
+    mockChatCompletionText.mockRejectedValue(new Error('LLM request timed out after 1000ms'));
+    const original = process.env.CORTEX_LLM_MAX_DIRECT_FAILURES;
+    process.env.CORTEX_LLM_MAX_DIRECT_FAILURES = '1';
+    const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      await expect(runLlmPromptDirect('prompt', 1000))
+        .rejects.toThrow(/direct LLM endpoint saturated: 1 consecutive failure/);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringMatching(/suppressing \S+ subprocess fallback after 1 consecutive failure\(s\)/),
+      );
+    } finally {
+      if (original === undefined) delete process.env.CORTEX_LLM_MAX_DIRECT_FAILURES;
+      else process.env.CORTEX_LLM_MAX_DIRECT_FAILURES = original;
+      warn.mockRestore();
+    }
   });
 });

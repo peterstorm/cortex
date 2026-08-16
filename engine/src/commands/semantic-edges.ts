@@ -37,8 +37,11 @@ import { acquireLock, releaseLock } from '../infra/lock.js';
 /** Max pairs per LLM call. Direct calls with thinking disabled are cheap. */
 const BATCH_SIZE = 10;
 
-/** Max classification calls in flight at once (vLLM max-num-seqs is typically 8+). */
-const CONCURRENCY = 3;
+/** Max classification calls in flight at once. Must stay at or below the
+ * process-wide LLM slot pool (CORTEX_LLM_MAX_CONCURRENCY, default 2) — the
+ * pool is the true cap on shared-server occupancy; this worker pool only
+ * shapes how many batches queue for it. */
+const CONCURRENCY = 2;
 
 export interface SemanticEdgesOptions {
   /** Max edges to process (0 = all) */
