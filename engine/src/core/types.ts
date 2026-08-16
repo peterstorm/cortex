@@ -160,6 +160,13 @@ export interface Edge {
   readonly classified_at: string | null;
   /** Hash of the endpoint memories' content at the last attempt; null when never attempted. */
   readonly classify_hash: string | null;
+  /**
+   * ISO8601 timestamp of the last FAILED classification attempt; null when
+   * never failed (or when a later attempt answered). Within the failure
+   * backoff window a same-content failure is not re-asked, so an unhealthy
+   * server is not re-hammered on every maintenance run.
+   */
+  readonly last_failed_at: string | null;
 }
 
 // Extraction Checkpoint (FR-004, FR-105)
@@ -382,6 +389,7 @@ export function createEdge(input: {
   created_at?: string;
   classified_at?: string | null;
   classify_hash?: string | null;
+  last_failed_at?: string | null;
 }): Edge {
   // Validate no self-referencing edges
   if (input.source_id === input.target_id) {
@@ -417,6 +425,7 @@ export function createEdge(input: {
     created_at: input.created_at ?? now,
     classified_at: input.classified_at ?? null,
     classify_hash: input.classify_hash ?? null,
+    last_failed_at: input.last_failed_at ?? null,
   };
 }
 

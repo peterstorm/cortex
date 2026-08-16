@@ -114,7 +114,7 @@ describe('executeSemanticEdges', () => {
     expect(kept.classify_hash).not.toBeNull();
   });
 
-  it('leaves edges unmarked and counts the batch on a thrown classification failure', async () => {
+  it('leaves edges unclassified but records the failure for backoff on a thrown classification failure', async () => {
     seedMemory('a');
     seedMemory('b');
     const edgeId = insertEdge(db, { source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active' });
@@ -124,11 +124,15 @@ describe('executeSemanticEdges', () => {
 
     expect(result).toEqual({ ok: true, classified: 0, failed: 1 });
     const kept = getAllEdges(db).find((e) => e.id === edgeId)!;
+    // A failure is never a decline: the edge stays unclassified so it is
+    // retried, but the failure is recorded (timestamp + content hash) so
+    // the backoff delays the retry instead of re-hammering every run.
     expect(kept.classified_at).toBeNull();
-    expect(kept.classify_hash).toBeNull();
+    expect(kept.last_failed_at).not.toBeNull();
+    expect(kept.classify_hash).not.toBeNull();
   });
 
-  it('leaves edges unmarked and counts the batch on an unparseable response instead of retiring them', async () => {
+  it('leaves edges unclassified but records the failure for backoff on an unparseable response instead of retiring them', async () => {
     seedMemory('a');
     seedMemory('b');
     const edgeId = insertEdge(db, { source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active' });
@@ -141,11 +145,13 @@ describe('executeSemanticEdges', () => {
 
     // The run must not report a green ok:true/failed:0 while permanently
     // retiring the pair: the batch counts as failed and the edge stays
-    // unmarked so a later run retries it.
+    // unclassified (with a failure record for the backoff) so a later run
+    // retries it.
     expect(result).toEqual({ ok: true, classified: 0, failed: 1 });
     const kept = getAllEdges(db).find((e) => e.id === edgeId)!;
     expect(kept.classified_at).toBeNull();
-    expect(kept.classify_hash).toBeNull();
+    expect(kept.last_failed_at).not.toBeNull();
+    expect(kept.classify_hash).not.toBeNull();
   });
 
   it('retires a replace-edge unique-constraint conflict instead of re-asking forever', async () => {
@@ -212,7 +218,66 @@ describe('executeSemanticEdges', () => {
     expect(result).toEqual({ ok: true, classified: 0, failed: 1 });
     const kept = getAllEdges(db).find((edge) => edge.id === edgeId)!;
     expect(kept.classified_at).toBeNull();
-    expect(kept.classify_hash).toBeNull();
+    expect(kept.last_failed_at).not.toBeNull();
+    expect(kept.classify_hash).not.toBeNull();
+  });
+
+  it('does not re-ask an edge whose last failure is recent and content is unchanged (backoff)', async () => {
+    seedMemory('a');
+    seedMemory('b');
+    const recentFailure = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    insertEdge(db, {
+      source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active',
+      classify_hash: pairContentHash(
+        { content: 'content a', summary: 'summary a' },
+        { content: 'content b', summary: 'summary b' },
+      ),
+      last_failed_at: recentFailure,
+    });
+
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+
+    expect(result).toEqual({ ok: true, classified: 0, failed: 0 });
+    expect(mockClassifyEdges).not.toHaveBeenCalled();
+  });
+
+  it('re-asks a failed edge once the failure backoff has elapsed', async () => {
+    seedMemory('a');
+    seedMemory('b');
+    const oldFailure = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+    insertEdge(db, {
+      source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active',
+      classify_hash: pairContentHash(
+        { content: 'content a', summary: 'summary a' },
+        { content: 'content b', summary: 'summary b' },
+      ),
+      last_failed_at: oldFailure,
+    });
+    mockClassifyEdges.mockResolvedValue({ kind: 'ok', classifications: [] });
+
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+
+    expect(result).toEqual({ ok: true, classified: 0, failed: 0 });
+    expect(mockClassifyEdges).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-asks a failed edge immediately when its content changed since the failure', async () => {
+    seedMemory('a');
+    seedMemory('b');
+    const recentFailure = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    insertEdge(db, {
+      source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active',
+      // Hash of content the edge no longer has: the pair changed since the
+      // failure, which is new information and resets the backoff.
+      classify_hash: 'stale-hash-from-previous-content',
+      last_failed_at: recentFailure,
+    });
+    mockClassifyEdges.mockResolvedValue({ kind: 'ok', classifications: [] });
+
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+
+    expect(result).toEqual({ ok: true, classified: 0, failed: 0 });
+    expect(mockClassifyEdges).toHaveBeenCalledTimes(1);
   });
 
   it('rejects duplicate unindexed answers as a corrupt batch', async () => {

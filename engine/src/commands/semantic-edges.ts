@@ -30,9 +30,11 @@ import {
   deleteEdge,
   insertEdge,
   markEdgeClassified,
+  markEdgeFailed,
 } from '../infra/db.js';
 import { resolveOpenAiCompatEndpoint } from '../infra/llm-client.js';
 import { acquireLock, releaseLock } from '../infra/lock.js';
+import { EDGE_FAILURE_BACKOFF_HOURS } from '../config.js';
 
 /** Max pairs per LLM call. Direct calls with thinking disabled are cheap. */
 const BATCH_SIZE = 10;
@@ -118,19 +120,29 @@ export function pairContentHash(
  *
  * An edge qualifies when it has never been attempted (classified_at IS NULL)
  * or its endpoint content changed since the last attempt (classify_hash no
- * longer matches). Pure function.
+ * longer matches). On top of that, a FAILED attempt carries a backoff: an
+ * edge whose last failure is younger than backoffMs and whose content is
+ * unchanged since the failure is skipped, so an unhealthy server is not
+ * re-hammered with the same failed batch on every maintenance run. A content
+ * change resets the backoff (new information is worth one more try).
+ * Pure function.
  */
 export function selectClassificationCandidates(
   rows: readonly ReturnType<typeof getRelatesToEdgesWithMemories>[number][],
-  limit: number
+  limit: number,
+  now: Date = new Date(),
+  backoffMs: number = EDGE_FAILURE_BACKOFF_HOURS * 60 * 60 * 1000
 ): readonly { edgeId: string; pair: MemoryPair }[] {
   const candidates: Array<{ edgeId: string; pair: MemoryPair }> = [];
 
   for (const { edge, source, target } of rows) {
     if (candidates.length >= limit && limit > 0) break;
+    const hash = pairContentHash(source, target);
     if (edge.classified_at !== null) {
-      const hash = pairContentHash(source, target);
       if (hash === edge.classify_hash) continue;
+    } else if (edge.last_failed_at !== null && hash === edge.classify_hash) {
+      const lastFailedMs = Date.parse(edge.last_failed_at);
+      if (!Number.isNaN(lastFailedMs) && now.getTime() - lastFailedMs < backoffMs) continue;
     }
     candidates.push({
       edgeId: edge.id,
@@ -182,7 +194,8 @@ export async function executeSemanticEdges(
     }
 
     // Step 1: Load relates_to edges joined with endpoint memories, then
-    // select candidates (never-attempted or content-changed since attempt)
+    // select candidates (never-attempted or content-changed since attempt;
+    // failed attempts inside the backoff window are skipped)
     const allRows = getRelatesToEdgesWithMemories(db);
     const candidates = selectClassificationCandidates(allRows, options.limit);
 
@@ -200,8 +213,9 @@ export async function executeSemanticEdges(
     // Step 3: Batch and classify with bounded concurrency
     // Attempt timestamp: set on every edge in this batch once the model
     // answered, so declined edges are not re-asked on future runs. On a
-    // thrown error or an unparseable response the edges stay unmarked and
-    // are retried next run.
+    // thrown error or an unparseable response the edges stay UNCLASSIFIED
+    // (a failure is never a decline) but record last_failed_at so the
+    // backoff delays the retry instead of re-hammering an unhealthy server.
     let classified = 0;
     let failed = 0;
 
@@ -216,11 +230,14 @@ export async function executeSemanticEdges(
           batchPairs.map((p) => p.pair)
         );
         if (outcome.kind === 'unparseable') {
-          // Garbage is not a decline: leave the edges unmarked and count the
-          // batch as failed so a later run retries them. The old behavior
-          // ([] on parse failure) permanently retired every pair while
-          // reporting ok:true failed:0.
-          logError(`Classification response was not parseable (${outcome.reason}) — batch of ${batchPairs.length} left unmarked, will be retried`);
+          // Garbage is not a decline: count the batch as failed and retry it
+          // later — but record the failure on each edge (timestamp + content
+          // hash) so candidate selection applies the failure backoff instead
+          // of re-asking the same batch on every maintenance run.
+          logError(`Classification response was not parseable (${outcome.reason}) — batch of ${batchPairs.length} left unmarked, will be retried after backoff`);
+          for (const { edgeId, pair } of batchPairs) {
+            markEdgeFailed(db, edgeId, attemptedAt, pairContentHash(pair.source, pair.target));
+          }
           failed += batchPairs.length;
           return;
         }
@@ -278,6 +295,9 @@ export async function executeSemanticEdges(
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         logError(`Classification batch failed: ${message}`);
+        for (const { edgeId, pair } of batchPairs) {
+          markEdgeFailed(db, edgeId, attemptedAt, pairContentHash(pair.source, pair.target));
+        }
         failed += batchPairs.length;
         return;
       }

@@ -1311,12 +1311,15 @@ describe('Database Layer', () => {
       const db = openDatabase(dbPath);
       const edgeCols = (db.prepare(`PRAGMA table_info(edges)`).all() as { name: string }[]).map(c => c.name);
       expect(edgeCols).toContain('classified_at');
+      expect(edgeCols).toContain('classify_hash');
+      expect(edgeCols).toContain('last_failed_at');
       db.close();
 
       // Idempotent: re-opening must not throw (duplicate column)
       const again = openDatabase(dbPath);
       const edgeCols2 = (again.prepare(`PRAGMA table_info(edges)`).all() as { name: string }[]).map(c => c.name);
       expect(edgeCols2).toContain('classified_at');
+      expect(edgeCols2).toContain('last_failed_at');
       again.close();
 
       fs.rmSync(dir, { recursive: true, force: true });
@@ -1379,6 +1382,64 @@ describe('Database Layer', () => {
       const e1Stored = getAllEdges(db).find(e => e.id === e1)!;
       expect(e1Stored.classified_at).toBe('2026-08-12T10:00:00.000Z');
       expect(e1Stored.classify_hash).toBe(e1Hash);
+      db.close();
+    });
+
+    it('failure backoff gates re-classification until expiry or content change', () => {
+      const { getRelatesToEdgesWithMemories, markEdgeClassified, markEdgeFailed } = require('./db.js');
+      const { selectClassificationCandidates, pairContentHash } = require('../commands/semantic-edges.js');
+      const db = openDatabase(':memory:');
+
+      function seedMemory(id: string): void {
+        insertMemory(db, createMemory({
+          id, content: `content ${id}`, summary: `summary ${id}`,
+          memory_type: 'context', scope: 'project', confidence: 0.8, priority: 5,
+          source_type: 'manual', source_session: 'sess', source_context: '{}',
+        }));
+      }
+      seedMemory('a');
+      seedMemory('b');
+
+      const e1 = insertEdge(db, {
+        source_id: 'a', target_id: 'b', relation_type: 'relates_to',
+        strength: 0.5, bidirectional: true, status: 'active',
+      });
+
+      const rows = getRelatesToEdgesWithMemories(db);
+      const row = rows.find(r => r.edge.id === e1)!;
+      const hash = pairContentHash(row.source, row.target);
+
+      // Recent failure with unchanged content → not classifiable (backoff)
+      const recent = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+      markEdgeFailed(db, e1, recent, hash);
+      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 0).map(c => c.edgeId))
+        .toEqual([]);
+
+      // last_failed_at round-trips through reads; a failure is NOT an answer
+      const stored = getAllEdges(db).find(e => e.id === e1)!;
+      expect(stored.last_failed_at).toBe(recent);
+      expect(stored.classified_at).toBeNull();
+
+      // Content change after the failure → immediately re-qualifies
+      updateMemory(db, 'a', { content: 'changed content a' });
+      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 0).map(c => c.edgeId))
+        .toEqual([e1]);
+
+      // Re-failed with the new content hash, but the backoff has expired
+      // (25h > 24h) → classifiable again
+      const rowsAfter = getRelatesToEdgesWithMemories(db);
+      const rowAfter = rowsAfter.find(r => r.edge.id === e1)!;
+      const hashAfter = pairContentHash(rowAfter.source, rowAfter.target);
+      const stale = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+      markEdgeFailed(db, e1, stale, hashAfter);
+      expect(selectClassificationCandidates(getRelatesToEdgesWithMemories(db), 0).map(c => c.edgeId))
+        .toEqual([e1]);
+
+      // An answered edge clears the failure record: the backoff only applies
+      // to edges that are still unclassified
+      markEdgeClassified(db, e1, '2026-08-12T10:00:00.000Z', hashAfter);
+      const cleared = getAllEdges(db).find(e => e.id === e1)!;
+      expect(cleared.last_failed_at).toBeNull();
       db.close();
     });
   });

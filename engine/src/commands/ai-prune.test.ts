@@ -31,6 +31,7 @@ vi.mock('../infra/llm-client.js', () => ({
 
 import {
   runAiPrune,
+  runAiPruneIfNeeded,
   isProtectedStableMemory,
   isTooYoungToArchive,
   shouldRunAiPrune,
@@ -265,18 +266,85 @@ describe('parsePruneResponse / shouldRunAiPrune (sanity)', () => {
     expect(parsePruneResponse('{"candidates":[{"id":"abc"}]}').kind).toBe('unparseable');
   });
 
-  it('triggers on session interval', () => {
-    expect(shouldRunAiPrune(5, 0, 5, 50)).toBe(true);
-    expect(shouldRunAiPrune(1, 0, 5, 50)).toBe(false);
+});
+
+describe('shouldRunAiPrune (watermark trigger)', () => {
+  const NOW = new Date('2026-08-16T04:00:00.000Z');
+  const hoursAgo = (hours: number) => new Date(NOW.getTime() - hours * 60 * 60 * 1000).toISOString();
+  const daysAgo = (days: number) => new Date(NOW.getTime() - days * 24 * 60 * 60 * 1000).toISOString();
+
+  it('first run: waits until the store is worth reviewing', () => {
+    expect(shouldRunAiPrune(null, 0, 7, NOW)).toBe(false);
+    expect(shouldRunAiPrune(null, 0, 8, NOW)).toBe(true);
   });
 
-  it('does not rerun every session merely because the store remains large', () => {
-    expect(shouldRunAiPrune(1, 276, 5, 50, 276)).toBe(false);
+  it('treats a corrupted watermark timestamp as never-pruned (safe direction: review again)', () => {
+    expect(shouldRunAiPrune('not-a-timestamp', 0, 8, NOW)).toBe(true);
+    expect(shouldRunAiPrune('not-a-timestamp', 0, 3, NOW)).toBe(false);
   });
 
-  it('retriggers after 25 percent memory growth', () => {
-    expect(shouldRunAiPrune(1, 124, 5, 50, 100)).toBe(false);
-    expect(shouldRunAiPrune(1, 125, 5, 50, 100)).toBe(true);
+  it('does not run inside the minimum interval, even with plenty of new memories', () => {
+    expect(shouldRunAiPrune(hoursAgo(2), 25, 400, NOW)).toBe(false);
+  });
+
+  it('runs once the watermark shows enough new memories since the last success', () => {
+    expect(shouldRunAiPrune(daysAgo(1), 19, 400, NOW)).toBe(false);
+    expect(shouldRunAiPrune(daysAgo(1), 20, 400, NOW)).toBe(true);
+  });
+
+  it('does not run merely because time passed when there is no new material', () => {
+    expect(shouldRunAiPrune(daysAgo(3), 0, 400, NOW)).toBe(false);
+    expect(shouldRunAiPrune(daysAgo(3), 5, 400, NOW)).toBe(false);
+  });
+
+  it('runs on the staleness floor even without new memories (boundary: exactly at the floor)', () => {
+    expect(shouldRunAiPrune(daysAgo(6.99), 0, 400, NOW)).toBe(false);
+    expect(shouldRunAiPrune(daysAgo(7), 0, 400, NOW)).toBe(true);
+  });
+});
+
+describe('runAiPruneIfNeeded (watermark wiring)', () => {
+  beforeEach(() => {
+    mockRunLlmPrompt.mockReset();
+    mockIsClaudeLlmAvailable.mockReset().mockReturnValue(true);
+    mockResolveEndpoint.mockReset().mockReturnValue(null);
+  });
+
+  it('skips without an LLM call when nothing new arrived since the last successful prune', async () => {
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    const telemetryPath = makeTelemetryPath();
+    // Watermark one hour ago; all 20 active memories are older than it.
+    fs.writeFileSync(telemetryPath, JSON.stringify({
+      last_ai_prune_at: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+    }));
+    for (let index = 0; index < 20; index++) {
+      insertMemory(projectDb, makeMemory(`quiet-${index}`, 10));
+    }
+
+    const result = await runAiPruneIfNeeded(projectDb, globalDb, telemetryPath);
+
+    expect(result).toMatchObject({ archived: 0, reviewed: 0, skipped: true });
+    expect(mockRunLlmPrompt).not.toHaveBeenCalled();
+    projectDb.close();
+    globalDb.close();
+  });
+
+  it('proceeds on first run once the store reaches the review floor', async () => {
+    mockRunLlmPrompt.mockResolvedValue('{"candidates":[]}');
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    const telemetryPath = makeTelemetryPath(); // no watermark yet
+    for (let index = 0; index < 8; index++) {
+      insertMemory(projectDb, makeMemory(`first-${index}`, 10));
+    }
+
+    const result = await runAiPruneIfNeeded(projectDb, globalDb, telemetryPath);
+
+    expect(result).toMatchObject({ archived: 0, reviewed: 8 });
+    expect(mockRunLlmPrompt).toHaveBeenCalledTimes(1);
+    projectDb.close();
+    globalDb.close();
   });
 });
 

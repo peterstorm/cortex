@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS edges (
   created_at TEXT NOT NULL,
   classified_at TEXT,
   classify_hash TEXT,
+  last_failed_at TEXT,
   FOREIGN KEY (source_id) REFERENCES memories(id) ON DELETE CASCADE,
   FOREIGN KEY (target_id) REFERENCES memories(id) ON DELETE CASCADE,
   UNIQUE (source_id, target_id, relation_type)
@@ -237,10 +238,13 @@ function migrateArchivedAt(db: Database): void {
 }
 
 /**
- * Idempotent migration: add edges.classified_at / edges.classify_hash for
- * existing databases. Records when an edge was last attempted by the
- * semantic-edges LLM pass (and the endpoint content hash at that time) so
- * declined/typed edges are not re-classified on every maintenance run.
+ * Idempotent migration: add edges.classified_at / edges.classify_hash /
+ * edges.last_failed_at for existing databases. classified_at + classify_hash
+ * record when an edge was last answered by the semantic-edges LLM pass (and
+ * the endpoint content hash at that time) so declined/typed edges are not
+ * re-classified on every maintenance run. last_failed_at records the last
+ * FAILED attempt so a same-content failure is not re-asked within the backoff
+ * window (an unhealthy server is not re-hammered every run).
  */
 function migrateEdgeClassifiedAt(db: Database): void {
   const columns = db.prepare(`PRAGMA table_info(edges)`).all() as { name: string }[];
@@ -250,6 +254,9 @@ function migrateEdgeClassifiedAt(db: Database): void {
   }
   if (!names.has('classify_hash')) {
     db.run(`ALTER TABLE edges ADD COLUMN classify_hash TEXT`);
+  }
+  if (!names.has('last_failed_at')) {
+    db.run(`ALTER TABLE edges ADD COLUMN last_failed_at TEXT`);
   }
 }
 
@@ -995,9 +1002,10 @@ export function getLatestMemoryTimestamp(db: Database): string | null {
  */
 export function insertEdge(
   db: Database,
-  edge: Omit<Edge, 'id' | 'created_at' | 'classified_at' | 'classify_hash'> & {
+  edge: Omit<Edge, 'id' | 'created_at' | 'classified_at' | 'classify_hash' | 'last_failed_at'> & {
     classified_at?: string | null;
     classify_hash?: string | null;
+    last_failed_at?: string | null;
   }
 ): string {
   const id = randomUUID();
@@ -1014,11 +1022,12 @@ export function insertEdge(
     created_at,
     classified_at: edge.classified_at ?? null,
     classify_hash: edge.classify_hash ?? null,
+    last_failed_at: edge.last_failed_at ?? null,
   });
 
   const stmt = db.prepare(`
-    INSERT INTO edges (id, source_id, target_id, relation_type, strength, bidirectional, status, created_at, classified_at, classify_hash)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO edges (id, source_id, target_id, relation_type, strength, bidirectional, status, created_at, classified_at, classify_hash, last_failed_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   stmt.run(
@@ -1031,7 +1040,8 @@ export function insertEdge(
     validated.status,
     validated.created_at,
     validated.classified_at,
-    validated.classify_hash
+    validated.classify_hash,
+    validated.last_failed_at
   );
 
   return validated.id;
@@ -1070,6 +1080,7 @@ export function getEdgesForMemory(db: Database, memoryId: string): readonly Edge
       created_at: row.created_at,
       classified_at: (row.classified_at ?? null) as string | null,
       classify_hash: (row.classify_hash ?? null) as string | null,
+      last_failed_at: (row.last_failed_at ?? null) as string | null,
     })];
   });
 }
@@ -1102,6 +1113,7 @@ export function getAllEdges(db: Database): readonly Edge[] {
       created_at: asString(row.created_at),
       classified_at: (row.classified_at ?? null) as string | null,
       classify_hash: (row.classify_hash ?? null) as string | null,
+      last_failed_at: (row.last_failed_at ?? null) as string | null,
     })];
   });
 }
@@ -1177,6 +1189,7 @@ export function getRelatesToEdgesWithMemories(db: Database): readonly EdgeWithMe
       created_at: asString(row.created_at),
       classified_at: (row.classified_at ?? null) as string | null,
       classify_hash: (row.classify_hash ?? null) as string | null,
+      last_failed_at: (row.last_failed_at ?? null) as string | null,
     });
 
     return [
@@ -1210,11 +1223,47 @@ export function markEdgeClassified(
   at: string,
   contentHash: string
 ): void {
-  db.prepare(`UPDATE edges SET classified_at = ?, classify_hash = ? WHERE id = ?`).run(
+  // An answered edge clears any prior failure record: the backoff only makes
+  // sense while the edge is still unclassified.
+  db.prepare(`UPDATE edges SET classified_at = ?, classify_hash = ?, last_failed_at = NULL WHERE id = ?`).run(
     at,
     contentHash,
     edgeId
   );
+}
+
+/**
+ * Record a FAILED semantic-classification attempt for an edge: the failure
+ * timestamp plus the endpoint content hash at failure time, so candidate
+ * selection can apply the failure backoff (skip while the content is
+ * unchanged and the failure is recent; re-ask immediately when the content
+ * changed, since that is new information). Never sets classified_at — a
+ * failure must not make the edge look answered.
+ */
+export function markEdgeFailed(
+  db: Database,
+  edgeId: string,
+  at: string,
+  contentHash: string
+): void {
+  db.prepare(`UPDATE edges SET last_failed_at = ?, classify_hash = ? WHERE id = ?`).run(
+    at,
+    contentHash,
+    edgeId
+  );
+}
+
+/**
+ * Count active memories created after the given ISO8601 timestamp.
+ * This is the AI-prune watermark: "new work since the last successful
+ * prune". Archived memories are excluded (they are not in the review
+ * population); the watermark timestamp comes from telemetry.
+ */
+export function countActiveMemoriesCreatedAfter(db: Database, sinceIso: string): number {
+  const row = db.prepare(
+    `SELECT COUNT(*) AS n FROM memories WHERE status = 'active' AND created_at > ?`
+  ).get(sinceIso) as { n: number };
+  return row.n;
 }
 
 function edgeRowsToEdges(rows: Array<Record<string, unknown>>): readonly Edge[] {

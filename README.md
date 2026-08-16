@@ -375,7 +375,7 @@ Archived memories with no access for 30+ days → status changes to `pruned` (ef
 
 ### AI Prune
 
-The LLM evaluates active memories in batches and archives low-value ones. Triggered when 5+ sessions have passed since the last prune, or when the active memory count reaches max(50, 1.25 × the count at the last prune) — the growth backoff prevents a full prune from firing every session once the store stays above the base threshold. It runs inside the per-project-locked maintenance pipeline and also holds an AI-prune-specific lock.
+The LLM evaluates active memories in batches and archives low-value ones. Triggered by a watermark: it runs when **20+ active memories were created since the last successful prune** (telemetry `last_ai_prune_at`) or when that successful prune is **7+ days old** (staleness floor), subject to a 6h minimum interval between runs. The watermark advances only on a fully successful run, so a failed prune keeps the review owed and retries on the next maintenance pass. Session *count* deliberately no longer triggers it — subagent-heavy runs end many sessions per hour, which used to turn a full multi-batch LLM re-review into a per-session tax. It runs inside the per-project-locked maintenance pipeline and also holds an AI-prune-specific lock.
 
 ## Configuration
 

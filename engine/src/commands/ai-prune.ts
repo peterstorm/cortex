@@ -4,9 +4,11 @@
  * CLI subprocess as fallback) to evaluate active memories and archive stale/
  * redundant ones.
  *
- * Smart trigger: runs if session count >= AI_PRUNE_SESSION_INTERVAL, or the
- * active memory count crossed AI_PRUNE_MEMORY_THRESHOLD AND grew >= 1.25x
- * since the last prune (see shouldRunAiPrune for the exact rule).
+ * Watermark trigger: runs when enough NEW memories have accumulated since
+ * the last SUCCESSFUL prune (telemetry last_ai_prune_at), or when that
+ * successful prune is older than the staleness floor — subject to a minimum
+ * interval between runs. The watermark advances only on full success, so a
+ * failed run never skips the review it owes (see shouldRunAiPrune).
  *
  * Imperative shell - orchestrates I/O and pure functions.
  */
@@ -14,15 +16,16 @@
 import type { Database } from 'bun:sqlite';
 import * as fs from 'node:fs';
 import type { Memory } from '../core/types.js';
-import { getActiveMemories, updateMemory, archiveEdgesForMemory, supersedeFactsForMemory } from '../infra/db.js';
+import { getActiveMemories, countActiveMemoriesCreatedAfter, updateMemory, archiveEdgesForMemory, supersedeFactsForMemory } from '../infra/db.js';
 import { isClaudeLlmAvailable, runLlmPromptDirect } from '../infra/claude-llm.js';
 import { resolveOpenAiCompatEndpoint } from '../infra/llm-client.js';
 import { writeTelemetry } from '../infra/filesystem.js';
 import { parseJsonFromLlmText } from '../core/json-utils.js';
 import { invalidateSurfaceCache } from './generate.js';
 import {
-  AI_PRUNE_SESSION_INTERVAL,
-  AI_PRUNE_MEMORY_THRESHOLD,
+  AI_PRUNE_MIN_NEW_MEMORIES,
+  AI_PRUNE_MAX_AGE_DAYS,
+  AI_PRUNE_MIN_INTERVAL_HOURS,
   AI_PRUNE_TIMEOUT_MS,
   AI_PRUNE_BATCH_SIZE,
   AI_PRUNE_MIN_MEMORIES,
@@ -56,24 +59,54 @@ export type PruneParseOutcome =
 /**
  * Check whether AI prune should run (pure).
  *
- * Triggers if EITHER:
- * - sessions_since_ai_prune >= sessionInterval (regular cadence)
- * - active memory count crossed the threshold AND grew >= 25% since the
- *   last prune. A raw count check would fire a full multi-batch LLM prune
- *   on EVERY session once the store stays above the threshold — pruning is
- *   selective, so the count rarely drops back below it.
+ * Watermark semantics — the trigger reads the last SUCCESSFUL prune
+ * (lastPruneAt, null = never pruned) and the amount of new work since it:
+ *
+ * - First run (lastPruneAt === null): run only once the store is worth
+ *   reviewing (activeMemoryCount >= minMemories).
+ * - Otherwise: the minimum interval must have elapsed (no tight retry
+ *   loops right after a prune), and then EITHER
+ *     - newMemoriesSinceLastPrune >= minNewMemories (the watermark: there is
+ *       genuinely new material for the LLM to judge), OR
+ *     - the last successful prune is at least maxAgeDays old (staleness
+ *       floor — memories go stale even when nothing new arrives).
+ *
+ * Deliberately NOT session-count based: a loom run ends many sessions per
+ * hour, which used to turn a full multi-batch LLM re-review into a
+ * per-session tax.
  */
 export function shouldRunAiPrune(
-  sessionsSinceAiPrune: number,
+  lastPruneAt: string | null,
+  newMemoriesSinceLastPrune: number,
   activeMemoryCount: number,
-  sessionInterval: number,
-  memoryThreshold: number,
-  activeCountAtLastPrune: number = 0
+  now: Date,
+  options: {
+    readonly minNewMemories?: number;
+    readonly maxAgeDays?: number;
+    readonly minIntervalHours?: number;
+    readonly minMemories?: number;
+  } = {}
 ): boolean {
-  if (sessionsSinceAiPrune >= sessionInterval) return true;
+  const minNewMemories = options.minNewMemories ?? AI_PRUNE_MIN_NEW_MEMORIES;
+  const maxAgeDays = options.maxAgeDays ?? AI_PRUNE_MAX_AGE_DAYS;
+  const minIntervalHours = options.minIntervalHours ?? AI_PRUNE_MIN_INTERVAL_HOURS;
+  const minMemories = options.minMemories ?? AI_PRUNE_MIN_MEMORIES;
 
-  const growthFloor = Math.max(memoryThreshold, Math.ceil(activeCountAtLastPrune * 1.25));
-  return activeMemoryCount >= growthFloor;
+  if (lastPruneAt === null) {
+    return activeMemoryCount >= minMemories;
+  }
+
+  const lastPruneMs = Date.parse(lastPruneAt);
+  if (Number.isNaN(lastPruneMs)) {
+    // A corrupted/missing timestamp reads as "never pruned": the safe
+    // direction is to review again (idempotent) and re-record the watermark.
+    return activeMemoryCount >= minMemories;
+  }
+
+  const ageMs = now.getTime() - lastPruneMs;
+  if (ageMs < minIntervalHours * 60 * 60 * 1000) return false;
+  if (ageMs >= maxAgeDays * 24 * 60 * 60 * 1000) return true;
+  return newMemoriesSinceLastPrune >= minNewMemories;
 }
 
 /**
@@ -166,26 +199,22 @@ function readTelemetry(path: string): Record<string, unknown> {
   }
 }
 
-function getActiveCountAtLastPrune(telemetryPath: string): number {
+function getLastAiPruneAt(telemetryPath: string): string | null {
   const data = readTelemetry(telemetryPath);
-  const val = data.active_count_at_last_ai_prune;
-  return typeof val === 'number' ? val : 0;
+  const val = data.last_ai_prune_at;
+  return typeof val === 'string' && val.length > 0 ? val : null;
 }
 
-function incrementSessionCounter(telemetryPath: string): number {
+/**
+ * Advance the prune watermark. Called ONLY after a fully successful review
+ * (or a terminal no-op like "store too small" / "empty store"): a failed or
+ * partially failed run must leave the watermark in place, or the review it
+ * owes would be silently skipped — the same invariant as extraction
+ * checkpointing.
+ */
+function recordSuccessfulAiPrune(telemetryPath: string, at: Date): void {
   const data = readTelemetry(telemetryPath);
-  const current = typeof data.sessions_since_ai_prune === 'number' ? data.sessions_since_ai_prune : 0;
-  const next = current + 1;
-  data.sessions_since_ai_prune = next;
-  writeTelemetry(telemetryPath, data);
-  return next;
-}
-
-function resetSessionCounter(telemetryPath: string, activeCount: number): void {
-  const data = readTelemetry(telemetryPath);
-  data.sessions_since_ai_prune = 0;
-  data.last_ai_prune_at = new Date().toISOString();
-  data.active_count_at_last_ai_prune = activeCount;
+  data.last_ai_prune_at = at.toISOString();
   writeTelemetry(telemetryPath, data);
 }
 
@@ -228,8 +257,8 @@ async function callClaudePrune(prompt: string): Promise<string> {
 // ============================================================================
 
 /**
- * Run AI prune only if triggered by session count or memory threshold.
- * Increments session counter on every call; resets after successful prune.
+ * Run AI prune only if the watermark trigger is satisfied: enough new
+ * memories since the last successful prune, or the staleness floor reached.
  */
 export async function runAiPruneIfNeeded(
   projectDb: Database,
@@ -237,16 +266,17 @@ export async function runAiPruneIfNeeded(
   telemetryPath: string,
   cwd?: string
 ): Promise<AiPruneResult> {
-  // Always increment session counter
-  const sessionCount = incrementSessionCounter(telemetryPath);
-
-  // Count active memories
   const projectMemories = getActiveMemories(projectDb);
   const globalMemories = getActiveMemories(globalDb);
   const totalActive = projectMemories.length + globalMemories.length;
 
-  const lastPruneCount = getActiveCountAtLastPrune(telemetryPath);
-  if (!shouldRunAiPrune(sessionCount, totalActive, AI_PRUNE_SESSION_INTERVAL, AI_PRUNE_MEMORY_THRESHOLD, lastPruneCount)) {
+  const lastPruneAt = getLastAiPruneAt(telemetryPath);
+  const newSinceLastPrune = lastPruneAt === null
+    ? totalActive
+    : countActiveMemoriesCreatedAfter(projectDb, lastPruneAt)
+      + countActiveMemoriesCreatedAfter(globalDb, lastPruneAt);
+
+  if (!shouldRunAiPrune(lastPruneAt, newSinceLastPrune, totalActive, new Date())) {
     return { archived: 0, reviewed: 0, skipped: true };
   }
 
@@ -315,7 +345,7 @@ export async function runAiPrune(
   const allMemories = [...projectMemories, ...globalMemories];
 
   if (allMemories.length === 0) {
-    resetSessionCounter(telemetryPath, 0);
+    recordSuccessfulAiPrune(telemetryPath, new Date());
     return { archived: 0, reviewed: 0 };
   }
 
@@ -323,7 +353,7 @@ export async function runAiPrune(
   // With few memories, aggressive pruning wipes out ALL context.
   if (allMemories.length < AI_PRUNE_MIN_MEMORIES) {
     logInfo(`Skipping AI prune: only ${allMemories.length} active memories (min: ${AI_PRUNE_MIN_MEMORIES})`);
-    resetSessionCounter(telemetryPath, allMemories.length);
+    recordSuccessfulAiPrune(telemetryPath, new Date());
     return { archived: 0, reviewed: allMemories.length, skipped: true };
   }
 
@@ -457,7 +487,7 @@ export async function runAiPrune(
     };
   }
 
-  resetSessionCounter(telemetryPath, allMemories.length - totalArchived);
+  recordSuccessfulAiPrune(telemetryPath, new Date());
 
   logInfo(`AI prune complete: ${totalArchived} archived out of ${reviewedMemories} reviewed`);
 

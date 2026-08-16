@@ -301,14 +301,36 @@ export const PRUNE_THRESHOLD_DAYS = 30;
 export const LIFECYCLE_FALLBACK_HOURS = 2;
 
 /**
- * AI prune: run every N sessions (whichever fires first with memory threshold)
+ * AI prune watermark trigger: run when at least this many active memories
+ * were created since the last SUCCESSFUL prune. Data-driven — the LLM
+ * re-review fires because there is genuinely new material to judge, not
+ * because a number of sessions happened to end (subagent-heavy runs end
+ * many sessions per hour, which used to turn prune into a per-session tax).
  */
-export const AI_PRUNE_SESSION_INTERVAL = 5;
+export const AI_PRUNE_MIN_NEW_MEMORIES = 20;
 
 /**
- * AI prune: trigger when active memory count exceeds this
+ * AI prune staleness floor: run at least this often (wall clock) even without
+ * new memories, so slowly-stale material still gets an LLM review. Time-driven
+ * decay itself is handled locally by lifecycle on every maintenance run.
  */
-export const AI_PRUNE_MEMORY_THRESHOLD = 50;
+export const AI_PRUNE_MAX_AGE_DAYS = 7;
+
+/**
+ * AI prune minimum interval between runs (wall clock). Prevents tight retry
+ * loops right after a prune; the watermark only advances on success, so a
+ * failed run stays "due" and retries on the next maintenance pass.
+ */
+export const AI_PRUNE_MIN_INTERVAL_HOURS = 6;
+
+/**
+ * Semantic-edges failure backoff: an edge whose last classification attempt
+ * FAILED is not re-asked within this window while its endpoint content is
+ * unchanged. Without it, a saturated/unhealthy server gets the same failed
+ * batches re-sent on every maintenance run. Content changes reset the
+ * backoff immediately (new information is worth one more try).
+ */
+export const EDGE_FAILURE_BACKOFF_HOURS = 24;
 
 /**
  * AI prune: minimum active memory count below which pruning is skipped.
