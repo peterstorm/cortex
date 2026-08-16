@@ -3,10 +3,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const childProcess = {
+const childProcess = vi.hoisted(() => ({
   execFileSync: vi.fn(() => ''),
   spawn: vi.fn(),
-};
+}));
 
 vi.mock('node:child_process', () => childProcess);
 
@@ -141,36 +141,35 @@ describe('Cortex Pi extension shutdown', () => {
     expect(child.unref).toHaveBeenCalledOnce();
   });
 
-  it('enqueues maintenance when an ephemeral session has no transcript', async () => {
+  it('spawns no worker when an ephemeral session has no transcript (subagent shutdown)', async () => {
     const child = fakeChild();
     childProcess.spawn.mockReturnValue(child as never);
     const handlers = registerHandlers();
     const cwd = tempProject();
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
 
-    await handlers.get('session_shutdown')?.({ reason: 'quit' }, {
-      cwd,
-      model: { provider: 'openai-codex', id: 'gpt-5.6-sol' },
-      sessionManager: {
-        getSessionFile: () => undefined,
-        getSessionId: () => 'ephemeral-session',
-      },
-    });
-
-    expect(childProcess.spawn).toHaveBeenCalledTimes(1);
-    expect(childProcess.spawn).toHaveBeenCalledWith(
-      'bun',
-      [expect.stringMatching(/engine\/src\/cli\.ts$/), 'maintenance', cwd],
-      expect.objectContaining({
+    try {
+      await handlers.get('session_shutdown')?.({ reason: 'quit' }, {
         cwd,
-        detached: true,
-        stdio: ['ignore', expect.any(Number), expect.any(Number)],
-        env: expect.objectContaining({
-          CORTEX_PI_PROVIDER: 'openai-codex',
-          CORTEX_PI_MODEL: 'gpt-5.6-sol',
-        }),
-      }),
-    );
-    expect(child.unref).toHaveBeenCalledOnce();
+        model: { provider: 'openai-codex', id: 'gpt-5.6-sol' },
+        sessionManager: {
+          getSessionFile: () => undefined,
+          getSessionId: () => 'ephemeral-session',
+        },
+      });
+
+      // Ephemeral sessions (subagent spawns use --no-session) never run
+      // extraction, so nothing new entered the store. Maintenance would only
+      // burn LLM budget (ai-prune, semantic-edges) competing with the live
+      // agents that spawned the session, and the spawning session's own
+      // ingest-session pipeline already maintains the store.
+      expect(childProcess.spawn).not.toHaveBeenCalled();
+      expect(stderr).toHaveBeenCalledWith(
+        expect.stringContaining('extraction and maintenance skipped (ephemeral session)'),
+      );
+    } finally {
+      stderr.mockRestore();
+    }
   });
 
   it('falls back to session-start metadata and model when shutdown context omits them', async () => {
