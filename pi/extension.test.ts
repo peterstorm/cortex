@@ -3,10 +3,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const childProcess = vi.hoisted(() => ({
+const childProcess = {
   execFileSync: vi.fn(() => ''),
   spawn: vi.fn(),
-}));
+};
 
 vi.mock('node:child_process', () => childProcess);
 
