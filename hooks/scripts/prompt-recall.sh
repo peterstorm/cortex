@@ -19,6 +19,12 @@ CLI_PATH="${PLUGIN_ROOT}/engine/src/cli.ts"
 # libstdc++ at runtime. On NixOS that is not on the default library path, so a
 # hook process finds no libstdc++ and embedding silently degrades. Probe the
 # store unless CORTEX_ONNX_LD_PATH pins it explicitly; a no-op elsewhere.
+#
+# infra/native-library-path.ts does the same resolution for every OTHER entry
+# point (a direct `bun cli.ts backfill`, /remember, /recall), where it costs a
+# re-exec because the loader reads LD_LIBRARY_PATH only at process start. This
+# block is what keeps the per-prompt hook path off that second process: set the
+# variable here, and the engine sees a resolvable library and proceeds.
 if [[ -z "${CORTEX_ONNX_LD_PATH:-}" && -d /nix/store ]]; then
   for _candidate in /nix/store/*-gcc-*-lib/lib; do
     _so="${_candidate}/libstdc++.so.6"

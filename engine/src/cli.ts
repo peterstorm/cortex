@@ -78,6 +78,7 @@ import {
   type SessionIngestionRetryPolicy,
 } from './commands/ingest-session.js';
 import { disposeLocalModel, embedLocal } from './infra/local-embed.js';
+import { ensureNativeLibraryPath } from './infra/native-library-path.js';
 
 // ============================================================================
 // TYPES
@@ -1452,6 +1453,12 @@ async function handleIngestSession(): Promise<CommandResult> {
  * Parses subcommand and dispatches to appropriate handler
  */
 async function main() {
+  // Before any subcommand runs, because the loader reads LD_LIBRARY_PATH once
+  // at process start: where onnxruntime's libstdc++ is off the default path,
+  // this re-runs the process with it and never returns. A no-op everywhere
+  // else, including the hook scripts that already set the path themselves.
+  ensureNativeLibraryPath();
+
   const args = process.argv.slice(2);
 
   if (args.length === 0) {
