@@ -314,7 +314,18 @@ export async function executeSemanticEdges(
       // retry-safety paths cannot diverge.
       const recordBatchFailure = (batch: readonly { edgeId: string; pair: MemoryPair }[]): void => {
         for (const { edgeId, pair } of batch) {
-          markEdgeFailed(db, edgeId, attemptedAt, pairContentHash(pair.source, pair.target));
+          try {
+            markEdgeFailed(db, edgeId, attemptedAt, pairContentHash(pair.source, pair.target));
+          } catch (err) {
+            // This runs inside a mapLimit worker, so an escaping error rejects
+            // Promise.all and discards the classified/failed tallies of every
+            // other batch that already finished. Losing one edge's backoff
+            // stamp costs a premature retry; losing the whole run's counts
+            // costs the run. Both stay accounted for: the batch is still
+            // counted as failed below.
+            const message = err instanceof Error ? err.message : String(err);
+            logError(`Edge ${edgeId} failure stamp could not be recorded (backoff not applied): ${message}`);
+          }
         }
         failed += batch.length;
       };
@@ -354,12 +365,15 @@ export async function executeSemanticEdges(
       // and is never misattributed to the LLM batch.
       const joinByIndex = join.byOrdinal;
       for (const [pairOrdinal, { edgeId, pair }] of batchPairs.entries()) {
+        // Content fingerprint at attempt time, stored for future runs. Computed
+        // once per pair, outside the guard: both the success path and the
+        // unique-constraint path in the catch stamp the same fingerprint, and
+        // hashing it twice invites the two copies to drift apart.
+        const contentHash = pairContentHash(pair.source, pair.target);
         try {
           const classification = join.byOrdinal
             ? join.byIndex.get(pairOrdinal + 1)
             : join.byKey.get(pairKey(pair.source.id, pair.target.id));
-          // Content fingerprint at attempt time, stored for future runs
-          const contentHash = pairContentHash(pair.source, pair.target);
 
           if (classification && classification.relation_type !== 'relates_to') {
             // Delete old generic edge + insert typed one atomically
@@ -398,7 +412,7 @@ export async function executeSemanticEdges(
           // classification is effectively already done — retire the
           // candidate so it is not re-sent to the LLM on every run.
           if (isUniqueConstraintError(err)) {
-            markEdgeClassified(db, edgeId, attemptedAt, pairContentHash(pair.source, pair.target));
+            markEdgeClassified(db, edgeId, attemptedAt, contentHash);
           }
         }
       }

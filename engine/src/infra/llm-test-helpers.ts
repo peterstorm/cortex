@@ -2,10 +2,14 @@
  * Test-only helpers for the LLM boundary.
  *
  * Kept out of the test files themselves because more than one suite needs
- * them: five tests across the routing, concurrency and semantic-edges suites
- * were each re-deriving the same `globalThis` cast and save/restore dance,
- * which is boilerplate a reader has to re-verify every time rather than a
- * named precondition they can read once.
+ * them: the routing, concurrency, semantic-edges and ai-prune suites were each
+ * re-deriving the same `globalThis` cast and save/restore dance, which is
+ * boilerplate a reader has to re-verify every time rather than a named
+ * precondition they can read once.
+ *
+ * The consuming suites are named, not counted: an exact tally of call sites is
+ * stale the moment a test is added, and a maintainer scoping a change to this
+ * helper needs to know WHICH suites to check, not how many.
  */
 
 /** The subset of the Bun global these helpers touch. */

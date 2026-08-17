@@ -803,10 +803,10 @@ async function handleAiPrune(args: string[]): Promise<CommandResult> {
         ? await runAiPruneIfNeeded(projectDb, globalDb, getTelemetryPath(cwd), cwd)
         : await runAiPrune(projectDb, globalDb, getTelemetryPath(cwd), cwd);
 
-      if (result.skipped) {
-        return { success: true, output: 'AI prune skipped (thresholds not met)' };
+      if (result.kind === 'skipped') {
+        return { success: true, output: `AI prune skipped: ${result.reason}` };
       }
-      if (result.error) {
+      if (result.kind === 'failed') {
         return { success: false, error: `AI prune failed: ${result.error}` };
       }
       return {

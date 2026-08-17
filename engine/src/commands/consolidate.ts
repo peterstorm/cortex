@@ -11,8 +11,8 @@ import { randomUUID } from 'crypto';
 import { unlinkSync } from 'fs';
 import {
   getActiveMemories,
-  createCheckpoint,
-  restoreCheckpoint,
+  createDbSnapshot,
+  restoreDbSnapshot,
   insertMemory,
   insertEdge,
   updateMemory,
@@ -224,7 +224,7 @@ export interface ConsolidateResult {
   readonly pairs_found: number;
   readonly pairs_merged: number;
   readonly pairs_skipped: number;
-  readonly checkpoint_path: string;
+  readonly snapshot_path: string;
 }
 
 /**
@@ -377,8 +377,8 @@ export function mergePair(
 }
 
 /**
- * Execute full consolidate command with checkpoint/rollback safety
- * FR-079: Create checkpoint before consolidation
+ * Execute full consolidate command with snapshot/rollback safety
+ * FR-079: Create a whole-database snapshot before consolidation
  * FR-080: Rollback on failure
  * FR-081: Max 3 passes per trigger
  *
@@ -394,12 +394,12 @@ export function mergePair(
  * @param options - Consolidate options
  * @returns Consolidate result
  */
-export function removeCheckpointFile(
-  checkpointPath: string,
+export function removeSnapshotFile(
+  snapshotPath: string,
   remove: (path: string) => void = unlinkSync
 ): void {
   try {
-    remove(checkpointPath);
+    remove(snapshotPath);
   } catch (err) {
     const code = typeof err === 'object' && err !== null && 'code' in err
       ? (err as { readonly code?: unknown }).code
@@ -407,7 +407,7 @@ export function removeCheckpointFile(
     if (code === 'ENOENT') return;
 
     const message = err instanceof Error ? err.message : String(err);
-    throw new Error(`Failed to remove checkpoint ${checkpointPath}: ${message}`);
+    throw new Error(`Failed to remove snapshot ${snapshotPath}: ${message}`);
   }
 }
 
@@ -419,13 +419,13 @@ export function executeConsolidate(
   const maxPasses = options.maxPasses ?? 3; // FR-081: default 3, enforced below
   const sessionId = options.sessionId ?? 'consolidate-session';
 
-  // FR-079: Create checkpoint before consolidation
-  let checkpointPath: string;
+  // FR-079: Create a whole-database snapshot before consolidation
+  let snapshotPath: string;
   try {
-    checkpointPath = createCheckpoint(db);
+    snapshotPath = createDbSnapshot(db);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    throw new Error(`Failed to create checkpoint: ${message}`);
+    throw new Error(`Failed to create snapshot: ${message}`);
   }
 
   try {
@@ -450,20 +450,20 @@ export function executeConsolidate(
       break;
     }
 
-    // Clean up checkpoint file on success. Only an already-absent file is
+    // Clean up the snapshot file on success. Only an already-absent file is
     // benign; permission and filesystem failures must enter rollback/error.
-    removeCheckpointFile(checkpointPath);
+    removeSnapshotFile(snapshotPath);
 
     return {
       pairs_found: totalPairsFound,
       pairs_merged: totalPairsMerged,
       pairs_skipped: totalPairsSkipped,
-      checkpoint_path: checkpointPath,
+      snapshot_path: snapshotPath,
     };
   } catch (err) {
     // FR-080: Rollback on failure
     try {
-      restoreCheckpoint(db, checkpointPath);
+      restoreDbSnapshot(db, snapshotPath);
     } catch (rollbackErr) {
       const rollbackMsg = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
       const origMsg = err instanceof Error ? err.message : String(err);

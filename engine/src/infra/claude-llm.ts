@@ -589,24 +589,18 @@ export function parseEdgeClassificationResponse(
         `Edge classification response is not valid JSON (probably truncated): ${(e as Error).message}`
       );
     }
-    // Accept both the bare array and the schema-guided {"edges": [...]} shape
-    const array = unwrapEdgesArray(parsed);
-    if (array === null) {
-      throw new Error(
-        `Edge classification response has no edges array: ${String(response).slice(0, 200)}`
-      );
-    }
-    const valid = array.filter(isValidEdgeClassification);
-    if (valid.length !== array.length) {
+    const checked = checkEdgesArray(parsed, 'strict mode');
+    if (!checked.ok) {
       // A dropped item must never degrade into a permanent "declined" verdict:
       // schema-guided decoding makes invalid items a decoder/server anomaly,
       // so the batch fails and the edges are retried instead of retired.
       throw new Error(
-        `Edge classification response contained ${array.length - valid.length} of ` +
-          `${array.length} items with invalid shape (strict mode)`
+        checked.reason === NO_EDGES_ARRAY
+          ? `Edge classification response has no edges array: ${String(response).slice(0, 200)}`
+          : `Edge classification response contained ${checked.reason}`
       );
     }
-    return { kind: 'ok', classifications: normalizeClassifications(valid) };
+    return { kind: 'ok', classifications: normalizeClassifications(checked.valid) };
   }
 
   try {
@@ -617,32 +611,55 @@ export function parseEdgeClassificationResponse(
 
     const parsed: unknown = JSON.parse(jsonText.trim());
 
-    // Accept both the bare array and the schema-guided {"edges": [...]} shape
-    const array = unwrapEdgesArray(parsed);
-    if (array === null) {
-      return {
-        kind: 'unparseable',
-        reason: 'response contains no edges array',
-      };
-    }
-
-    const valid = array.filter(isValidEdgeClassification);
-    if (valid.length !== array.length) {
+    const checked = checkEdgesArray(parsed, 'tolerant response');
+    if (!checked.ok) {
       // Any dropped item can correspond to a pair the shell would otherwise
       // retire as an implicit decline. Fail the whole tolerant batch so every
       // edge remains unmarked and retryable.
       return {
         kind: 'unparseable',
-        reason: `${array.length - valid.length} of ${array.length} items had invalid shape (tolerant response)`,
+        reason: checked.reason === NO_EDGES_ARRAY
+          ? 'response contains no edges array'
+          : checked.reason,
       };
     }
-    return { kind: 'ok', classifications: normalizeClassifications(valid) };
+    return { kind: 'ok', classifications: normalizeClassifications(checked.valid) };
   } catch (e) {
     return {
       kind: 'unparseable',
       reason: `failed to parse edge classification response: ${(e as Error).message}`,
     };
   }
+}
+
+/** Sentinel for the one rejection whose wording differs between the modes. */
+const NO_EDGES_ARRAY = 'no-edges-array';
+
+/**
+ * The shared half of both parse modes: unwrap the envelope and require EVERY
+ * item to be schema-valid.
+ *
+ * Only what the two modes genuinely disagree about is left to them — strict
+ * throws where tolerant returns, and each phrases the missing-array case for
+ * its own caller. The rule itself ("any invalid item fails the whole batch,
+ * so no pair can be mistaken for a decline") is stated once, because two
+ * copies of it are two places it can be weakened to a filter.
+ */
+function checkEdgesArray(
+  parsed: unknown,
+  mode: string
+): Readonly<{ ok: true; valid: readonly EdgeClassification[] }> | Readonly<{ ok: false; reason: string }> {
+  const array = unwrapEdgesArray(parsed);
+  if (array === null) return { ok: false, reason: NO_EDGES_ARRAY };
+
+  const valid = array.filter(isValidEdgeClassification);
+  if (valid.length !== array.length) {
+    return {
+      ok: false,
+      reason: `${array.length - valid.length} of ${array.length} items with invalid shape (${mode})`,
+    };
+  }
+  return { ok: true, valid };
 }
 
 /**

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Database } from 'bun:sqlite';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -18,8 +18,8 @@ import {
   getAllEdges,
   getExtractionCheckpoint,
   saveExtractionCheckpoint,
-  createCheckpoint,
-  restoreCheckpoint,
+  createDbSnapshot,
+  restoreDbSnapshot,
   routeToDatabase,
   getActiveCodeMemoriesByFilePath,
   getActiveProseMemoriesByFilePath,
@@ -95,6 +95,10 @@ describe('Database Layer', () => {
       db = openDatabase(':memory:');
     });
 
+    afterEach(() => {
+      db.close();
+    });
+
     it('inserts and retrieves memory by ID', () => {
       const memory = makeMemory('mem-1', {
         content: 'Use functional core pattern',
@@ -119,13 +123,11 @@ describe('Database Layer', () => {
       expect(retrieved?.pinned).toBe(false);
       expect(retrieved?.status).toBe('active');
 
-      db.close();
     });
 
     it('returns null for non-existent memory', () => {
       const retrieved = getMemory(db, 'non-existent');
       expect(retrieved).toBeNull();
-      db.close();
     });
 
     it('inserts memory with embeddings and retrieves correctly', () => {
@@ -149,7 +151,6 @@ describe('Database Layer', () => {
       expect(retrieved?.embedding).toEqual(voyageEmbedding);
       expect(retrieved?.local_embedding).toEqual(localEmbedding);
 
-      db.close();
     });
 
     it('updates memory fields', () => {
@@ -178,7 +179,6 @@ describe('Database Layer', () => {
       expect(retrieved?.tags).toEqual(['updated']);
       expect(retrieved?.summary).toBe('Original summary'); // Unchanged
 
-      db.close();
     });
 
     it('rejects invalid memory_type through updateMemory (C6 validation is enforced)', () => {
@@ -187,7 +187,6 @@ describe('Database Layer', () => {
 
       expect(() => updateMemory(db, 'mem-invalid-type', { memory_type: 'not-a-type' as unknown as MemoryType }))
         .toThrow(/invalid memory_type/);
-      db.close();
     });
 
     it('rejects invalid status through updateMemory', () => {
@@ -196,7 +195,6 @@ describe('Database Layer', () => {
 
       expect(() => updateMemory(db, 'mem-invalid-status', { status: 'zombie' as unknown as MemoryStatus }))
         .toThrow(/invalid status/);
-      db.close();
     });
 
     it('rejects invalid scope through updateMemory', () => {
@@ -206,7 +204,6 @@ describe('Database Layer', () => {
       expect(() => updateMemory(db, 'mem-invalid-scope', { scope: 'workspace' as unknown as MemoryScope }))
         .toThrow(/invalid scope/);
       expect(getMemory(db, 'mem-invalid-scope')?.scope).toBe('project');
-      db.close();
     });
 
     it('rejects out-of-range confidence through updateMemory', () => {
@@ -215,7 +212,6 @@ describe('Database Layer', () => {
 
       expect(() => updateMemory(db, 'mem-invalid-confidence', { confidence: 1.4 }))
         .toThrow(/confidence must be in \[0, 1\]/);
-      db.close();
     });
 
     it('rejects out-of-range priority through updateMemory', () => {
@@ -224,7 +220,6 @@ describe('Database Layer', () => {
 
       expect(() => updateMemory(db, 'mem-invalid-priority', { priority: 11 }))
         .toThrow(/priority must be in \[1, 10\]/);
-      db.close();
     });
 
     it('rejects empty content through updateMemory', () => {
@@ -233,7 +228,6 @@ describe('Database Layer', () => {
 
       expect(() => updateMemory(db, 'mem-invalid-content', { content: '   ' }))
         .toThrow(/content must not be empty/);
-      db.close();
     });
 
     it('maintains the status/archived_at coupling when archiving', () => {
@@ -251,7 +245,6 @@ describe('Database Layer', () => {
       const reactivated = getMemory(db, 'mem-archive-coupling');
       expect(reactivated?.status).toBe('active');
       expect(reactivated?.archived_at).toBeNull();
-      db.close();
     });
 
     it('refuses an active memory with a non-null archived_at through updateMemory', () => {
@@ -262,7 +255,6 @@ describe('Database Layer', () => {
         status: 'active',
         archived_at: '2026-08-12T00:00:00.000Z',
       })).toThrow(/active memory must not have archived_at/);
-      db.close();
     });
 
     it('refuses an archived_at-only update on an active row (no status change)', () => {
@@ -275,7 +267,6 @@ describe('Database Layer', () => {
       // The row is untouched and still readable.
       const retrieved = getMemory(db, 'mem-anchor-only');
       expect(retrieved?.archived_at).toBeNull();
-      db.close();
     });
 
     it('allows re-anchoring an already-archived memory through archived_at only', () => {
@@ -287,7 +278,6 @@ describe('Database Layer', () => {
 
       updateMemory(db, 'mem-reanchor', { archived_at: '2026-08-02T00:00:00.000Z' });
       expect(getMemory(db, 'mem-reanchor')?.archived_at).toBe('2026-08-02T00:00:00.000Z');
-      db.close();
     });
 
     it('refuses a status-only supersede on an anchored row (anchor must be cleared first)', () => {
@@ -304,7 +294,6 @@ describe('Database Layer', () => {
       const row = getMemory(db, 'mem-supersede-anchor');
       expect(row?.status).toBe('archived');
       expect(row?.archived_at).toBe('2026-08-01T00:00:00.000Z');
-      db.close();
     });
 
     it('allows superseding an unanchored row', () => {
@@ -314,7 +303,6 @@ describe('Database Layer', () => {
       const row = getMemory(db, 'mem-supersede-active');
       expect(row?.status).toBe('superseded');
       expect(row?.archived_at).toBeNull();
-      db.close();
     });
 
     it('falls back to no tags (with a diagnostic) when a tags cell is corrupt', () => {
@@ -331,7 +319,6 @@ describe('Database Layer', () => {
         );
       } finally {
         warn.mockRestore();
-        db.close();
       }
     });
 
@@ -376,7 +363,6 @@ describe('Database Layer', () => {
       expect(activeMemories).toHaveLength(2);
       expect(activeMemories.map((m) => m.id).sort()).toEqual(['mem-active-1', 'mem-active-2']);
 
-      db.close();
     });
   });
 
@@ -385,6 +371,10 @@ describe('Database Layer', () => {
 
     beforeEach(() => {
       db = openDatabase(':memory:');
+    });
+
+    afterEach(() => {
+      db.close();
     });
 
     it('finds the code memory for a plain path (including paths with spaces) and nothing else', () => {
@@ -403,7 +393,6 @@ describe('Database Layer', () => {
 
       expect(getActiveCodeMemoriesByFilePath(db, '/tmp/plain.ts').map((m) => m.id)).toEqual(['code-plain']);
       expect(getActiveCodeMemoriesByFilePath(db, '/tmp/dir with spaces/main.ts').map((m) => m.id)).toEqual(['code-spaces']);
-      db.close();
     });
 
     it('finds a path containing a double quote, matching only its own row', () => {
@@ -418,7 +407,6 @@ describe('Database Layer', () => {
 
       expect(getActiveCodeMemoriesByFilePath(db, '/tmp/we"ird.ts').map((m) => m.id)).toEqual(['code-quote']);
       expect(getActiveCodeMemoriesByFilePath(db, '/tmp/weird.ts').map((m) => m.id)).toEqual(['code-decoy']);
-      db.close();
     });
 
     it('finds a backslash path without cross-matching a collapsed form', () => {
@@ -436,7 +424,6 @@ describe('Database Layer', () => {
 
       expect(getActiveCodeMemoriesByFilePath(db, 'C:\\Users\\x\\main.ts').map((m) => m.id)).toEqual(['code-win']);
       expect(getActiveCodeMemoriesByFilePath(db, 'C:Usersxmain.ts').map((m) => m.id)).toEqual(['code-collapsed']);
-      db.close();
     });
 
     it('splits code and prose (code_description) lookups on the same contract', () => {
@@ -452,7 +439,6 @@ describe('Database Layer', () => {
 
       expect(getActiveProseMemoriesByFilePath(db, path).map((m) => m.id)).toEqual(['prose-1']);
       expect(getActiveCodeMemoriesByFilePath(db, path).map((m) => m.id)).toEqual(['code-1']);
-      db.close();
     });
 
     it('ignores non-active memories and malformed stored JSON (no match, no throw)', () => {
@@ -477,7 +463,6 @@ describe('Database Layer', () => {
 
       expect(getActiveCodeMemoriesByFilePath(db, '/tmp/a.ts')).toEqual([]);
       expect(getActiveCodeMemoriesByFilePath(db, '/tmp/real.ts').map((m) => m.id)).toEqual(['code-real']);
-      db.close();
     });
   });
 
@@ -526,13 +511,16 @@ describe('Database Layer', () => {
       insertMemory(db, mem3);
     });
 
+    afterEach(() => {
+      db.close();
+    });
+
     it('searches by keyword in content', () => {
       const results = searchByKeyword(db, 'functional', 10);
       expect(results.length).toBeGreaterThan(0);
       expect(results.map((m) => m.id)).toContain('mem-fts-1');
       expect(results.map((m) => m.id)).toContain('mem-fts-2');
 
-      db.close();
     });
 
     it('searches by keyword in tags', () => {
@@ -540,21 +528,18 @@ describe('Database Layer', () => {
       expect(results.length).toBeGreaterThan(0);
       expect(results.map((m) => m.id)).toContain('mem-fts-2');
 
-      db.close();
     });
 
     it('respects limit parameter', () => {
       const results = searchByKeyword(db, 'architecture', 1);
       expect(results).toHaveLength(1);
 
-      db.close();
     });
 
     it('returns empty for empty or whitespace-only query instead of FTS5 syntax error', () => {
       expect(searchByKeyword(db, '', 10)).toEqual([]);
       expect(searchByKeyword(db, '   ', 10)).toEqual([]);
 
-      db.close();
     });
   });
 
@@ -603,6 +588,10 @@ describe('Database Layer', () => {
       insertMemory(db, mem3);
     });
 
+    afterEach(() => {
+      db.close();
+    });
+
     it('excludes non-active memories from embedding candidates', () => {
       // Archival keeps the embedding — without a status filter, /forget-ed
       // memories would resurface in semantic recall.
@@ -617,7 +606,6 @@ describe('Database Layer', () => {
       );
       expect(byIds.map((c) => c.memory.id).sort()).toEqual(['mem-emb-1', 'mem-emb-3']);
 
-      db.close();
     });
 
     it('tags local embeddings with the producing model and filters reads to it', () => {
@@ -715,7 +703,6 @@ describe('Database Layer', () => {
         );
       } finally {
         warn.mockRestore();
-        db.close();
       }
     });
 
@@ -734,7 +721,6 @@ describe('Database Layer', () => {
       expect(results[0].score).toBeGreaterThan(results[1].score);
       expect(results[1].score).toBeGreaterThan(results[2].score);
 
-      db.close();
     });
 
     it('respects limit parameter', () => {
@@ -746,7 +732,6 @@ describe('Database Layer', () => {
       expect(results[0].memory.id).toBe('mem-emb-1');
       expect(results[1].memory.id).toBe('mem-emb-2');
 
-      db.close();
     });
 
     it('fetches and ranks by local embedding similarity', () => {
@@ -774,7 +759,6 @@ describe('Database Layer', () => {
       expect(results[0].score).toBeGreaterThan(0);
 
       db2.close();
-      db.close();
     });
   });
 
@@ -809,6 +793,10 @@ describe('Database Layer', () => {
       insertMemory(db, mem2);
     });
 
+    afterEach(() => {
+      db.close();
+    });
+
     it('inserts edge and retrieves by memory ID', () => {
       const edgeId = insertEdge(db, {
         source_id: 'mem-edge-1',
@@ -828,7 +816,6 @@ describe('Database Layer', () => {
       expect(edges[0].relation_type).toBe('relates_to');
       expect(edges[0].strength).toBe(0.7);
 
-      db.close();
     });
 
     it('materializes classified_at/classify_hash through getEdgesForMemory (attempt-tracking parity)', () => {
@@ -848,7 +835,6 @@ describe('Database Layer', () => {
       expect(edges[0].classified_at).toBe('2026-08-12T00:00:00.000Z');
       expect(edges[0].classify_hash).toBe('abc123');
 
-      db.close();
     });
 
     it('enforces unique constraint on (source_id, target_id, relation_type)', () => {
@@ -873,7 +859,6 @@ describe('Database Layer', () => {
         })
       ).toThrow();
 
-      db.close();
     });
 
     it('allows same source/target with different relation type', () => {
@@ -901,7 +886,6 @@ describe('Database Layer', () => {
       const edges = getEdgesForMemory(db, 'mem-edge-1');
       expect(edges).toHaveLength(2);
 
-      db.close();
     });
 
     it('retrieves bidirectional edges from target side', () => {
@@ -921,7 +905,6 @@ describe('Database Layer', () => {
       expect(edgesFromTarget).toHaveLength(1);
       expect(edgesFromTarget[0].bidirectional).toBe(true);
 
-      db.close();
     });
 
     it('does not retrieve unidirectional edges from target side', () => {
@@ -937,7 +920,6 @@ describe('Database Layer', () => {
       const edgesFromTarget = getEdgesForMemory(db, 'mem-edge-2');
       expect(edgesFromTarget).toHaveLength(0);
 
-      db.close();
     });
 
     it('gets all edges', () => {
@@ -962,7 +944,6 @@ describe('Database Layer', () => {
       const allEdges = getAllEdges(db);
       expect(allEdges).toHaveLength(2);
 
-      db.close();
     });
   });
 
@@ -971,6 +952,10 @@ describe('Database Layer', () => {
 
     beforeEach(() => {
       db = openDatabase(':memory:');
+    });
+
+    afterEach(() => {
+      db.close();
     });
 
     it('saves and retrieves checkpoint', () => {
@@ -984,14 +969,12 @@ describe('Database Layer', () => {
       expect(checkpoint?.session_id).toBe('session-ckpt-1');
       expect(checkpoint?.cursor_position).toBe(12345);
 
-      db.close();
     });
 
     it('returns null for non-existent checkpoint', () => {
       const checkpoint = getExtractionCheckpoint(db, 'non-existent');
       expect(checkpoint).toBeNull();
 
-      db.close();
     });
 
     it('updates checkpoint on duplicate session_id', () => {
@@ -1008,7 +991,6 @@ describe('Database Layer', () => {
       const checkpoint = getExtractionCheckpoint(db, 'session-ckpt-2');
       expect(checkpoint?.cursor_position).toBe(200);
 
-      db.close();
     });
 
     it('respects caller-provided extracted_at timestamp', () => {
@@ -1023,7 +1005,6 @@ describe('Database Layer', () => {
       const checkpoint = getExtractionCheckpoint(db, 'session-ckpt-3');
       expect(checkpoint?.extracted_at).toBe(customTimestamp);
 
-      db.close();
     });
 
     it('generates extracted_at when not provided', () => {
@@ -1043,7 +1024,6 @@ describe('Database Layer', () => {
       expect(extractedAt.getTime()).toBeGreaterThanOrEqual(beforeSave.getTime());
       expect(extractedAt.getTime()).toBeLessThanOrEqual(afterSave.getTime());
 
-      db.close();
     });
   });
 
@@ -1064,9 +1044,9 @@ describe('Database Layer', () => {
 
       insertMemory(db, mem1);
 
-      // Create checkpoint
-      const checkpointPath = createCheckpoint(db);
-      expect(checkpointPath).toBeDefined();
+      // Create snapshot
+      const snapshotPath = createDbSnapshot(db);
+      expect(snapshotPath).toBeDefined();
 
       // Modify database
       updateMemory(db, 'mem-ckpt-1', { content: 'Modified content' });
@@ -1074,8 +1054,8 @@ describe('Database Layer', () => {
       const modifiedMemory = getMemory(db, 'mem-ckpt-1');
       expect(modifiedMemory?.content).toBe('Modified content');
 
-      // Restore from checkpoint
-      restoreCheckpoint(db, checkpointPath);
+      // Restore from snapshot
+      restoreDbSnapshot(db, snapshotPath);
 
       const restoredMemory = getMemory(db, 'mem-ckpt-1');
       expect(restoredMemory?.content).toBe('Original memory');
@@ -1086,7 +1066,7 @@ describe('Database Layer', () => {
     it('cleans up FTS rows orphaned by restore (regression)', () => {
       const db = openDatabase(':memory:');
 
-      // Insert one memory, checkpoint it
+      // Insert one memory, snapshot it
       insertMemory(db, makeMemory('mem-fts-keep', {
         content: 'Memory about zebras and savannas',
         summary: 'Zebra memory',
@@ -1095,9 +1075,9 @@ describe('Database Layer', () => {
         source_session: 'session-fts',
       }));
 
-      const checkpointPath = createCheckpoint(db);
+      const snapshotPath = createDbSnapshot(db);
 
-      // Insert a SECOND memory after the checkpoint — its FTS row would
+      // Insert a SECOND memory after the snapshot — its FTS row would
       // become an orphan on restore without explicit cleanup
       insertMemory(db, makeMemory('mem-fts-orphan', {
         content: 'Memory about quixotic wombats',
@@ -1107,9 +1087,9 @@ describe('Database Layer', () => {
         source_session: 'session-fts',
       }));
 
-      restoreCheckpoint(db, checkpointPath);
+      restoreDbSnapshot(db, snapshotPath);
 
-      // Base table only has the checkpointed memory
+      // Base table only has the snapshotted memory
       expect(getMemory(db, 'mem-fts-orphan')).toBeNull();
       expect(getMemory(db, 'mem-fts-keep')).not.toBeNull();
 
@@ -1128,20 +1108,20 @@ describe('Database Layer', () => {
       expect(realHits.map((m) => m.id)).toEqual(['mem-fts-keep']);
 
       db.close();
-      rmSync(checkpointPath, { force: true });
+      rmSync(snapshotPath, { force: true });
     });
 
-    it('rejects checkpoint path with single quote (SQL injection prevention)', () => {
+    it('rejects snapshot path with single quote (SQL injection prevention)', () => {
       const db = openDatabase(':memory:');
 
-      // Attempt to create checkpoint - should pass validation
-      const validPath = createCheckpoint(db);
+      // Attempt to create a snapshot - should pass validation
+      const validPath = createDbSnapshot(db);
       expect(validPath).toBeDefined();
 
       // Attempt to restore with malicious path containing single quote
       const maliciousPath = "'; DROP TABLE memories; --";
 
-      expect(() => restoreCheckpoint(db, maliciousPath)).toThrow(
+      expect(() => restoreDbSnapshot(db, maliciousPath)).toThrow(
         'Path contains invalid character: single quote'
       );
 
@@ -1643,6 +1623,10 @@ describe('getMemoriesByIds status filter (finding 11)', () => {
     insertMemory(db, makeStatusMemory('m-superseded', 'superseded'));
   });
 
+  afterEach(() => {
+    db.close();
+  });
+
   it('defaults to active-only', () => {
     const result = getMemoriesByIds(db, ['m-active', 'm-archived', 'm-superseded']);
     expect(result.map(m => m.id)).toEqual(['m-active']);
@@ -1682,6 +1666,10 @@ describe('fact supersede on archive (finding 12)', () => {
       valid_to: null,
       created_at: new Date().toISOString(),
     });
+  });
+
+  afterEach(() => {
+    db.close();
   });
 
   it('supersedeFactsForMemory retracts current facts and reports count', () => {
@@ -1822,6 +1810,10 @@ describe('corrupt JSON list cells degrade the row, never the read', () => {
     db = openDatabase(':memory:');
   });
 
+  afterEach(() => {
+    db.close();
+  });
+
   // The comment on rowToMemory claims parity with the local_embedding guard,
   // which warns unconditionally. Valid-but-non-array JSON never enters the
   // catch, so without an explicit branch it degraded silently while the
@@ -1844,7 +1836,6 @@ describe('corrupt JSON list cells degrade the row, never the read', () => {
       );
     } finally {
       warn.mockRestore();
-      db.close();
     }
   });
 
@@ -1864,7 +1855,6 @@ describe('corrupt JSON list cells degrade the row, never the read', () => {
       );
     } finally {
       warn.mockRestore();
-      db.close();
     }
   });
 
@@ -1880,7 +1870,6 @@ describe('corrupt JSON list cells degrade the row, never the read', () => {
       );
     } finally {
       warn.mockRestore();
-      db.close();
     }
   });
 });
@@ -1890,6 +1879,10 @@ describe('countActiveMemoriesCreatedAfter (AI-prune watermark)', () => {
 
   beforeEach(() => {
     db = openDatabase(':memory:');
+  });
+
+  afterEach(() => {
+    db.close();
   });
 
   it('counts strictly after the watermark and excludes non-active rows', () => {
@@ -1906,7 +1899,6 @@ describe('countActiveMemoriesCreatedAfter (AI-prune watermark)', () => {
     }));
 
     expect(countActiveMemoriesCreatedAfter(db, watermark)).toBe(2);
-    db.close();
   });
 });
 

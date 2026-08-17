@@ -38,12 +38,24 @@ import { chunk } from '../core/chunk.js';
 // TYPES
 // ============================================================================
 
-export interface AiPruneResult {
-  readonly archived: number;
-  readonly reviewed: number;
-  readonly skipped?: boolean;
-  readonly error?: string;
-}
+/**
+ * What a prune run did, as three mutually exclusive outcomes.
+ *
+ * Independent `skipped?`/`error?` flags on one stats record admitted
+ * combinations no call site produces — `skipped: true` beside an `error`, an
+ * `error` beside a full success — and left every consumer to re-derive the
+ * outcome from which optional fields happened to be set. The discriminant
+ * makes the three real outcomes exhaustive and checkable.
+ *
+ * `failed` deliberately carries counts: a partially failed run legitimately
+ * archived what its successful batches decided, and dropping those numbers
+ * would misreport work that actually happened. What `failed` guarantees is
+ * that the watermark did NOT advance, so the review it owes is still owed.
+ */
+export type AiPruneResult =
+  | Readonly<{ kind: 'completed'; archived: number; reviewed: number }>
+  | Readonly<{ kind: 'skipped'; archived: 0; reviewed: number; reason: string }>
+  | Readonly<{ kind: 'failed'; archived: number; reviewed: number; error: string }>;
 
 export interface PruneCandidate {
   readonly id: string;
@@ -287,7 +299,12 @@ export async function runAiPruneIfNeeded(
       + countActiveMemoriesCreatedAfter(globalDb, lastPruneAt);
 
   if (!shouldRunAiPrune(lastPruneAt, newSinceLastPrune, totalActive, new Date())) {
-    return { archived: 0, reviewed: 0, skipped: true };
+    return {
+      kind: 'skipped',
+      archived: 0,
+      reviewed: 0,
+      reason: 'watermark trigger not satisfied (not enough new memories, and the last successful prune is not stale)',
+    };
   }
 
   return runAiPrune(projectDb, globalDb, telemetryPath, cwd, transport);
@@ -334,19 +351,67 @@ export async function runAiPrune(
 ): Promise<AiPruneResult> {
   if (resolveOpenAiCompatEndpoint() === null && !isClaudeLlmAvailable()) {
     return {
+      kind: 'failed',
       archived: 0,
       reviewed: 0,
       error: 'No LLM available: no OpenAI-compatible endpoint configured and no LLM CLI on PATH',
     };
   }
 
+  // Counters live outside the guard so an abort still reports the work its
+  // successful batches already committed — and, because the watermark is only
+  // advanced on the success path below, an abort leaves the review still owed.
+  const progress = { archived: 0, reviewed: 0 };
+  try {
+    return await prune(projectDb, globalDb, telemetryPath, progress, cwd, transport);
+  } catch (err) {
+    // Everything under here is I/O — SQLite, telemetry, the surface cache.
+    // Without this the sibling of executeSemanticEdges' guard, a DB or
+    // telemetry fault leaves the caller with an unhandled rejection instead of
+    // an outcome it can report.
+    const message = err instanceof Error ? err.message : String(err);
+    logError(`AI prune aborted: ${message}`);
+    return {
+      kind: 'failed',
+      archived: progress.archived,
+      reviewed: progress.reviewed,
+      error: `AI prune aborted: ${message}`,
+    };
+  }
+}
+
+/**
+ * Archive one memory and everything derived from it, as one transaction.
+ *
+ * A memory and its graph/entity records form one archive consistency boundary:
+ * if any dependent write fails, SQLite rolls the whole archive back so a later
+ * prune can retry the still-active memory. Built per database because the
+ * transaction must be prepared against the connection it runs on — the only
+ * thing that ever differed between the two copies of this closure.
+ */
+function archiverFor(db: Database): (id: string, archivedAt: string) => void {
+  return db.transaction((id: string, archivedAt: string) => {
+    updateMemory(db, id, { status: 'archived', archived_at: archivedAt });
+    archiveEdgesForMemory(db, id);
+    supersedeFactsForMemory(db, id);
+  });
+}
+
+async function prune(
+  projectDb: Database,
+  globalDb: Database,
+  telemetryPath: string,
+  progress: { archived: number; reviewed: number },
+  cwd?: string,
+  transport?: LlmPromptTransport
+): Promise<AiPruneResult> {
   const projectMemories = getActiveMemories(projectDb);
   const globalMemories = getActiveMemories(globalDb);
   const allMemories = [...projectMemories, ...globalMemories];
 
   if (allMemories.length === 0) {
     recordSuccessfulAiPrune(telemetryPath, new Date());
-    return { archived: 0, reviewed: 0 };
+    return { kind: 'completed', archived: 0, reviewed: 0 };
   }
 
   // Guard: don't prune when memory count is very low.
@@ -354,7 +419,12 @@ export async function runAiPrune(
   if (allMemories.length < AI_PRUNE_MIN_MEMORIES) {
     logInfo(`Skipping AI prune: only ${allMemories.length} active memories (min: ${AI_PRUNE_MIN_MEMORIES})`);
     recordSuccessfulAiPrune(telemetryPath, new Date());
-    return { archived: 0, reviewed: allMemories.length, skipped: true };
+    return {
+      kind: 'skipped',
+      archived: 0,
+      reviewed: allMemories.length,
+      reason: `only ${allMemories.length} active memories (min: ${AI_PRUNE_MIN_MEMORIES})`,
+    };
   }
 
   // Build memory data for prompt
@@ -382,23 +452,11 @@ export async function runAiPrune(
 
   logInfo(`AI pruning ${allMemories.length} memories in ${totalBatches} batch(es)...`);
 
-  let totalArchived = 0;
   let successfulBatches = 0;
-  let reviewedMemories = 0;
+  let archiveFailures = 0;
 
-  // A memory and the graph/entity records derived from it form one archive
-  // consistency boundary. If any dependent write fails, SQLite rolls the
-  // entire archive back so a later prune can retry the still-active memory.
-  const archiveProjectMemory = projectDb.transaction((id: string, archivedAt: string) => {
-    updateMemory(projectDb, id, { status: 'archived', archived_at: archivedAt });
-    archiveEdgesForMemory(projectDb, id);
-    supersedeFactsForMemory(projectDb, id);
-  });
-  const archiveGlobalMemory = globalDb.transaction((id: string, archivedAt: string) => {
-    updateMemory(globalDb, id, { status: 'archived', archived_at: archivedAt });
-    archiveEdgesForMemory(globalDb, id);
-    supersedeFactsForMemory(globalDb, id);
-  });
+  const archiveProjectMemory = archiverFor(projectDb);
+  const archiveGlobalMemory = archiverFor(globalDb);
 
   for (let i = 0; i < batches.length; i++) {
     const batch = batches[i];
@@ -435,7 +493,7 @@ export async function runAiPrune(
     }
 
     successfulBatches++;
-    reviewedMemories += batch.length;
+    progress.reviewed += batch.length;
 
     for (const candidate of parsed.candidates) {
       if (pinnedIds.has(candidate.id)) {
@@ -456,44 +514,69 @@ export async function runAiPrune(
         continue;
       }
 
+      // Route once, then act once: the two arms only ever chose a database,
+      // and duplicating the count and the log line in both is how they drift.
+      const archive = projectIds.has(candidate.id)
+        ? archiveProjectMemory
+        : globalIds.has(candidate.id) ? archiveGlobalMemory : null;
+      if (archive === null) continue;
+
       // archived_at anchors the archive→prune grace period (FR-091)
       const archivedAt = new Date().toISOString();
-      if (projectIds.has(candidate.id)) {
-        archiveProjectMemory(candidate.id, archivedAt);
-        totalArchived++;
-        logInfo(`Archived ${candidate.id.slice(0, 8)}: ${candidate.reason}`);
-      } else if (globalIds.has(candidate.id)) {
-        archiveGlobalMemory(candidate.id, archivedAt);
-        totalArchived++;
-        logInfo(`Archived ${candidate.id.slice(0, 8)}: ${candidate.reason}`);
+      try {
+        archive(candidate.id, archivedAt);
+      } catch (err) {
+        // One candidate's write must not abandon the rest of the batch: the
+        // transaction already rolled this memory back on its own, so the
+        // others are still archivable and this run still owes its review.
+        const message = err instanceof Error ? err.message : String(err);
+        logError(`Failed to archive ${candidate.id.slice(0, 8)}: ${message}`);
+        archiveFailures++;
+        continue;
       }
+      progress.archived++;
+      logInfo(`Archived ${candidate.id.slice(0, 8)}: ${candidate.reason}`);
     }
   }
 
   // Successful batches may already have archived memories even when a sibling
   // batch failed, so invalidate the surface before returning a partial error.
-  if (cwd !== undefined && totalArchived > 0) {
+  if (cwd !== undefined && progress.archived > 0) {
     invalidateSurfaceCache(cwd);
   }
 
   if (successfulBatches !== totalBatches) {
     const failedBatches = totalBatches - successfulBatches;
     return {
-      archived: totalArchived,
-      reviewed: reviewedMemories,
+      kind: 'failed',
+      archived: progress.archived,
+      reviewed: progress.reviewed,
       error: successfulBatches === 0
         ? `All ${totalBatches} AI prune batches failed`
         : `${failedBatches} of ${totalBatches} AI prune batches failed; cadence was not reset`,
     };
   }
 
+  // Every batch answered, but a write refused: the review is incomplete, so
+  // the watermark must not advance or the refused candidates are never
+  // reconsidered.
+  if (archiveFailures > 0) {
+    return {
+      kind: 'failed',
+      archived: progress.archived,
+      reviewed: progress.reviewed,
+      error: `${archiveFailures} memor${archiveFailures === 1 ? 'y' : 'ies'} could not be archived; cadence was not reset`,
+    };
+  }
+
   recordSuccessfulAiPrune(telemetryPath, new Date());
 
-  logInfo(`AI prune complete: ${totalArchived} archived out of ${reviewedMemories} reviewed`);
+  logInfo(`AI prune complete: ${progress.archived} archived out of ${progress.reviewed} reviewed`);
 
   return {
-    archived: totalArchived,
-    reviewed: reviewedMemories,
+    kind: 'completed',
+    archived: progress.archived,
+    reviewed: progress.reviewed,
   };
 }
 

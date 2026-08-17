@@ -5,22 +5,6 @@
  */
 
 // ============================================================================
-// BRANDED TYPES
-// ============================================================================
-
-/** Branded type for memory IDs — prevents argument-swap bugs */
-export type MemoryId = string & { readonly __brand: 'MemoryId' };
-export const MemoryId = (s: string): MemoryId => s as MemoryId;
-
-/** Branded type for edge IDs */
-export type EdgeId = string & { readonly __brand: 'EdgeId' };
-export const EdgeId = (s: string): EdgeId => s as EdgeId;
-
-/** Branded type for local embeddings (Float32; width set by LOCAL_EMBEDDING_DIMENSIONS) */
-export type LocalEmbedding = Float32Array & { readonly __brand: 'LocalEmbedding' };
-export const LocalEmbedding = (a: Float32Array): LocalEmbedding => a as LocalEmbedding;
-
-// ============================================================================
 // SOURCE CONTEXT
 // ============================================================================
 
@@ -79,18 +63,27 @@ export type MemoryScope = 'project' | 'global';
 
 export const MEMORY_SCOPES: readonly MemoryScope[] = ['project', 'global'] as const;
 
-export function isMemoryScope(value: unknown): value is MemoryScope {
-  return typeof value === 'string' && (MEMORY_SCOPES as readonly string[]).includes(value);
+/**
+ * Build the type guard for a closed string union from its member list.
+ *
+ * Every union in this file needs the same check — "is a string, and is one of
+ * these" — and hand-writing it six times produced two different casting styles
+ * for one idea. One factory means one place to read, and a new union gets its
+ * guard for free instead of a seventh copy that may drift.
+ */
+function unionGuard<T extends string>(members: readonly T[]): (value: unknown) => value is T {
+  const allowed: ReadonlySet<string> = new Set(members);
+  return (value: unknown): value is T => typeof value === 'string' && allowed.has(value);
 }
+
+export const isMemoryScope = unionGuard(MEMORY_SCOPES);
 
 // Source Type
 export type SourceType = 'extraction' | 'manual' | 'code_index';
 
 export const SOURCE_TYPES: readonly SourceType[] = ['extraction', 'manual', 'code_index'] as const;
 
-export function isSourceType(value: unknown): value is SourceType {
-  return typeof value === 'string' && (SOURCE_TYPES as readonly string[]).includes(value);
-}
+export const isSourceType = unionGuard(SOURCE_TYPES);
 
 // Core Memory domain object (FR-103)
 export interface Memory {
@@ -142,9 +135,7 @@ export type EdgeStatus = 'active' | 'suggested' | 'archived';
 
 export const EDGE_STATUSES: readonly EdgeStatus[] = ['active', 'suggested', 'archived'] as const;
 
-export function isEdgeStatus(value: unknown): value is EdgeStatus {
-  return typeof value === 'string' && (EDGE_STATUSES as readonly string[]).includes(value);
-}
+export const isEdgeStatus = unionGuard(EDGE_STATUSES);
 
 // Graph edge (FR-104)
 export interface Edge {
@@ -256,6 +247,32 @@ export interface GitContext {
 // Factory Functions with Validation
 
 /**
+ * Refuse a score outside its closed range (pure).
+ *
+ * The three factories below all enforce a [min, max] score with an identical
+ * NaN-guarded comparison and an identical message. One named check keeps the
+ * bound and the wording from drifting between them — a Memory that rejects
+ * confidence 1.5 while its Candidate accepts it is a real divergence, not a
+ * stylistic one.
+ *
+ * @throws when the value is NaN or outside [min, max].
+ */
+function assertInRange(field: string, value: number, min: number, max: number): void {
+  if (Number.isNaN(value) || value < min || value > max) {
+    throw new Error(`${field} must be in [${min}, ${max}], got ${value}`);
+  }
+}
+
+/** @throws when a required identity/content string is empty after trimming. */
+function requireNonEmpty(field: string, value: string): string {
+  const trimmed = value.trim();
+  if (trimmed === '') {
+    throw new Error(`${field} must not be empty`);
+  }
+  return trimmed;
+}
+
+/**
  * Validate and create a Memory with invariants checked.
  * Throws if invariants violated (parse, don't validate pattern).
  */
@@ -282,54 +299,30 @@ export function createMemory(input: {
   archived_at?: string | null;
 }): Memory {
   // Validate non-empty strings
-  const trimmedId = input.id.trim();
-  if (trimmedId === '') {
-    throw new Error('id must not be empty');
-  }
+  const trimmedId = requireNonEmpty('id', input.id);
+  const trimmedContent = requireNonEmpty('content', input.content);
+  const trimmedSummary = requireNonEmpty('summary', input.summary);
+  const trimmedSourceSession = requireNonEmpty('source_session', input.source_session);
 
-  const trimmedContent = input.content.trim();
-  if (trimmedContent === '') {
-    throw new Error('content must not be empty');
-  }
+  assertInRange('confidence', input.confidence, 0, 1);
+  assertInRange('priority', input.priority, 1, 10);
 
-  const trimmedSummary = input.summary.trim();
-  if (trimmedSummary === '') {
-    throw new Error('summary must not be empty');
-  }
-
-  const trimmedSourceSession = input.source_session.trim();
-  if (trimmedSourceSession === '') {
-    throw new Error('source_session must not be empty');
-  }
-
-  // Validate confidence [0, 1]
-  if (Number.isNaN(input.confidence) || input.confidence < 0 || input.confidence > 1) {
-    throw new Error(`confidence must be in [0, 1], got ${input.confidence}`);
-  }
-
-  // Validate priority [1, 10]
-  if (Number.isNaN(input.priority) || input.priority < 1 || input.priority > 10) {
-    throw new Error(`priority must be in [1, 10], got ${input.priority}`);
-  }
-
-  // Validate memory_type
-  if (!MEMORY_TYPES.includes(input.memory_type)) {
+  // The union members are validated unconditionally: the input type declares
+  // them required, so an `!== undefined` guard would be a branch the compiler
+  // proves dead while leaving untyped JSON-sourced callers — the only callers
+  // that can actually pass undefined — unchecked.
+  if (!isMemoryType(input.memory_type)) {
     throw new Error(`invalid memory_type: ${input.memory_type}`);
   }
-
-  // Validate scope
-  if (input.scope !== undefined && !isMemoryScope(input.scope)) {
+  if (!isMemoryScope(input.scope)) {
     throw new Error(`invalid scope: ${input.scope}`);
   }
-
-  // Validate source_type
-  if (input.source_type !== undefined && !isSourceType(input.source_type)) {
+  if (!isSourceType(input.source_type)) {
     throw new Error(`invalid source_type: ${input.source_type}`);
   }
 
-  // Validate status
   const status = input.status ?? 'active';
-  if (!MEMORY_STATUSES.includes(status)) {
+  if (!isMemoryStatus(status)) {
     throw new Error(`invalid status: ${status}`);
   }
 
@@ -401,6 +394,23 @@ export function resolveArchiveAnchor(
 ):
   | { ok: true; archived_at: string | null | undefined }
   | { ok: false; reason: string } {
+  // An explicit null CLEARS the anchor, and is legal only when the row ends up
+  // in a status that must not carry one. Clearing it while the memory stays
+  // archived or pruned leaves the retention window (FR-091) with nothing to
+  // measure from — the same status/anchor contradiction the non-null cases
+  // below refuse, arriving from the other side. `patch.archived_at === null`
+  // is not `undefined`, so neither of those branches would have caught it.
+  if (patch.archived_at === null) {
+    const resolvedStatus = patch.status ?? current.status;
+    if (resolvedStatus === 'archived' || resolvedStatus === 'pruned') {
+      return {
+        ok: false,
+        reason: `memory ${current.id} is ${resolvedStatus}; archived_at must not be cleared (only archived/pruned memories anchor an archive timestamp)`,
+      };
+    }
+    return { ok: true, archived_at: null };
+  }
+
   // An explicit anchor is only ever legal alongside an archived/pruned status,
   // whether that status arrives in this patch or is already on the row.
   if (patch.archived_at != null) {
@@ -463,28 +473,18 @@ export function createEdge(input: {
   // Validate non-empty identity strings (createMemory's equivalent): SQLite
   // NOT NULL does not reject empty strings, so an empty id/source_id/target_id
   // would otherwise be insertable and unfindable.
-  if (input.id.trim() === '') {
-    throw new Error('id must not be empty');
-  }
-  if (input.source_id.trim() === '') {
-    throw new Error('source_id must not be empty');
-  }
-  if (input.target_id.trim() === '') {
-    throw new Error('target_id must not be empty');
-  }
+  requireNonEmpty('id', input.id);
+  requireNonEmpty('source_id', input.source_id);
+  requireNonEmpty('target_id', input.target_id);
 
   // Validate no self-referencing edges
   if (input.source_id === input.target_id) {
     throw new Error('source_id and target_id must not be equal (no self-referencing edges)');
   }
 
-  // Validate strength [0, 1]
-  if (Number.isNaN(input.strength) || input.strength < 0 || input.strength > 1) {
-    throw new Error(`strength must be in [0, 1], got ${input.strength}`);
-  }
+  assertInRange('strength', input.strength, 0, 1);
 
-  // Validate relation_type
-  if (!EDGE_RELATIONS.includes(input.relation_type)) {
+  if (!isEdgeRelation(input.relation_type)) {
     throw new Error(`invalid relation_type: ${input.relation_type}`);
   }
 
@@ -570,18 +570,10 @@ export function createMemoryCandidate(input: {
   priority: number;
   tags?: readonly string[];
 }): MemoryCandidate {
-  // Validate confidence [0, 1]
-  if (Number.isNaN(input.confidence) || input.confidence < 0 || input.confidence > 1) {
-    throw new Error(`confidence must be in [0, 1], got ${input.confidence}`);
-  }
+  assertInRange('confidence', input.confidence, 0, 1);
+  assertInRange('priority', input.priority, 1, 10);
 
-  // Validate priority [1, 10]
-  if (Number.isNaN(input.priority) || input.priority < 1 || input.priority > 10) {
-    throw new Error(`priority must be in [1, 10], got ${input.priority}`);
-  }
-
-  // Validate memory_type
-  if (!MEMORY_TYPES.includes(input.memory_type)) {
+  if (!isMemoryType(input.memory_type)) {
     throw new Error(`invalid memory_type: ${input.memory_type}`);
   }
 
@@ -596,32 +588,11 @@ export function createMemoryCandidate(input: {
   };
 }
 
-/**
- * Type guard for MemoryType.
- */
-export function isMemoryType(value: unknown): value is MemoryType {
-  return (
-    typeof value === 'string' &&
-    MEMORY_TYPES.includes(value as MemoryType)
-  );
-}
+/** Type guard for MemoryType. */
+export const isMemoryType = unionGuard(MEMORY_TYPES);
 
-/**
- * Type guard for EdgeRelation.
- */
-export function isEdgeRelation(value: unknown): value is EdgeRelation {
-  return (
-    typeof value === 'string' &&
-    EDGE_RELATIONS.includes(value as EdgeRelation)
-  );
-}
+/** Type guard for EdgeRelation. */
+export const isEdgeRelation = unionGuard(EDGE_RELATIONS);
 
-/**
- * Type guard for MemoryStatus.
- */
-export function isMemoryStatus(value: unknown): value is MemoryStatus {
-  return (
-    typeof value === 'string' &&
-    MEMORY_STATUSES.includes(value as MemoryStatus)
-  );
-}
+/** Type guard for MemoryStatus. */
+export const isMemoryStatus = unionGuard(MEMORY_STATUSES);

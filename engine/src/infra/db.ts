@@ -18,7 +18,7 @@ import type {
   SourceType,
   EdgeRelation,
 } from '../core/types.js';
-import { createMemory, createEdge, createExtractionCheckpoint, isEdgeRelation, isMemoryType, isMemoryStatus, isMemoryScope, resolveArchiveAnchor } from '../core/types.js';
+import { createMemory, createEdge, createExtractionCheckpoint, isEdgeRelation, isEdgeStatus, isMemoryType, isMemoryStatus, isMemoryScope, resolveArchiveAnchor } from '../core/types.js';
 import type { Entity, Fact, EntityType } from '../core/entities.js';
 import { createEntity, createFact, isEntityType } from '../core/entities.js';
 import { LOCAL_EMBED_MODEL } from '../config.js';
@@ -1309,14 +1309,23 @@ function rowToEdge(row: EdgeRow): Edge | null {
     console.warn(`[cortex:db] Skipping edge ${row.id}: invalid relation_type '${row.relation_type}'`);
     return null;
   }
+  // status gets the same treatment as relation_type rather than a cast: both
+  // are unvalidated cell values, and createEdge throws on an invalid status.
+  // A cast would turn one corrupt cell into an exception thrown out of every
+  // edge read in the process — none of the four callers catch it — instead of
+  // dropping the one unreadable row the way this mapper already promises.
+  if (!isEdgeStatus(row.status)) {
+    console.warn(`[cortex:db] Skipping edge ${row.id}: invalid status '${row.status}'`);
+    return null;
+  }
   return createEdge({
     id: row.id,
     source_id: row.source_id,
     target_id: row.target_id,
-    relation_type: row.relation_type as EdgeRelation,
+    relation_type: row.relation_type,
     strength: Number(row.strength),
     bidirectional: row.bidirectional === 1,
-    status: row.status as Edge['status'],
+    status: row.status,
     created_at: row.created_at,
     classified_at: row.classified_at ?? null,
     classify_hash: row.classify_hash ?? null,
@@ -1478,6 +1487,21 @@ export function vacuumPrunedMemories(db: Database, retentionDays: number): numbe
 // ============================================================================
 
 /**
+ * Raw extraction_checkpoints row shape. Declared for the same reason as
+ * MemoryRow and EdgeRow: an `as any` here lets a column rename drift past the
+ * compiler and reach createExtractionCheckpoint as undefined, which is exactly
+ * the silent-column-drift class the typed rows exist to prevent.
+ */
+type ExtractionCheckpointRow = {
+  id: string;
+  session_id: string;
+  cursor_position: number;
+  extracted_at: string;
+  transcript_length: number | null;
+  projection_version: number | null;
+};
+
+/**
  * Get extraction checkpoint for session
  * I/O: Reads from database
  *
@@ -1493,7 +1517,7 @@ export function getExtractionCheckpoint(
     SELECT * FROM extraction_checkpoints WHERE session_id = ?
   `);
 
-  const row = stmt.get(sessionId) as any;
+  const row = stmt.get(sessionId) as ExtractionCheckpointRow | null;
   if (!row) {
     return null;
   }
@@ -1557,7 +1581,13 @@ export function saveExtractionCheckpoint(
 }
 
 // ============================================================================
-// CHECKPOINT/RESTORE FOR CONSOLIDATION SAFETY
+// WHOLE-DATABASE SNAPSHOT/RESTORE FOR CONSOLIDATION SAFETY
+//
+// Named "snapshot", not "checkpoint": an ExtractionCheckpoint is a transcript
+// resume cursor, and these are a full-database VACUUM INTO backup. They are
+// unrelated concepts, and while both wore the word "checkpoint" as sibling
+// exports of this module nothing in the names told a reader — or a future
+// edit — which of the two it was touching.
 // ============================================================================
 
 /**
@@ -1571,35 +1601,32 @@ function validatePath(path: string): void {
 }
 
 /**
- * Create database checkpoint (backup)
+ * Create a whole-database snapshot (backup).
  * I/O: Creates backup file using VACUUM INTO
  *
+ * Only the DESTINATION differs between an on-disk database and an in-memory
+ * one; the timestamp, the injection check and the VACUUM are the same work, so
+ * the branch picks a path and the single write below runs it.
+ *
  * @param db - Database instance
- * @returns Path to checkpoint file
+ * @returns Path to the snapshot file
  */
-export function createCheckpoint(db: Database): string {
+export function createDbSnapshot(db: Database): string {
   const filename = db.filename;
-
-  // Guard: :memory: or empty filename → use temp directory
-  if (!filename || filename === ':memory:' || filename === '') {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const checkpointPath = joinPath(tmpdir(), `cortex-checkpoint-${timestamp}.db`);
-
-    validatePath(checkpointPath);
-    db.run(`VACUUM INTO '${checkpointPath}'`);
-    return checkpointPath;
-  }
-
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const checkpointPath = `${filename}.checkpoint-${timestamp}`;
+  const isInMemory = !filename || filename === ':memory:';
+
+  const snapshotPath = isInMemory
+    ? joinPath(tmpdir(), `cortex-snapshot-${timestamp}.db`)
+    : `${filename}.snapshot-${timestamp}`;
 
   // Validate path to prevent SQL injection
-  validatePath(checkpointPath);
+  validatePath(snapshotPath);
 
   // Use VACUUM INTO to create a backup
-  db.run(`VACUUM INTO '${checkpointPath}'`);
+  db.run(`VACUUM INTO '${snapshotPath}'`);
 
-  return checkpointPath;
+  return snapshotPath;
 }
 
 /**
@@ -1618,26 +1645,26 @@ function validateTableName(name: string): void {
 }
 
 /**
- * Restore database from checkpoint.
+ * Restore the database from a whole-database snapshot.
  *
- * Validates and attaches the checkpoint to the open database, validates every
+ * Validates and attaches the snapshot to the open database, validates every
  * copied table, transactionally replaces main-table contents and cleans FTS
- * orphans, then detaches the checkpoint even when restoration fails.
+ * orphans, then detaches the snapshot even when restoration fails.
  *
  * @param db - Database instance
- * @param checkpointPath - Path to checkpoint file
+ * @param snapshotPath - Path to the snapshot file
  */
-export function restoreCheckpoint(db: Database, checkpointPath: string): void {
+export function restoreDbSnapshot(db: Database, snapshotPath: string): void {
   // Validate path to prevent SQL injection
-  validatePath(checkpointPath);
+  validatePath(snapshotPath);
 
-  // Attach the checkpoint database and copy all data
-  db.run(`ATTACH DATABASE '${checkpointPath}' AS checkpoint`);
+  // Attach the snapshot database and copy all data
+  db.run(`ATTACH DATABASE '${snapshotPath}' AS snapshot`);
 
   try {
-    // Get all regular table names from checkpoint (exclude FTS tables)
+    // Get all regular table names from the snapshot (exclude FTS tables)
     const tables = db.query(`
-      SELECT name FROM checkpoint.sqlite_master
+      SELECT name FROM snapshot.sqlite_master
       WHERE type='table'
         AND name NOT LIKE 'sqlite_%'
         AND name NOT LIKE '%_fts%'
@@ -1654,7 +1681,7 @@ export function restoreCheckpoint(db: Database, checkpointPath: string): void {
       for (const { name } of tables) {
         // Use double quotes for table identifiers (SQL standard)
         db.run(`DELETE FROM main."${name}"`);
-        db.run(`INSERT INTO main."${name}" SELECT * FROM checkpoint."${name}"`);
+        db.run(`INSERT INTO main."${name}" SELECT * FROM snapshot."${name}"`);
       }
 
       // The insert triggers resync FTS rows for restored ids, but FTS rows
@@ -1666,8 +1693,8 @@ export function restoreCheckpoint(db: Database, checkpointPath: string): void {
     tx();
   } finally {
     // Always detach — a stuck ATTACH makes every retry fail with
-    // "database checkpoint is already in use".
-    db.run('DETACH DATABASE checkpoint');
+    // "database snapshot is already in use".
+    db.run('DETACH DATABASE snapshot');
   }
 }
 
@@ -1707,10 +1734,11 @@ export function upsertEntity(
   entityType: EntityType,
   aliases: readonly string[] = []
 ): string {
-  // Try exact match first (case-insensitive)
+  // Try exact match first (case-insensitive). Only the id is read back, so the
+  // row is narrowed to the one column this path uses rather than cast to `any`.
   const existing = db.prepare(
-    `SELECT * FROM entities WHERE LOWER(name) = LOWER(?) AND entity_type = ?`
-  ).get(name, entityType) as any;
+    `SELECT id FROM entities WHERE LOWER(name) = LOWER(?) AND entity_type = ?`
+  ).get(name, entityType) as { id: string } | null;
 
   if (existing) {
     return existing.id;
@@ -1811,6 +1839,41 @@ function rowToEntity(row: Record<string, unknown>): Entity {
 // ============================================================================
 
 /**
+ * Raw facts-table row shape, and the one mapper every fact read goes through.
+ *
+ * The three readers below (`getCurrentFacts`, `getAllFacts`,
+ * `getFactsByMemory`) each carried their own copy of this nine-field mapping
+ * over an `any[]`, which is the same shape of hazard `rowToEdge` was extracted
+ * to end: three copies of one mapping is three places a new column can be
+ * added to two of them.
+ */
+type FactRow = {
+  id: string;
+  entity_id: string;
+  predicate: string;
+  object: string;
+  source_memory_id: string;
+  confidence: number;
+  valid_from: string;
+  valid_to: string | null;
+  created_at: string;
+};
+
+function rowToFact(row: FactRow): Fact {
+  return createFact({
+    id: row.id,
+    entity_id: row.entity_id,
+    predicate: row.predicate,
+    object: row.object,
+    source_memory_id: row.source_memory_id,
+    confidence: row.confidence,
+    valid_from: row.valid_from,
+    valid_to: row.valid_to,
+    created_at: row.created_at,
+  });
+}
+
+/**
  * Insert a new fact.
  * I/O: Writes to database
  */
@@ -1849,19 +1912,9 @@ export function getCurrentFacts(db: Database, entityId: string): readonly Fact[]
      WHERE f.entity_id = ? AND f.valid_to IS NULL
        AND (m.id IS NULL OR m.status = 'active')
      ORDER BY f.created_at DESC`
-  ).all(entityId) as any[];
+  ).all(entityId) as FactRow[];
 
-  return rows.map(row => createFact({
-    id: row.id,
-    entity_id: row.entity_id,
-    predicate: row.predicate,
-    object: row.object,
-    source_memory_id: row.source_memory_id,
-    confidence: row.confidence,
-    valid_from: row.valid_from,
-    valid_to: row.valid_to,
-    created_at: row.created_at,
-  }));
+  return rows.map(rowToFact);
 }
 
 /**
@@ -1871,19 +1924,9 @@ export function getCurrentFacts(db: Database, entityId: string): readonly Fact[]
 export function getAllFacts(db: Database, entityId: string): readonly Fact[] {
   const rows = db.prepare(
     `SELECT * FROM facts WHERE entity_id = ? ORDER BY created_at DESC`
-  ).all(entityId) as any[];
+  ).all(entityId) as FactRow[];
 
-  return rows.map(row => createFact({
-    id: row.id,
-    entity_id: row.entity_id,
-    predicate: row.predicate,
-    object: row.object,
-    source_memory_id: row.source_memory_id,
-    confidence: row.confidence,
-    valid_from: row.valid_from,
-    valid_to: row.valid_to,
-    created_at: row.created_at,
-  }));
+  return rows.map(rowToFact);
 }
 
 /**
@@ -1918,17 +1961,7 @@ export function supersedeFactsForMemory(db: Database, memoryId: string): number 
 export function getFactsByMemory(db: Database, memoryId: string): readonly Fact[] {
   const rows = db.prepare(
     `SELECT * FROM facts WHERE source_memory_id = ?`
-  ).all(memoryId) as any[];
+  ).all(memoryId) as FactRow[];
 
-  return rows.map(row => createFact({
-    id: row.id,
-    entity_id: row.entity_id,
-    predicate: row.predicate,
-    object: row.object,
-    source_memory_id: row.source_memory_id,
-    confidence: row.confidence,
-    valid_from: row.valid_from,
-    valid_to: row.valid_to,
-    created_at: row.created_at,
-  }));
+  return rows.map(rowToFact);
 }

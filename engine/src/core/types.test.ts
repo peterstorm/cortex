@@ -24,20 +24,42 @@ import {
   type SimilarityAction,
 } from './types.js';
 
+/**
+ * The ten required fields of a Memory, so a test states only what it varies.
+ *
+ * Nearly every case here differs from its neighbour in one field and repeated
+ * the other nine verbatim, which buries the thing under test in boilerplate
+ * and makes a required-field change a 27-site edit.
+ */
+const BASE_MEMORY_INPUT = {
+  id: 'mem-base',
+  content: 'Content',
+  summary: 'Summary',
+  memory_type: 'architecture' as MemoryType,
+  scope: 'project' as const,
+  confidence: 0.5,
+  priority: 5,
+  source_type: 'manual' as const,
+  source_session: 'session',
+  source_context: '{}',
+};
+
+type MemoryInput = Parameters<typeof createMemory>[0];
+
+function memoryInput(overrides: Partial<MemoryInput> = {}): MemoryInput {
+  return { ...BASE_MEMORY_INPUT, ...overrides };
+}
+
 describe('createMemory', () => {
   it('creates valid memory with all required fields', () => {
-    const memory = createMemory({
+    const memory = createMemory(memoryInput({
       id: 'mem-1',
       content: 'Test content',
       summary: 'Test summary',
-      memory_type: 'architecture',
-      scope: 'project',
       confidence: 0.8,
-      priority: 5,
-      source_type: 'manual',
       source_session: 'session-1',
       source_context: JSON.stringify({ branch: 'main' }),
-    });
+    }));
 
     expect(memory.id).toBe('mem-1');
     expect(memory.content).toBe('Test content');
@@ -57,23 +79,20 @@ describe('createMemory', () => {
 
   it('creates memory with optional fields', () => {
     const embedding = new Float64Array([0.1, 0.2, 0.3]);
-    const memory = createMemory({
+    const memory = createMemory(memoryInput({
       id: 'mem-2',
-      content: 'Content',
-      summary: 'Summary',
       memory_type: 'decision',
       scope: 'global',
       confidence: 0.9,
       priority: 8,
       source_type: 'extraction',
       source_session: 'session-2',
-      source_context: '{}',
       tags: ['tag1', 'tag2'],
       pinned: true,
       embedding: embedding,
       access_count: 5,
       status: 'superseded',
-    });
+    }));
 
     expect(memory.tags).toEqual(['tag1', 'tag2']);
     expect(memory.pinned).toBe(true);
@@ -84,242 +103,141 @@ describe('createMemory', () => {
 
   it('throws on confidence < 0', () => {
     expect(() =>
-      createMemory({
+      createMemory(memoryInput({
         id: 'mem-3',
-        content: 'Content',
-        summary: 'Summary',
         memory_type: 'pattern',
-        scope: 'project',
         confidence: -0.1,
-        priority: 5,
-        source_type: 'manual',
         source_session: 'session-3',
-        source_context: '{}',
-      })
+      }))
     ).toThrow('confidence must be in [0, 1]');
   });
 
   it('throws on confidence > 1', () => {
     expect(() =>
-      createMemory({
+      createMemory(memoryInput({
         id: 'mem-4',
-        content: 'Content',
-        summary: 'Summary',
         memory_type: 'gotcha',
-        scope: 'project',
         confidence: 1.5,
-        priority: 5,
-        source_type: 'manual',
         source_session: 'session-4',
-        source_context: '{}',
-      })
+      }))
     ).toThrow('confidence must be in [0, 1]');
   });
 
   it('throws on priority < 1', () => {
     expect(() =>
-      createMemory({
+      createMemory(memoryInput({
         id: 'mem-5',
-        content: 'Content',
-        summary: 'Summary',
         memory_type: 'context',
-        scope: 'project',
-        confidence: 0.5,
         priority: 0,
-        source_type: 'manual',
         source_session: 'session-5',
-        source_context: '{}',
-      })
+      }))
     ).toThrow('priority must be in [1, 10]');
   });
 
   it('throws on priority > 10', () => {
     expect(() =>
-      createMemory({
+      createMemory(memoryInput({
         id: 'mem-6',
-        content: 'Content',
-        summary: 'Summary',
         memory_type: 'progress',
-        scope: 'project',
-        confidence: 0.5,
         priority: 11,
-        source_type: 'manual',
         source_session: 'session-6',
-        source_context: '{}',
-      })
+      }))
     ).toThrow('priority must be in [1, 10]');
   });
 
   it('throws on invalid memory_type', () => {
     expect(() =>
-      createMemory({
+      createMemory(memoryInput({
         id: 'mem-7',
-        content: 'Content',
-        summary: 'Summary',
         memory_type: 'invalid' as MemoryType,
-        scope: 'project',
-        confidence: 0.5,
-        priority: 5,
-        source_type: 'manual',
         source_session: 'session-7',
-        source_context: '{}',
-      })
+      }))
     ).toThrow('invalid memory_type');
   });
 
   it('throws on invalid status', () => {
     expect(() =>
-      createMemory({
+      createMemory(memoryInput({
         id: 'mem-8',
-        content: 'Content',
-        summary: 'Summary',
         memory_type: 'code_description',
-        scope: 'project',
-        confidence: 0.5,
-        priority: 5,
-        source_type: 'manual',
         source_session: 'session-8',
-        source_context: '{}',
         status: 'invalid' as any,
-      })
+      }))
     ).toThrow('invalid status');
   });
 
   it('accepts all valid memory types', () => {
     MEMORY_TYPES.forEach((type) => {
-      const memory = createMemory({
+      const memory = createMemory(memoryInput({
         id: `mem-${type}`,
-        content: 'Content',
-        summary: 'Summary',
         memory_type: type,
-        scope: 'project',
-        confidence: 0.5,
-        priority: 5,
-        source_type: 'manual',
-        source_session: 'session',
-        source_context: '{}',
-      });
+      }));
       expect(memory.memory_type).toBe(type);
     });
   });
 
   it('accepts all valid statuses', () => {
     MEMORY_STATUSES.forEach((status) => {
-      const memory = createMemory({
+      const memory = createMemory(memoryInput({
         id: `mem-${status}`,
-        content: 'Content',
-        summary: 'Summary',
-        memory_type: 'architecture',
-        scope: 'project',
-        confidence: 0.5,
-        priority: 5,
-        source_type: 'manual',
-        source_session: 'session',
-        source_context: '{}',
         status,
-      });
+      }));
       expect(memory.status).toBe(status);
     });
   });
 
   it('throws when an active memory carries an archived_at timestamp', () => {
-    expect(() => createMemory({
+    expect(() => createMemory(memoryInput({
       id: 'mem-active-archive',
-      content: 'Content',
-      summary: 'Summary',
       memory_type: 'context',
-      confidence: 0.5,
-      priority: 5,
-      source_type: 'manual',
-      source_session: 'session',
-      scope: 'project',
-      source_context: '{}',
       status: 'active',
       archived_at: '2026-08-12T00:00:00.000Z',
-    })).toThrow(/active memory must not have archived_at/);
+    }))).toThrow(/active memory must not have archived_at/);
   });
 
   it('throws when archived_at is set on a non-archived, non-pruned status', () => {
-    expect(() => createMemory({
+    expect(() => createMemory(memoryInput({
       id: 'mem-superseded-archive',
-      content: 'Content',
-      summary: 'Summary',
       memory_type: 'context',
-      confidence: 0.5,
-      priority: 5,
-      source_type: 'manual',
-      source_session: 'session',
-      scope: 'project',
-      source_context: '{}',
       status: 'superseded',
       archived_at: '2026-08-12T00:00:00.000Z',
-    })).toThrow(/must not have archived_at/);
+    }))).toThrow(/must not have archived_at/);
   });
 
   it('accepts a pruned memory retaining its archive anchor (retention window)', () => {
-    const memory = createMemory({
+    const memory = createMemory(memoryInput({
       id: 'mem-pruned-anchored',
-      content: 'Content',
-      summary: 'Summary',
       memory_type: 'context',
-      confidence: 0.5,
-      priority: 5,
-      source_type: 'manual',
-      source_session: 'session',
-      scope: 'project',
-      source_context: '{}',
       status: 'pruned',
       archived_at: '2026-08-12T00:00:00.000Z',
-    });
+    }));
     expect(memory.archived_at).toBe('2026-08-12T00:00:00.000Z');
   });
 
   it('accepts an archived memory with an archived_at anchor', () => {
-    const memory = createMemory({
+    const memory = createMemory(memoryInput({
       id: 'mem-archived-anchored',
-      content: 'Content',
-      summary: 'Summary',
       memory_type: 'context',
-      confidence: 0.5,
-      priority: 5,
-      source_type: 'manual',
-      source_session: 'session',
-      scope: 'project',
-      source_context: '{}',
       status: 'archived',
       archived_at: '2026-08-12T00:00:00.000Z',
-    });
+    }));
     expect(memory.archived_at).toBe('2026-08-12T00:00:00.000Z');
   });
 
   it('throws on invalid scope', () => {
-    expect(() => createMemory({
+    expect(() => createMemory(memoryInput({
       id: 'mem-bad-scope',
-      content: 'Content',
-      summary: 'Summary',
       memory_type: 'context',
       scope: 'workspace' as never,
-      confidence: 0.5,
-      priority: 5,
-      source_type: 'manual',
-      source_session: 'session',
-      source_context: '{}',
-    })).toThrow(/invalid scope/);
+    }))).toThrow(/invalid scope/);
   });
 
   it('throws on invalid source_type', () => {
-    expect(() => createMemory({
+    expect(() => createMemory(memoryInput({
       id: 'mem-bad-source',
-      content: 'Content',
-      summary: 'Summary',
       memory_type: 'context',
-      scope: 'project',
-      confidence: 0.5,
-      priority: 5,
       source_type: 'imported' as never,
-      source_session: 'session',
-      source_context: '{}',
-    })).toThrow(/invalid source_type/);
+    }))).toThrow(/invalid source_type/);
   });
 
   it('serializes every SourceContext variant deterministically', () => {
@@ -344,18 +262,11 @@ describe('createMemory', () => {
 
   it('sets timestamps automatically', () => {
     const before = new Date().toISOString();
-    const memory = createMemory({
+    const memory = createMemory(memoryInput({
       id: 'mem-9',
-      content: 'Content',
-      summary: 'Summary',
       memory_type: 'code',
-      scope: 'project',
-      confidence: 0.5,
-      priority: 5,
       source_type: 'code_index',
-      source_session: 'session',
-      source_context: '{}',
-    });
+    }));
     const after = new Date().toISOString();
 
     expect(memory.created_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
@@ -367,187 +278,99 @@ describe('createMemory', () => {
 
   it('throws on empty id', () => {
     expect(() =>
-      createMemory({
+      createMemory(memoryInput({
         id: '',
-        content: 'Content',
-        summary: 'Summary',
-        memory_type: 'architecture',
-        scope: 'project',
-        confidence: 0.5,
-        priority: 5,
-        source_type: 'manual',
-        source_session: 'session',
-        source_context: '{}',
-      })
+      }))
     ).toThrow('id must not be empty');
   });
 
   it('throws on whitespace-only id', () => {
     expect(() =>
-      createMemory({
+      createMemory(memoryInput({
         id: '   ',
-        content: 'Content',
-        summary: 'Summary',
-        memory_type: 'architecture',
-        scope: 'project',
-        confidence: 0.5,
-        priority: 5,
-        source_type: 'manual',
-        source_session: 'session',
-        source_context: '{}',
-      })
+      }))
     ).toThrow('id must not be empty');
   });
 
   it('throws on empty content', () => {
     expect(() =>
-      createMemory({
+      createMemory(memoryInput({
         id: 'mem-1',
         content: '',
-        summary: 'Summary',
-        memory_type: 'architecture',
-        scope: 'project',
-        confidence: 0.5,
-        priority: 5,
-        source_type: 'manual',
-        source_session: 'session',
-        source_context: '{}',
-      })
+      }))
     ).toThrow('content must not be empty');
   });
 
   it('throws on whitespace-only content', () => {
     expect(() =>
-      createMemory({
+      createMemory(memoryInput({
         id: 'mem-1',
         content: '   ',
-        summary: 'Summary',
-        memory_type: 'architecture',
-        scope: 'project',
-        confidence: 0.5,
-        priority: 5,
-        source_type: 'manual',
-        source_session: 'session',
-        source_context: '{}',
-      })
+      }))
     ).toThrow('content must not be empty');
   });
 
   it('throws on empty summary', () => {
     expect(() =>
-      createMemory({
+      createMemory(memoryInput({
         id: 'mem-1',
-        content: 'Content',
         summary: '',
-        memory_type: 'architecture',
-        scope: 'project',
-        confidence: 0.5,
-        priority: 5,
-        source_type: 'manual',
-        source_session: 'session',
-        source_context: '{}',
-      })
+      }))
     ).toThrow('summary must not be empty');
   });
 
   it('throws on whitespace-only summary', () => {
     expect(() =>
-      createMemory({
+      createMemory(memoryInput({
         id: 'mem-1',
-        content: 'Content',
         summary: '   ',
-        memory_type: 'architecture',
-        scope: 'project',
-        confidence: 0.5,
-        priority: 5,
-        source_type: 'manual',
-        source_session: 'session',
-        source_context: '{}',
-      })
+      }))
     ).toThrow('summary must not be empty');
   });
 
   it('throws on empty source_session', () => {
     expect(() =>
-      createMemory({
+      createMemory(memoryInput({
         id: 'mem-1',
-        content: 'Content',
-        summary: 'Summary',
-        memory_type: 'architecture',
-        scope: 'project',
-        confidence: 0.5,
-        priority: 5,
-        source_type: 'manual',
         source_session: '',
-        source_context: '{}',
-      })
+      }))
     ).toThrow('source_session must not be empty');
   });
 
   it('throws on whitespace-only source_session', () => {
     expect(() =>
-      createMemory({
+      createMemory(memoryInput({
         id: 'mem-1',
-        content: 'Content',
-        summary: 'Summary',
-        memory_type: 'architecture',
-        scope: 'project',
-        confidence: 0.5,
-        priority: 5,
-        source_type: 'manual',
         source_session: '   ',
-        source_context: '{}',
-      })
+      }))
     ).toThrow('source_session must not be empty');
   });
 
   it('throws on NaN confidence', () => {
     expect(() =>
-      createMemory({
+      createMemory(memoryInput({
         id: 'mem-1',
-        content: 'Content',
-        summary: 'Summary',
-        memory_type: 'architecture',
-        scope: 'project',
         confidence: NaN,
-        priority: 5,
-        source_type: 'manual',
-        source_session: 'session',
-        source_context: '{}',
-      })
+      }))
     ).toThrow('confidence must be in [0, 1]');
   });
 
   it('throws on NaN priority', () => {
     expect(() =>
-      createMemory({
+      createMemory(memoryInput({
         id: 'mem-1',
-        content: 'Content',
-        summary: 'Summary',
-        memory_type: 'architecture',
-        scope: 'project',
-        confidence: 0.5,
         priority: NaN,
-        source_type: 'manual',
-        source_session: 'session',
-        source_context: '{}',
-      })
+      }))
     ).toThrow('priority must be in [1, 10]');
   });
 
   it('trims whitespace from id, content, summary, and source_session', () => {
-    const memory = createMemory({
+    const memory = createMemory(memoryInput({
       id: '  mem-1  ',
       content: '  Content  ',
       summary: '  Summary  ',
-      memory_type: 'architecture',
-      scope: 'project',
-      confidence: 0.5,
-      priority: 5,
-      source_type: 'manual',
       source_session: '  session  ',
-      source_context: '{}',
-    });
+    }));
 
     expect(memory.id).toBe('mem-1');
     expect(memory.content).toBe('Content');
@@ -992,18 +815,14 @@ describe('property tests', () => {
           fc.float({ min: 0, max: 1, noNaN: true }),
           fc.integer({ min: 1, max: 10 }),
           (confidence, priority) => {
-            const memory = createMemory({
+            const memory = createMemory(memoryInput({
               id: 'test',
               content: 'test',
               summary: 'test',
               memory_type: 'architecture',
-              scope: 'project',
               confidence,
               priority,
-              source_type: 'manual',
-              source_session: 'session',
-              source_context: '{}',
-            });
+            }));
             expect(memory.confidence).toBeGreaterThanOrEqual(0);
             expect(memory.confidence).toBeLessThanOrEqual(1);
           }
@@ -1017,18 +836,14 @@ describe('property tests', () => {
           fc.float({ min: 0, max: 1, noNaN: true }),
           fc.integer({ min: 1, max: 10 }),
           (confidence, priority) => {
-            const memory = createMemory({
+            const memory = createMemory(memoryInput({
               id: 'test',
               content: 'test',
               summary: 'test',
               memory_type: 'decision',
-              scope: 'project',
               confidence,
               priority,
-              source_type: 'manual',
-              source_session: 'session',
-              source_context: '{}',
-            });
+            }));
             expect(memory.priority).toBeGreaterThanOrEqual(1);
             expect(memory.priority).toBeLessThanOrEqual(10);
           }
@@ -1043,18 +858,14 @@ describe('property tests', () => {
           fc.float({ min: 0, max: 1, noNaN: true }),
           fc.integer({ min: 1, max: 10 }),
           (memoryType, confidence, priority) => {
-            const memory = createMemory({
+            const memory = createMemory(memoryInput({
               id: 'test',
               content: 'test',
               summary: 'test',
               memory_type: memoryType,
-              scope: 'project',
               confidence,
               priority,
-              source_type: 'manual',
-              source_session: 'session',
-              source_context: '{}',
-            });
+            }));
             expect(memory.pinned).toBe(false);
             expect(memory.tags).toEqual([]);
             expect(memory.access_count).toBe(0);

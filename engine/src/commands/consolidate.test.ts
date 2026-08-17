@@ -12,7 +12,7 @@ import {
   detectDuplicates,
   mergePair,
   executeConsolidate,
-  removeCheckpointFile,
+  removeSnapshotFile,
   type MemoryPair,
 } from './consolidate.js';
 import { createMemory } from '../core/types.js';
@@ -52,17 +52,17 @@ function createTestMemory(overrides: Partial<Memory> = {}): Memory {
 // CHECKPOINT CLEANUP
 // ============================================================================
 
-describe('removeCheckpointFile', () => {
-  test('treats an already-absent checkpoint as successfully removed', () => {
-    expect(() => removeCheckpointFile('/tmp/missing-checkpoint', () => {
+describe('removeSnapshotFile', () => {
+  test('treats an already-absent snapshot as successfully removed', () => {
+    expect(() => removeSnapshotFile('/tmp/missing-snapshot', () => {
       throw Object.assign(new Error('not found'), { code: 'ENOENT' });
     })).not.toThrow();
   });
 
-  test('surfaces checkpoint cleanup failures other than ENOENT', () => {
-    expect(() => removeCheckpointFile('/tmp/protected-checkpoint', () => {
+  test('surfaces snapshot cleanup failures other than ENOENT', () => {
+    expect(() => removeSnapshotFile('/tmp/protected-snapshot', () => {
       throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
-    })).toThrow('Failed to remove checkpoint /tmp/protected-checkpoint: permission denied');
+    })).toThrow('Failed to remove snapshot /tmp/protected-snapshot: permission denied');
   });
 });
 
@@ -911,11 +911,11 @@ describe('executeConsolidate', () => {
     db = openDatabase(':memory:');
   });
 
-  test('creates checkpoint before processing', () => {
+  test('creates a snapshot before processing', () => {
     const result = executeConsolidate(db);
 
-    expect(result.checkpoint_path).toBeDefined();
-    expect(result.checkpoint_path).toContain('checkpoint');
+    expect(result.snapshot_path).toBeDefined();
+    expect(result.snapshot_path).toContain('snapshot');
   });
 
   test('detects pairs but does not auto-merge (FR-082)', () => {
@@ -970,7 +970,7 @@ describe('executeConsolidate', () => {
     expect(result.pairs_found).toBe(0);
     expect(result.pairs_merged).toBe(0);
     expect(result.pairs_skipped).toBe(0);
-    expect(result.checkpoint_path).toBeDefined();
+    expect(result.snapshot_path).toBeDefined();
   });
 });
 

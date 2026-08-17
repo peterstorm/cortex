@@ -43,8 +43,19 @@ import {
   shouldRunAiPrune,
   parsePruneResponse,
 } from './ai-prune.js';
+import type { AiPruneResult } from './ai-prune.js';
 
 const tempDirs: string[] = [];
+
+/**
+ * Assert a run failed and hand back the narrowed arm, so `.error` is read from
+ * the only outcome that carries one instead of off the union.
+ */
+function failedPrune(result: AiPruneResult): Extract<AiPruneResult, { kind: 'failed' }> {
+  expect(result.kind).toBe('failed');
+  if (result.kind !== 'failed') throw new Error(`expected a failed prune, got ${result.kind}`);
+  return result;
+}
 
 function makeTelemetryPath(): string {
   const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'cortex-ai-prune-test-'));
@@ -130,7 +141,7 @@ describe('runAiPrune age guard (enforced in code, not just prompt)', () => {
     // The gate passed on the endpoint alone; with no memories the run
     // completes as an empty ok without reaching the transport.
     expect(transportCall).not.toHaveBeenCalled();
-    expect(result.error).toBeUndefined();
+    expect(result.kind).toBe('completed');
   });
 
   it('fails with the dual-transport error when neither endpoint nor CLI exists', async () => {
@@ -143,7 +154,7 @@ describe('runAiPrune age guard (enforced in code, not just prompt)', () => {
       runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport)
     );
 
-    expect(result.error).toMatch(/no LLM available/i);
+    expect(failedPrune(result).error).toMatch(/no LLM available/i);
   });
 
   it('does not archive a fresh memory even when the LLM names it', async () => {
@@ -330,7 +341,7 @@ describe('runAiPruneIfNeeded (watermark wiring)', () => {
 
     const result = await runAiPruneIfNeeded(projectDb, globalDb, telemetryPath, undefined, transport);
 
-    expect(result).toMatchObject({ archived: 0, reviewed: 0, skipped: true });
+    expect(result).toMatchObject({ kind: 'skipped', archived: 0, reviewed: 0 });
     expect(transportCall).not.toHaveBeenCalled();
     projectDb.close();
     globalDb.close();
@@ -349,6 +360,60 @@ describe('runAiPruneIfNeeded (watermark wiring)', () => {
 
     expect(result).toMatchObject({ archived: 0, reviewed: 8 });
     expect(transportCall).toHaveBeenCalledTimes(1);
+    projectDb.close();
+    globalDb.close();
+  });
+
+  // The whole watermark redesign rests on recordSuccessfulAiPrune persisting
+  // last_ai_prune_at. Every other test in this file writes that field by hand,
+  // so a regression in the WRITE path — a wrong key, a dropped writeTelemetry
+  // call — would leave them all green while the prune ran again every session,
+  // which is precisely the tax the watermark exists to remove. This test never
+  // touches the telemetry file: it runs the real thing twice and requires the
+  // second run to be skipped by the watermark the first one wrote.
+  it('advances the watermark on success so an immediate rerun is skipped', async () => {
+    transportCall.mockResolvedValue('{"candidates":[]}');
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    const telemetryPath = makeTelemetryPath(); // no watermark, nothing pre-written
+    for (let index = 0; index < 8; index++) {
+      insertMemory(projectDb, makeMemory(`watermark-${index}`, 10));
+    }
+
+    const first = await runAiPruneIfNeeded(projectDb, globalDb, telemetryPath, undefined, transport);
+    expect(first).toMatchObject({ kind: 'completed', reviewed: 8 });
+    expect(transportCall).toHaveBeenCalledTimes(1);
+
+    // Round-trip the file the run itself wrote, not one the test staged.
+    const persisted = JSON.parse(fs.readFileSync(telemetryPath, 'utf8')) as { last_ai_prune_at?: unknown };
+    expect(typeof persisted.last_ai_prune_at).toBe('string');
+    expect(Number.isNaN(Date.parse(persisted.last_ai_prune_at as string))).toBe(false);
+
+    const second = await runAiPruneIfNeeded(projectDb, globalDb, telemetryPath, undefined, transport);
+
+    expect(second.kind).toBe('skipped');
+    expect(transportCall).toHaveBeenCalledTimes(1); // no second LLM call
+    projectDb.close();
+    globalDb.close();
+  });
+
+  it('leaves the watermark untouched when the run fails, so the review stays owed', async () => {
+    transportCall.mockRejectedValue(new Error('llm exploded'));
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    const telemetryPath = makeTelemetryPath();
+    for (let index = 0; index < 8; index++) {
+      insertMemory(projectDb, makeMemory(`unwatermarked-${index}`, 10));
+    }
+
+    const first = await runAiPruneIfNeeded(projectDb, globalDb, telemetryPath, undefined, transport);
+    expect(first.kind).toBe('failed');
+    expect(fs.existsSync(telemetryPath)).toBe(false);
+
+    // Still due: a failed run must not buy itself a skip.
+    transportCall.mockReset().mockResolvedValue('{"candidates":[]}');
+    const second = await runAiPruneIfNeeded(projectDb, globalDb, telemetryPath, undefined, transport);
+    expect(second.kind).toBe('completed');
     projectDb.close();
     globalDb.close();
   });
@@ -378,7 +443,7 @@ describe('runAiPruneIfNeeded (watermark wiring)', () => {
 
     const result = await runAiPruneIfNeeded(projectDb, globalDb, telemetryPath, undefined, transport);
 
-    expect(result.skipped).toBeUndefined();
+    expect(result.kind).not.toBe('skipped');
     expect(transportCall).toHaveBeenCalled();
     projectDb.close();
     globalDb.close();
@@ -403,7 +468,7 @@ describe('AI prune failure telemetry', () => {
     const result = await runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport);
 
     expect(result).toMatchObject({ archived: 0, reviewed: 0 });
-    expect(result.error).toContain('All 1 AI prune batches failed');
+    expect(failedPrune(result).error).toContain('All 1 AI prune batches failed');
     expect(fs.existsSync(telemetryPath)).toBe(false);
     projectDb.close();
     globalDb.close();
@@ -452,7 +517,7 @@ describe('AI prune failure telemetry', () => {
     const result = await runAiPrune(projectDb, globalDb, telemetryPath, cwd, transport);
 
     expect(result).toMatchObject({ archived: 1, reviewed: 80 });
-    expect(result.error).toContain('1 of 2 AI prune batches failed');
+    expect(failedPrune(result).error).toContain('1 of 2 AI prune batches failed');
     expect(getMemory(projectDb, 'partial-0')?.status).toBe('archived');
     expect(fs.readdirSync(cacheDir).filter((file) => file.endsWith('.json'))).toHaveLength(0);
     expect(fs.existsSync(telemetryPath)).toBe(false);
@@ -475,7 +540,7 @@ describe('AI prune failure telemetry', () => {
     const result = await runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport);
 
     expect(result).toMatchObject({ archived: 0, reviewed: 0 });
-    expect(result.error).toContain('All 1 AI prune batches failed');
+    expect(failedPrune(result).error).toContain('All 1 AI prune batches failed');
     expect(getMemory(projectDb, 'semantic-0')?.status).toBe('active');
     expect(fs.existsSync(telemetryPath)).toBe(false);
     projectDb.close();
@@ -494,7 +559,7 @@ describe('AI prune failure telemetry', () => {
     const result = await runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport);
 
     expect(result).toMatchObject({ archived: 0, reviewed: 0 });
-    expect(result.error).toContain('All 1 AI prune batches failed');
+    expect(failedPrune(result).error).toContain('All 1 AI prune batches failed');
     expect(fs.existsSync(telemetryPath)).toBe(false);
     projectDb.close();
     globalDb.close();
@@ -654,9 +719,13 @@ describe('ai-prune side effects (findings 1b, 12)', () => {
         { id: 'atomic-0', reason: 'obsolete' },
       ] }));
 
-      await expect(runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport)).rejects.toThrow(
-        'forced dependent archive failure'
-      );
+      // A dependent write failure is reported, not thrown: the transaction
+      // still rolls the memory back, the run keeps going for the remaining
+      // candidates, and the outcome is a failure so the watermark stays put.
+      const result = await runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport);
+
+      expect(failedPrune(result).error).toContain('could not be archived');
+      expect(result.archived).toBe(0);
       expect(getMemory(projectDb, 'atomic-0')).toMatchObject({
         status: 'active',
         archived_at: null,
@@ -664,6 +733,7 @@ describe('ai-prune side effects (findings 1b, 12)', () => {
       expect(projectDb.query('SELECT status FROM edges').all()).toEqual([
         { status: 'active' },
       ]);
+      expect(fs.existsSync(telemetryPath)).toBe(false);
     } finally {
       projectDb.close();
       globalDb.close();
