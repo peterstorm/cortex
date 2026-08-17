@@ -11,7 +11,7 @@
  * Flow:
  * 1. Find 'relates_to' edges that have not been classified yet (attempt
  *    tracking via edges.classified_at; content-changed edges re-qualify)
- * 2. Load source/target memories for each
+ * 2. Load source/target memories in a single JOIN (no per-edge lookups)
  * 3. Batch pairs and send to the LLM for classification (bounded concurrency)
  * 4. Replace generic edges with typed ones; after a successfully parsed model
  *    answer, mark answered/declined edges so they are not re-asked next run
@@ -23,6 +23,7 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import type { Database } from 'bun:sqlite';
 import type { Memory } from '../core/types.js';
+import { chunk } from '../core/chunk.js';
 import type { MemoryPair, EdgeClassification } from '../infra/claude-llm.js';
 import { classifyEdges, isClaudeLlmAvailable } from '../infra/claude-llm.js';
 import {
@@ -56,18 +57,6 @@ export interface SemanticEdgesOptions {
 export type SemanticEdgesResult =
   | { ok: true; classified: number; failed: number }
   | { ok: false; error: string };
-
-/**
- * Batch an array into chunks.
- * Pure function.
- */
-function batch<T>(arr: readonly T[], size: number): readonly T[][] {
-  const batches: T[][] = [];
-  for (let i = 0; i < arr.length; i += size) {
-    batches.push(arr.slice(i, i + size));
-  }
-  return batches;
-}
 
 /**
  * Run bounded-concurrency map over an array. Worker failures propagate to
@@ -216,7 +205,7 @@ export async function executeSemanticEdges(
 
     // Step 2: Build batches of pairs (endpoint memories come from the JOIN,
     // so no per-edge lookups and no missing-memory skips are possible)
-    const batches = batch(candidates, BATCH_SIZE);
+    const batches = chunk(candidates, BATCH_SIZE);
 
     // Step 3: Batch and classify with bounded concurrency
     // Attempt timestamp: set on every edge in this batch once the model

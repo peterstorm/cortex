@@ -31,6 +31,7 @@ import {
   AI_PRUNE_MIN_MEMORIES,
   AI_PRUNE_MIN_AGE_DAYS,
 } from '../config.js';
+import { chunk } from '../core/chunk.js';
 
 // ============================================================================
 // TYPES
@@ -309,17 +310,6 @@ export function isProtectedStableMemory(
     (memory.memory_type === 'architecture' || memory.memory_type === 'decision') &&
     memory.confidence >= 0.8
   );
-}
-
-/**
- * Split array into chunks of given size (pure).
- */
-function chunk<T>(arr: readonly T[], size: number): T[][] {
-  const result: T[][] = [];
-  for (let i = 0; i < arr.length; i += size) {
-    result.push(arr.slice(i, i + size));
-  }
-  return result;
 }
 
 /**

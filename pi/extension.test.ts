@@ -1,12 +1,15 @@
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const childProcess = {
+// vi.mock is hoisted above imports, so the mock target must come from
+// vi.hoisted — a plain top-level const would be in its TDZ when the factory
+// runs and collection fails.
+const childProcess = vi.hoisted(() => ({
   execFileSync: vi.fn(() => ''),
   spawn: vi.fn(),
-};
+}));
 
 vi.mock('node:child_process', () => childProcess);
 
@@ -315,5 +318,44 @@ describe('Cortex Pi extension diagnostics and surface contract', () => {
     } finally {
       stderr.mockRestore();
     }
+  });
+
+  it('injects the cached memory surface and the CLI path into the agent start prompt', async () => {
+    // Happy path: a readable surface file is surfaced to the agent as a
+    // hidden cortex-memory message, and the system prompt carries the
+    // resolved plugin root so ${CLAUDE_PLUGIN_ROOT} commands work.
+    const cwd = tempProject();
+    const surfacePath = join(cwd, '.claude', 'cortex-memory.local.md');
+    mkdirSync(dirname(surfacePath), { recursive: true });
+    writeFileSync(surfacePath, 'Recall: use the functional core pattern');
+    const handlers = registerHandlers();
+
+    const result = (await handlers.get('before_agent_start')?.(
+      { systemPrompt: 'base prompt', prompt: '' },
+      { cwd },
+    )) as {
+      systemPrompt: string;
+      message?: { customType: string; content: string; display: boolean };
+    };
+
+    expect(result.systemPrompt.startsWith('base prompt')).toBe(true);
+    expect(result.systemPrompt).toContain('Cortex Memory CLI');
+    expect(result.systemPrompt).toContain('${CLAUDE_PLUGIN_ROOT}');
+    expect(result.message?.customType).toBe('cortex-memory');
+    expect(result.message?.content).toBe('Recall: use the functional core pattern');
+    expect(result.message?.display).toBe(false);
+  });
+
+  it('returns only the system prompt when no surface exists and the prompt is empty', async () => {
+    const cwd = tempProject();
+    const handlers = registerHandlers();
+
+    const result = (await handlers.get('before_agent_start')?.(
+      { systemPrompt: 'base prompt', prompt: '' },
+      { cwd },
+    )) as { systemPrompt: string; message?: unknown };
+
+    expect(result.systemPrompt).toContain('Cortex Memory CLI');
+    expect(result.message).toBeUndefined();
   });
 });

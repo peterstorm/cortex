@@ -261,6 +261,27 @@ describe('executeSemanticEdges', () => {
     expect(mockClassifyEdges).toHaveBeenCalledTimes(1);
   });
 
+  it('re-asks an edge with an unparseable last_failed_at even inside the backoff window (fail-safe)', async () => {
+    // A corrupt timestamp (NaN from Date.parse) must never pin the edge in
+    // backoff forever: the !Number.isNaN guard sends it back to the queue.
+    seedMemory('a');
+    seedMemory('b');
+    insertEdge(db, {
+      source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active',
+      classify_hash: pairContentHash(
+        { content: 'content a', summary: 'summary a' },
+        { content: 'content b', summary: 'summary b' },
+      ),
+      last_failed_at: 'not-a-date',
+    });
+    mockClassifyEdges.mockResolvedValue({ kind: 'ok', classifications: [] });
+
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+
+    expect(result).toEqual({ ok: true, classified: 0, failed: 0 });
+    expect(mockClassifyEdges).toHaveBeenCalledTimes(1);
+  });
+
   it('re-asks a failed edge immediately when its content changed since the failure', async () => {
     seedMemory('a');
     seedMemory('b');

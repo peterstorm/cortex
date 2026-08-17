@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { shouldRunShutdownPipeline, type CortexShutdownReason } from "./shutdown-policy.js";
+import { shouldRunShutdownPipeline, isCortexShutdownReason } from "./shutdown-policy.js";
 import { getSurfaceOutputPath } from "../engine/src/config.js";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -125,11 +125,6 @@ function runCliDetached(args: string[], options?: {
   }
 }
 
-/** Get the unified surface file path for the current project. */
-function getSurfacePath(cwd: string): string {
-  return getSurfaceOutputPath(cwd);
-}
-
 type PiModelSelection = Readonly<{
   provider: string;
   id: string;
@@ -183,7 +178,7 @@ export default function (pi: ExtensionAPI) {
 
     // 2. Load cached surface file
     const parts: string[] = [];
-    const surfacePath = getSurfacePath(cwd);
+    const surfacePath = getSurfaceOutputPath(cwd);
     if (existsSync(surfacePath)) {
       try {
         const surface = readFileSync(surfacePath, "utf-8").trim();
@@ -244,8 +239,17 @@ export default function (pi: ExtensionAPI) {
     // A nested `pi -p` extraction inherits this marker. Never let that child
     // invoke Cortex's shutdown pipeline again: doing so recursively forks one
     // maintenance worker per extraction LLM call.
+    // pi types reason as a closed union today, but a future pi version can
+    // extend it; the guard fails closed on any reason this policy has not
+    // reviewed instead of laundering it through a cast.
+    if (!isCortexShutdownReason(event.reason)) {
+      console.error(
+        `[cortex] Unknown session_shutdown reason '${String(event.reason)}'; skipping shutdown pipeline`
+      );
+      return;
+    }
     if (!shouldRunShutdownPipeline(
-      event.reason as CortexShutdownReason,
+      event.reason,
       process.env.CORTEX_EXTRACTING,
     )) return;
 

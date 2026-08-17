@@ -6,6 +6,8 @@
 
 import { Database } from 'bun:sqlite';
 import { randomUUID } from 'crypto';
+import { tmpdir } from 'node:os';
+import { join as joinPath } from 'node:path';
 import type {
   Memory,
   Edge,
@@ -413,6 +415,20 @@ type MemoryRow = {
  * Pure helper — centralizes the row-to-Memory mapping used by all query functions.
  */
 function rowToMemory(row: MemoryRow): Memory {
+  // One corrupt tags cell must not abort every read that maps rows: the
+  // corrupt-row precedent in this file is warn-with-row-identity and continue
+  // (see the local_embedding guard in collectMemoriesWithEmbeddings). The row
+  // itself is still readable, so its tags fall back to none.
+  let tags: readonly string[] = [];
+  try {
+    const parsed: unknown = JSON.parse(row.tags);
+    if (Array.isArray(parsed)) {
+      tags = parsed as string[];
+    }
+  } catch {
+    console.warn(`[cortex:db] Memory ${row.id}: tags deserialized to invalid JSON; falling back to []`);
+  }
+
   return createMemory({
     id: row.id,
     content: row.content,
@@ -427,7 +443,7 @@ function rowToMemory(row: MemoryRow): Memory {
     source_type: row.source_type,
     source_session: row.source_session,
     source_context: row.source_context,
-    tags: JSON.parse(row.tags),
+    tags,
     access_count: row.access_count,
     last_accessed_at: row.last_accessed_at,
     created_at: row.created_at,
@@ -548,6 +564,19 @@ export function updateMemory(db: Database, id: string, fields: Partial<Memory>):
       throw new Error(`updateMemory: memory ${id} is ${String(current)}; cannot set archived_at without archiving it`);
     }
   }
+  // The mirror image of the guard above: a status-only update leaves
+  // archived_at at the row's current value, so the guard needs the row's
+  // CURRENT anchor. 'superseded' cannot carry an archive anchor (createMemory
+  // refuses to read such a row back); 'active' is excluded because it
+  // auto-clears the anchor below, and 'archived'/'pruned' may carry it.
+  if (fields.status !== undefined && fields.status !== 'active' &&
+      fields.status !== 'archived' && fields.status !== 'pruned' &&
+      fields.archived_at === undefined) {
+    const row = db.prepare('SELECT archived_at FROM memories WHERE id = ?').get(id) as { archived_at?: unknown } | null;
+    if (row?.archived_at !== undefined && row?.archived_at !== null) {
+      throw new Error(`updateMemory: memory ${id} has archived_at set; status ${fields.status} must not carry an archive anchor (only archived/pruned memories anchor an archive timestamp)`);
+    }
+  }
   if (fields.status === 'archived' && fields.archived_at === undefined) {
     fields = { ...fields, archived_at: new Date().toISOString() };
   }
@@ -650,7 +679,7 @@ export function getMemory(db: Database, id: string): Memory | null {
     SELECT * FROM memories WHERE id = ?
   `);
 
-  const row = stmt.get(id) as any;
+  const row = stmt.get(id) as MemoryRow | undefined;
   if (!row) {
     return null;
   }
@@ -695,7 +724,7 @@ export function getMemoriesByIds(
   `);
 
   const params = statuses === 'any' ? [...ids] : [...ids, ...statuses];
-  const rows = stmt.all(...params) as any[];
+  const rows = stmt.all(...params) as MemoryRow[];
 
   return rows.map(rowToMemory);
 }
@@ -712,52 +741,63 @@ export function getActiveMemories(db: Database): readonly Memory[] {
     SELECT * FROM memories WHERE status = 'active'
   `);
 
-  const rows = stmt.all() as any[];
+  const rows = stmt.all() as MemoryRow[];
+
+  return rows.map(rowToMemory);
+}
+
+/**
+ * Get active memories of the given type matching a file path in source_context.
+ * I/O: Reads from database
+ *
+ * source_context is stored as JSON (serializeSourceContext), so the lookup
+ * parses it at the query boundary with json_extract instead of pattern-
+ * matching the serialized text: a LIKE over the JSON breaks on paths that
+ * contain a backslash or a double quote (their JSON-escaped forms), silently
+ * matching no row — and a backslash path could even match a different file's
+ * collapsed form. json_extract is exact and parameterized. createMemory does
+ * not validate source_context, so a corrupt cell is reachable; json_valid
+ * guards it so malformed rows are skipped (no match), never a throw — one
+ * bad row must not break a whole index pass.
+ */
+function getActiveMemoriesByFilePath(
+  db: Database,
+  memoryType: 'code' | 'code_description',
+  filePath: string
+): readonly Memory[] {
+  const stmt = db.prepare(`
+    SELECT * FROM memories
+    WHERE status = 'active'
+      AND memory_type = ?
+      AND CASE WHEN json_valid(source_context)
+               THEN json_extract(source_context, '$.file_path') END = ?
+  `);
+  const rows = stmt.all(memoryType, filePath) as MemoryRow[];
 
   return rows.map(rowToMemory);
 }
 
 /**
  * Get active code memories matching a file path in source_context.
- * Uses SQL LIKE on source_context JSON to avoid full table scan.
+ * I/O: Reads from database
  */
 export function getActiveCodeMemoriesByFilePath(
   db: Database,
   filePath: string
 ): readonly Memory[] {
-  // Escape LIKE wildcards and double quotes in file path
-  const escaped = filePath.replace(/"/g, '\\"').replace(/%/g, '\\%').replace(/_/g, '\\_');
-  const pattern = `%"file_path":"${escaped}"%`;
-  const stmt = db.prepare(`
-    SELECT * FROM memories
-    WHERE status = 'active'
-      AND memory_type = 'code'
-      AND source_context LIKE ? ESCAPE '\\'
-  `);
-  const rows = stmt.all(pattern) as any[];
-
-  return rows.map(rowToMemory);
+  return getActiveMemoriesByFilePath(db, 'code', filePath);
 }
 
 /**
  * Get active code_description (prose) memories matching a file path in source_context.
  * Used for superseding old prose memories on re-index.
+ * I/O: Reads from database
  */
 export function getActiveProseMemoriesByFilePath(
   db: Database,
   filePath: string
 ): readonly Memory[] {
-  const escaped = filePath.replace(/"/g, '\\"').replace(/%/g, '\\%').replace(/_/g, '\\_');
-  const pattern = `%"file_path":"${escaped}"%`;
-  const stmt = db.prepare(`
-    SELECT * FROM memories
-    WHERE status = 'active'
-      AND memory_type = 'code_description'
-      AND source_context LIKE ? ESCAPE '\\'
-  `);
-  const rows = stmt.all(pattern) as any[];
-
-  return rows.map(rowToMemory);
+  return getActiveMemoriesByFilePath(db, 'code_description', filePath);
 }
 
 /**
@@ -772,7 +812,7 @@ export function getArchivedMemories(db: Database): readonly Memory[] {
     SELECT * FROM memories WHERE status = 'archived'
   `);
 
-  const rows = stmt.all() as any[];
+  const rows = stmt.all() as MemoryRow[];
 
   return rows.map(rowToMemory);
 }
@@ -814,7 +854,20 @@ export function getMemoriesWithEmbedding(
     `SELECT * FROM memories WHERE ${pred.sql} AND status = 'active'`
   );
 
-  const rows = stmt.all(...pred.params) as any[];
+  const rows = stmt.all(...pred.params) as MemoryRow[];
+
+  return collectMemoriesWithEmbeddings(rows);
+}
+
+/**
+ * Shared row loop for the two embedding read paths: map each row, skip rows
+ * whose local_embedding cannot deserialize (with the #9 diagnostic), keep the
+ * rest. Both paths must apply the same skip policy — a row skipped in one
+ * path and returned in the other would rank differently by query shape.
+ */
+function collectMemoriesWithEmbeddings(
+  rows: readonly MemoryRow[]
+): { memory: Memory; embedding: Float32Array }[] {
   const results: { memory: Memory; embedding: Float32Array }[] = [];
 
   for (const row of rows) {
@@ -847,30 +900,9 @@ export function searchByKeyword(
   query: string,
   limit: number
 ): readonly Memory[] {
-  const stmt = db.prepare(`
-    SELECT m.*
-    FROM memories m
-    JOIN memories_fts fts ON m.id = fts.id
-    WHERE memories_fts MATCH ?
-    AND m.status = 'active'
-    ORDER BY rank
-    LIMIT ?
-  `);
-
-  // Quote each token individually to prevent FTS5 syntax injection (e.g. hyphens
-  // in UUIDs being parsed as column/NOT operators) while preserving AND semantics.
-  const safeQuery = query
-    .split(/\s+/)
-    .filter(t => t.length > 0)
-    .map(t => '"' + t.replace(/"/g, '""') + '"')
-    .join(' ');
-
-  // MATCH '' is an FTS5 syntax error — empty/whitespace query means no results
-  if (safeQuery.length === 0) return [];
-
-  const rows = stmt.all(safeQuery, limit) as any[];
-
-  return rows.map(rowToMemory);
+  // Split into tokens and search with FTS5 implicit-AND semantics (the same
+  // joiner as searchByKeywordAnd); token quoting is buildFts5Query's job.
+  return searchByKeywordWithJoiner(db, query.split(/\s+/), limit, ' ');
 }
 
 /**
@@ -926,16 +958,28 @@ function searchByKeywordWithJoiner(
     LIMIT ?
   `);
 
-  const safeQuery = tokens
+  const safeQuery = buildFts5Query(tokens, joiner);
+
+  // MATCH '' is an FTS5 syntax error — empty/whitespace tokens mean no results
+  if (safeQuery.length === 0) return [];
+
+  const rows = stmt.all(safeQuery, limit) as MemoryRow[];
+
+  return rows.map(rowToMemory);
+}
+
+/**
+ * Build a safe FTS5 MATCH expression from raw tokens: each token is
+ * double-quote-escaped and wrapped in quotes, so FTS5 syntax operators (e.g.
+ * hyphens in UUIDs being parsed as column/NOT operators) can never be
+ * injected. The joiner picks the semantics: ' ' is FTS5 implicit AND,
+ * ' OR ' is OR. Pure; shared by every FTS5 MATCH builder in this file.
+ */
+function buildFts5Query(tokens: readonly string[], joiner: ' ' | ' OR '): string {
+  return tokens
     .filter(t => t.length > 0)
     .map(t => '"' + t.replace(/"/g, '""') + '"')
     .join(joiner);
-
-  if (safeQuery.length === 0) return [];
-
-  const rows = stmt.all(safeQuery, limit) as any[];
-
-  return rows.map(rowToMemory);
 }
 
 /**
@@ -955,20 +999,9 @@ export function getMemoriesWithEmbeddingByIds(
     SELECT * FROM memories WHERE id IN (${placeholders}) AND ${pred.sql} AND status = 'active'
   `);
 
-  const rows = stmt.all(...ids, ...pred.params) as any[];
-  const results: { memory: Memory; embedding: Float32Array }[] = [];
+  const rows = stmt.all(...ids, ...pred.params) as MemoryRow[];
 
-  for (const row of rows) {
-    const memory = rowToMemory(row);
-    const memoryEmbedding = memory.local_embedding;
-    if (!memoryEmbedding) {
-      console.warn(`[cortex:db] Skipping memory ${memory.id}: local_embedding deserialized to null`);
-      continue;
-    }
-    results.push({ memory, embedding: memoryEmbedding });
-  }
-
-  return results;
+  return collectMemoriesWithEmbeddings(rows);
 }
 
 /**
@@ -996,7 +1029,7 @@ export function getLatestMemoryTimestamp(db: Database): string | null {
  * I/O: Writes to database
  *
  * @param db - Database instance
- * @param edge - Edge to insert (without id and created_at)
+ * @param edge - Edge to insert (without id and created_at; classified_at/classify_hash/last_failed_at optional, default null)
  * @returns Generated edge ID
  * @throws If unique constraint violated (duplicate edge)
  */
@@ -1062,27 +1095,9 @@ export function getEdgesForMemory(db: Database, memoryId: string): readonly Edge
     AND status IN ('active', 'suggested')
   `);
 
-  const rows = stmt.all(memoryId, memoryId) as any[];
+  const rows = stmt.all(memoryId, memoryId) as unknown as Array<Record<string, unknown>>;
 
-  return rows.flatMap(row => {
-    if (!isEdgeRelation(row.relation_type)) {
-      console.warn(`[cortex:db] Skipping edge ${row.id}: invalid relation_type '${row.relation_type}'`);
-      return [];
-    }
-    return [createEdge({
-      id: row.id,
-      source_id: row.source_id,
-      target_id: row.target_id,
-      relation_type: row.relation_type,
-      strength: row.strength,
-      bidirectional: row.bidirectional === 1,
-      status: row.status,
-      created_at: row.created_at,
-      classified_at: (row.classified_at ?? null) as string | null,
-      classify_hash: (row.classify_hash ?? null) as string | null,
-      last_failed_at: (row.last_failed_at ?? null) as string | null,
-    })];
-  });
+  return edgeRowsToEdges(rows);
 }
 
 /**
@@ -1097,25 +1112,7 @@ export function getAllEdges(db: Database): readonly Edge[] {
   const stmt = db.prepare(`SELECT * FROM edges WHERE status IN ('active', 'suggested')`);
   const rows = stmt.all() as unknown as Array<Record<string, unknown>>;
 
-  return rows.flatMap(row => {
-    if (!isEdgeRelation(asString(row.relation_type))) {
-      console.warn(`[cortex:db] Skipping edge ${row.id}: invalid relation_type '${row.relation_type}'`);
-      return [];
-    }
-    return [createEdge({
-      id: asString(row.id),
-      source_id: asString(row.source_id),
-      target_id: asString(row.target_id),
-      relation_type: asString(row.relation_type) as EdgeRelation,
-      strength: Number(row.strength),
-      bidirectional: row.bidirectional === 1,
-      status: asString(row.status) as Edge['status'],
-      created_at: asString(row.created_at),
-      classified_at: (row.classified_at ?? null) as string | null,
-      classify_hash: (row.classify_hash ?? null) as string | null,
-      last_failed_at: (row.last_failed_at ?? null) as string | null,
-    })];
-  });
+  return edgeRowsToEdges(rows);
 }
 
 /**
@@ -1176,21 +1173,8 @@ export function getRelatesToEdgesWithMemories(db: Database): readonly EdgeWithMe
 
   const rows = stmt.all() as unknown as Array<Record<string, unknown>>;
   return rows.flatMap((row) => {
-    if (!isEdgeRelation(asString(row.relation_type))) return [];
-
-    const edge = createEdge({
-      id: asString(row.id),
-      source_id: asString(row.source_id),
-      target_id: asString(row.target_id),
-      relation_type: asString(row.relation_type) as EdgeRelation,
-      strength: Number(row.strength),
-      bidirectional: row.bidirectional === 1,
-      status: asString(row.status) as Edge['status'],
-      created_at: asString(row.created_at),
-      classified_at: (row.classified_at ?? null) as string | null,
-      classify_hash: (row.classify_hash ?? null) as string | null,
-      last_failed_at: (row.last_failed_at ?? null) as string | null,
-    });
+    const edge = rowToEdge(row);
+    if (edge === null) return [];
 
     return [
       {
@@ -1266,26 +1250,39 @@ export function countActiveMemoriesCreatedAfter(db: Database, sinceIso: string):
   return row.n;
 }
 
+/**
+ * Map one edges-table row to an Edge, or null (with a stderr diagnostic) when
+ * relation_type is not a domain value. Every edge read path routes through
+ * this single mapper: r44's last_failed_at omission lived in four separate
+ * copies of this mapping, where one drifted copy silently falsified the
+ * failure-backoff signal — a shared mapper makes that drift structurally
+ * impossible and keeps the invalid-row drop diagnosable in every path.
+ */
+function rowToEdge(row: Record<string, unknown>): Edge | null {
+  const relationType = asString(row.relation_type);
+  if (!isEdgeRelation(relationType)) {
+    console.warn(`[cortex:db] Skipping edge ${asString(row.id)}: invalid relation_type '${relationType}'`);
+    return null;
+  }
+  return createEdge({
+    id: asString(row.id),
+    source_id: asString(row.source_id),
+    target_id: asString(row.target_id),
+    relation_type: relationType as EdgeRelation,
+    strength: Number(row.strength),
+    bidirectional: row.bidirectional === 1,
+    status: asString(row.status) as Edge['status'],
+    created_at: asString(row.created_at),
+    classified_at: (row.classified_at ?? null) as string | null,
+    classify_hash: (row.classify_hash ?? null) as string | null,
+    last_failed_at: (row.last_failed_at ?? null) as string | null,
+  });
+}
+
 function edgeRowsToEdges(rows: Array<Record<string, unknown>>): readonly Edge[] {
   return rows.flatMap((row) => {
-    if (!isEdgeRelation(asString(row.relation_type))) {
-      return [];
-    }
-    return [
-      createEdge({
-        id: asString(row.id),
-        source_id: asString(row.source_id),
-        target_id: asString(row.target_id),
-        relation_type: asString(row.relation_type) as EdgeRelation,
-        strength: Number(row.strength),
-        bidirectional: row.bidirectional === 1,
-        status: asString(row.status) as Edge['status'],
-        created_at: asString(row.created_at),
-        classified_at: (row.classified_at ?? null) as string | null,
-        classify_hash: (row.classify_hash ?? null) as string | null,
-        last_failed_at: (row.last_failed_at ?? null) as string | null,
-      }),
-    ];
+    const edge = rowToEdge(row);
+    return edge === null ? [] : [edge];
   });
 }
 
@@ -1540,10 +1537,8 @@ export function createCheckpoint(db: Database): string {
 
   // Guard: :memory: or empty filename → use temp directory
   if (!filename || filename === ':memory:' || filename === '') {
-    const os = require('node:os');
-    const path = require('node:path');
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const checkpointPath = path.join(os.tmpdir(), `cortex-checkpoint-${timestamp}.db`);
+    const checkpointPath = joinPath(tmpdir(), `cortex-checkpoint-${timestamp}.db`);
 
     validatePath(checkpointPath);
     db.run(`VACUUM INTO '${checkpointPath}'`);
@@ -1702,18 +1697,11 @@ export function upsertEntity(
 export function getEntityByName(db: Database, name: string): Entity | null {
   const row = db.prepare(
     `SELECT * FROM entities WHERE LOWER(name) = LOWER(?)`
-  ).get(name) as any;
+  ).get(name) as Record<string, unknown> | undefined;
 
   if (!row) return null;
 
-  return createEntity({
-    id: row.id,
-    name: row.name,
-    entity_type: row.entity_type,
-    aliases: JSON.parse(row.aliases),
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-  });
+  return rowToEntity(row);
 }
 
 /**
@@ -1725,11 +1713,7 @@ export function searchEntities(
   query: string,
   limit: number = 10
 ): readonly Entity[] {
-  const safeQuery = query
-    .split(/\s+/)
-    .filter(t => t.length > 0)
-    .map(t => '"' + t.replace(/"/g, '""') + '"')
-    .join(' OR ');
+  const safeQuery = buildFts5Query(query.split(/\s+/), ' OR ');
 
   if (safeQuery.length === 0) return [];
 
@@ -1739,16 +1723,9 @@ export function searchEntities(
     JOIN entities_fts fts ON e.id = fts.id
     WHERE entities_fts MATCH ?
     LIMIT ?
-  `).all(safeQuery, limit) as any[];
+  `).all(safeQuery, limit) as unknown as Array<Record<string, unknown>>;
 
-  return rows.map(row => createEntity({
-    id: row.id,
-    name: row.name,
-    entity_type: row.entity_type,
-    aliases: JSON.parse(row.aliases),
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-  }));
+  return rows.map(rowToEntity);
 }
 
 /**
@@ -1758,16 +1735,24 @@ export function searchEntities(
 export function getAllEntities(db: Database): readonly Entity[] {
   const rows = db.prepare(
     `SELECT * FROM entities ORDER BY name`
-  ).all() as any[];
+  ).all() as unknown as Array<Record<string, unknown>>;
 
-  return rows.map(row => createEntity({
-    id: row.id,
-    name: row.name,
-    entity_type: row.entity_type,
-    aliases: JSON.parse(row.aliases),
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-  }));
+  return rows.map(rowToEntity);
+}
+
+/**
+ * Centralizes the row-to-Entity mapping used by all entity query functions
+ * (the same convention as rowToMemory and the edge mappers).
+ */
+function rowToEntity(row: Record<string, unknown>): Entity {
+  return createEntity({
+    id: asString(row.id),
+    name: asString(row.name),
+    entity_type: asString(row.entity_type) as EntityType,
+    aliases: JSON.parse(asString(row.aliases)),
+    created_at: asString(row.created_at),
+    updated_at: asString(row.updated_at),
+  });
 }
 
 // ============================================================================

@@ -18,8 +18,8 @@ import type { SimilaritySpace } from './core/types.js';
  * Returns undefined if not set.
  */
 export function getPluginRoot(): string | undefined {
-  return (typeof Bun !== 'undefined' ? Bun.env : process.env).CLAUDE_PLUGIN_ROOT
-    ?? (typeof Bun !== 'undefined' ? Bun.env : process.env).CORTEX_PLUGIN_ROOT;
+  const env = typeof Bun !== 'undefined' ? Bun.env : process.env;
+  return env.CLAUDE_PLUGIN_ROOT ?? env.CORTEX_PLUGIN_ROOT;
 }
 
 // ============================================================================

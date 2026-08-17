@@ -21,11 +21,38 @@ import {
   createCheckpoint,
   restoreCheckpoint,
   routeToDatabase,
+  getActiveCodeMemoriesByFilePath,
+  getActiveProseMemoriesByFilePath,
 } from './db.js';
 import { rankBySimilarity } from '../core/similarity.js';
 import { createMemory, createEdge } from '../core/types.js';
 import { LOCAL_EMBED_MODEL } from '../config.js';
 import type { Memory, Edge, MemoryScope, MemoryType, MemoryStatus } from '../core/types.js';
+
+/**
+ * Test fixture factory: a valid Memory with neutral defaults, so each test
+ * spells only the fields it actually exercises (same convention as
+ * ai-prune.test.ts's makeMemory). The 12-field boilerplate no longer drifts
+ * across dozens of call sites.
+ */
+function makeMemory(
+  id: string,
+  overrides: Partial<Parameters<typeof createMemory>[0]> = {}
+): Memory {
+  return createMemory({
+    id,
+    content: 'c',
+    summary: 's',
+    memory_type: 'context',
+    scope: 'project',
+    confidence: 0.5,
+    priority: 5,
+    source_type: 'manual',
+    source_session: 's',
+    source_context: '{}',
+    ...overrides,
+  });
+}
 
 describe('Database Layer', () => {
   describe('openDatabase', () => {
@@ -69,12 +96,10 @@ describe('Database Layer', () => {
     });
 
     it('inserts and retrieves memory by ID', () => {
-      const memory = createMemory({
-        id: 'mem-1',
+      const memory = makeMemory('mem-1', {
         content: 'Use functional core pattern',
         summary: 'FP architecture principle',
         memory_type: 'architecture',
-        scope: 'project',
         confidence: 0.9,
         priority: 8,
         source_type: 'extraction',
@@ -107,17 +132,12 @@ describe('Database Layer', () => {
       const voyageEmbedding = new Float64Array([0.1, 0.2, 0.3, 0.4]);
       const localEmbedding = new Float32Array([0.5, 0.6, 0.7, 0.8]);
 
-      const memory = createMemory({
-        id: 'mem-emb',
+      const memory = makeMemory('mem-emb', {
         content: 'Test embeddings',
         summary: 'Embedding test',
-        memory_type: 'context',
         scope: 'global',
         confidence: 0.8,
-        priority: 5,
-        source_type: 'manual',
         source_session: 'session-2',
-        source_context: '{}',
         embedding: voyageEmbedding,
         local_embedding: localEmbedding,
       });
@@ -133,17 +153,13 @@ describe('Database Layer', () => {
     });
 
     it('updates memory fields', () => {
-      const memory = createMemory({
-        id: 'mem-update',
+      const memory = makeMemory('mem-update', {
         content: 'Original content',
         summary: 'Original summary',
         memory_type: 'decision',
-        scope: 'project',
-        confidence: 0.5,
         priority: 3,
         source_type: 'extraction',
         source_session: 'session-3',
-        source_context: '{}',
       });
 
       insertMemory(db, memory);
@@ -166,18 +182,7 @@ describe('Database Layer', () => {
     });
 
     it('rejects invalid memory_type through updateMemory (C6 validation is enforced)', () => {
-      const memory = createMemory({
-        id: 'mem-invalid-type',
-        content: 'c',
-        summary: 's',
-        memory_type: 'context',
-        scope: 'project',
-        confidence: 0.5,
-        priority: 5,
-        source_type: 'manual',
-        source_session: 's',
-        source_context: '{}',
-      });
+      const memory = makeMemory('mem-invalid-type');
       insertMemory(db, memory);
 
       expect(() => updateMemory(db, 'mem-invalid-type', { memory_type: 'not-a-type' as unknown as MemoryType }))
@@ -186,18 +191,7 @@ describe('Database Layer', () => {
     });
 
     it('rejects invalid status through updateMemory', () => {
-      const memory = createMemory({
-        id: 'mem-invalid-status',
-        content: 'c',
-        summary: 's',
-        memory_type: 'context',
-        scope: 'project',
-        confidence: 0.5,
-        priority: 5,
-        source_type: 'manual',
-        source_session: 's',
-        source_context: '{}',
-      });
+      const memory = makeMemory('mem-invalid-status');
       insertMemory(db, memory);
 
       expect(() => updateMemory(db, 'mem-invalid-status', { status: 'zombie' as unknown as MemoryStatus }))
@@ -206,18 +200,7 @@ describe('Database Layer', () => {
     });
 
     it('rejects invalid scope through updateMemory', () => {
-      const memory = createMemory({
-        id: 'mem-invalid-scope',
-        content: 'c',
-        summary: 's',
-        memory_type: 'context',
-        scope: 'project',
-        confidence: 0.5,
-        priority: 5,
-        source_type: 'manual',
-        source_session: 's',
-        source_context: '{}',
-      });
+      const memory = makeMemory('mem-invalid-scope');
       insertMemory(db, memory);
 
       expect(() => updateMemory(db, 'mem-invalid-scope', { scope: 'workspace' as unknown as MemoryScope }))
@@ -227,18 +210,7 @@ describe('Database Layer', () => {
     });
 
     it('rejects out-of-range confidence through updateMemory', () => {
-      const memory = createMemory({
-        id: 'mem-invalid-confidence',
-        content: 'c',
-        summary: 's',
-        memory_type: 'context',
-        scope: 'project',
-        confidence: 0.5,
-        priority: 5,
-        source_type: 'manual',
-        source_session: 's',
-        source_context: '{}',
-      });
+      const memory = makeMemory('mem-invalid-confidence');
       insertMemory(db, memory);
 
       expect(() => updateMemory(db, 'mem-invalid-confidence', { confidence: 1.4 }))
@@ -247,18 +219,7 @@ describe('Database Layer', () => {
     });
 
     it('rejects out-of-range priority through updateMemory', () => {
-      const memory = createMemory({
-        id: 'mem-invalid-priority',
-        content: 'c',
-        summary: 's',
-        memory_type: 'context',
-        scope: 'project',
-        confidence: 0.5,
-        priority: 5,
-        source_type: 'manual',
-        source_session: 's',
-        source_context: '{}',
-      });
+      const memory = makeMemory('mem-invalid-priority');
       insertMemory(db, memory);
 
       expect(() => updateMemory(db, 'mem-invalid-priority', { priority: 11 }))
@@ -267,18 +228,7 @@ describe('Database Layer', () => {
     });
 
     it('rejects empty content through updateMemory', () => {
-      const memory = createMemory({
-        id: 'mem-invalid-content',
-        content: 'c',
-        summary: 's',
-        memory_type: 'context',
-        scope: 'project',
-        confidence: 0.5,
-        priority: 5,
-        source_type: 'manual',
-        source_session: 's',
-        source_context: '{}',
-      });
+      const memory = makeMemory('mem-invalid-content');
       insertMemory(db, memory);
 
       expect(() => updateMemory(db, 'mem-invalid-content', { content: '   ' }))
@@ -287,18 +237,7 @@ describe('Database Layer', () => {
     });
 
     it('maintains the status/archived_at coupling when archiving', () => {
-      const memory = createMemory({
-        id: 'mem-archive-coupling',
-        content: 'c',
-        summary: 's',
-        memory_type: 'context',
-        scope: 'project',
-        confidence: 0.5,
-        priority: 5,
-        source_type: 'manual',
-        source_session: 's',
-        source_context: '{}',
-      });
+      const memory = makeMemory('mem-archive-coupling');
       insertMemory(db, memory);
 
       // Flipping to archived without archived_at writes the archive anchor.
@@ -316,18 +255,7 @@ describe('Database Layer', () => {
     });
 
     it('refuses an active memory with a non-null archived_at through updateMemory', () => {
-      const memory = createMemory({
-        id: 'mem-active-archive',
-        content: 'c',
-        summary: 's',
-        memory_type: 'context',
-        scope: 'project',
-        confidence: 0.5,
-        priority: 5,
-        source_type: 'manual',
-        source_session: 's',
-        source_context: '{}',
-      });
+      const memory = makeMemory('mem-active-archive');
       insertMemory(db, memory);
 
       expect(() => updateMemory(db, 'mem-active-archive', {
@@ -338,18 +266,7 @@ describe('Database Layer', () => {
     });
 
     it('refuses an archived_at-only update on an active row (no status change)', () => {
-      const memory = createMemory({
-        id: 'mem-anchor-only',
-        content: 'c',
-        summary: 's',
-        memory_type: 'context',
-        scope: 'project',
-        confidence: 0.5,
-        priority: 5,
-        source_type: 'manual',
-        source_session: 's',
-        source_context: '{}',
-      });
+      const memory = makeMemory('mem-anchor-only');
       insertMemory(db, memory);
 
       expect(() => updateMemory(db, 'mem-anchor-only', {
@@ -362,17 +279,7 @@ describe('Database Layer', () => {
     });
 
     it('allows re-anchoring an already-archived memory through archived_at only', () => {
-      const memory = createMemory({
-        id: 'mem-reanchor',
-        content: 'c',
-        summary: 's',
-        memory_type: 'context',
-        scope: 'project',
-        confidence: 0.5,
-        priority: 5,
-        source_type: 'manual',
-        source_session: 's',
-        source_context: '{}',
+      const memory = makeMemory('mem-reanchor', {
         status: 'archived',
         archived_at: '2026-08-01T00:00:00.000Z',
       });
@@ -383,46 +290,81 @@ describe('Database Layer', () => {
       db.close();
     });
 
+    it('refuses a status-only supersede on an anchored row (anchor must be cleared first)', () => {
+      const memory = makeMemory('mem-supersede-anchor', {
+        status: 'archived',
+        archived_at: '2026-08-01T00:00:00.000Z',
+      });
+      insertMemory(db, memory);
+
+      // A status-only update leaves archived_at at the row's current value,
+      // persisting a row createMemory refuses to read back.
+      expect(() => updateMemory(db, 'mem-supersede-anchor', { status: 'superseded' }))
+        .toThrow(/must not carry an archive anchor/);
+      const row = getMemory(db, 'mem-supersede-anchor');
+      expect(row?.status).toBe('archived');
+      expect(row?.archived_at).toBe('2026-08-01T00:00:00.000Z');
+      db.close();
+    });
+
+    it('allows superseding an unanchored row', () => {
+      insertMemory(db, makeMemory('mem-supersede-active'));
+
+      updateMemory(db, 'mem-supersede-active', { status: 'superseded' });
+      const row = getMemory(db, 'mem-supersede-active');
+      expect(row?.status).toBe('superseded');
+      expect(row?.archived_at).toBeNull();
+      db.close();
+    });
+
+    it('falls back to no tags (with a diagnostic) when a tags cell is corrupt', () => {
+      insertMemory(db, makeMemory('mem-bad-tags', { tags: ['ok'] }));
+      db.prepare('UPDATE memories SET tags = ? WHERE id = ?').run('not-json', 'mem-bad-tags');
+
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      try {
+        const retrieved = getMemory(db, 'mem-bad-tags');
+        expect(retrieved).not.toBeNull();
+        expect(retrieved?.tags).toEqual([]);
+        expect(warn).toHaveBeenCalledWith(
+          '[cortex:db] Memory mem-bad-tags: tags deserialized to invalid JSON; falling back to []'
+        );
+      } finally {
+        warn.mockRestore();
+        db.close();
+      }
+    });
+
     it('gets only active memories', () => {
-      const active1 = createMemory({
-        id: 'mem-active-1',
+      const active1 = makeMemory('mem-active-1', {
         content: 'Active memory 1',
         summary: 'Active 1',
         memory_type: 'pattern',
-        scope: 'project',
         confidence: 0.9,
         priority: 8,
         source_type: 'extraction',
         source_session: 'session-4',
-        source_context: '{}',
         status: 'active',
       });
 
-      const active2 = createMemory({
-        id: 'mem-active-2',
+      const active2 = makeMemory('mem-active-2', {
         content: 'Active memory 2',
         summary: 'Active 2',
         memory_type: 'gotcha',
-        scope: 'project',
         confidence: 0.8,
         priority: 6,
         source_type: 'extraction',
         source_session: 'session-4',
-        source_context: '{}',
         status: 'active',
       });
 
-      const superseded = createMemory({
-        id: 'mem-superseded',
+      const superseded = makeMemory('mem-superseded', {
         content: 'Superseded memory',
         summary: 'Superseded',
         memory_type: 'pattern',
-        scope: 'project',
         confidence: 0.7,
-        priority: 5,
         source_type: 'extraction',
         source_session: 'session-4',
-        source_context: '{}',
         status: 'superseded',
       });
 
@@ -438,6 +380,107 @@ describe('Database Layer', () => {
     });
   });
 
+  describe('file-path lookup in source_context (json_extract)', () => {
+    let db: ReturnType<typeof openDatabase>;
+
+    beforeEach(() => {
+      db = openDatabase(':memory:');
+    });
+
+    it('finds the code memory for a plain path (including paths with spaces) and nothing else', () => {
+      insertMemory(db, makeMemory('code-plain', {
+        memory_type: 'code',
+        source_context: JSON.stringify({ file_path: '/tmp/plain.ts' }),
+      }));
+      insertMemory(db, makeMemory('code-spaces', {
+        memory_type: 'code',
+        source_context: JSON.stringify({ file_path: '/tmp/dir with spaces/main.ts' }),
+      }));
+      insertMemory(db, makeMemory('code-other', {
+        memory_type: 'code',
+        source_context: JSON.stringify({ file_path: '/tmp/other.ts' }),
+      }));
+
+      expect(getActiveCodeMemoriesByFilePath(db, '/tmp/plain.ts').map((m) => m.id)).toEqual(['code-plain']);
+      expect(getActiveCodeMemoriesByFilePath(db, '/tmp/dir with spaces/main.ts').map((m) => m.id)).toEqual(['code-spaces']);
+      db.close();
+    });
+
+    it('finds a path containing a double quote, matching only its own row', () => {
+      insertMemory(db, makeMemory('code-quote', {
+        memory_type: 'code',
+        source_context: JSON.stringify({ file_path: '/tmp/we"ird.ts' }),
+      }));
+      insertMemory(db, makeMemory('code-decoy', {
+        memory_type: 'code',
+        source_context: JSON.stringify({ file_path: '/tmp/weird.ts' }),
+      }));
+
+      expect(getActiveCodeMemoriesByFilePath(db, '/tmp/we"ird.ts').map((m) => m.id)).toEqual(['code-quote']);
+      expect(getActiveCodeMemoriesByFilePath(db, '/tmp/weird.ts').map((m) => m.id)).toEqual(['code-decoy']);
+      db.close();
+    });
+
+    it('finds a backslash path without cross-matching a collapsed form', () => {
+      // A LIKE over the JSON-escaped text missed backslash paths entirely and
+      // could cross-match; json_extract compares the parsed value, so only
+      // the exact path matches.
+      insertMemory(db, makeMemory('code-win', {
+        memory_type: 'code',
+        source_context: JSON.stringify({ file_path: 'C:\\Users\\x\\main.ts' }),
+      }));
+      insertMemory(db, makeMemory('code-collapsed', {
+        memory_type: 'code',
+        source_context: JSON.stringify({ file_path: 'C:Usersxmain.ts' }),
+      }));
+
+      expect(getActiveCodeMemoriesByFilePath(db, 'C:\\Users\\x\\main.ts').map((m) => m.id)).toEqual(['code-win']);
+      expect(getActiveCodeMemoriesByFilePath(db, 'C:Usersxmain.ts').map((m) => m.id)).toEqual(['code-collapsed']);
+      db.close();
+    });
+
+    it('splits code and prose (code_description) lookups on the same contract', () => {
+      const path = 'C:\\Users\\x\\readme.md';
+      insertMemory(db, makeMemory('prose-1', {
+        memory_type: 'code_description',
+        source_context: JSON.stringify({ file_path: path }),
+      }));
+      insertMemory(db, makeMemory('code-1', {
+        memory_type: 'code',
+        source_context: JSON.stringify({ file_path: path }),
+      }));
+
+      expect(getActiveProseMemoriesByFilePath(db, path).map((m) => m.id)).toEqual(['prose-1']);
+      expect(getActiveCodeMemoriesByFilePath(db, path).map((m) => m.id)).toEqual(['code-1']);
+      db.close();
+    });
+
+    it('ignores non-active memories and malformed stored JSON (no match, no throw)', () => {
+      insertMemory(db, makeMemory('code-archived', {
+        memory_type: 'code',
+        source_context: JSON.stringify({ file_path: '/tmp/a.ts' }),
+        status: 'archived',
+        archived_at: '2026-08-01T00:00:00.000Z',
+      }));
+      // createMemory does not validate source_context, so a corrupt cell is
+      // reachable; the json_valid guard skips it — no match, no throw.
+      insertMemory(db, makeMemory('code-malformed', {
+        memory_type: 'code',
+        source_context: 'not-json',
+      }));
+      // The invariant the guard exists for: a corrupt row must not break a
+      // lookup that has real matches in the same pass.
+      insertMemory(db, makeMemory('code-real', {
+        memory_type: 'code',
+        source_context: JSON.stringify({ file_path: '/tmp/real.ts' }),
+      }));
+
+      expect(getActiveCodeMemoriesByFilePath(db, '/tmp/a.ts')).toEqual([]);
+      expect(getActiveCodeMemoriesByFilePath(db, '/tmp/real.ts').map((m) => m.id)).toEqual(['code-real']);
+      db.close();
+    });
+  });
+
   describe('searchByKeyword', () => {
     let db: ReturnType<typeof openDatabase>;
 
@@ -445,45 +488,36 @@ describe('Database Layer', () => {
       db = openDatabase(':memory:');
 
       // Insert test memories
-      const mem1 = createMemory({
-        id: 'mem-fts-1',
+      const mem1 = makeMemory('mem-fts-1', {
         content: 'Use functional programming patterns',
         summary: 'FP patterns',
         memory_type: 'pattern',
-        scope: 'project',
         confidence: 0.9,
         priority: 8,
         source_type: 'extraction',
         source_session: 'session-5',
-        source_context: '{}',
         tags: ['fp', 'patterns'],
       });
 
-      const mem2 = createMemory({
-        id: 'mem-fts-2',
+      const mem2 = makeMemory('mem-fts-2', {
         content: 'Immutability is a core functional principle',
         summary: 'Immutability principle',
         memory_type: 'architecture',
-        scope: 'project',
         confidence: 0.95,
         priority: 9,
         source_type: 'extraction',
         source_session: 'session-5',
-        source_context: '{}',
         tags: ['fp', 'immutability'],
       });
 
-      const mem3 = createMemory({
-        id: 'mem-fts-3',
+      const mem3 = makeMemory('mem-fts-3', {
         content: 'Database operations should be isolated at boundaries',
         summary: 'DB boundary isolation',
         memory_type: 'architecture',
-        scope: 'project',
         confidence: 0.85,
         priority: 7,
         source_type: 'extraction',
         source_session: 'session-5',
-        source_context: '{}',
         tags: ['architecture', 'database'],
       });
 
@@ -531,45 +565,36 @@ describe('Database Layer', () => {
       db = openDatabase(':memory:');
 
       // Insert memories with embeddings
-      const mem1 = createMemory({
-        id: 'mem-emb-1',
+      const mem1 = makeMemory('mem-emb-1', {
         content: 'Memory 1',
         summary: 'Summary 1',
         memory_type: 'pattern',
-        scope: 'project',
         confidence: 0.9,
         priority: 8,
         source_type: 'extraction',
         source_session: 'session-6',
-        source_context: '{}',
         local_embedding: new Float32Array([1, 0, 0, 0]),
       });
 
-      const mem2 = createMemory({
-        id: 'mem-emb-2',
+      const mem2 = makeMemory('mem-emb-2', {
         content: 'Memory 2',
         summary: 'Summary 2',
         memory_type: 'pattern',
-        scope: 'project',
         confidence: 0.8,
         priority: 7,
         source_type: 'extraction',
         source_session: 'session-6',
-        source_context: '{}',
         local_embedding: new Float32Array([0.9, 0.1, 0, 0]),
       });
 
-      const mem3 = createMemory({
-        id: 'mem-emb-3',
+      const mem3 = makeMemory('mem-emb-3', {
         content: 'Memory 3',
         summary: 'Summary 3',
         memory_type: 'pattern',
-        scope: 'project',
         confidence: 0.7,
         priority: 6,
         source_type: 'extraction',
         source_session: 'session-6',
-        source_context: '{}',
         local_embedding: new Float32Array([0, 1, 0, 0]),
       });
 
@@ -599,17 +624,12 @@ describe('Database Layer', () => {
       // Vectors from two models share a column but not a space. Comparing
       // across them yields plausible scores rather than an error, so reads are
       // filtered to the current model.
-      const withLocal = createMemory({
-        id: 'mem-local-1',
+      const withLocal = makeMemory('mem-local-1', {
         content: 'local vector memory',
         summary: 'local vector memory',
-        memory_type: 'context',
-        scope: 'project',
         confidence: 0.8,
-        priority: 5,
         source_type: 'extraction',
         source_session: 'session-local',
-        source_context: '{}',
         local_embedding: new Float32Array([0.1, 0.2, 0.3]),
       });
       insertMemory(db, withLocal);
@@ -636,17 +656,12 @@ describe('Database Layer', () => {
       // and getMemoriesWithEmbedding otherwise. If only one filtered by model,
       // the same query would silently compare across vector spaces depending
       // on which branch it took.
-      const m = createMemory({
-        id: 'mem-local-both',
+      const m = makeMemory('mem-local-both', {
         content: 'both paths',
         summary: 'both paths',
-        memory_type: 'context',
-        scope: 'project',
         confidence: 0.8,
-        priority: 5,
         source_type: 'extraction',
         source_session: 'session-local',
-        source_context: '{}',
         local_embedding: new Float32Array([0.7, 0.8, 0.9]),
       });
       insertMemory(db, m);
@@ -671,17 +686,12 @@ describe('Database Layer', () => {
     });
 
     it('excludes legacy local vectors that carry no model tag', () => {
-      const legacy = createMemory({
-        id: 'mem-local-legacy',
+      const legacy = makeMemory('mem-local-legacy', {
         content: 'legacy local vector',
         summary: 'legacy local vector',
-        memory_type: 'context',
-        scope: 'project',
         confidence: 0.8,
-        priority: 5,
         source_type: 'extraction',
         source_session: 'session-local',
-        source_context: '{}',
         local_embedding: new Float32Array([0.4, 0.5, 0.6]),
       });
       insertMemory(db, legacy);
@@ -742,17 +752,14 @@ describe('Database Layer', () => {
     it('fetches and ranks by local embedding similarity', () => {
       const db2 = openDatabase(':memory:');
 
-      const mem = createMemory({
-        id: 'mem-local',
+      const mem = makeMemory('mem-local', {
         content: 'Local embedding test',
         summary: 'Local test',
         memory_type: 'pattern',
-        scope: 'project',
         confidence: 0.9,
         priority: 8,
         source_type: 'extraction',
         source_session: 'session-7',
-        source_context: '{}',
         local_embedding: new Float32Array([1, 0, 0]),
       });
 
@@ -778,30 +785,24 @@ describe('Database Layer', () => {
       db = openDatabase(':memory:');
 
       // Insert memories for edge tests
-      const mem1 = createMemory({
-        id: 'mem-edge-1',
+      const mem1 = makeMemory('mem-edge-1', {
         content: 'Source memory',
         summary: 'Source',
         memory_type: 'pattern',
-        scope: 'project',
         confidence: 0.9,
         priority: 8,
         source_type: 'extraction',
         source_session: 'session-8',
-        source_context: '{}',
       });
 
-      const mem2 = createMemory({
-        id: 'mem-edge-2',
+      const mem2 = makeMemory('mem-edge-2', {
         content: 'Target memory',
         summary: 'Target',
         memory_type: 'pattern',
-        scope: 'project',
         confidence: 0.8,
         priority: 7,
         source_type: 'extraction',
         source_session: 'session-8',
-        source_context: '{}',
       });
 
       insertMemory(db, mem1);
@@ -1051,17 +1052,14 @@ describe('Database Layer', () => {
       const db = openDatabase(':memory:');
 
       // Insert initial data
-      const mem1 = createMemory({
-        id: 'mem-ckpt-1',
+      const mem1 = makeMemory('mem-ckpt-1', {
         content: 'Original memory',
         summary: 'Original',
         memory_type: 'pattern',
-        scope: 'project',
         confidence: 0.9,
         priority: 8,
         source_type: 'extraction',
         source_session: 'session-9',
-        source_context: '{}',
       });
 
       insertMemory(db, mem1);
@@ -1089,34 +1087,24 @@ describe('Database Layer', () => {
       const db = openDatabase(':memory:');
 
       // Insert one memory, checkpoint it
-      insertMemory(db, createMemory({
-        id: 'mem-fts-keep',
+      insertMemory(db, makeMemory('mem-fts-keep', {
         content: 'Memory about zebras and savannas',
         summary: 'Zebra memory',
-        memory_type: 'context',
-        scope: 'project',
         confidence: 0.9,
-        priority: 5,
         source_type: 'extraction',
         source_session: 'session-fts',
-        source_context: '{}',
       }));
 
       const checkpointPath = createCheckpoint(db);
 
       // Insert a SECOND memory after the checkpoint — its FTS row would
       // become an orphan on restore without explicit cleanup
-      insertMemory(db, createMemory({
-        id: 'mem-fts-orphan',
+      insertMemory(db, makeMemory('mem-fts-orphan', {
         content: 'Memory about quixotic wombats',
         summary: 'Wombat memory',
-        memory_type: 'context',
-        scope: 'project',
         confidence: 0.9,
-        priority: 5,
         source_type: 'extraction',
         source_session: 'session-fts',
-        source_context: '{}',
       }));
 
       restoreCheckpoint(db, checkpointPath);
@@ -1257,11 +1245,9 @@ describe('Database Layer', () => {
     it('persists archived_at through insert, update, and read', () => {
       const db = openDatabase(':memory:');
       const now = new Date().toISOString();
-      const memory = createMemory({
-        id: 'arch-1',
-        content: 'c', summary: 's', memory_type: 'context', scope: 'project',
-        confidence: 0.8, priority: 5, source_type: 'manual',
-        source_session: 'sess', source_context: '{}',
+      const memory = makeMemory('arch-1', {
+        confidence: 0.8,
+        source_session: 'sess',
       });
       insertMemory(db, memory);
 
@@ -1331,10 +1317,9 @@ describe('Database Layer', () => {
       const db = openDatabase(':memory:');
 
       function seedMemory(id: string): void {
-        insertMemory(db, createMemory({
-          id, content: `content ${id}`, summary: `summary ${id}`,
-          memory_type: 'context', scope: 'project', confidence: 0.8, priority: 5,
-          source_type: 'manual', source_session: 'sess', source_context: '{}',
+        insertMemory(db, makeMemory(id, {
+          content: `content ${id}`, summary: `summary ${id}`,
+          confidence: 0.8, source_session: 'sess',
         }));
       }
       seedMemory('a');
@@ -1391,10 +1376,9 @@ describe('Database Layer', () => {
       const db = openDatabase(':memory:');
 
       function seedMemory(id: string): void {
-        insertMemory(db, createMemory({
-          id, content: `content ${id}`, summary: `summary ${id}`,
-          memory_type: 'context', scope: 'project', confidence: 0.8, priority: 5,
-          source_type: 'manual', source_session: 'sess', source_context: '{}',
+        insertMemory(db, makeMemory(id, {
+          content: `content ${id}`, summary: `summary ${id}`,
+          confidence: 0.8, source_session: 'sess',
         }));
       }
       seedMemory('a');
@@ -1449,10 +1433,9 @@ describe('Database Layer', () => {
       const db = openDatabase(':memory:');
 
       function seedMemory(id: string): void {
-        insertMemory(db, createMemory({
-          id, content: `content ${id}`, summary: `summary ${id}`,
-          memory_type: 'context', scope: 'project', confidence: 0.8, priority: 5,
-          source_type: 'manual', source_session: 'sess', source_context: '{}',
+        insertMemory(db, makeMemory(id, {
+          content: `content ${id}`, summary: `summary ${id}`,
+          confidence: 0.8, source_session: 'sess',
         }));
       }
       seedMemory('a');
@@ -1493,10 +1476,9 @@ describe('Database Layer', () => {
     const { repointEdgesToMemory, repointFactSources, upsertEntity, insertFact, getFactsByMemory } = require('./db.js');
 
     function seedMemory(db: ReturnType<typeof openDatabase>, id: string): void {
-      insertMemory(db, createMemory({
-        id, content: `content ${id}`, summary: `summary ${id}`,
-        memory_type: 'context', scope: 'project', confidence: 0.8, priority: 5,
-        source_type: 'manual', source_session: 'sess', source_context: '{}',
+      insertMemory(db, makeMemory(id, {
+        content: `content ${id}`, summary: `summary ${id}`,
+        confidence: 0.8, source_session: 'sess',
       }));
     }
 
@@ -1602,17 +1584,12 @@ describe('Schema versioning (PRAGMA user_version)', () => {
     const dbPath = join(tmpDir, 'legacy.db');
 
     const db = openDatabase(dbPath);
-    insertMemory(db, createMemory({
-      id: 'mem-schema-1',
+    insertMemory(db, makeMemory('mem-schema-1', {
       content: 'legacy content survives version stamping',
       summary: 'legacy',
-      memory_type: 'context',
-      scope: 'project',
       confidence: 0.8,
-      priority: 5,
       source_type: 'extraction',
       source_session: 'sess-schema',
-      source_context: '{}',
     }));
     // Reset to 0 as if written by pre-versioning code
     db.run('PRAGMA user_version = 0');
@@ -1644,17 +1621,11 @@ import {
 
 function makeStatusMemory(id: string, status: 'active' | 'archived' | 'superseded'): Memory {
   const now = new Date().toISOString();
-  return createMemory({
-    id,
+  return makeMemory(id, {
     content: `content ${id}`,
     summary: `summary ${id}`,
-    memory_type: 'context',
-    scope: 'project',
     confidence: 0.8,
-    priority: 5,
-    source_type: 'extraction',
     source_session: 'sess',
-    source_context: '{}',
     created_at: now,
     updated_at: now,
     last_accessed_at: now,
@@ -1750,17 +1721,11 @@ import { openDatabaseReadOnly, searchByKeywordOr } from './db.js';
 describe('openDatabaseReadOnly', () => {
   function makeRoMemory(id: string): Memory {
     const now = new Date().toISOString();
-    return createMemory({
-      id,
+    return makeMemory(id, {
       content: 'readonly nixos content',
       summary: 'readonly nixos summary',
-      memory_type: 'context',
-      scope: 'project',
       confidence: 0.9,
-      priority: 5,
-      source_type: 'manual',
       source_session: 's1',
-      source_context: '{}',
       created_at: now,
       last_accessed_at: now,
       updated_at: now,

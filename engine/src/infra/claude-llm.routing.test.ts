@@ -204,4 +204,73 @@ describe('classifyEdges transport routing', () => {
       warn.mockRestore();
     }
   });
+
+  it('falls back to the default threshold for invalid CORTEX_LLM_MAX_DIRECT_FAILURES values', async () => {
+    // 'abc' → NaN → default 3: the first failure still escalates to the
+    // subprocess fallback (which fails fast here, CLI stubbed away) instead
+    // of throwing the saturation error the valid-'1' test asserts.
+    mockResolveOpenAiCompatEndpoint.mockReturnValue(FAKE_ENDPOINT);
+    mockChatCompletionText.mockRejectedValue(new Error('LLM API 503'));
+    const original = process.env.CORTEX_LLM_MAX_DIRECT_FAILURES;
+    process.env.CORTEX_LLM_MAX_DIRECT_FAILURES = 'abc';
+    const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const bunGlobal = (globalThis as { Bun?: { which: (bin: string) => string | null } }).Bun;
+    const originalWhich = bunGlobal!.which;
+    bunGlobal!.which = () => null;
+    try {
+      await expect(runLlmPromptDirect('prompt', 1000)).rejects.toThrow(/CLI not found/);
+      expect(warn).not.toHaveBeenCalledWith(expect.stringMatching(/direct LLM endpoint saturated/));
+    } finally {
+      bunGlobal!.which = originalWhich;
+      if (original === undefined) delete process.env.CORTEX_LLM_MAX_DIRECT_FAILURES;
+      else process.env.CORTEX_LLM_MAX_DIRECT_FAILURES = original;
+      warn.mockRestore();
+    }
+  });
+
+  it('returns the subprocess text with direct:false when no endpoint is configured', async () => {
+    // No OpenAI-compatible endpoint → runLlmPromptDirectUnbounded skips the
+    // direct attempt entirely and the real Bun.spawn-based subprocess path
+    // produces the text. The flag must say direct:false so callers route
+    // subprocess output to the tolerant parser.
+    mockResolveOpenAiCompatEndpoint.mockReturnValue(null);
+    const bunGlobal = (globalThis as {
+      Bun?: {
+        which: (bin: string) => string | null;
+        spawn: (args: string[], opts: unknown) => unknown;
+      };
+    }).Bun!;
+    const originalWhich = bunGlobal.which;
+    const originalSpawn = bunGlobal.spawn;
+    const emptyStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.close();
+      },
+    });
+    const stdoutStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('unbounded-fallback-output'));
+        controller.close();
+      },
+    });
+    bunGlobal.which = () => '/fake/llm-cli';
+    bunGlobal.spawn = (() => ({
+      stdin: { write: () => undefined, end: () => undefined },
+      stdout: stdoutStream,
+      stderr: emptyStream,
+      exited: Promise.resolve(0),
+      kill: () => undefined,
+    })) as unknown as typeof originalSpawn;
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      await expect(runLlmPromptDirect('prompt', 1000)).resolves.toEqual({
+        text: 'unbounded-fallback-output',
+        direct: false,
+      });
+    } finally {
+      bunGlobal.which = originalWhich;
+      bunGlobal.spawn = originalSpawn;
+      stderr.mockRestore();
+    }
+  });
 });

@@ -26,6 +26,7 @@ import type { EdgeRelation, MemoryType } from '../core/types.js';
 import { isEdgeRelation, EDGE_RELATIONS } from '../core/types.js';
 import { extractJsonSlice } from '../core/json-utils.js';
 import { resolveOpenAiCompatEndpoint, chatCompletionText } from './llm-client.js';
+import { readFileSync } from 'node:fs';
 
 const EXTRACTION_TIMEOUT_MS = 90_000;
 const EDGE_CLASSIFICATION_TIMEOUT_MS = 90_000;
@@ -103,7 +104,7 @@ function getDefaultProvider(env: NodeJS.ProcessEnv): string | undefined {
   try {
     const home = env.HOME || env.USERPROFILE || '';
     const settingsPath = `${home}/.pi/agent/settings.json`;
-    const content = require('fs').readFileSync(settingsPath, 'utf-8');
+    const content = readFileSync(settingsPath, 'utf-8');
     const settings = JSON.parse(content) as { defaultProvider?: unknown };
     return typeof settings.defaultProvider === 'string' ? settings.defaultProvider : undefined;
   } catch (err) {
@@ -174,7 +175,7 @@ export function isClaudeLlmAvailable(): boolean {
  * @param prompt - Prompt to send via stdin
  * @param timeoutMs - Timeout in milliseconds
  * @returns Raw response text
- * @throws Error if binary not found, non-zero exit, or timeout
+ * @throws Error if binary not found, non-zero exit, timeout, or empty response
  */
 export async function runLlmPrompt(prompt: string, timeoutMs: number): Promise<string> {
   const env = typeof Bun !== 'undefined' ? Bun.env : process.env;
@@ -243,12 +244,19 @@ export async function runLlmPrompt(prompt: string, timeoutMs: number): Promise<s
   return stdout;
 }
 
+/** Shared option shape for the direct-endpoint LLM calls and their fallback. */
+export type DirectLlmOptions = {
+  jsonMode?: boolean;
+  jsonSchema?: object;
+  maxTokens?: number;
+};
+
 /** Transport used by the classification call; injectable so tests can drive
  * the strict/tolerant routing without shelling out. */
 export type LlmPromptTransport = (
   prompt: string,
   timeoutMs: number,
-  options?: { jsonMode?: boolean; jsonSchema?: object; maxTokens?: number }
+  options?: DirectLlmOptions
 ) => Promise<{ text: string; direct: boolean }>;
 
 /**
@@ -272,11 +280,6 @@ export function resetLlmConcurrencyForTests(): void {
 }
 
 /**
- * Max in-flight LLM calls per process. Background work must be a polite
- * straggler on a shared server, so the default is small; 1 is the most
- * conservative setting, values below 1 are rejected and fall back to 2.
- */
-/**
  * Shared env-int parser for the LLM guardrail knobs: a positive integer
  * wins; absent, non-integer, or below 1 falls back to the default.
  */
@@ -287,6 +290,11 @@ function envPositiveInt(env: NodeJS.ProcessEnv, name: string, fallback: number):
   return Number.isInteger(parsed) && parsed >= 1 ? parsed : fallback;
 }
 
+/**
+ * Max in-flight LLM calls per process. Background work must be a polite
+ * straggler on a shared server, so the default is small; 1 is the most
+ * conservative setting, values below 1 are rejected and fall back to 2.
+ */
 function maxConcurrentLlmCalls(env: NodeJS.ProcessEnv): number {
   return envPositiveInt(env, 'CORTEX_LLM_MAX_CONCURRENCY', 2);
 }
@@ -327,7 +335,7 @@ function getDirectFailureFallbackThreshold(env: NodeJS.ProcessEnv): number {
 export async function runLlmPromptDirect(
   prompt: string,
   timeoutMs: number,
-  direct: { jsonMode?: boolean; jsonSchema?: object; maxTokens?: number } = {}
+  direct: DirectLlmOptions = {}
 ): Promise<{ text: string; direct: boolean }> {
   // The slot covers BOTH the direct attempt and any subprocess fallback: a
   // `claude -p` / `pi -p` agent loop is one background job from the server's
@@ -353,7 +361,7 @@ export async function runLlmPromptDirect(
 async function runLlmPromptDirectUnbounded(
   prompt: string,
   timeoutMs: number,
-  direct: { jsonMode?: boolean; jsonSchema?: object; maxTokens?: number } = {}
+  direct: DirectLlmOptions = {}
 ): Promise<{ text: string; direct: boolean }> {
   const endpoint = resolveOpenAiCompatEndpoint();
   if (endpoint) {
@@ -408,7 +416,8 @@ async function runLlmPromptDirectUnbounded(
  *
  * @param prompt - Extraction prompt (from buildExtractionPrompt)
  * @returns Raw LLM response text
- * @throws Error if the LLM binary not found, non-zero exit, or timeout
+ * @throws Error if the LLM binary not found, non-zero exit, timeout, empty
+ * response, or the direct endpoint is saturated (subprocess fallback suppressed)
  */
 export async function extractMemories(prompt: string): Promise<string> {
   const { text } = await runLlmPromptDirect(prompt, EXTRACTION_TIMEOUT_MS, {
@@ -581,12 +590,7 @@ export function parseEdgeClassificationResponse(
       );
     }
     // Accept both the bare array and the schema-guided {"edges": [...]} shape
-    const array =
-      Array.isArray(parsed)
-        ? parsed
-        : Array.isArray((parsed as { edges?: unknown })?.edges)
-          ? (parsed as { edges: unknown[] }).edges
-          : null;
+    const array = unwrapEdgesArray(parsed);
     if (array === null) {
       throw new Error(
         `Edge classification response has no edges array: ${String(response).slice(0, 200)}`
@@ -602,16 +606,7 @@ export function parseEdgeClassificationResponse(
           `${array.length} items with invalid shape (strict mode)`
       );
     }
-    return {
-      kind: 'ok',
-      classifications: valid.map((c) => ({
-        ...(c.pair_index !== undefined ? { pair_index: c.pair_index } : {}),
-        source_id: String(c.source_id),
-        target_id: String(c.target_id),
-        relation_type: c.relation_type,
-        strength: Number(c.strength),
-      })),
-    };
+    return { kind: 'ok', classifications: normalizeClassifications(valid) };
   }
 
   try {
@@ -623,12 +618,7 @@ export function parseEdgeClassificationResponse(
     const parsed: unknown = JSON.parse(jsonText.trim());
 
     // Accept both the bare array and the schema-guided {"edges": [...]} shape
-    const array =
-      Array.isArray(parsed)
-        ? parsed
-        : Array.isArray((parsed as { edges?: unknown })?.edges)
-          ? (parsed as { edges: unknown[] }).edges
-          : null;
+    const array = unwrapEdgesArray(parsed);
     if (array === null) {
       return {
         kind: 'unparseable',
@@ -646,22 +636,43 @@ export function parseEdgeClassificationResponse(
         reason: `${array.length - valid.length} of ${array.length} items had invalid shape (tolerant response)`,
       };
     }
-    return {
-      kind: 'ok',
-      classifications: valid.map((c) => ({
-        ...(c.pair_index !== undefined ? { pair_index: c.pair_index } : {}),
-        source_id: String(c.source_id),
-        target_id: String(c.target_id),
-        relation_type: c.relation_type,
-        strength: Number(c.strength),
-      })),
-    };
+    return { kind: 'ok', classifications: normalizeClassifications(valid) };
   } catch (e) {
     return {
       kind: 'unparseable',
       reason: `failed to parse edge classification response: ${(e as Error).message}`,
     };
   }
+}
+
+/**
+ * Unwrap the classification envelope: accept either the bare array or the
+ * schema-guided {"edges": [...]} shape (legacy compatibility). Returns null
+ * when the response carries no edges array at all.
+ */
+function unwrapEdgesArray(parsed: unknown): unknown[] | null {
+  if (Array.isArray(parsed)) return parsed;
+  if (Array.isArray((parsed as { edges?: unknown })?.edges)) {
+    return (parsed as { edges: unknown[] }).edges;
+  }
+  return null;
+}
+
+/**
+ * Normalize schema-valid classification items into the domain shape. Coerces
+ * the ID/strength fields defensively (the type guard already checked types,
+ * so this is belt-and-suspenders) and keeps pair_index optional for legacy
+ * responses. Shared by strict and tolerant modes: the only difference
+ * between those modes is the failure channel (throw vs unparseable).
+ */
+function normalizeClassifications(valid: readonly EdgeClassification[]): readonly EdgeClassification[] {
+  return valid.map((c) => ({
+    ...(c.pair_index !== undefined ? { pair_index: c.pair_index } : {}),
+    source_id: String(c.source_id),
+    target_id: String(c.target_id),
+    relation_type: c.relation_type,
+    strength: Number(c.strength),
+  }));
 }
 
 /**

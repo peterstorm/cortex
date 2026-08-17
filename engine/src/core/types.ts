@@ -207,9 +207,6 @@ export interface HookInput {
   readonly cwd: string;
 }
 
-// Alias for backward compatibility
-export type StopHookInput = HookInput;
-
 // Search Result
 export interface SearchResult {
   readonly memory: Memory;
@@ -391,6 +388,19 @@ export function createEdge(input: {
   classify_hash?: string | null;
   last_failed_at?: string | null;
 }): Edge {
+  // Validate non-empty identity strings (createMemory's equivalent): SQLite
+  // NOT NULL does not reject empty strings, so an empty id/source_id/target_id
+  // would otherwise be insertable and unfindable.
+  if (input.id.trim() === '') {
+    throw new Error('id must not be empty');
+  }
+  if (input.source_id.trim() === '') {
+    throw new Error('source_id must not be empty');
+  }
+  if (input.target_id.trim() === '') {
+    throw new Error('target_id must not be empty');
+  }
+
   // Validate no self-referencing edges
   if (input.source_id === input.target_id) {
     throw new Error('source_id and target_id must not be equal (no self-referencing edges)');
