@@ -6,13 +6,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import registerCortex from './extension.js';
 import type { CliDetachedOptions, CliRunOptions, CliRunResult, CliRunner } from './cli-runner.js';
 
-// This file mocks NOTHING. The engine boundary is a port (CliRunner), so the
+// This file mocks no MODULE. The engine boundary is a port (CliRunner), so the
 // extension's behaviour is driven with the plain object below instead of
 // `vi.mock('node:child_process', ...)` — a seam whose hoisting requirements
 // differ between vitest and bun's vitest shim, and which killed every test in
 // this file at import twice (fixed in 153e032, reverted in e1b26f3). The real
 // adapter's own behaviour is covered by cli-runner.test.ts, against real
-// subprocesses.
+// subprocesses. (The two vi.fn() calls further down are plain spies on a
+// caller-supplied notify callback — no module is intercepted.)
 type RecordedCall = { args: readonly string[]; options?: CliRunOptions | CliDetachedOptions };
 
 function fakeCli() {

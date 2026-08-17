@@ -472,13 +472,17 @@ export function createEdge(input: {
 }): Edge {
   // Validate non-empty identity strings (createMemory's equivalent): SQLite
   // NOT NULL does not reject empty strings, so an empty id/source_id/target_id
-  // would otherwise be insertable and unfindable.
-  requireNonEmpty('id', input.id);
-  requireNonEmpty('source_id', input.source_id);
-  requireNonEmpty('target_id', input.target_id);
+  // would otherwise be insertable and unfindable. The TRIMMED values are what
+  // gets stored, also mirroring createMemory — validating one string and
+  // persisting another would let " mem-1" pass the check and then sit in the
+  // row padded, unfindable by the id every other table holds.
+  const trimmedId = requireNonEmpty('id', input.id);
+  const trimmedSourceId = requireNonEmpty('source_id', input.source_id);
+  const trimmedTargetId = requireNonEmpty('target_id', input.target_id);
 
-  // Validate no self-referencing edges
-  if (input.source_id === input.target_id) {
+  // Validate no self-referencing edges. Compared after trimming, so "mem-1"
+  // and "mem-1 " cannot slip past as two different memories.
+  if (trimmedSourceId === trimmedTargetId) {
     throw new Error('source_id and target_id must not be equal (no self-referencing edges)');
   }
 
@@ -497,9 +501,9 @@ export function createEdge(input: {
   const now = new Date().toISOString();
 
   return {
-    id: input.id,
-    source_id: input.source_id,
-    target_id: input.target_id,
+    id: trimmedId,
+    source_id: trimmedSourceId,
+    target_id: trimmedTargetId,
     relation_type: input.relation_type,
     strength: input.strength,
     bidirectional: input.bidirectional ?? false,

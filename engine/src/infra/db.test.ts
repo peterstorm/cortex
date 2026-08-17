@@ -1874,6 +1874,174 @@ describe('corrupt JSON list cells degrade the row, never the read', () => {
   });
 });
 
+// ============================================================================
+// A corrupt cell drops its own row, never the read (edges, entities, facts)
+// ============================================================================
+//
+// Every mapper here feeds several readers that do not catch, so one row whose
+// cell the domain factory refuses used to throw the whole result set away.
+// Each case corrupts one column, then asserts the sibling row still reads.
+
+describe('corrupt domain cells drop only their own row', () => {
+  let db: Database;
+
+  beforeEach(() => {
+    db = openDatabase(':memory:');
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  // rowToEdge's isEdgeStatus guard is defense in depth that no reader can
+  // currently reach: all four edge readers filter `status IN ('active',
+  // 'suggested')` in SQL, so an out-of-domain status is excluded before the
+  // mapper sees it. Pinning the observable behaviour — the corrupt row is gone
+  // and its sibling survives — is what's actually testable; asserting the
+  // mapper's diagnostic here would be asserting a branch SQL makes dead, and
+  // would start failing the day a reader legitimately drops the filter.
+  it('excludes an edge whose status cell is out of domain, keeping its sibling', () => {
+    insertMemory(db, makeMemory('mem-a'));
+    insertMemory(db, makeMemory('mem-b'));
+    insertMemory(db, makeMemory('mem-c'));
+    const corrupt = insertEdge(db, {
+      source_id: 'mem-a', target_id: 'mem-b', relation_type: 'relates_to',
+      strength: 0.5, bidirectional: false, status: 'active',
+    });
+    insertEdge(db, {
+      source_id: 'mem-a', target_id: 'mem-c', relation_type: 'relates_to',
+      strength: 0.5, bidirectional: false, status: 'active',
+    });
+    db.prepare('UPDATE edges SET status = ? WHERE id = ?').run('not-a-status', corrupt);
+
+    expect(getAllEdges(db).map((e) => e.id)).not.toContain(corrupt);
+    expect(getAllEdges(db)).toHaveLength(1);
+    expect(getEdgesForMemory(db, 'mem-a')).toHaveLength(1);
+  });
+
+  it('drops an edge whose relation_type cell is out of domain, keeping its sibling', () => {
+    // relation_type has no SQL filter shadowing it on getEdgesForMemory, so
+    // this is the union-cell guard actually being exercised end to end.
+    insertMemory(db, makeMemory('mem-a'));
+    insertMemory(db, makeMemory('mem-b'));
+    insertMemory(db, makeMemory('mem-c'));
+    const corrupt = insertEdge(db, {
+      source_id: 'mem-a', target_id: 'mem-b', relation_type: 'relates_to',
+      strength: 0.5, bidirectional: false, status: 'active',
+    });
+    insertEdge(db, {
+      source_id: 'mem-a', target_id: 'mem-c', relation_type: 'relates_to',
+      strength: 0.5, bidirectional: false, status: 'active',
+    });
+    db.prepare('UPDATE edges SET relation_type = ? WHERE id = ?').run('not-a-relation', corrupt);
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(getEdgesForMemory(db, 'mem-a')).toHaveLength(1);
+      expect(warn).toHaveBeenCalledWith(
+        `[cortex:db] Skipping edge ${corrupt}: invalid relation_type 'not-a-relation'`
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('drops an edge whose strength cell is out of range, keeping its sibling', () => {
+    // strength is a VALUE invariant createEdge owns, not a union cell — the
+    // guard above cannot see it, so this is what readRow is for.
+    insertMemory(db, makeMemory('mem-a'));
+    insertMemory(db, makeMemory('mem-b'));
+    insertMemory(db, makeMemory('mem-c'));
+    const corrupt = insertEdge(db, {
+      source_id: 'mem-a', target_id: 'mem-b', relation_type: 'relates_to',
+      strength: 0.5, bidirectional: false, status: 'active',
+    });
+    insertEdge(db, {
+      source_id: 'mem-a', target_id: 'mem-c', relation_type: 'relates_to',
+      strength: 0.5, bidirectional: false, status: 'active',
+    });
+    db.prepare('UPDATE edges SET strength = ? WHERE id = ?').run(7, corrupt);
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(getAllEdges(db)).toHaveLength(1);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(`Skipping edge ${corrupt}`));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('drops an entity whose entity_type cell is out of domain, keeping every reader alive', () => {
+    const corrupt = upsertEntity(db, 'Ada Lovelace', 'person', ['Ada']);
+    upsertEntity(db, 'Grace Hopper', 'person', ['Grace']);
+    db.prepare('UPDATE entities SET entity_type = ? WHERE id = ?').run('not-a-type', corrupt);
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      // All three readers: before the guard, createEntity's throw escaped each
+      // one and took the readable sibling row with it.
+      expect(getEntityByName(db, 'Ada Lovelace')).toBeNull();
+      expect(getEntityByName(db, 'Grace Hopper')?.name).toBe('Grace Hopper');
+      expect(getAllEntities(db).map((e) => e.name)).toEqual(['Grace Hopper']);
+      expect(searchEntities(db, 'Ada OR Grace').map((e) => e.name)).toEqual(['Grace Hopper']);
+      expect(warn).toHaveBeenCalledWith(
+        `[cortex:db] Skipping entity ${corrupt}: invalid entity_type 'not-a-type'`
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('drops a fact whose confidence cell is out of range, keeping its sibling', () => {
+    const entityId = upsertEntity(db, 'PgBouncer', 'tool');
+    insertMemory(db, makeMemory('mem-src'));
+    insertFact(db, {
+      id: 'fact-corrupt', entity_id: entityId, predicate: 'runs_on', object: 'port 6432',
+      source_memory_id: 'mem-src', confidence: 0.9, valid_from: new Date().toISOString(),
+      valid_to: null, created_at: new Date().toISOString(),
+    });
+    insertFact(db, {
+      id: 'fact-ok', entity_id: entityId, predicate: 'pools', object: 'connections',
+      source_memory_id: 'mem-src', confidence: 0.9, valid_from: new Date().toISOString(),
+      valid_to: null, created_at: new Date().toISOString(),
+    });
+    db.prepare('UPDATE facts SET confidence = ? WHERE id = ?').run(4, 'fact-corrupt');
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(getCurrentFacts(db, entityId).map((f) => f.id)).toEqual(['fact-ok']);
+      expect(getFactsByMemory(db, 'mem-src').map((f) => f.id)).toEqual(['fact-ok']);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('Skipping fact fact-corrupt'));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('drops a fact whose predicate cell is empty, keeping its sibling', () => {
+    const entityId = upsertEntity(db, 'Redis', 'tool');
+    insertMemory(db, makeMemory('mem-src2'));
+    insertFact(db, {
+      id: 'fact-empty', entity_id: entityId, predicate: 'caches', object: 'sessions',
+      source_memory_id: 'mem-src2', confidence: 0.9, valid_from: new Date().toISOString(),
+      valid_to: null, created_at: new Date().toISOString(),
+    });
+    insertFact(db, {
+      id: 'fact-fine', entity_id: entityId, predicate: 'evicts', object: 'lru',
+      source_memory_id: 'mem-src2', confidence: 0.9, valid_from: new Date().toISOString(),
+      valid_to: null, created_at: new Date().toISOString(),
+    });
+    db.prepare('UPDATE facts SET predicate = ? WHERE id = ?').run('   ', 'fact-empty');
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(getCurrentFacts(db, entityId).map((f) => f.id)).toEqual(['fact-fine']);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('Skipping fact fact-empty'));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
 describe('countActiveMemoriesCreatedAfter (AI-prune watermark)', () => {
   let db: Database;
 

@@ -314,18 +314,9 @@ export async function executeSemanticEdges(
       // retry-safety paths cannot diverge.
       const recordBatchFailure = (batch: readonly { edgeId: string; pair: MemoryPair }[]): void => {
         for (const { edgeId, pair } of batch) {
-          try {
-            markEdgeFailed(db, edgeId, attemptedAt, pairContentHash(pair.source, pair.target));
-          } catch (err) {
-            // This runs inside a mapLimit worker, so an escaping error rejects
-            // Promise.all and discards the classified/failed tallies of every
-            // other batch that already finished. Losing one edge's backoff
-            // stamp costs a premature retry; losing the whole run's counts
-            // costs the run. Both stay accounted for: the batch is still
-            // counted as failed below.
-            const message = err instanceof Error ? err.message : String(err);
-            logError(`Edge ${edgeId} failure stamp could not be recorded (backoff not applied): ${message}`);
-          }
+          recordAttempt(edgeId, 'failure stamp (backoff not applied)', () =>
+            markEdgeFailed(db, edgeId, attemptedAt, pairContentHash(pair.source, pair.target))
+          );
         }
         failed += batch.length;
       };
@@ -412,7 +403,9 @@ export async function executeSemanticEdges(
           // classification is effectively already done — retire the
           // candidate so it is not re-sent to the LLM on every run.
           if (isUniqueConstraintError(err)) {
-            markEdgeClassified(db, edgeId, attemptedAt, contentHash);
+            recordAttempt(edgeId, 'unique-constraint recovery stamp', () =>
+              markEdgeClassified(db, edgeId, attemptedAt, contentHash)
+            );
           }
         }
       }
@@ -425,6 +418,34 @@ export async function executeSemanticEdges(
     return { ok: false, error: `Semantic edges failed: ${message}` };
   } finally {
     releaseLock(lockFile);
+  }
+}
+
+/**
+ * Record one edge's attempt outcome without letting the write escape.
+ *
+ * Every call site is inside a `mapLimit` worker, where an escaping error
+ * rejects `Promise.all` and discards the classified/failed tallies of every
+ * other batch that already finished — while the abandoned runner keeps writing
+ * against a database the caller's `finally` is about to close. Losing one
+ * edge's stamp costs a premature re-ask on the next run; losing the run's
+ * counts costs the run.
+ *
+ * Both stamping paths share this because they are the same decision made
+ * twice: `recordBatchFailure`'s backoff stamp and the unique-constraint
+ * recovery stamp are mirror images, and the recovery one was reachable
+ * unguarded for exactly as long as the two were written separately.
+ *
+ * @param edgeId - Edge the stamp belongs to, for the diagnostic.
+ * @param what - What was being recorded, for the diagnostic.
+ * @param write - The stamping write; its failure is reported, never rethrown.
+ */
+function recordAttempt(edgeId: string, what: string, write: () => void): void {
+  try {
+    write();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logError(`Edge ${edgeId} ${what} could not be recorded: ${message}`);
   }
 }
 

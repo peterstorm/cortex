@@ -948,8 +948,7 @@ describe('executeConsolidate', () => {
     expect(stillB!.status).toBe('active');
   });
 
-  test('respects maxPasses limit (FR-081)', () => {
-    // Insert memories that would trigger multiple passes
+  test('detects every pair once and merges none (FR-082)', () => {
     for (let i = 0; i < 10; i++) {
       const memory = createTestMemory({
         summary: `test content ${i}`,
@@ -958,10 +957,15 @@ describe('executeConsolidate', () => {
       insertMemory(db, memory);
     }
 
-    const result = executeConsolidate(db, { threshold: 0.01, maxPasses: 3 });
+    const result = executeConsolidate(db, { threshold: 0.01 });
 
-    // Should stop after detecting pairs (no auto-merge)
-    expect(result.pairs_found).toBeGreaterThanOrEqual(0);
+    // Detection-only: everything found is left for human review, and running
+    // again over the same unchanged state finds exactly the same pairs — the
+    // reason a second pass was never possible.
+    expect(result.pairs_found).toBeGreaterThan(0);
+    expect(result.pairs_merged).toBe(0);
+    expect(result.pairs_skipped).toBe(result.pairs_found);
+    expect(executeConsolidate(db, { threshold: 0.01 }).pairs_found).toBe(result.pairs_found);
   });
 
   test('handles empty database gracefully', () => {

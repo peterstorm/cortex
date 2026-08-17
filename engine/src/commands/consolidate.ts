@@ -228,12 +228,16 @@ export interface ConsolidateResult {
 }
 
 /**
- * Options for consolidate command
+ * Options for consolidate command.
+ *
+ * Detection-only, so detection is all this configures. `maxPasses` and
+ * `sessionId` used to sit here as well: the first capped a loop that could
+ * never run twice, and the second was read into a local that nothing used,
+ * because merging — the only thing either would inform — is human-driven
+ * through mergePair (FR-082), which takes its own sessionId.
  */
 export interface ConsolidateOptions {
   readonly threshold?: number; // Default: per-space (consolidationThresholdFor)
-  readonly maxPasses?: number; // Default 3 (FR-081)
-  readonly sessionId?: string; // For source tracking
 }
 
 /**
@@ -377,22 +381,14 @@ export function mergePair(
 }
 
 /**
- * Execute full consolidate command with snapshot/rollback safety
- * FR-079: Create a whole-database snapshot before consolidation
- * FR-080: Rollback on failure
- * FR-081: Max 3 passes per trigger
+ * Delete a snapshot file, treating an already-absent one as done.
  *
- * Note: This function detects pairs but does NOT automatically merge them.
- * FR-082 requires human approval for each merge. The caller (skill/agent)
- * must call detectDuplicates() to get pairs, review them, and then call
- * mergePair() for each approved merge.
+ * Only ENOENT is benign: a permission or filesystem failure means the snapshot
+ * is still on disk and the caller's success path would be lying about having
+ * cleaned up, so it throws and lets executeConsolidate's rollback handle it.
  *
- * This function is provided for convenience in testing and future automation,
- * but in production the skill will use detectDuplicates() + mergePair() directly.
- *
- * @param db - Database instance
- * @param options - Consolidate options
- * @returns Consolidate result
+ * @param snapshotPath - Snapshot file to remove.
+ * @param remove - Deletion seam, so tests drive the failure branches directly.
  */
 export function removeSnapshotFile(
   snapshotPath: string,
@@ -411,13 +407,29 @@ export function removeSnapshotFile(
   }
 }
 
+/**
+ * Execute full consolidate command with snapshot/rollback safety.
+ *
+ * FR-079: Create a whole-database snapshot before consolidation.
+ * FR-080: Rollback on failure.
+ *
+ * Note: This function detects pairs but does NOT automatically merge them.
+ * FR-082 requires human approval for each merge. The caller (skill/agent)
+ * must call detectDuplicates() to get pairs, review them, and then call
+ * mergePair() for each approved merge.
+ *
+ * This function is provided for convenience in testing and future automation,
+ * but in production the skill will use detectDuplicates() + mergePair() directly.
+ *
+ * @param db - Database instance
+ * @param options - Consolidate options
+ * @returns Consolidate result
+ */
 export function executeConsolidate(
   db: Database,
   options: ConsolidateOptions = {}
 ): ConsolidateResult {
   const threshold = options.threshold; // undefined → per-space defaults
-  const maxPasses = options.maxPasses ?? 3; // FR-081: default 3, enforced below
-  const sessionId = options.sessionId ?? 'consolidate-session';
 
   // FR-079: Create a whole-database snapshot before consolidation
   let snapshotPath: string;
@@ -429,35 +441,24 @@ export function executeConsolidate(
   }
 
   try {
-    let totalPairsMerged = 0;
-    let totalPairsSkipped = 0;
-    let totalPairsFound = 0;
-
-    // FR-081: Cap detection passes to prevent infinite loops.
-    // Each pass detects pairs; merging is human-only (FR-082).
-    // Currently single-pass since no auto-merge, but the guard
-    // ensures safety if iterative merge logic is added later.
-    for (let pass = 0; pass < maxPasses; pass++) {
-      const activeMemories = getActiveMemories(db);
-      const pairs = findSimilarPairs(activeMemories, threshold);
-
-      totalPairsFound += pairs.length;
-      totalPairsSkipped += pairs.length;
-
-      // FR-082: human-only — pairs returned for review, not auto-merged.
-      // No merges happen here, so subsequent passes would find same pairs.
-      // Break after first pass since results won't change without merges.
-      break;
-    }
+    // One detection pass, because a second could not differ. FR-082 makes
+    // merging human-only, so this function never mutates the memories it
+    // reads — a repeat pass over unchanged state finds the identical pairs.
+    // This was a `for` loop bounded by maxPasses with an unconditional break
+    // at the bottom, which made the bound look load-bearing and cost every
+    // reader a trip through the loop body to learn it was not.
+    const activeMemories = getActiveMemories(db);
+    const pairs = findSimilarPairs(activeMemories, threshold);
 
     // Clean up the snapshot file on success. Only an already-absent file is
     // benign; permission and filesystem failures must enter rollback/error.
     removeSnapshotFile(snapshotPath);
 
     return {
-      pairs_found: totalPairsFound,
-      pairs_merged: totalPairsMerged,
-      pairs_skipped: totalPairsSkipped,
+      pairs_found: pairs.length,
+      // Nothing is merged here, so every pair found is a pair left for review.
+      pairs_merged: 0,
+      pairs_skipped: pairs.length,
       snapshot_path: snapshotPath,
     };
   } catch (err) {

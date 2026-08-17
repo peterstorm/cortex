@@ -366,9 +366,9 @@ export async function runAiPrune(
     return await prune(projectDb, globalDb, telemetryPath, progress, cwd, transport);
   } catch (err) {
     // Everything under here is I/O — SQLite, telemetry, the surface cache.
-    // Without this the sibling of executeSemanticEdges' guard, a DB or
-    // telemetry fault leaves the caller with an unhandled rejection instead of
-    // an outcome it can report.
+    // This is the sibling of executeSemanticEdges' top-level guard: without it
+    // a DB or telemetry fault leaves the caller with an unhandled rejection
+    // instead of an outcome it can report.
     const message = err instanceof Error ? err.message : String(err);
     logError(`AI prune aborted: ${message}`);
     return {

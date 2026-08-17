@@ -1305,8 +1305,13 @@ type EdgeRow = {
  * impossible and keeps the invalid-row drop diagnosable in every path.
  */
 function rowToEdge(row: EdgeRow): Edge | null {
-  if (!isEdgeRelation(row.relation_type)) {
-    console.warn(`[cortex:db] Skipping edge ${row.id}: invalid relation_type '${row.relation_type}'`);
+  // Narrowed into consts because the guards below do not survive into the
+  // readRow closure — a property narrowing is discarded at the callback
+  // boundary, and re-casting there would undo the parsing these guards do.
+  const relationType = row.relation_type;
+  const status = row.status;
+  if (!isEdgeRelation(relationType)) {
+    console.warn(`[cortex:db] Skipping edge ${row.id}: invalid relation_type '${relationType}'`);
     return null;
   }
   // status gets the same treatment as relation_type rather than a cast: both
@@ -1314,30 +1319,63 @@ function rowToEdge(row: EdgeRow): Edge | null {
   // A cast would turn one corrupt cell into an exception thrown out of every
   // edge read in the process — none of the four callers catch it — instead of
   // dropping the one unreadable row the way this mapper already promises.
-  if (!isEdgeStatus(row.status)) {
-    console.warn(`[cortex:db] Skipping edge ${row.id}: invalid status '${row.status}'`);
+  if (!isEdgeStatus(status)) {
+    console.warn(`[cortex:db] Skipping edge ${row.id}: invalid status '${status}'`);
     return null;
   }
-  return createEdge({
-    id: row.id,
-    source_id: row.source_id,
-    target_id: row.target_id,
-    relation_type: row.relation_type,
-    strength: Number(row.strength),
-    bidirectional: row.bidirectional === 1,
-    status: row.status,
-    created_at: row.created_at,
-    classified_at: row.classified_at ?? null,
-    classify_hash: row.classify_hash ?? null,
-    last_failed_at: row.last_failed_at ?? null,
+  return readRow(`edge ${row.id}`, () =>
+    createEdge({
+      id: row.id,
+      source_id: row.source_id,
+      target_id: row.target_id,
+      relation_type: relationType,
+      strength: Number(row.strength),
+      bidirectional: row.bidirectional === 1,
+      status,
+      created_at: row.created_at,
+      classified_at: row.classified_at ?? null,
+      classify_hash: row.classify_hash ?? null,
+      last_failed_at: row.last_failed_at ?? null,
+    })
+  );
+}
+
+/**
+ * Construct a domain object from a row, dropping the row (with a diagnostic)
+ * when its constructor refuses it.
+ *
+ * The union-cell guards in the mappers below parse what the TYPE system needs —
+ * a `string` column narrowed to `EdgeStatus`/`EntityType` before it reaches a
+ * factory that demands one. They cannot cover the VALUE invariants the factory
+ * also enforces (empty name, empty predicate, confidence outside [0,1],
+ * strength outside [0,1]), and re-stating those in each mapper would put the
+ * same rules in two places for the same rows.
+ *
+ * So the factory stays the single owner of the invariants and this turns its
+ * refusal into the outcome every read path here already promises: one
+ * unreadable row is skipped and named, not an exception thrown out of every
+ * read in the process. The scope is deliberately one constructor call — this is
+ * a corrupt-cell boundary, not a catch-all around I/O.
+ */
+function readRow<T>(rowLabel: string, construct: () => T): T | null {
+  try {
+    return construct();
+  } catch (err) {
+    console.warn(`[cortex:db] Skipping ${rowLabel}: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
+/** Map rows through a mapper that drops unreadable ones. */
+function readRows<R, T>(rows: readonly R[], map: (row: R) => T | null): readonly T[] {
+  return rows.flatMap((row) => {
+    const mapped = map(row);
+    return mapped === null ? [] : [mapped];
   });
 }
 
 function edgeRowsToEdges(rows: readonly EdgeRow[]): readonly Edge[] {
-  return rows.flatMap((row) => {
-    const edge = rowToEdge(row);
-    return edge === null ? [] : [edge];
-  });
+  return readRows(rows, rowToEdge);
 }
 
 /** Narrow a SQLite cell to a string (columns are NOT NULL by schema). */
@@ -1798,7 +1836,7 @@ export function searchEntities(
     LIMIT ?
   `).all(safeQuery, limit) as unknown as Array<Record<string, unknown>>;
 
-  return rows.map(rowToEntity);
+  return readRows(rows, rowToEntity);
 }
 
 /**
@@ -1810,7 +1848,7 @@ export function getAllEntities(db: Database): readonly Entity[] {
     `SELECT * FROM entities ORDER BY name`
   ).all() as unknown as Array<Record<string, unknown>>;
 
-  return rows.map(rowToEntity);
+  return readRows(rows, rowToEntity);
 }
 
 /**
@@ -1821,17 +1859,31 @@ export function getAllEntities(db: Database): readonly Entity[] {
  * mapper backs getEntityByName, searchEntities and getAllEntities, so an
  * unguarded JSON.parse would let one bad cell throw a context-free SyntaxError
  * out of every entity read rather than degrade that one row.
+ *
+ * `entity_type` gets the treatment rowToEdge's status does, for the same
+ * reason: it is an unvalidated cell that createEntity refuses, and a cast would
+ * turn one corrupt row into an exception thrown out of all three readers —
+ * none of which catch it — instead of dropping the row it belongs to. There is
+ * no CHECK constraint on the column, so the guard is the only thing standing
+ * between a hand-edited or migrated cell and every entity read.
  */
-function rowToEntity(row: Record<string, unknown>): Entity {
+function rowToEntity(row: Record<string, unknown>): Entity | null {
   const id = asString(row.id);
-  return createEntity({
-    id,
-    name: asString(row.name),
-    entity_type: asString(row.entity_type) as EntityType,
-    aliases: parseJsonStringArray(asString(row.aliases), `Entity ${id}`, 'aliases'),
-    created_at: asString(row.created_at),
-    updated_at: asString(row.updated_at),
-  });
+  const entityType = asString(row.entity_type);
+  if (!isEntityType(entityType)) {
+    console.warn(`[cortex:db] Skipping entity ${id}: invalid entity_type '${entityType}'`);
+    return null;
+  }
+  return readRow(`entity ${id}`, () =>
+    createEntity({
+      id,
+      name: asString(row.name),
+      entity_type: entityType,
+      aliases: parseJsonStringArray(asString(row.aliases), `Entity ${id}`, 'aliases'),
+      created_at: asString(row.created_at),
+      updated_at: asString(row.updated_at),
+    })
+  );
 }
 
 // ============================================================================
@@ -1859,18 +1911,27 @@ type FactRow = {
   created_at: string;
 };
 
-function rowToFact(row: FactRow): Fact {
-  return createFact({
-    id: row.id,
-    entity_id: row.entity_id,
-    predicate: row.predicate,
-    object: row.object,
-    source_memory_id: row.source_memory_id,
-    confidence: row.confidence,
-    valid_from: row.valid_from,
-    valid_to: row.valid_to,
-    created_at: row.created_at,
-  });
+/**
+ * Facts have no union-typed cell, but createFact still refuses an empty
+ * predicate/object and a confidence outside [0,1] — none of which the schema
+ * constrains. Unguarded, one such row threw out of all three readers below;
+ * dropping it names the row and leaves the rest of the entity's knowledge
+ * readable.
+ */
+function rowToFact(row: FactRow): Fact | null {
+  return readRow(`fact ${row.id}`, () =>
+    createFact({
+      id: row.id,
+      entity_id: row.entity_id,
+      predicate: row.predicate,
+      object: row.object,
+      source_memory_id: row.source_memory_id,
+      confidence: row.confidence,
+      valid_from: row.valid_from,
+      valid_to: row.valid_to,
+      created_at: row.created_at,
+    })
+  );
 }
 
 /**
@@ -1914,7 +1975,7 @@ export function getCurrentFacts(db: Database, entityId: string): readonly Fact[]
      ORDER BY f.created_at DESC`
   ).all(entityId) as FactRow[];
 
-  return rows.map(rowToFact);
+  return readRows(rows, rowToFact);
 }
 
 /**
@@ -1926,7 +1987,7 @@ export function getAllFacts(db: Database, entityId: string): readonly Fact[] {
     `SELECT * FROM facts WHERE entity_id = ? ORDER BY created_at DESC`
   ).all(entityId) as FactRow[];
 
-  return rows.map(rowToFact);
+  return readRows(rows, rowToFact);
 }
 
 /**
@@ -1963,5 +2024,5 @@ export function getFactsByMemory(db: Database, memoryId: string): readonly Fact[
     `SELECT * FROM facts WHERE source_memory_id = ?`
   ).all(memoryId) as FactRow[];
 
-  return rows.map(rowToFact);
+  return readRows(rows, rowToFact);
 }

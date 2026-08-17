@@ -720,8 +720,10 @@ describe('ai-prune side effects (findings 1b, 12)', () => {
       ] }));
 
       // A dependent write failure is reported, not thrown: the transaction
-      // still rolls the memory back, the run keeps going for the remaining
-      // candidates, and the outcome is a failure so the watermark stays put.
+      // still rolls the memory back, and the outcome is a failure so the
+      // watermark stays put. (That the run keeps going for the REMAINING
+      // candidates needs more than one candidate to show — the sibling test
+      // below does that.)
       const result = await runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport);
 
       expect(failedPrune(result).error).toContain('could not be archived');
@@ -735,6 +737,96 @@ describe('ai-prune side effects (findings 1b, 12)', () => {
       ]);
       expect(fs.existsSync(telemetryPath)).toBe(false);
     } finally {
+      projectDb.close();
+      globalDb.close();
+    }
+  });
+
+  it('keeps archiving the remaining candidates after one candidate fails', async () => {
+    // The single-candidate test above cannot show continuation — with one
+    // candidate there is nothing left to continue to. Two candidates, only the
+    // first of which owns the edge the trigger aborts on: the second must
+    // still be archived, and both outcomes must show up in the counts.
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    const telemetryPath = makeTelemetryPath();
+
+    try {
+      for (let i = 0; i < 8; i++) {
+        insertMemory(projectDb, makeMemory(`multi-${i}`, 30));
+      }
+      insertEdge(projectDb, {
+        source_id: 'multi-0',
+        target_id: 'multi-1',
+        relation_type: 'relates_to',
+        strength: 0.8,
+        bidirectional: true,
+        status: 'active',
+      });
+      projectDb.exec(`
+        CREATE TRIGGER fail_archive_edge_multi
+        BEFORE UPDATE OF status ON edges
+        WHEN NEW.status = 'archived'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced dependent archive failure');
+        END;
+      `);
+      transportCall.mockResolvedValue(JSON.stringify({ candidates: [
+        { id: 'multi-0', reason: 'obsolete' },
+        { id: 'multi-2', reason: 'obsolete' },
+      ] }));
+
+      const result = await runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport);
+
+      // multi-0 rolled back whole; multi-2 archived anyway.
+      expect(getMemory(projectDb, 'multi-0')).toMatchObject({ status: 'active', archived_at: null });
+      expect(getMemory(projectDb, 'multi-2')).toMatchObject({ status: 'archived' });
+      expect(result.archived).toBe(1);
+      expect(failedPrune(result).error).toContain('could not be archived');
+      // The run still owes its review, so the watermark stays unwritten.
+      expect(fs.existsSync(telemetryPath)).toBe(false);
+    } finally {
+      projectDb.close();
+      globalDb.close();
+    }
+  });
+
+  it('reports a structured failure when an unexpected fault escapes the run', async () => {
+    // runAiPrune's top-level guard. Everything under it is I/O, so a DB or
+    // cache fault has to become an outcome the caller can report rather than
+    // an unhandled rejection — with the counters the successful batches
+    // already earned still attached.
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    const telemetryPath = makeTelemetryPath();
+    const cwd = nodePath.dirname(telemetryPath);
+
+    // The surface-cache invalidation runs after archiving, so progress is
+    // non-zero by the time this throws — which is what makes the preserved
+    // counters observable rather than vacuously 0.
+    const cacheSpy = vi.spyOn(await import('./generate.js'), 'invalidateSurfaceCache')
+      .mockImplementation(() => { throw new Error('surface cache is unwritable'); });
+
+    try {
+      for (let i = 0; i < 8; i++) {
+        insertMemory(projectDb, makeMemory(`abort-${i}`, 30));
+      }
+      transportCall.mockResolvedValue(JSON.stringify({ candidates: [
+        { id: 'abort-0', reason: 'obsolete' },
+      ] }));
+
+      const result = await runAiPrune(projectDb, globalDb, telemetryPath, cwd, transport);
+
+      expect(result.kind).toBe('failed');
+      expect(failedPrune(result).error).toContain('AI prune aborted: surface cache is unwritable');
+      // Partial progress survives the abort: abort-0 was committed before the
+      // fault, so the caller is told about it.
+      expect(result.archived).toBe(1);
+      expect(result.reviewed).toBeGreaterThan(0);
+      // An abort never advances the watermark — the review is still owed.
+      expect(fs.existsSync(telemetryPath)).toBe(false);
+    } finally {
+      cacheSpy.mockRestore();
       projectDb.close();
       globalDb.close();
     }

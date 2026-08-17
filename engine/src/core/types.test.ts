@@ -989,6 +989,19 @@ describe('createEdge identity guards', () => {
   it.each(['id', 'source_id', 'target_id'])('rejects a whitespace-only %s', (field) => {
     expect(() => createEdge({ ...base, [field]: '   ' })).toThrow(/must not be empty/);
   });
+
+  // The guard trims to decide emptiness, so it must also STORE the trimmed
+  // value: validating " mem-1" and persisting it padded leaves a row keyed by
+  // an id no other table holds.
+  it('stores the trimmed identity strings rather than the raw input', () => {
+    const edge = createEdge({ ...base, id: '  edge-1 ', source_id: ' mem-1', target_id: 'mem-2  ' });
+    expect(edge).toMatchObject({ id: 'edge-1', source_id: 'mem-1', target_id: 'mem-2' });
+  });
+
+  it('rejects a self-referencing edge whose two ids differ only by padding', () => {
+    expect(() => createEdge({ ...base, source_id: 'mem-1', target_id: 'mem-1 ' }))
+      .toThrow('source_id and target_id must not be equal (no self-referencing edges)');
+  });
 });
 
 describe('resolveArchiveAnchor', () => {
@@ -1056,4 +1069,37 @@ describe('resolveArchiveAnchor', () => {
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain('memory gone is undefined');
   });
+
+  // An explicit `archived_at: null` CLEARS the anchor. It is not `undefined`,
+  // so neither the "explicit anchor" nor the "status-only" branch below it
+  // sees the patch at all — without its own guard the null falls through to
+  // the terminal return and persists an archived row with no anchor, leaving
+  // the FR-091 retention window nothing to measure from. createMemory reads
+  // such a row back happily (it only refuses an anchor a status must not
+  // hold, never a missing one), so this resolver is the only enforcement
+  // point. Both directions, so deleting the guard cannot stay green.
+  it.each(['archived', 'pruned'] as const)(
+    'refuses an explicit null anchor when the patch leaves the row %s',
+    (status) => {
+      const result = resolveArchiveAnchor(archived, { status, archived_at: null }, NOW);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.reason).toMatch(new RegExp(`memory mem-1 is ${status}; archived_at must not be cleared`));
+    }
+  );
+
+  it('refuses an explicit null anchor that leaves an already-archived row archived', () => {
+    // Status omitted: the resolved status comes from the stored row, so the
+    // guard must consult `current.status`, not just the patch.
+    const result = resolveArchiveAnchor(archived, { archived_at: null }, NOW);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/memory mem-1 is archived; archived_at must not be cleared/);
+  });
+
+  it.each(['active', 'superseded'] as const)(
+    'allows an explicit null anchor when the patch leaves the row %s',
+    (status) => {
+      expect(resolveArchiveAnchor(archived, { status, archived_at: null }, NOW))
+        .toEqual({ ok: true, archived_at: null });
+    }
+  );
 });

@@ -422,6 +422,74 @@ describe('executeSemanticEdges', () => {
     }
   });
 
+  // Both stamping paths run inside a mapLimit worker. An error escaping either
+  // one rejects Promise.all, which discards the tallies of every other batch
+  // and leaves the abandoned runner writing to a database the caller's finally
+  // is about to close. These two pin that neither path can escape.
+
+  it('keeps sibling batch counts when one edge\'s failure stamp cannot be written', async () => {
+    // Same 12-pair, two-batch shape as the mixed-accounting test below: batch
+    // one is unparseable (10 failures, each needing a backoff stamp), batch two
+    // classifies 2. With markEdgeFailed throwing, the run used to lose all of
+    // it; the counts below are what survives.
+    for (let i = 0; i < 12; i++) {
+      seedMemory(`m${i}`);
+      seedMemory(`m${i}-t`);
+      insertEdge(db, {
+        source_id: `m${i}`, target_id: `m${i}-t`, relation_type: 'relates_to',
+        strength: 0.5, bidirectional: true, status: 'active',
+      });
+    }
+    transportCall
+      .mockResolvedValueOnce({ text: 'garbage', direct: false })
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          edges: [
+            { pair_index: 1, source_id: 'm10', target_id: 'm10-t', relation_type: 'refines', strength: 0.8 },
+            { pair_index: 2, source_id: 'm11', target_id: 'm11-t', relation_type: 'supersedes', strength: 0.9 },
+          ],
+        }),
+        direct: true,
+      });
+    const failedSpy = vi.spyOn(await import('../infra/db.js'), 'markEdgeFailed')
+      .mockImplementation(() => { throw new Error('SQLITE_BUSY: database is locked'); });
+
+    try {
+      const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
+      expect(result).toEqual({ ok: true, classified: 2, failed: 10 });
+      // The stamp is what was lost, not the run: the failed edges stay
+      // unclassified and simply get re-asked without the backoff delay.
+      expect(getAllEdges(db).filter((e) => e.relation_type !== 'relates_to')).toHaveLength(2);
+    } finally {
+      failedSpy.mockRestore();
+    }
+  });
+
+  it('survives a unique-constraint recovery stamp that cannot be written', async () => {
+    seedMemory('a');
+    seedMemory('b');
+    // The candidate the run will classify...
+    insertEdge(db, { source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active' });
+    // ...and a typed edge for the same pair that already exists, so the
+    // replacement insert trips UNIQUE (source_id, target_id, relation_type)
+    // and the run takes the recovery branch.
+    insertEdge(db, { source_id: 'a', target_id: 'b', relation_type: 'refines', strength: 0.9, bidirectional: false, status: 'active' });
+    answerWith([
+      { source_id: 'a', target_id: 'b', relation_type: 'refines', strength: 0.8 },
+    ]);
+    const classifiedSpy = vi.spyOn(await import('../infra/db.js'), 'markEdgeClassified')
+      .mockImplementation(() => { throw new Error('SQLITE_BUSY: database is locked'); });
+
+    try {
+      const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
+      // Unguarded, this threw out of the worker and the whole run reported
+      // ok:false with no counts at all.
+      expect(result).toEqual({ ok: true, classified: 0, failed: 1 });
+    } finally {
+      classifiedSpy.mockRestore();
+    }
+  });
+
   it('handles multiple batches with mixed success and failure accounting', async () => {
     // 12 pairs → batches of 10 + 2 (BATCH_SIZE=10). The first batch's
     // response is unparseable (all 10 fail, unmarked); the second batch
