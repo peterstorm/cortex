@@ -373,6 +373,78 @@ export function createMemory(input: {
 }
 
 /**
+ * The status/archived_at coupling, resolved for a PARTIAL update (pure).
+ *
+ * The invariant is "archived_at is non-null only while status is archived or
+ * pruned". createMemory can enforce it directly because it sees a whole
+ * Memory; updateMemory cannot, because it takes a `Partial<Memory>` patch in
+ * which either half may be absent and the missing half is whatever the stored
+ * row already holds. That is also why the coupling is not expressible as a
+ * discriminated union on Memory: `{ status: 'archived' }` on its own is a
+ * legitimate patch, and no partial over such a union admits it.
+ *
+ * So the coupling lives here instead — one named pure function, given the
+ * row's current values and the incoming patch, deciding both whether the
+ * result is legal and what archived_at should become. The shell reads the row
+ * once, calls this, and persists; it holds no coupling logic of its own.
+ *
+ * @param current - The stored row's status and anchor.
+ * @param patch - The requested change; `undefined` means "leave alone".
+ * @returns The resolved anchor, or the reason the patch is refused. The
+ *   `archived_at` arm is `undefined` when the patch leaves the anchor
+ *   untouched, mirroring the patch semantics the caller already speaks.
+ */
+export function resolveArchiveAnchor(
+  current: { id: string; status?: MemoryStatus; archived_at?: string | null },
+  patch: { status?: MemoryStatus; archived_at?: string | null },
+  now: Date
+):
+  | { ok: true; archived_at: string | null | undefined }
+  | { ok: false; reason: string } {
+  // An explicit anchor is only ever legal alongside an archived/pruned status,
+  // whether that status arrives in this patch or is already on the row.
+  if (patch.archived_at != null) {
+    if (patch.status === 'active') {
+      return { ok: false, reason: 'active memory must not have archived_at set' };
+    }
+    if (patch.status !== undefined && patch.status !== 'archived' && patch.status !== 'pruned') {
+      return {
+        ok: false,
+        reason: `status ${patch.status} must not have archived_at set (only archived/pruned memories anchor an archive timestamp)`,
+      };
+    }
+    if (patch.status === undefined && current.status !== 'archived' && current.status !== 'pruned') {
+      return {
+        ok: false,
+        reason: `memory ${current.id} is ${String(current.status)}; cannot set archived_at without archiving it`,
+      };
+    }
+    return { ok: true, archived_at: patch.archived_at };
+  }
+
+  // A status-only change inherits the row's existing anchor, so a status that
+  // cannot carry one must not be reachable from a row that has one. 'archived'
+  // stamps a fresh anchor and 'active' clears it, so neither can conflict;
+  // 'pruned' legitimately keeps the anchor through the retention window.
+  if (patch.status !== undefined && patch.archived_at === undefined) {
+    if (patch.status === 'archived') {
+      return { ok: true, archived_at: now.toISOString() };
+    }
+    if (patch.status === 'active') {
+      return { ok: true, archived_at: null };
+    }
+    if (patch.status !== 'pruned' && current.archived_at != null) {
+      return {
+        ok: false,
+        reason: `memory ${current.id} has archived_at set; status ${patch.status} must not carry an archive anchor (only archived/pruned memories anchor an archive timestamp)`,
+      };
+    }
+  }
+
+  return { ok: true, archived_at: patch.archived_at };
+}
+
+/**
  * Validate and create an Edge with invariants checked.
  */
 export function createEdge(input: {

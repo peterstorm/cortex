@@ -18,7 +18,7 @@ import type {
   SourceType,
   EdgeRelation,
 } from '../core/types.js';
-import { createMemory, createEdge, createExtractionCheckpoint, isEdgeRelation, isMemoryType, isMemoryStatus, isMemoryScope } from '../core/types.js';
+import { createMemory, createEdge, createExtractionCheckpoint, isEdgeRelation, isMemoryType, isMemoryStatus, isMemoryScope, resolveArchiveAnchor } from '../core/types.js';
 import type { Entity, Fact, EntityType } from '../core/entities.js';
 import { createEntity, createFact, isEntityType } from '../core/entities.js';
 import { LOCAL_EMBED_MODEL } from '../config.js';
@@ -411,23 +411,45 @@ type MemoryRow = {
 };
 
 /**
+ * Read a JSON-serialized string array out of a TEXT cell, falling back to `[]`
+ * with a diagnostic when the cell is corrupt.
+ *
+ * One corrupt cell must not abort every read that maps rows: the corrupt-row
+ * precedent in this file is warn-with-row-identity and continue (see the
+ * local_embedding guard in collectMemoriesWithEmbeddings). The row itself is
+ * still readable, so its list field falls back to none.
+ *
+ * Both corruption shapes warn, which is the whole point of sharing this: a
+ * cell holding valid JSON that is not an array (`5`, `null`, `{}`) never
+ * enters the catch, and warning only there would degrade silently while
+ * claiming parity with a guard that warns unconditionally.
+ *
+ * @param rowLabel - Row identity for the diagnostic, e.g. `Memory mem-1`.
+ * @param column - Column name for the diagnostic, e.g. `tags`.
+ */
+function parseJsonStringArray(cell: string, rowLabel: string, column: string): readonly string[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cell);
+  } catch {
+    console.warn(`[cortex:db] ${rowLabel}: ${column} deserialized to invalid JSON; falling back to []`);
+    return [];
+  }
+  if (!Array.isArray(parsed)) {
+    console.warn(
+      `[cortex:db] ${rowLabel}: ${column} deserialized to ${parsed === null ? 'null' : typeof parsed}, not an array; falling back to []`
+    );
+    return [];
+  }
+  return parsed as string[];
+}
+
+/**
  * Convert a raw database row to a Memory domain object.
  * Pure helper — centralizes the row-to-Memory mapping used by all query functions.
  */
 function rowToMemory(row: MemoryRow): Memory {
-  // One corrupt tags cell must not abort every read that maps rows: the
-  // corrupt-row precedent in this file is warn-with-row-identity and continue
-  // (see the local_embedding guard in collectMemoriesWithEmbeddings). The row
-  // itself is still readable, so its tags fall back to none.
-  let tags: readonly string[] = [];
-  try {
-    const parsed: unknown = JSON.parse(row.tags);
-    if (Array.isArray(parsed)) {
-      tags = parsed as string[];
-    }
-  } catch {
-    console.warn(`[cortex:db] Memory ${row.id}: tags deserialized to invalid JSON; falling back to []`);
-  }
+  const tags = parseJsonStringArray(row.tags, `Memory ${row.id}`, 'tags');
 
   return createMemory({
     id: row.id,
@@ -547,41 +569,25 @@ function validateMemoryFields(fields: Partial<Memory>, operation: string): void 
  * @param fields - Partial memory fields to update
  */
 export function updateMemory(db: Database, id: string, fields: Partial<Memory>): void {
-  if (fields.status === 'active' && fields.archived_at !== undefined && fields.archived_at !== null) {
-    throw new Error('updateMemory: active memory must not have archived_at set');
+  // Load the row's current coupling state once, decide purely, then persist.
+  // The decision itself lives in resolveArchiveAnchor (core/types.ts) because
+  // a partial patch can leave either half of the pair implicit, so the rule
+  // needs both the patch and the stored row to be evaluated at all.
+  const touchesAnchor = fields.status !== undefined || fields.archived_at !== undefined;
+  const currentRow = touchesAnchor
+    ? db.prepare('SELECT status, archived_at FROM memories WHERE id = ?').get(id) as
+        { status?: MemoryStatus; archived_at?: string | null } | null
+    : null;
+  const resolved = resolveArchiveAnchor(
+    { id, status: currentRow?.status, archived_at: currentRow?.archived_at },
+    { status: fields.status, archived_at: fields.archived_at },
+    new Date()
+  );
+  if (!resolved.ok) {
+    throw new Error(`updateMemory: ${resolved.reason}`);
   }
-  if (fields.archived_at !== undefined && fields.archived_at !== null &&
-      fields.status !== undefined && fields.status !== 'archived' && fields.status !== 'pruned') {
-    throw new Error(`updateMemory: status ${fields.status} must not have archived_at set (only archived/pruned memories anchor an archive timestamp)`);
-  }
-  // An archived_at-only update on a live row would persist the exact state
-  // createMemory refuses to read back. The coupling guard needs the row's
-  // CURRENT status when the update itself doesn't change it.
-  if (fields.archived_at !== undefined && fields.archived_at !== null && fields.status === undefined) {
-    const row = db.prepare('SELECT status FROM memories WHERE id = ?').get(id) as { status?: unknown } | null;
-    const current = row?.status;
-    if (current !== 'archived' && current !== 'pruned') {
-      throw new Error(`updateMemory: memory ${id} is ${String(current)}; cannot set archived_at without archiving it`);
-    }
-  }
-  // The mirror image of the guard above: a status-only update leaves
-  // archived_at at the row's current value, so the guard needs the row's
-  // CURRENT anchor. 'superseded' cannot carry an archive anchor (createMemory
-  // refuses to read such a row back); 'active' is excluded because it
-  // auto-clears the anchor below, and 'archived'/'pruned' may carry it.
-  if (fields.status !== undefined && fields.status !== 'active' &&
-      fields.status !== 'archived' && fields.status !== 'pruned' &&
-      fields.archived_at === undefined) {
-    const row = db.prepare('SELECT archived_at FROM memories WHERE id = ?').get(id) as { archived_at?: unknown } | null;
-    if (row?.archived_at !== undefined && row?.archived_at !== null) {
-      throw new Error(`updateMemory: memory ${id} has archived_at set; status ${fields.status} must not carry an archive anchor (only archived/pruned memories anchor an archive timestamp)`);
-    }
-  }
-  if (fields.status === 'archived' && fields.archived_at === undefined) {
-    fields = { ...fields, archived_at: new Date().toISOString() };
-  }
-  if (fields.status === 'active' && fields.archived_at === undefined) {
-    fields = { ...fields, archived_at: null };
+  if (resolved.archived_at !== fields.archived_at) {
+    fields = { ...fields, archived_at: resolved.archived_at };
   }
   validateMemoryFields(fields, 'updateMemory');
   const updates: string[] = [];
@@ -1095,7 +1101,7 @@ export function getEdgesForMemory(db: Database, memoryId: string): readonly Edge
     AND status IN ('active', 'suggested')
   `);
 
-  const rows = stmt.all(memoryId, memoryId) as unknown as Array<Record<string, unknown>>;
+  const rows = stmt.all(memoryId, memoryId) as unknown as EdgeRow[];
 
   return edgeRowsToEdges(rows);
 }
@@ -1110,7 +1116,7 @@ export function getEdgesForMemory(db: Database, memoryId: string): readonly Edge
  */
 export function getAllEdges(db: Database): readonly Edge[] {
   const stmt = db.prepare(`SELECT * FROM edges WHERE status IN ('active', 'suggested')`);
-  const rows = stmt.all() as unknown as Array<Record<string, unknown>>;
+  const rows = stmt.all() as unknown as EdgeRow[];
 
   return edgeRowsToEdges(rows);
 }
@@ -1128,13 +1134,16 @@ export function getRelatesToEdges(db: Database): readonly Edge[] {
     SELECT * FROM edges WHERE relation_type = 'relates_to' AND status IN ('active', 'suggested')
   `);
 
-  return edgeRowsToEdges(stmt.all() as unknown as Array<Record<string, unknown>>);
+  return edgeRowsToEdges(stmt.all() as unknown as EdgeRow[]);
 }
 
 /**
  * Slim endpoint-memory projection used by the classification pre-filter.
- * memory_type comes from a memories row (createMemory-validated); the cast
- * is the domain union, matching Memory.memory_type.
+ *
+ * memory_type is read straight off the joined memories row, NOT through
+ * rowToMemory, so nothing on this path re-checks it — the value is validated
+ * here at the boundary (see getRelatesToEdgesWithMemories) rather than assumed
+ * from the insert-time createMemory call.
  */
 export interface EdgeEndpointMemory {
   readonly id: string;
@@ -1171,25 +1180,40 @@ export function getRelatesToEdgesWithMemories(db: Database): readonly EdgeWithMe
     ORDER BY e.created_at
   `);
 
-  const rows = stmt.all() as unknown as Array<Record<string, unknown>>;
+  const rows = stmt.all() as unknown as Array<EdgeRow & {
+    s_content: string; s_summary: string; s_memory_type: string;
+    t_content: string; t_summary: string; t_memory_type: string;
+  }>;
   return rows.flatMap((row) => {
     const edge = rowToEdge(row);
     if (edge === null) return [];
+
+    // The endpoint memory_type values bypass rowToMemory entirely on this raw
+    // JOIN, so they get the same validate-and-drop treatment rowToEdge gives
+    // relation_type one function below. Feeding an out-of-domain type into a
+    // classification prompt with no diagnostic is the failure this prevents.
+    if (!isMemoryType(row.s_memory_type) || !isMemoryType(row.t_memory_type)) {
+      console.warn(
+        `[cortex:db] Skipping edge ${row.id}: invalid endpoint memory_type ` +
+        `(source '${row.s_memory_type}', target '${row.t_memory_type}')`
+      );
+      return [];
+    }
 
     return [
       {
         edge,
         source: {
-          id: asString(row.source_id),
-          content: asString(row.s_content),
-          summary: asString(row.s_summary),
-          memory_type: asString(row.s_memory_type) as MemoryType,
+          id: row.source_id,
+          content: row.s_content,
+          summary: row.s_summary,
+          memory_type: row.s_memory_type,
         },
         target: {
-          id: asString(row.target_id),
-          content: asString(row.t_content),
-          summary: asString(row.t_summary),
-          memory_type: asString(row.t_memory_type) as MemoryType,
+          id: row.target_id,
+          content: row.t_content,
+          summary: row.t_summary,
+          memory_type: row.t_memory_type,
         },
       },
     ];
@@ -1251,6 +1275,28 @@ export function countActiveMemoriesCreatedAfter(db: Database, sinceIso: string):
 }
 
 /**
+ * Raw edges-table row shape, the counterpart to MemoryRow. Declared for the
+ * same reason: an untyped `Record<string, unknown>` lets a column addition or
+ * rename drift past the compiler and surface as a silent runtime miscoercion.
+ * That is exactly the class of defect r44's dropped last_failed_at belonged
+ * to. `relation_type` and `status` stay `string` here because they are the
+ * unvalidated cell values — rowToEdge narrows them to the domain unions.
+ */
+type EdgeRow = {
+  id: string;
+  source_id: string;
+  target_id: string;
+  relation_type: string;
+  strength: number;
+  bidirectional: number;
+  status: string;
+  created_at: string;
+  classified_at: string | null;
+  classify_hash: string | null;
+  last_failed_at: string | null;
+};
+
+/**
  * Map one edges-table row to an Edge, or null (with a stderr diagnostic) when
  * relation_type is not a domain value. Every edge read path routes through
  * this single mapper: r44's last_failed_at omission lived in four separate
@@ -1258,28 +1304,27 @@ export function countActiveMemoriesCreatedAfter(db: Database, sinceIso: string):
  * failure-backoff signal — a shared mapper makes that drift structurally
  * impossible and keeps the invalid-row drop diagnosable in every path.
  */
-function rowToEdge(row: Record<string, unknown>): Edge | null {
-  const relationType = asString(row.relation_type);
-  if (!isEdgeRelation(relationType)) {
-    console.warn(`[cortex:db] Skipping edge ${asString(row.id)}: invalid relation_type '${relationType}'`);
+function rowToEdge(row: EdgeRow): Edge | null {
+  if (!isEdgeRelation(row.relation_type)) {
+    console.warn(`[cortex:db] Skipping edge ${row.id}: invalid relation_type '${row.relation_type}'`);
     return null;
   }
   return createEdge({
-    id: asString(row.id),
-    source_id: asString(row.source_id),
-    target_id: asString(row.target_id),
-    relation_type: relationType as EdgeRelation,
+    id: row.id,
+    source_id: row.source_id,
+    target_id: row.target_id,
+    relation_type: row.relation_type as EdgeRelation,
     strength: Number(row.strength),
     bidirectional: row.bidirectional === 1,
-    status: asString(row.status) as Edge['status'],
-    created_at: asString(row.created_at),
-    classified_at: (row.classified_at ?? null) as string | null,
-    classify_hash: (row.classify_hash ?? null) as string | null,
-    last_failed_at: (row.last_failed_at ?? null) as string | null,
+    status: row.status as Edge['status'],
+    created_at: row.created_at,
+    classified_at: row.classified_at ?? null,
+    classify_hash: row.classify_hash ?? null,
+    last_failed_at: row.last_failed_at ?? null,
   });
 }
 
-function edgeRowsToEdges(rows: Array<Record<string, unknown>>): readonly Edge[] {
+function edgeRowsToEdges(rows: readonly EdgeRow[]): readonly Edge[] {
   return rows.flatMap((row) => {
     const edge = rowToEdge(row);
     return edge === null ? [] : [edge];
@@ -1743,13 +1788,19 @@ export function getAllEntities(db: Database): readonly Entity[] {
 /**
  * Centralizes the row-to-Entity mapping used by all entity query functions
  * (the same convention as rowToMemory and the edge mappers).
+ *
+ * `aliases` goes through the same corrupt-cell guard as Memory.tags: this
+ * mapper backs getEntityByName, searchEntities and getAllEntities, so an
+ * unguarded JSON.parse would let one bad cell throw a context-free SyntaxError
+ * out of every entity read rather than degrade that one row.
  */
 function rowToEntity(row: Record<string, unknown>): Entity {
+  const id = asString(row.id);
   return createEntity({
-    id: asString(row.id),
+    id,
     name: asString(row.name),
     entity_type: asString(row.entity_type) as EntityType,
-    aliases: JSON.parse(asString(row.aliases)),
+    aliases: parseJsonStringArray(asString(row.aliases), `Entity ${id}`, 'aliases'),
     created_at: asString(row.created_at),
     updated_at: asString(row.updated_at),
   });

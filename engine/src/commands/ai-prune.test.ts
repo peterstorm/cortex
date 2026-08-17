@@ -13,18 +13,24 @@ import type { Memory } from '../core/types.js';
 import { createMemory } from '../core/types.js';
 import { openDatabase, insertMemory, getMemory } from '../infra/db.js';
 import { AI_PRUNE_MIN_AGE_DAYS } from '../config.js';
+import type { LlmPromptTransport } from '../infra/claude-llm.js';
+import { withBunWhichUnavailable } from '../infra/llm-test-helpers.js';
 
-// Mock the LLM boundary — each test sets the response via mockRunLlmPrompt
-const mockRunLlmPrompt = vi.fn();
-const mockIsClaudeLlmAvailable = vi.fn();
+// The LLM boundary is the injectable transport, not the whole claude-llm
+// module: these tests drive the real prompt building and response parsing and
+// stub only the network call. Each test sets the answer via transportCall.
+const transportCall = vi.fn();
+const transport: LlmPromptTransport = async (prompt, timeoutMs, options) => ({
+  text: await transportCall(prompt, timeoutMs, options) as string,
+  direct: false,
+});
+
+// Endpoint resolution stays mocked: it is the configuration seam deciding
+// direct-vs-CLI, not the LLM call. A configured endpoint short-circuits the
+// isClaudeLlmAvailable PATH probe; the two dual-transport gate tests below
+// steer that probe with withBunWhichUnavailable instead.
+const FAKE_ENDPOINT = { baseUrl: 'http://llm.example/v1', apiKey: 'k', model: 'm' };
 const mockResolveEndpoint = vi.fn();
-vi.mock('../infra/claude-llm.js', () => ({
-  isClaudeLlmAvailable: () => mockIsClaudeLlmAvailable(),
-  runLlmPromptDirect: async (prompt: string, timeout: number, options: unknown) => ({
-    text: await mockRunLlmPrompt(prompt, timeout, options),
-    direct: false,
-  }),
-}));
 vi.mock('../infra/llm-client.js', () => ({
   resolveOpenAiCompatEndpoint: () => mockResolveEndpoint(),
 }));
@@ -107,23 +113,23 @@ describe('isProtectedStableMemory', () => {
 
 describe('runAiPrune age guard (enforced in code, not just prompt)', () => {
   beforeEach(() => {
-    mockRunLlmPrompt.mockReset();
-    mockIsClaudeLlmAvailable.mockReset().mockReturnValue(true);
-    mockResolveEndpoint.mockReset().mockReturnValue(null);
+    transportCall.mockReset();
+    mockResolveEndpoint.mockReset().mockReturnValue(FAKE_ENDPOINT);
   });
 
   it('proceeds via the direct endpoint when no CLI is available (dual-transport gate)', async () => {
     const projectDb = openDatabase(':memory:');
     const globalDb = openDatabase(':memory:');
     const telemetryPath = makeTelemetryPath();
-    mockIsClaudeLlmAvailable.mockReturnValue(false);
-    mockResolveEndpoint.mockReturnValue({ baseUrl: 'http://llm.example/v1', apiKey: 'k', model: 'm' });
+    mockResolveEndpoint.mockReturnValue(FAKE_ENDPOINT);
 
-    const result = await runAiPrune(projectDb, globalDb, telemetryPath);
+    const result = await withBunWhichUnavailable(() =>
+      runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport)
+    );
 
-    // The gate passed and the (mocked) direct transport was called;
-    // with no memories the run completes as an empty ok.
-    expect(mockRunLlmPrompt).not.toHaveBeenCalled();
+    // The gate passed on the endpoint alone; with no memories the run
+    // completes as an empty ok without reaching the transport.
+    expect(transportCall).not.toHaveBeenCalled();
     expect(result.error).toBeUndefined();
   });
 
@@ -131,10 +137,11 @@ describe('runAiPrune age guard (enforced in code, not just prompt)', () => {
     const projectDb = openDatabase(':memory:');
     const globalDb = openDatabase(':memory:');
     const telemetryPath = makeTelemetryPath();
-    mockIsClaudeLlmAvailable.mockReturnValue(false);
     mockResolveEndpoint.mockReturnValue(null);
 
-    const result = await runAiPrune(projectDb, globalDb, telemetryPath);
+    const result = await withBunWhichUnavailable(() =>
+      runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport)
+    );
 
     expect(result.error).toMatch(/no LLM available/i);
   });
@@ -151,12 +158,12 @@ describe('runAiPrune age guard (enforced in code, not just prompt)', () => {
     insertMemory(projectDb, makeMemory('fresh-1', 1));
 
     // LLM (mis)behaves: names both a fresh memory and an old one
-    mockRunLlmPrompt.mockResolvedValue(JSON.stringify({ candidates: [
+    transportCall.mockResolvedValue(JSON.stringify({ candidates: [
       { id: 'fresh-1', reason: 'looks redundant' },
       { id: 'old-0', reason: 'stale session context' },
     ] }));
 
-    const result = await runAiPrune(projectDb, globalDb, telemetryPath);
+    const result = await runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport);
 
     // Fresh memory survives despite the LLM output
     expect(getMemory(projectDb, 'fresh-1')!.status).toBe('active');
@@ -181,11 +188,11 @@ describe('runAiPrune age guard (enforced in code, not just prompt)', () => {
     }
     insertMemory(projectDb, makeMemory('pinned-1', 30, { pinned: true }));
 
-    mockRunLlmPrompt.mockResolvedValue(JSON.stringify({ candidates: [
+    transportCall.mockResolvedValue(JSON.stringify({ candidates: [
       { id: 'pinned-1', reason: 'redundant' },
     ] }));
 
-    const result = await runAiPrune(projectDb, globalDb, telemetryPath);
+    const result = await runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport);
 
     expect(getMemory(projectDb, 'pinned-1')!.status).toBe('active');
     expect(result.archived).toBe(0);
@@ -216,13 +223,13 @@ describe('runAiPrune age guard (enforced in code, not just prompt)', () => {
       confidence: 0.95,
     }));
 
-    mockRunLlmPrompt.mockResolvedValue(JSON.stringify({ candidates: [
+    transportCall.mockResolvedValue(JSON.stringify({ candidates: [
       { id: 'protected-architecture', reason: 'model ignored the stable-memory rule' },
       { id: 'protected-decision', reason: 'model ignored the stable-memory rule' },
       { id: 'ordinary-global', reason: 'stale context' },
     ] }));
 
-    const result = await runAiPrune(projectDb, globalDb, telemetryPath);
+    const result = await runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport);
 
     expect(getMemory(projectDb, 'protected-architecture')!.status).toBe('active');
     expect(getMemory(globalDb, 'protected-decision')!.status).toBe('active');
@@ -305,9 +312,8 @@ describe('shouldRunAiPrune (watermark trigger)', () => {
 
 describe('runAiPruneIfNeeded (watermark wiring)', () => {
   beforeEach(() => {
-    mockRunLlmPrompt.mockReset();
-    mockIsClaudeLlmAvailable.mockReset().mockReturnValue(true);
-    mockResolveEndpoint.mockReset().mockReturnValue(null);
+    transportCall.mockReset();
+    mockResolveEndpoint.mockReset().mockReturnValue(FAKE_ENDPOINT);
   });
 
   it('skips without an LLM call when nothing new arrived since the last successful prune', async () => {
@@ -322,16 +328,16 @@ describe('runAiPruneIfNeeded (watermark wiring)', () => {
       insertMemory(projectDb, makeMemory(`quiet-${index}`, 10));
     }
 
-    const result = await runAiPruneIfNeeded(projectDb, globalDb, telemetryPath);
+    const result = await runAiPruneIfNeeded(projectDb, globalDb, telemetryPath, undefined, transport);
 
     expect(result).toMatchObject({ archived: 0, reviewed: 0, skipped: true });
-    expect(mockRunLlmPrompt).not.toHaveBeenCalled();
+    expect(transportCall).not.toHaveBeenCalled();
     projectDb.close();
     globalDb.close();
   });
 
   it('proceeds on first run once the store reaches the review floor', async () => {
-    mockRunLlmPrompt.mockResolvedValue('{"candidates":[]}');
+    transportCall.mockResolvedValue('{"candidates":[]}');
     const projectDb = openDatabase(':memory:');
     const globalDb = openDatabase(':memory:');
     const telemetryPath = makeTelemetryPath(); // no watermark yet
@@ -339,10 +345,41 @@ describe('runAiPruneIfNeeded (watermark wiring)', () => {
       insertMemory(projectDb, makeMemory(`first-${index}`, 10));
     }
 
-    const result = await runAiPruneIfNeeded(projectDb, globalDb, telemetryPath);
+    const result = await runAiPruneIfNeeded(projectDb, globalDb, telemetryPath, undefined, transport);
 
     expect(result).toMatchObject({ archived: 0, reviewed: 8 });
-    expect(mockRunLlmPrompt).toHaveBeenCalledTimes(1);
+    expect(transportCall).toHaveBeenCalledTimes(1);
+    projectDb.close();
+    globalDb.close();
+  });
+
+  it('sums new memories across BOTH databases when deciding to run', async () => {
+    transportCall.mockResolvedValue('{"candidates":[]}');
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    const telemetryPath = makeTelemetryPath();
+    // Past the 6h minimum interval but well inside the 7-day staleness floor,
+    // so the watermark count is the only thing that can trigger the run.
+    fs.writeFileSync(telemetryPath, JSON.stringify({
+      last_ai_prune_at: new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString(),
+    }));
+
+    // 200 old rows put the store past the review floor without counting as
+    // new work, then the new arrivals are split across the two databases so
+    // that NEITHER alone clears the threshold of 20 (15 each) — only their
+    // sum does. A regression dropping the globalDb term leaves this skipped.
+    for (let index = 0; index < 200; index++) {
+      insertMemory(projectDb, makeMemory(`old-${index}`, 10));
+    }
+    for (let index = 0; index < 15; index++) {
+      insertMemory(projectDb, makeMemory(`new-project-${index}`, 0));
+      insertMemory(globalDb, makeMemory(`new-global-${index}`, 0));
+    }
+
+    const result = await runAiPruneIfNeeded(projectDb, globalDb, telemetryPath, undefined, transport);
+
+    expect(result.skipped).toBeUndefined();
+    expect(transportCall).toHaveBeenCalled();
     projectDb.close();
     globalDb.close();
   });
@@ -350,13 +387,12 @@ describe('runAiPruneIfNeeded (watermark wiring)', () => {
 
 describe('AI prune failure telemetry', () => {
   beforeEach(() => {
-    mockRunLlmPrompt.mockReset();
-    mockIsClaudeLlmAvailable.mockReset().mockReturnValue(true);
-    mockResolveEndpoint.mockReset().mockReturnValue(null);
+    transportCall.mockReset();
+    mockResolveEndpoint.mockReset().mockReturnValue(FAKE_ENDPOINT);
   });
 
   it('does not mark a prune complete when every LLM batch fails', async () => {
-    mockRunLlmPrompt.mockRejectedValue(new Error('provider unavailable'));
+    transportCall.mockRejectedValue(new Error('provider unavailable'));
     const projectDb = openDatabase(':memory:');
     const globalDb = openDatabase(':memory:');
     const telemetryPath = makeTelemetryPath();
@@ -364,7 +400,7 @@ describe('AI prune failure telemetry', () => {
       insertMemory(projectDb, makeMemory(`failure-${index}`, 10));
     }
 
-    const result = await runAiPrune(projectDb, globalDb, telemetryPath);
+    const result = await runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport);
 
     expect(result).toMatchObject({ archived: 0, reviewed: 0 });
     expect(result.error).toContain('All 1 AI prune batches failed');
@@ -374,7 +410,7 @@ describe('AI prune failure telemetry', () => {
   });
 
   it('uses an object JSON schema compatible with the pruning envelope', async () => {
-    mockRunLlmPrompt.mockResolvedValue('{"candidates":[]}');
+    transportCall.mockResolvedValue('{"candidates":[]}');
     const projectDb = openDatabase(':memory:');
     const globalDb = openDatabase(':memory:');
     const telemetryPath = makeTelemetryPath();
@@ -382,9 +418,9 @@ describe('AI prune failure telemetry', () => {
       insertMemory(projectDb, makeMemory(`schema-${index}`, 10));
     }
 
-    await runAiPrune(projectDb, globalDb, telemetryPath);
+    await runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport);
 
-    expect(mockRunLlmPrompt).toHaveBeenCalledWith(
+    expect(transportCall).toHaveBeenCalledWith(
       expect.stringContaining('{"candidates": ['),
       expect.any(Number),
       expect.objectContaining({
@@ -399,7 +435,7 @@ describe('AI prune failure telemetry', () => {
   });
 
   it('invalidates cache but does not reset cadence when an earlier batch archives and a later batch fails', async () => {
-    mockRunLlmPrompt
+    transportCall
       .mockResolvedValueOnce('{"candidates":[{"id":"partial-0","reason":"obsolete"}]}')
       .mockRejectedValueOnce(new Error('second batch unavailable'));
     const projectDb = openDatabase(':memory:');
@@ -413,7 +449,7 @@ describe('AI prune failure telemetry', () => {
       insertMemory(projectDb, makeMemory(`partial-${index}`, 10));
     }
 
-    const result = await runAiPrune(projectDb, globalDb, telemetryPath, cwd);
+    const result = await runAiPrune(projectDb, globalDb, telemetryPath, cwd, transport);
 
     expect(result).toMatchObject({ archived: 1, reviewed: 80 });
     expect(result.error).toContain('1 of 2 AI prune batches failed');
@@ -431,12 +467,12 @@ describe('AI prune failure telemetry', () => {
     for (let index = 0; index < 8; index++) {
       insertMemory(projectDb, makeMemory(`semantic-${index}`, 10));
     }
-    mockRunLlmPrompt.mockResolvedValue(JSON.stringify({ candidates: [
+    transportCall.mockResolvedValue(JSON.stringify({ candidates: [
       { id: 'semantic-0', reason: 'obsolete' },
       { id: 'hallucinated-id', reason: 'model drift' },
     ] }));
 
-    const result = await runAiPrune(projectDb, globalDb, telemetryPath);
+    const result = await runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport);
 
     expect(result).toMatchObject({ archived: 0, reviewed: 0 });
     expect(result.error).toContain('All 1 AI prune batches failed');
@@ -447,7 +483,7 @@ describe('AI prune failure telemetry', () => {
   });
 
   it('treats malformed output as a failed batch rather than an empty decision', async () => {
-    mockRunLlmPrompt.mockResolvedValue('{"not_candidates":[]}');
+    transportCall.mockResolvedValue('{"not_candidates":[]}');
     const projectDb = openDatabase(':memory:');
     const globalDb = openDatabase(':memory:');
     const telemetryPath = makeTelemetryPath();
@@ -455,7 +491,7 @@ describe('AI prune failure telemetry', () => {
       insertMemory(projectDb, makeMemory(`malformed-${index}`, 10));
     }
 
-    const result = await runAiPrune(projectDb, globalDb, telemetryPath);
+    const result = await runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport);
 
     expect(result).toMatchObject({ archived: 0, reviewed: 0 });
     expect(result.error).toContain('All 1 AI prune batches failed');
@@ -479,9 +515,8 @@ import {
 
 describe('ai-prune side effects (findings 1b, 12)', () => {
   beforeEach(() => {
-    mockRunLlmPrompt.mockReset();
-    mockIsClaudeLlmAvailable.mockReset().mockReturnValue(true);
-    mockResolveEndpoint.mockReset().mockReturnValue(null);
+    transportCall.mockReset();
+    mockResolveEndpoint.mockReset().mockReturnValue(FAKE_ENDPOINT);
   });
 
   it('invalidates the surface cache when memories are archived', async () => {
@@ -497,11 +532,11 @@ describe('ai-prune side effects (findings 1b, 12)', () => {
     for (let i = 0; i < 8; i++) {
       insertMemory(projectDb, makeMemory(`old-${i}`, 30));
     }
-    mockRunLlmPrompt.mockResolvedValue(JSON.stringify({ candidates: [
+    transportCall.mockResolvedValue(JSON.stringify({ candidates: [
       { id: 'old-0', reason: 'stale' },
     ] }));
 
-    const result = await runAiPrune(projectDb, globalDb, telemetryPath, cwd);
+    const result = await runAiPrune(projectDb, globalDb, telemetryPath, cwd, transport);
 
     expect(result.archived).toBe(1);
     expect(fs.readdirSync(cacheDir).filter(f => f.endsWith('.json'))).toHaveLength(0);
@@ -523,9 +558,9 @@ describe('ai-prune side effects (findings 1b, 12)', () => {
     for (let i = 0; i < 8; i++) {
       insertMemory(projectDb, makeMemory(`old-${i}`, 30));
     }
-    mockRunLlmPrompt.mockResolvedValue('{"candidates":[]}');
+    transportCall.mockResolvedValue('{"candidates":[]}');
 
-    const result = await runAiPrune(projectDb, globalDb, telemetryPath, cwd);
+    const result = await runAiPrune(projectDb, globalDb, telemetryPath, cwd, transport);
 
     expect(result.archived).toBe(0);
     expect(fs.readdirSync(cacheDir).filter(f => f.endsWith('.json'))).toHaveLength(1);
@@ -569,11 +604,11 @@ describe('ai-prune side effects (findings 1b, 12)', () => {
       created_at: new Date().toISOString(),
     });
 
-    mockRunLlmPrompt.mockResolvedValue(JSON.stringify({ candidates: [
+    transportCall.mockResolvedValue(JSON.stringify({ candidates: [
       { id: 'global-target', reason: 'obsolete global context' },
     ] }));
 
-    const result = await runAiPrune(projectDb, globalDb, telemetryPath, cwd);
+    const result = await runAiPrune(projectDb, globalDb, telemetryPath, cwd, transport);
 
     expect(result.archived).toBe(1);
     expect(getMemory(globalDb, 'global-target')).toMatchObject({
@@ -615,11 +650,11 @@ describe('ai-prune side effects (findings 1b, 12)', () => {
           SELECT RAISE(ABORT, 'forced dependent archive failure');
         END;
       `);
-      mockRunLlmPrompt.mockResolvedValue(JSON.stringify({ candidates: [
+      transportCall.mockResolvedValue(JSON.stringify({ candidates: [
         { id: 'atomic-0', reason: 'obsolete' },
       ] }));
 
-      await expect(runAiPrune(projectDb, globalDb, telemetryPath)).rejects.toThrow(
+      await expect(runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport)).rejects.toThrow(
         'forced dependent archive failure'
       );
       expect(getMemory(projectDb, 'atomic-0')).toMatchObject({
@@ -657,11 +692,11 @@ describe('ai-prune side effects (findings 1b, 12)', () => {
     });
     expect(getCurrentFacts(projectDb, entityId)).toHaveLength(1);
 
-    mockRunLlmPrompt.mockResolvedValue(JSON.stringify({ candidates: [
+    transportCall.mockResolvedValue(JSON.stringify({ candidates: [
       { id: 'old-0', reason: 'stale' },
     ] }));
 
-    const result = await runAiPrune(projectDb, globalDb, telemetryPath);
+    const result = await runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport);
 
     expect(result.archived).toBe(1);
     expect(getCurrentFacts(projectDb, entityId)).toHaveLength(0);

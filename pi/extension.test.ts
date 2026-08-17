@@ -3,13 +3,18 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-// vi.mock is hoisted above imports, so the mock target must come from
-// vi.hoisted — a plain top-level const would be in its TDZ when the factory
-// runs and collection fails.
-const childProcess = vi.hoisted(() => ({
+// Do NOT wrap this in vi.hoisted(). `vi.hoisted` is a vitest-only API and this
+// file's only runner is `bun test` (pi/ has no package.json and no vitest
+// install; engine/vitest.config.ts is engine-rooted and never collects ../pi).
+// Bun's vitest shim has no `.hoisted`, so using it kills the whole file at
+// import with `TypeError: vi.hoisted is not a function` — every test below
+// silently stops running. A plain top-level const is what bun's `vi.mock`
+// factory resolves against, and it has entered this file twice already
+// (fixed in 153e032, reverted in e1b26f3). Keep it plain.
+const childProcess = {
   execFileSync: vi.fn(() => ''),
   spawn: vi.fn(),
-}));
+};
 
 vi.mock('node:child_process', () => childProcess);
 

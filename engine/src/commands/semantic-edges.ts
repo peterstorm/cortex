@@ -24,7 +24,7 @@ import { createHash } from 'node:crypto';
 import type { Database } from 'bun:sqlite';
 import type { Memory } from '../core/types.js';
 import { chunk } from '../core/chunk.js';
-import type { MemoryPair, EdgeClassification } from '../infra/claude-llm.js';
+import type { MemoryPair, EdgeClassification, LlmPromptTransport } from '../infra/claude-llm.js';
 import { classifyEdges, isClaudeLlmAvailable } from '../infra/claude-llm.js';
 import {
   getRelatesToEdgesWithMemories,
@@ -52,6 +52,95 @@ export interface SemanticEdgesOptions {
   readonly limit: number;
   /** Per-project lock directory. */
   readonly lockDir?: string;
+  /**
+   * LLM transport for the classification call. Defaults to the real direct
+   * endpoint; tests pass a plain function fake so they exercise the actual
+   * classifyEdges parsing/routing instead of mocking the whole module.
+   */
+  readonly transport?: LlmPromptTransport;
+}
+
+/**
+ * A batch's classifications, joined back to the pairs that produced them
+ * (pure). Either every entry matched a pair, or the response is corrupt and
+ * the whole batch fails — a partial join is never a decline.
+ */
+export type ClassificationJoin =
+  | { readonly ok: true; readonly byOrdinal: true; readonly byIndex: ReadonlyMap<number, EdgeClassification> }
+  | { readonly ok: true; readonly byOrdinal: false; readonly byKey: ReadonlyMap<string, EdgeClassification> }
+  | { readonly ok: false; readonly reason: string };
+
+/** The composite key used when the model did not echo pair_index. */
+function pairKey(sourceId: string, targetId: string): string {
+  return `${sourceId}:${targetId}`;
+}
+
+/**
+ * Join classifications back to the pairs they answer (pure).
+ *
+ * When the model echoed pair_index — the deterministic protocol this prompt
+ * requests — the join is by ordinal and never depends on free-text ID
+ * fidelity: a direction-flipped or mangled ID cannot silently discard a valid
+ * classification. A response that mixes indexed and unindexed entries,
+ * duplicates an index or key, references an unknown pair, or carries an
+ * out-of-range index is corrupt, and the caller must treat that as a batch
+ * failure (edges left unmarked and retried) rather than a decline.
+ *
+ * Extracted from the batch worker so the trickiest logic in this command has
+ * a unit-test surface that needs neither a database nor an LLM transport.
+ */
+export function joinClassificationsToPairs(
+  batchPairs: readonly { readonly pair: MemoryPair }[],
+  classifications: readonly EdgeClassification[]
+): ClassificationJoin {
+  const byIndex = new Map<number, EdgeClassification>();
+  const byKey = new Map<string, EdgeClassification>();
+  const expectedKeys = new Set(batchPairs.map(({ pair }) => pairKey(pair.source.id, pair.target.id)));
+
+  for (const c of classifications) {
+    if (c.pair_index !== undefined) {
+      if (byIndex.has(c.pair_index)) {
+        return { ok: false, reason: `classification response contains duplicate pair_index ${c.pair_index} — corrupt response, batch failed` };
+      }
+      byIndex.set(c.pair_index, c);
+    } else {
+      const key = pairKey(c.source_id, c.target_id);
+      if (!expectedKeys.has(key)) {
+        return { ok: false, reason: `classification response referenced unknown unindexed pair ${key} — batch failed` };
+      }
+      if (byKey.has(key)) {
+        return { ok: false, reason: `classification response contains duplicate unindexed pair ${key} — batch failed` };
+      }
+      byKey.set(key, c);
+    }
+  }
+
+  if (byIndex.size === 0) return { ok: true, byOrdinal: false, byKey };
+
+  if (byIndex.size !== classifications.length) {
+    return { ok: false, reason: `classification response mixed indexed and unindexed entries (${byIndex.size} of ${classifications.length} indexed)` };
+  }
+  for (const index of byIndex.keys()) {
+    if (index < 1 || index > batchPairs.length) {
+      return { ok: false, reason: `classification pair_index ${index} is out of range for a ${batchPairs.length}-pair batch` };
+    }
+  }
+  return { ok: true, byOrdinal: true, byIndex };
+}
+
+/**
+ * Whether a write error is a unique-constraint conflict (pure).
+ *
+ * Prefers the SQLite result code, which is stable across versions and
+ * locales; the message regex remains only as a fallback for drivers that
+ * surface the constraint without a code.
+ */
+export function isUniqueConstraintError(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  if (typeof code === 'string' && code.startsWith('SQLITE_CONSTRAINT')) {
+    return code === 'SQLITE_CONSTRAINT_UNIQUE' || code === 'SQLITE_CONSTRAINT_PRIMARYKEY';
+  }
+  return /unique constraint/i.test(err instanceof Error ? err.message : String(err));
 }
 
 export type SemanticEdgesResult =
@@ -230,12 +319,11 @@ export async function executeSemanticEdges(
         failed += batch.length;
       };
 
-      let classifications: readonly EdgeClassification[];
-      let byIndex: Map<number, EdgeClassification> | null = null;
-      let byKey: Map<string, EdgeClassification>;
+      let join: ClassificationJoin;
       try {
         const outcome = await classifyEdges(
-          batchPairs.map((p) => p.pair)
+          batchPairs.map((p) => p.pair),
+          options.transport
         );
         if (outcome.kind === 'unparseable') {
           // Garbage is not a decline: count the batch as failed and retry it
@@ -246,56 +334,13 @@ export async function executeSemanticEdges(
           recordBatchFailure(batchPairs);
           return;
         }
-        classifications = outcome.classifications;
-
-        // Join classifications to pairs. When the model echoed pair_index (the
-        // deterministic protocol this prompt requests), the join is by ordinal
-        // and never depends on free-text ID fidelity: a direction-flipped or
-        // mangled ID cannot silently discard a valid classification. A
-        // response that mixes indexed and unindexed entries, or carries an
-        // out-of-range index, is corrupt — treat it as a batch failure
-        // (edges unmarked, retried) rather than a decline.
-        byIndex = new Map<number, EdgeClassification>();
-        byKey = new Map<string, EdgeClassification>();
-        const expectedKeys = new Set(
-          batchPairs.map(({ pair }) => `${pair.source.id}:${pair.target.id}`)
-        );
-        for (const c of classifications) {
-          if (c.pair_index !== undefined) {
-            if (byIndex.has(c.pair_index)) {
-              throw new Error(
-                `classification response contains duplicate pair_index ${c.pair_index} — corrupt response, batch failed`
-              );
-            }
-            byIndex.set(c.pair_index, c);
-          } else {
-            const key = `${c.source_id}:${c.target_id}`;
-            if (!expectedKeys.has(key)) {
-              throw new Error(
-                `classification response referenced unknown unindexed pair ${key} — batch failed`
-              );
-            }
-            if (byKey.has(key)) {
-              throw new Error(
-                `classification response contains duplicate unindexed pair ${key} — batch failed`
-              );
-            }
-            byKey.set(key, c);
-          }
-        }
-        if (byIndex.size > 0) {
-          if (byIndex.size !== classifications.length) {
-            throw new Error(
-              `classification response mixed indexed and unindexed entries (${byIndex.size} of ${classifications.length} indexed)`
-            );
-          }
-          for (const index of byIndex.keys()) {
-            if (index < 1 || index > batchPairs.length) {
-              throw new Error(
-                `classification pair_index ${index} is out of range for a ${batchPairs.length}-pair batch`
-              );
-            }
-          }
+        // A corrupt join is a batch failure, not a decline: the edges stay
+        // unmarked and are retried after the backoff.
+        join = joinClassificationsToPairs(batchPairs, outcome.classifications);
+        if (!join.ok) {
+          logError(`Classification batch failed: ${join.reason}`);
+          recordBatchFailure(batchPairs);
+          return;
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -307,13 +352,12 @@ export async function executeSemanticEdges(
       // Step 4: Replace edges with typed versions. Each edge's write is
       // guarded separately so a persistence error counts exactly one failure
       // and is never misattributed to the LLM batch.
-      const joinByIndex = byIndex !== null && byIndex.size > 0;
+      const joinByIndex = join.byOrdinal;
       for (const [pairOrdinal, { edgeId, pair }] of batchPairs.entries()) {
         try {
-          const key = `${pair.source.id}:${pair.target.id}`;
-          const classification = joinByIndex
-            ? byIndex!.get(pairOrdinal + 1)
-            : byKey.get(key);
+          const classification = join.byOrdinal
+            ? join.byIndex.get(pairOrdinal + 1)
+            : join.byKey.get(pairKey(pair.source.id, pair.target.id));
           // Content fingerprint at attempt time, stored for future runs
           const contentHash = pairContentHash(pair.source, pair.target);
 
@@ -353,7 +397,7 @@ export async function executeSemanticEdges(
           // a relates_to candidate after a content change). The
           // classification is effectively already done — retire the
           // candidate so it is not re-sent to the LLM on every run.
-          if (/unique constraint/i.test(message)) {
+          if (isUniqueConstraintError(err)) {
             markEdgeClassified(db, edgeId, attemptedAt, pairContentHash(pair.source, pair.target));
           }
         }

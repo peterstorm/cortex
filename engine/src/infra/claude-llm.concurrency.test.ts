@@ -9,6 +9,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { withBunWhichUnavailable } from './llm-test-helpers.js';
 import {
   resetConsecutiveDirectFailuresForTests,
   resetLlmConcurrencyForTests,
@@ -107,11 +108,8 @@ describe('process-wide LLM concurrency cap', () => {
     // The first call fails once, which is below the saturation threshold, so
     // it falls back to the subprocess: stub the CLI lookup so the fallback
     // fails fast instead of spawning a real agent loop.
-    const bunGlobal = (globalThis as { Bun?: { which: (bin: string) => string | null } }).Bun;
-    const originalWhich = bunGlobal!.which;
-    bunGlobal!.which = () => null;
     const tracker = trackingTransport({ rejectFirst: 1 });
-    try {
+    await withBunWhichUnavailable(async () => {
       const calls = Array.from({ length: 3 }, () => runLlmPromptDirect('p', 2_000));
       const results = await Promise.allSettled(calls);
 
@@ -121,9 +119,7 @@ describe('process-wide LLM concurrency cap', () => {
       expect(results[2].status).toBe('fulfilled');
       expect(tracker.maxInFlight()).toBe(1);
       expect(tracker.settled()).toBe(3);
-    } finally {
-      bunGlobal!.which = originalWhich;
-    }
+    });
   });
 
   it('lets queued callers proceed as slots free (no deadlock past the cap)', async () => {

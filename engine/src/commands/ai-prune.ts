@@ -18,6 +18,7 @@ import * as fs from 'node:fs';
 import type { Memory } from '../core/types.js';
 import { getActiveMemories, countActiveMemoriesCreatedAfter, updateMemory, archiveEdgesForMemory, supersedeFactsForMemory } from '../infra/db.js';
 import { isClaudeLlmAvailable, runLlmPromptDirect } from '../infra/claude-llm.js';
+import type { LlmPromptTransport } from '../infra/claude-llm.js';
 import { resolveOpenAiCompatEndpoint } from '../infra/llm-client.js';
 import { writeTelemetry } from '../infra/filesystem.js';
 import { parseJsonFromLlmText } from '../core/json-utils.js';
@@ -227,9 +228,16 @@ function recordSuccessfulAiPrune(telemetryPath: string, at: Date): void {
  * Call the LLM with the prune prompt.
  * Prefers the direct OpenAI-compatible endpoint (thinking disabled); falls
  * back to the headless CLI subprocess (claude -p / pi -p).
+ *
+ * @param transport - Injectable LLM boundary; defaults to the real direct
+ *   endpoint. Tests pass a plain function fake so they drive the real prompt
+ *   building and response parsing instead of mocking the whole module.
  */
-async function callClaudePrune(prompt: string): Promise<string> {
-  const { text } = await runLlmPromptDirect(prompt, AI_PRUNE_TIMEOUT_MS, {
+async function callClaudePrune(
+  prompt: string,
+  transport: LlmPromptTransport = runLlmPromptDirect
+): Promise<string> {
+  const { text } = await transport(prompt, AI_PRUNE_TIMEOUT_MS, {
     jsonSchema: {
       type: 'object',
       properties: {
@@ -265,7 +273,8 @@ export async function runAiPruneIfNeeded(
   projectDb: Database,
   globalDb: Database,
   telemetryPath: string,
-  cwd?: string
+  cwd?: string,
+  transport?: LlmPromptTransport
 ): Promise<AiPruneResult> {
   const projectMemories = getActiveMemories(projectDb);
   const globalMemories = getActiveMemories(globalDb);
@@ -281,7 +290,7 @@ export async function runAiPruneIfNeeded(
     return { archived: 0, reviewed: 0, skipped: true };
   }
 
-  return runAiPrune(projectDb, globalDb, telemetryPath, cwd);
+  return runAiPrune(projectDb, globalDb, telemetryPath, cwd, transport);
 }
 
 /**
@@ -320,7 +329,8 @@ export async function runAiPrune(
   projectDb: Database,
   globalDb: Database,
   telemetryPath: string,
-  cwd?: string
+  cwd?: string,
+  transport?: LlmPromptTransport
 ): Promise<AiPruneResult> {
   if (resolveOpenAiCompatEndpoint() === null && !isClaudeLlmAvailable()) {
     return {
@@ -398,7 +408,7 @@ export async function runAiPrune(
 
     let response: string;
     try {
-      response = await callClaudePrune(prompt);
+      response = await callClaudePrune(prompt, transport);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logError(`Batch ${i + 1} LLM call failed: ${message}`);

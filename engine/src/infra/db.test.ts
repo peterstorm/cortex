@@ -1802,3 +1802,139 @@ describe('openDatabaseReadOnly', () => {
     }
   });
 });
+
+// ============================================================================
+// Corrupt-cell guards, watermark counting, and endpoint validation (r51)
+// ============================================================================
+
+import {
+  getEntityByName,
+  getAllEntities,
+  searchEntities,
+  countActiveMemoriesCreatedAfter,
+  getRelatesToEdgesWithMemories,
+} from './db.js';
+
+describe('corrupt JSON list cells degrade the row, never the read', () => {
+  let db: Database;
+
+  beforeEach(() => {
+    db = openDatabase(':memory:');
+  });
+
+  // The comment on rowToMemory claims parity with the local_embedding guard,
+  // which warns unconditionally. Valid-but-non-array JSON never enters the
+  // catch, so without an explicit branch it degraded silently while the
+  // comment promised a diagnostic.
+  it.each([
+    ['5', 'number'],
+    ['null', 'null'],
+    ['{}', 'object'],
+    ['"a string"', 'string'],
+  ])('warns and falls back to [] when a tags cell holds valid non-array JSON (%s)', (cell, shape) => {
+    insertMemory(db, makeMemory('mem-nonarray-tags', { tags: ['ok'] }));
+    db.prepare('UPDATE memories SET tags = ? WHERE id = ?').run(cell, 'mem-nonarray-tags');
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const retrieved = getMemory(db, 'mem-nonarray-tags');
+      expect(retrieved?.tags).toEqual([]);
+      expect(warn).toHaveBeenCalledWith(
+        `[cortex:db] Memory mem-nonarray-tags: tags deserialized to ${shape}, not an array; falling back to []`
+      );
+    } finally {
+      warn.mockRestore();
+      db.close();
+    }
+  });
+
+  it('keeps every entity read alive when one aliases cell is unparseable', () => {
+    const id = upsertEntity(db, 'Ada Lovelace', 'person', ['Ada']);
+    db.prepare('UPDATE entities SET aliases = ? WHERE id = ?').run('not-json', id);
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      // All three read paths route through rowToEntity; before the guard, any
+      // one of them threw a context-free SyntaxError for the whole result set.
+      expect(getEntityByName(db, 'Ada Lovelace')?.aliases).toEqual([]);
+      expect(getAllEntities(db).map((e) => e.aliases)).toEqual([[]]);
+      expect(searchEntities(db, 'Ada').map((e) => e.aliases)).toEqual([[]]);
+      expect(warn).toHaveBeenCalledWith(
+        `[cortex:db] Entity ${id}: aliases deserialized to invalid JSON; falling back to []`
+      );
+    } finally {
+      warn.mockRestore();
+      db.close();
+    }
+  });
+
+  it('warns and falls back when an aliases cell holds valid non-array JSON', () => {
+    const id = upsertEntity(db, 'Grace Hopper', 'person', ['Grace']);
+    db.prepare('UPDATE entities SET aliases = ? WHERE id = ?').run('{}', id);
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(getEntityByName(db, 'Grace Hopper')?.aliases).toEqual([]);
+      expect(warn).toHaveBeenCalledWith(
+        `[cortex:db] Entity ${id}: aliases deserialized to object, not an array; falling back to []`
+      );
+    } finally {
+      warn.mockRestore();
+      db.close();
+    }
+  });
+});
+
+describe('countActiveMemoriesCreatedAfter (AI-prune watermark)', () => {
+  let db: Database;
+
+  beforeEach(() => {
+    db = openDatabase(':memory:');
+  });
+
+  it('counts strictly after the watermark and excludes non-active rows', () => {
+    const watermark = '2026-01-10T00:00:00.000Z';
+    insertMemory(db, makeMemory('before', { created_at: '2026-01-09T23:59:59.999Z' }));
+    // Exactly at the watermark is NOT new work: the comparison is `>`.
+    insertMemory(db, makeMemory('at', { created_at: watermark }));
+    insertMemory(db, makeMemory('after-1', { created_at: '2026-01-10T00:00:00.001Z' }));
+    insertMemory(db, makeMemory('after-2', { created_at: '2026-02-01T00:00:00.000Z' }));
+    insertMemory(db, makeMemory('after-archived', {
+      created_at: '2026-02-01T00:00:00.000Z',
+      status: 'archived',
+      archived_at: '2026-02-02T00:00:00.000Z',
+    }));
+
+    expect(countActiveMemoriesCreatedAfter(db, watermark)).toBe(2);
+    db.close();
+  });
+});
+
+describe('getRelatesToEdgesWithMemories endpoint validation', () => {
+  it('drops a row whose endpoint memory_type is out of domain instead of passing it on', () => {
+    const db = openDatabase(':memory:');
+    insertMemory(db, makeMemory('src'));
+    insertMemory(db, makeMemory('tgt'));
+    insertEdge(db, {
+      source_id: 'src', target_id: 'tgt', relation_type: 'relates_to',
+      strength: 0.5, bidirectional: true, status: 'active',
+    });
+    expect(getRelatesToEdgesWithMemories(db)).toHaveLength(1);
+
+    // The JOIN reads memory_type straight off the memories table, bypassing
+    // rowToMemory — so a legacy/corrupt value would otherwise flow untouched
+    // into a classification prompt.
+    db.prepare('UPDATE memories SET memory_type = ? WHERE id = ?').run('not-a-type', 'src');
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(getRelatesToEdgesWithMemories(db)).toHaveLength(0);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("invalid endpoint memory_type (source 'not-a-type', target 'context')")
+      );
+    } finally {
+      warn.mockRestore();
+      db.close();
+    }
+  });
+});

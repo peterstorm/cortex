@@ -1,11 +1,12 @@
 /**
- * Tests for executeSemanticEdges orchestration.
+ * Tests for executeSemanticEdges orchestration and the pure helpers it
+ * delegates to.
  *
- * The LLM boundary is mocked (like extract.test.ts) so the attempt-tracking
- * wiring — typed replacement, declined marking, batch failure accounting,
- * unparseable-response retry, unique-conflict retirement, pair_index join,
- * lock skip, and the no-LLM guard — is exercised hermetically against a real
- * in-memory database.
+ * Only the network call is stubbed, via the injectable LlmPromptTransport, so
+ * the attempt-tracking wiring — typed replacement, declined marking, batch
+ * failure accounting, unparseable-response retry, unique-conflict retirement,
+ * pair_index join, lock skip, and the no-LLM guard — is exercised
+ * hermetically against a real in-memory database AND the real classifyEdges.
  */
 
 import { describe, it, expect, beforeEach, afterAll, vi } from 'vitest';
@@ -16,16 +17,32 @@ import * as nodePath from 'node:path';
 import { createMemory } from '../core/types.js';
 import { openDatabase, insertMemory, insertEdge, getAllEdges, updateMemory } from '../infra/db.js';
 import { acquireLock } from '../infra/lock.js';
-import { executeSemanticEdges, pairContentHash } from './semantic-edges.js';
+import type { LlmPromptTransport } from '../infra/claude-llm.js';
+import { withBunWhichUnavailable } from '../infra/llm-test-helpers.js';
+import {
+  executeSemanticEdges,
+  pairContentHash,
+  joinClassificationsToPairs,
+  isUniqueConstraintError,
+} from './semantic-edges.js';
 
-const mockClassifyEdges = vi.fn();
-const mockIsClaudeLlmAvailable = vi.fn();
+// The LLM boundary here is the injectable transport, not the whole
+// claude-llm module: these tests drive the real classifyEdges — prompt
+// building, strict-vs-tolerant parsing, and the pair_index join — and stub
+// only the network call underneath it.
+const transportCall = vi.fn();
+const transport: LlmPromptTransport = (prompt, timeoutMs, options) =>
+  transportCall(prompt, timeoutMs, options) as ReturnType<LlmPromptTransport>;
+
+/** Answer the batch on the direct (schema-guided, strict-parsed) path. */
+function answerWith(classifications: readonly Record<string, unknown>[]): void {
+  transportCall.mockResolvedValue({ text: JSON.stringify({ edges: classifications }), direct: true });
+}
+
+// Endpoint resolution stays mocked: it is the configuration seam deciding
+// direct-vs-CLI, not the LLM call. A configured endpoint also short-circuits
+// the isClaudeLlmAvailable PATH probe in the availability guard.
 const mockResolveEndpoint = vi.fn();
-
-vi.mock('../infra/claude-llm.js', () => ({
-  classifyEdges: (pairs: unknown) => mockClassifyEdges(pairs),
-  isClaudeLlmAvailable: () => mockIsClaudeLlmAvailable(),
-}));
 vi.mock('../infra/llm-client.js', () => ({
   resolveOpenAiCompatEndpoint: () => mockResolveEndpoint(),
 }));
@@ -33,6 +50,20 @@ vi.mock('../infra/llm-client.js', () => ({
 describe('executeSemanticEdges', () => {
   let db: Database;
   let lockDir: string;
+
+  /**
+   * The classify_hash an already-attempted edge between two seedMemory rows
+   * would carry. Mirrors seedMemory's own content template so the two cannot
+   * drift apart: if they did, the backoff tests below would silently start
+   * exercising the content-CHANGED branch while still claiming to pin the
+   * unchanged one, with nothing failing to say so.
+   */
+  function matchingContentHash(sourceId: string, targetId: string): string {
+    return pairContentHash(
+      { content: `content ${sourceId}`, summary: `summary ${sourceId}` },
+      { content: `content ${targetId}`, summary: `summary ${targetId}` },
+    );
+  }
 
   function seedMemory(id: string): void {
     insertMemory(db, createMemory({
@@ -45,8 +76,7 @@ describe('executeSemanticEdges', () => {
   beforeEach(() => {
     db = openDatabase(':memory:');
     lockDir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'cortex-semantic-edges-'));
-    mockClassifyEdges.mockReset();
-    mockIsClaudeLlmAvailable.mockReset().mockReturnValue(true);
+    transportCall.mockReset();
     mockResolveEndpoint.mockReset().mockReturnValue({ baseUrl: 'http://localhost:8000/v1', apiKey: 'k', model: 'm' });
   });
 
@@ -58,14 +88,11 @@ describe('executeSemanticEdges', () => {
     seedMemory('a');
     seedMemory('b');
     insertEdge(db, { source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active' });
-    mockClassifyEdges.mockResolvedValue({
-      kind: 'ok',
-      classifications: [
-        { source_id: 'a', target_id: 'b', relation_type: 'refines', strength: 0.8 },
-      ],
-    });
+    answerWith([
+      { source_id: 'a', target_id: 'b', relation_type: 'refines', strength: 0.8 },
+    ]);
 
-    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
 
     expect(result).toEqual({ ok: true, classified: 1, failed: 0 });
     const edges = getAllEdges(db);
@@ -82,14 +109,11 @@ describe('executeSemanticEdges', () => {
     seedMemory('a');
     seedMemory('b');
     insertEdge(db, { source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active' });
-    mockClassifyEdges.mockResolvedValue({
-      kind: 'ok',
-      classifications: [
-        { source_id: 'a', target_id: 'b', relation_type: 'contradicts', strength: 0.7 },
-      ],
-    });
+    answerWith([
+      { source_id: 'a', target_id: 'b', relation_type: 'contradicts', strength: 0.7 },
+    ]);
 
-    await executeSemanticEdges(db, { limit: 0, lockDir });
+    await executeSemanticEdges(db, { limit: 0, lockDir, transport });
     const contradicts = getAllEdges(db).find((e) => e.relation_type === 'contradicts')!;
     expect(contradicts.bidirectional).toBe(true);
   });
@@ -98,14 +122,11 @@ describe('executeSemanticEdges', () => {
     seedMemory('a');
     seedMemory('b');
     const edgeId = insertEdge(db, { source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active' });
-    mockClassifyEdges.mockResolvedValue({
-      kind: 'ok',
-      classifications: [
-        { source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5 },
-      ],
-    });
+    answerWith([
+      { source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5 },
+    ]);
 
-    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
 
     expect(result).toEqual({ ok: true, classified: 0, failed: 0 });
     const kept = getAllEdges(db).find((e) => e.id === edgeId)!;
@@ -118,9 +139,9 @@ describe('executeSemanticEdges', () => {
     seedMemory('a');
     seedMemory('b');
     const edgeId = insertEdge(db, { source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active' });
-    mockClassifyEdges.mockRejectedValue(new Error('LLM API 503'));
+    transportCall.mockRejectedValue(new Error('LLM API 503'));
 
-    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
 
     expect(result).toEqual({ ok: true, classified: 0, failed: 1 });
     const kept = getAllEdges(db).find((e) => e.id === edgeId)!;
@@ -136,12 +157,11 @@ describe('executeSemanticEdges', () => {
     seedMemory('a');
     seedMemory('b');
     const edgeId = insertEdge(db, { source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active' });
-    mockClassifyEdges.mockResolvedValue({
-      kind: 'unparseable',
-      reason: 'failed to parse edge classification response: garbage',
-    });
+    // Tolerant (CLI-fallback) path: unschematized garbage parses to
+    // 'unparseable' rather than throwing.
+    transportCall.mockResolvedValue({ text: 'not json at all', direct: false });
 
-    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
 
     // The run must not report a green ok:true/failed:0 while permanently
     // retiring the pair: the batch counts as failed and the edge stays
@@ -161,14 +181,11 @@ describe('executeSemanticEdges', () => {
     // for the pair already exists (content-change requalification).
     insertEdge(db, { source_id: 'a', target_id: 'b', relation_type: 'refines', strength: 0.8, bidirectional: false, status: 'active' });
     const candidateId = insertEdge(db, { source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active' });
-    mockClassifyEdges.mockResolvedValue({
-      kind: 'ok',
-      classifications: [
-        { source_id: 'a', target_id: 'b', relation_type: 'refines', strength: 0.8 },
-      ],
-    });
+    answerWith([
+      { source_id: 'a', target_id: 'b', relation_type: 'refines', strength: 0.8 },
+    ]);
 
-    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
 
     expect(result).toEqual({ ok: true, classified: 0, failed: 1 });
     // The candidate is retired so the next run does not re-ask the LLM.
@@ -183,14 +200,11 @@ describe('executeSemanticEdges', () => {
     // The model answers pair 1 but echoes the IDs in the wrong direction; the
     // deterministic pair_index join must still apply the classification
     // instead of treating it as unmatched (which would retire the edge).
-    mockClassifyEdges.mockResolvedValue({
-      kind: 'ok',
-      classifications: [
-        { pair_index: 1, source_id: 'b', target_id: 'a', relation_type: 'supersedes', strength: 0.9 },
-      ],
-    });
+    answerWith([
+      { pair_index: 1, source_id: 'b', target_id: 'a', relation_type: 'supersedes', strength: 0.9 },
+    ]);
 
-    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
 
     expect(result).toEqual({ ok: true, classified: 1, failed: 0 });
     const typed = getAllEdges(db).find((e) => e.id !== edgeId)!;
@@ -206,14 +220,11 @@ describe('executeSemanticEdges', () => {
     seedMemory('a');
     seedMemory('b');
     const edgeId = insertEdge(db, { source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active' });
-    mockClassifyEdges.mockResolvedValue({
-      kind: 'ok',
-      classifications: [
-        { source_id: 'b', target_id: 'a', relation_type: 'refines', strength: 0.7 },
-      ],
-    });
+    answerWith([
+      { source_id: 'b', target_id: 'a', relation_type: 'refines', strength: 0.7 },
+    ]);
 
-    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
 
     expect(result).toEqual({ ok: true, classified: 0, failed: 1 });
     const kept = getAllEdges(db).find((edge) => edge.id === edgeId)!;
@@ -228,17 +239,14 @@ describe('executeSemanticEdges', () => {
     const recentFailure = new Date(Date.now() - 60 * 60 * 1000).toISOString();
     insertEdge(db, {
       source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active',
-      classify_hash: pairContentHash(
-        { content: 'content a', summary: 'summary a' },
-        { content: 'content b', summary: 'summary b' },
-      ),
+      classify_hash: matchingContentHash('a', 'b'),
       last_failed_at: recentFailure,
     });
 
-    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
 
     expect(result).toEqual({ ok: true, classified: 0, failed: 0 });
-    expect(mockClassifyEdges).not.toHaveBeenCalled();
+    expect(transportCall).not.toHaveBeenCalled();
   });
 
   it('re-asks a failed edge once the failure backoff has elapsed', async () => {
@@ -247,18 +255,15 @@ describe('executeSemanticEdges', () => {
     const oldFailure = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
     insertEdge(db, {
       source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active',
-      classify_hash: pairContentHash(
-        { content: 'content a', summary: 'summary a' },
-        { content: 'content b', summary: 'summary b' },
-      ),
+      classify_hash: matchingContentHash('a', 'b'),
       last_failed_at: oldFailure,
     });
-    mockClassifyEdges.mockResolvedValue({ kind: 'ok', classifications: [] });
+    answerWith([]);
 
-    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
 
     expect(result).toEqual({ ok: true, classified: 0, failed: 0 });
-    expect(mockClassifyEdges).toHaveBeenCalledTimes(1);
+    expect(transportCall).toHaveBeenCalledTimes(1);
   });
 
   it('re-asks an edge with an unparseable last_failed_at even inside the backoff window (fail-safe)', async () => {
@@ -268,18 +273,15 @@ describe('executeSemanticEdges', () => {
     seedMemory('b');
     insertEdge(db, {
       source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active',
-      classify_hash: pairContentHash(
-        { content: 'content a', summary: 'summary a' },
-        { content: 'content b', summary: 'summary b' },
-      ),
+      classify_hash: matchingContentHash('a', 'b'),
       last_failed_at: 'not-a-date',
     });
-    mockClassifyEdges.mockResolvedValue({ kind: 'ok', classifications: [] });
+    answerWith([]);
 
-    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
 
     expect(result).toEqual({ ok: true, classified: 0, failed: 0 });
-    expect(mockClassifyEdges).toHaveBeenCalledTimes(1);
+    expect(transportCall).toHaveBeenCalledTimes(1);
   });
 
   it('re-asks a failed edge immediately when its content changed since the failure', async () => {
@@ -293,12 +295,12 @@ describe('executeSemanticEdges', () => {
       classify_hash: 'stale-hash-from-previous-content',
       last_failed_at: recentFailure,
     });
-    mockClassifyEdges.mockResolvedValue({ kind: 'ok', classifications: [] });
+    answerWith([]);
 
-    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
 
     expect(result).toEqual({ ok: true, classified: 0, failed: 0 });
-    expect(mockClassifyEdges).toHaveBeenCalledTimes(1);
+    expect(transportCall).toHaveBeenCalledTimes(1);
   });
 
   it('re-asks a declined edge after its content-change re-classification failure backoff elapses', async () => {
@@ -308,36 +310,30 @@ describe('executeSemanticEdges', () => {
 
     // Run 1: the classifier declines (answers relates_to) — the edge stays
     // relates_to with classified_at + classify_hash set.
-    mockClassifyEdges.mockResolvedValue({
-      kind: 'ok',
-      classifications: [{ source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5 }],
-    });
-    const first = await executeSemanticEdges(db, { limit: 0, lockDir });
+    answerWith([{ source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5 }]);
+    const first = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
     expect(first).toEqual({ ok: true, classified: 0, failed: 0 });
 
     // Content changed, so re-classification is due — and the attempt fails.
     updateMemory(db, 'a', { content: 'changed content a' });
-    mockClassifyEdges.mockRejectedValue(new Error('LLM API returned empty content'));
-    const second = await executeSemanticEdges(db, { limit: 0, lockDir });
+    transportCall.mockRejectedValue(new Error('LLM API returned empty content'));
+    const second = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
     expect(second).toEqual({ ok: true, classified: 0, failed: 1 });
 
     // Inside the backoff window the failed re-classification is not
     // re-asked (no re-hammering of the unhealthy server)...
-    mockClassifyEdges.mockClear();
-    const third = await executeSemanticEdges(db, { limit: 0, lockDir });
+    transportCall.mockClear();
+    const third = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
     expect(third).toEqual({ ok: true, classified: 0, failed: 0 });
-    expect(mockClassifyEdges).not.toHaveBeenCalled();
+    expect(transportCall).not.toHaveBeenCalled();
 
     // ...but a failure is never a decline: once the backoff elapses the
     // re-classification must be retried (regression: the failure used to
     // stamp the current content hash and retire the edge forever).
     db.prepare('UPDATE edges SET last_failed_at = ?')
       .run(new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString());
-    mockClassifyEdges.mockResolvedValue({
-      kind: 'ok',
-      classifications: [{ source_id: 'a', target_id: 'b', relation_type: 'refines', strength: 0.8 }],
-    });
-    const fourth = await executeSemanticEdges(db, { limit: 0, lockDir });
+    answerWith([{ source_id: 'a', target_id: 'b', relation_type: 'refines', strength: 0.8 }]);
+    const fourth = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
     expect(fourth).toEqual({ ok: true, classified: 1, failed: 0 });
     const typed = getAllEdges(db).find((edge) => edge.relation_type === 'refines')!;
     // A successful answer clears the failure record.
@@ -348,15 +344,12 @@ describe('executeSemanticEdges', () => {
     seedMemory('a');
     seedMemory('b');
     const edgeId = insertEdge(db, { source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active' });
-    mockClassifyEdges.mockResolvedValue({
-      kind: 'ok',
-      classifications: [
-        { source_id: 'a', target_id: 'b', relation_type: 'refines', strength: 0.7 },
-        { source_id: 'a', target_id: 'b', relation_type: 'supersedes', strength: 0.8 },
-      ],
-    });
+    answerWith([
+      { source_id: 'a', target_id: 'b', relation_type: 'refines', strength: 0.7 },
+      { source_id: 'a', target_id: 'b', relation_type: 'supersedes', strength: 0.8 },
+    ]);
 
-    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
 
     expect(result).toEqual({ ok: true, classified: 0, failed: 1 });
     expect(getAllEdges(db).find((edge) => edge.id === edgeId)!.classified_at).toBeNull();
@@ -366,14 +359,11 @@ describe('executeSemanticEdges', () => {
     seedMemory('a');
     seedMemory('b');
     const edgeId = insertEdge(db, { source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active' });
-    mockClassifyEdges.mockResolvedValue({
-      kind: 'ok',
-      classifications: [
-        { pair_index: 7, source_id: 'a', target_id: 'b', relation_type: 'refines', strength: 0.7 },
-      ],
-    });
+    answerWith([
+      { pair_index: 7, source_id: 'a', target_id: 'b', relation_type: 'refines', strength: 0.7 },
+    ]);
 
-    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
 
     expect(result).toEqual({ ok: true, classified: 0, failed: 1 });
     const kept = getAllEdges(db).find((e) => e.id === edgeId)!;
@@ -387,15 +377,12 @@ describe('executeSemanticEdges', () => {
     seedMemory('d');
     const edgeA = insertEdge(db, { source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active' });
     const edgeB = insertEdge(db, { source_id: 'c', target_id: 'd', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active' });
-    mockClassifyEdges.mockResolvedValue({
-      kind: 'ok',
-      classifications: [
-        { pair_index: 1, source_id: 'a', target_id: 'b', relation_type: 'refines', strength: 0.7 },
-        { source_id: 'c', target_id: 'd', relation_type: 'refines', strength: 0.7 },
-      ],
-    });
+    answerWith([
+      { pair_index: 1, source_id: 'a', target_id: 'b', relation_type: 'refines', strength: 0.7 },
+      { source_id: 'c', target_id: 'd', relation_type: 'refines', strength: 0.7 },
+    ]);
 
-    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
 
     expect(result).toEqual({ ok: true, classified: 0, failed: 2 });
     expect(getAllEdges(db).find((e) => e.id === edgeA)!.classified_at).toBeNull();
@@ -406,15 +393,12 @@ describe('executeSemanticEdges', () => {
     seedMemory('a');
     seedMemory('b');
     const edgeId = insertEdge(db, { source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active' });
-    mockClassifyEdges.mockResolvedValue({
-      kind: 'ok',
-      classifications: [
-        { pair_index: 1, source_id: 'a', target_id: 'b', relation_type: 'refines', strength: 0.7 },
-        { pair_index: 1, source_id: 'x', target_id: 'y', relation_type: 'supersedes', strength: 0.9 },
-      ],
-    });
+    answerWith([
+      { pair_index: 1, source_id: 'a', target_id: 'b', relation_type: 'refines', strength: 0.7 },
+      { pair_index: 1, source_id: 'x', target_id: 'y', relation_type: 'supersedes', strength: 0.9 },
+    ]);
 
-    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
 
     expect(result).toEqual({ ok: true, classified: 0, failed: 1 });
     expect(getAllEdges(db).find((e) => e.id === edgeId)!.classified_at).toBeNull();
@@ -424,17 +408,14 @@ describe('executeSemanticEdges', () => {
     seedMemory('a');
     seedMemory('b');
     insertEdge(db, { source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active' });
-    mockClassifyEdges.mockResolvedValue({
-      kind: 'ok',
-      classifications: [
-        { source_id: 'a', target_id: 'b', relation_type: 'contradicts', strength: 0.7 },
-      ],
-    });
+    answerWith([
+      { source_id: 'a', target_id: 'b', relation_type: 'contradicts', strength: 0.7 },
+    ]);
     // Make the replacement transaction fail like a locked/busy DB would.
     const insertSpy = vi.spyOn(await import('../infra/db.js'), 'insertEdge')
       .mockImplementationOnce(() => { throw new Error('SQLITE_BUSY: database is locked'); });
     try {
-      const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+      const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
       expect(result).toEqual({ ok: true, classified: 0, failed: 1 });
     } finally {
       insertSpy.mockRestore();
@@ -453,17 +434,19 @@ describe('executeSemanticEdges', () => {
         strength: 0.5, bidirectional: true, status: 'active',
       });
     }
-    mockClassifyEdges
-      .mockResolvedValueOnce({ kind: 'unparseable', reason: 'garbage' })
+    transportCall
+      .mockResolvedValueOnce({ text: 'garbage', direct: false })
       .mockResolvedValueOnce({
-        kind: 'ok',
-        classifications: [
-          { pair_index: 1, source_id: 'm10', target_id: 'm10-t', relation_type: 'refines', strength: 0.8 },
-          { pair_index: 2, source_id: 'm11', target_id: 'm11-t', relation_type: 'supersedes', strength: 0.9 },
-        ],
+        text: JSON.stringify({
+          edges: [
+            { pair_index: 1, source_id: 'm10', target_id: 'm10-t', relation_type: 'refines', strength: 0.8 },
+            { pair_index: 2, source_id: 'm11', target_id: 'm11-t', relation_type: 'supersedes', strength: 0.9 },
+          ],
+        }),
+        direct: true,
       });
 
-    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
 
     expect(result).toEqual({ ok: true, classified: 2, failed: 10 });
     const edges = getAllEdges(db);
@@ -480,23 +463,26 @@ describe('executeSemanticEdges', () => {
 
     seedMemory('a');
     seedMemory('b');
-    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
 
     expect(result).toEqual({ ok: true, classified: 0, failed: 0 });
-    expect(mockClassifyEdges).not.toHaveBeenCalled();
+    expect(transportCall).not.toHaveBeenCalled();
   });
 
   it('fails with a clear error when no LLM transport is available', async () => {
-    mockIsClaudeLlmAvailable.mockReturnValue(false);
+    // No endpoint AND no CLI on PATH: the real isClaudeLlmAvailable probe runs
+    // here, so the CLI lookup is stubbed away rather than the module mocked.
     mockResolveEndpoint.mockReturnValue(null);
     seedMemory('a');
     seedMemory('b');
 
-    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+    const result = await withBunWhichUnavailable(() =>
+      executeSemanticEdges(db, { limit: 0, lockDir, transport })
+    );
 
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toMatch(/no LLM available/i);
-    expect(mockClassifyEdges).not.toHaveBeenCalled();
+    expect(transportCall).not.toHaveBeenCalled();
   });
 
   it('returns immediately when every candidate is already classified', async () => {
@@ -509,9 +495,113 @@ describe('executeSemanticEdges', () => {
       classify_hash: pairContentHash({ content: 'content a', summary: 'summary a' }, { content: 'content b', summary: 'summary b' }),
     });
 
-    const result = await executeSemanticEdges(db, { limit: 0, lockDir });
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
 
     expect(result).toEqual({ ok: true, classified: 0, failed: 0 });
-    expect(mockClassifyEdges).not.toHaveBeenCalled();
+    expect(transportCall).not.toHaveBeenCalled();
+  });
+});
+
+// ============================================================================
+// Pure helpers extracted from the batch worker (r51)
+// ============================================================================
+
+describe('joinClassificationsToPairs', () => {
+  const pair = (sourceId: string, targetId: string) => ({
+    pair: {
+      source: { id: sourceId, content: `content ${sourceId}`, summary: `summary ${sourceId}`, memory_type: 'context' as const },
+      target: { id: targetId, content: `content ${targetId}`, summary: `summary ${targetId}`, memory_type: 'context' as const },
+    },
+  });
+  const classification = (over: Record<string, unknown>) => ({
+    source_id: 'a', target_id: 'b', relation_type: 'refines' as const, strength: 0.8, ...over,
+  });
+
+  it('joins by ordinal when every entry echoes pair_index', () => {
+    const result = joinClassificationsToPairs(
+      [pair('a', 'b'), pair('c', 'd')],
+      [classification({ pair_index: 2 }), classification({ pair_index: 1 })]
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && result.byOrdinal) {
+      expect([...result.byIndex.keys()].sort()).toEqual([1, 2]);
+    } else {
+      expect.unreachable('expected an ordinal join');
+    }
+  });
+
+  // The whole point of the ordinal protocol: a model that flips the IDs must
+  // not cost us the classification.
+  it('ignores flipped IDs when pair_index is present', () => {
+    const result = joinClassificationsToPairs(
+      [pair('a', 'b')],
+      [classification({ pair_index: 1, source_id: 'b', target_id: 'a' })]
+    );
+    expect(result.ok && result.byOrdinal && result.byIndex.has(1)).toBe(true);
+  });
+
+  it('joins by composite key when no entry echoes pair_index', () => {
+    const result = joinClassificationsToPairs([pair('a', 'b')], [classification({})]);
+    expect(result.ok && !result.byOrdinal && result.byKey.has('a:b')).toBe(true);
+  });
+
+  it('accepts an empty response as an empty join rather than a failure', () => {
+    const result = joinClassificationsToPairs([pair('a', 'b')], []);
+    expect(result).toEqual({ ok: true, byOrdinal: false, byKey: new Map() });
+  });
+
+  it.each([
+    [
+      'duplicate pair_index',
+      [classification({ pair_index: 1 }), classification({ pair_index: 1 })],
+      /duplicate pair_index 1/,
+    ],
+    [
+      'out-of-range pair_index',
+      [classification({ pair_index: 7 })],
+      /pair_index 7 is out of range for a 1-pair batch/,
+    ],
+    [
+      'unknown unindexed pair',
+      [classification({ source_id: 'x', target_id: 'y' })],
+      /referenced unknown unindexed pair x:y/,
+    ],
+    [
+      'duplicate unindexed pair',
+      [classification({}), classification({ relation_type: 'supersedes' as const })],
+      /duplicate unindexed pair a:b/,
+    ],
+  ])('rejects a corrupt response: %s', (_name, classifications, expected) => {
+    const result = joinClassificationsToPairs([pair('a', 'b')], classifications);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(expected);
+  });
+
+  it('rejects a response that mixes indexed and unindexed entries', () => {
+    const result = joinClassificationsToPairs(
+      [pair('a', 'b'), pair('c', 'd')],
+      [classification({ pair_index: 1 }), classification({ source_id: 'c', target_id: 'd' })]
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/mixed indexed and unindexed entries \(1 of 2 indexed\)/);
+  });
+});
+
+describe('isUniqueConstraintError', () => {
+  it('recognizes the SQLite result code without reading the message', () => {
+    expect(isUniqueConstraintError(Object.assign(new Error('opaque'), { code: 'SQLITE_CONSTRAINT_UNIQUE' }))).toBe(true);
+    expect(isUniqueConstraintError(Object.assign(new Error('opaque'), { code: 'SQLITE_CONSTRAINT_PRIMARYKEY' }))).toBe(true);
+  });
+
+  it('does not mistake another constraint class for a unique conflict', () => {
+    expect(isUniqueConstraintError(Object.assign(new Error('x'), { code: 'SQLITE_CONSTRAINT_FOREIGNKEY' }))).toBe(false);
+    expect(isUniqueConstraintError(Object.assign(new Error('x'), { code: 'SQLITE_CONSTRAINT_NOTNULL' }))).toBe(false);
+  });
+
+  it('falls back to the message when no code is present', () => {
+    expect(isUniqueConstraintError(new Error('UNIQUE constraint failed: edges.source_id'))).toBe(true);
+    expect(isUniqueConstraintError(new Error('database is locked'))).toBe(false);
+    expect(isUniqueConstraintError('UNIQUE constraint failed')).toBe(true);
+    expect(isUniqueConstraintError(null)).toBe(false);
   });
 });

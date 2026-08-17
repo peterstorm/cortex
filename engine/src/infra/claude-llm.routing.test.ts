@@ -11,6 +11,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { withBunWhichUnavailable } from './llm-test-helpers.js';
 import {
   classifyEdges,
   resetConsecutiveDirectFailuresForTests,
@@ -115,18 +116,10 @@ describe('classifyEdges transport routing', () => {
     mockResolveOpenAiCompatEndpoint.mockReturnValue(FAKE_ENDPOINT);
     mockChatCompletionText.mockRejectedValue(new Error('LLM API 503'));
     const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    // Stub the CLI lookup so the subprocess fallback fails fast with a typed
-    // error instead of spawning. (globalThis cast avoids a Bun-global typing
-    // dependency in this file.)
-    const bunGlobal = (globalThis as { Bun?: { which: (bin: string) => string | null } }).Bun;
-    const originalWhich = bunGlobal!.which;
-    bunGlobal!.which = () => null;
-    try {
+    await withBunWhichUnavailable(async () => {
       await expect(runLlmPromptDirect('prompt', 1000)).rejects.toThrow(/CLI not found/);
       await expect(runLlmPromptDirect('prompt', 1000)).rejects.toThrow(/CLI not found/);
-    } finally {
-      bunGlobal!.which = originalWhich;
-    }
+    });
     // The second failure warning carries the recurrence signal.
     expect(warn).toHaveBeenCalledWith(expect.stringMatching(/2 consecutive direct-endpoint failures/));
     warn.mockRestore();
@@ -141,17 +134,12 @@ describe('classifyEdges transport routing', () => {
       .mockResolvedValueOnce('{"edges": []}')
       .mockRejectedValueOnce(new Error('LLM API 503'));
     const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    const bunGlobal = (globalThis as { Bun?: { which: (bin: string) => string | null } }).Bun;
-    const originalWhich = bunGlobal!.which;
-    bunGlobal!.which = () => null;
-    try {
+    await withBunWhichUnavailable(async () => {
       await expect(runLlmPromptDirect('prompt', 1000)).rejects.toThrow(/CLI not found/);
       const success = await runLlmPromptDirect('prompt', 1000);
       expect(success).toEqual({ text: '{"edges": []}', direct: true });
       await expect(runLlmPromptDirect('prompt', 1000)).rejects.toThrow(/CLI not found/);
-    } finally {
-      bunGlobal!.which = originalWhich;
-    }
+    });
     // Warning 1 = first failure (no suffix); warning 2 = the third call's
     // failure, which must carry no recurrence suffix because the middle
     // success reset the counter.
@@ -169,17 +157,12 @@ describe('classifyEdges transport routing', () => {
     mockResolveOpenAiCompatEndpoint.mockReturnValue(FAKE_ENDPOINT);
     mockChatCompletionText.mockRejectedValue(new Error('LLM API returned empty content'));
     const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    const bunGlobal = (globalThis as { Bun?: { which: (bin: string) => string | null } }).Bun;
-    const originalWhich = bunGlobal!.which;
-    bunGlobal!.which = () => null;
-    try {
+    await withBunWhichUnavailable(async () => {
       await expect(runLlmPromptDirect('prompt', 1000)).rejects.toThrow(/CLI not found/);
       await expect(runLlmPromptDirect('prompt', 1000)).rejects.toThrow(/CLI not found/);
       await expect(runLlmPromptDirect('prompt', 1000))
         .rejects.toThrow(/direct LLM endpoint saturated: 3 consecutive failure/);
-    } finally {
-      bunGlobal!.which = originalWhich;
-    }
+    });
     expect(warn).toHaveBeenCalledWith(
       expect.stringMatching(/suppressing \S+ subprocess fallback after 3 consecutive failure\(s\)/),
     );
@@ -214,14 +197,12 @@ describe('classifyEdges transport routing', () => {
     const original = process.env.CORTEX_LLM_MAX_DIRECT_FAILURES;
     process.env.CORTEX_LLM_MAX_DIRECT_FAILURES = 'abc';
     const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    const bunGlobal = (globalThis as { Bun?: { which: (bin: string) => string | null } }).Bun;
-    const originalWhich = bunGlobal!.which;
-    bunGlobal!.which = () => null;
     try {
-      await expect(runLlmPromptDirect('prompt', 1000)).rejects.toThrow(/CLI not found/);
-      expect(warn).not.toHaveBeenCalledWith(expect.stringMatching(/direct LLM endpoint saturated/));
+      await withBunWhichUnavailable(async () => {
+        await expect(runLlmPromptDirect('prompt', 1000)).rejects.toThrow(/CLI not found/);
+        expect(warn).not.toHaveBeenCalledWith(expect.stringMatching(/direct LLM endpoint saturated/));
+      });
     } finally {
-      bunGlobal!.which = originalWhich;
       if (original === undefined) delete process.env.CORTEX_LLM_MAX_DIRECT_FAILURES;
       else process.env.CORTEX_LLM_MAX_DIRECT_FAILURES = original;
       warn.mockRestore();

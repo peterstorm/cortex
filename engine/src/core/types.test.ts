@@ -3,6 +3,7 @@ import fc from 'fast-check';
 import {
   createMemory,
   createEdge,
+  resolveArchiveAnchor,
   createExtractionCheckpoint,
   createMemoryCandidate,
   isMemoryType,
@@ -1147,5 +1148,101 @@ describe('property tests', () => {
         )
       );
     });
+  });
+});
+
+// ============================================================================
+// createEdge identity guards and the archive-anchor resolver (r51)
+// ============================================================================
+
+describe('createEdge identity guards', () => {
+  // SQLite NOT NULL does not reject '', so an empty identity column would be
+  // insertable and then unfindable. createMemory's equivalent guards are
+  // tested above; these are their counterparts.
+  const base = {
+    id: 'edge-1',
+    source_id: 'mem-1',
+    target_id: 'mem-2',
+    relation_type: 'relates_to' as const,
+    strength: 0.5,
+  };
+
+  it.each([
+    ['id', 'id must not be empty'],
+    ['source_id', 'source_id must not be empty'],
+    ['target_id', 'target_id must not be empty'],
+  ])('rejects an empty %s', (field, message) => {
+    expect(() => createEdge({ ...base, [field]: '' })).toThrow(message);
+  });
+
+  it.each(['id', 'source_id', 'target_id'])('rejects a whitespace-only %s', (field) => {
+    expect(() => createEdge({ ...base, [field]: '   ' })).toThrow(/must not be empty/);
+  });
+});
+
+describe('resolveArchiveAnchor', () => {
+  const NOW = new Date('2026-03-01T12:00:00.000Z');
+  const active = { id: 'mem-1', status: 'active' as const, archived_at: null };
+  const archived = { id: 'mem-1', status: 'archived' as const, archived_at: '2026-02-01T00:00:00.000Z' };
+
+  it('stamps a fresh anchor when a row is archived without one', () => {
+    expect(resolveArchiveAnchor(active, { status: 'archived' }, NOW))
+      .toEqual({ ok: true, archived_at: NOW.toISOString() });
+  });
+
+  it('clears the anchor when a row goes back to active', () => {
+    expect(resolveArchiveAnchor(archived, { status: 'active' }, NOW))
+      .toEqual({ ok: true, archived_at: null });
+  });
+
+  it('leaves the anchor untouched for a patch that names neither half', () => {
+    expect(resolveArchiveAnchor(active, {}, NOW)).toEqual({ ok: true, archived_at: undefined });
+  });
+
+  it('lets pruned keep the anchor through the retention window', () => {
+    expect(resolveArchiveAnchor(archived, { status: 'pruned' }, NOW))
+      .toEqual({ ok: true, archived_at: undefined });
+  });
+
+  it('refuses an explicit anchor alongside active', () => {
+    expect(resolveArchiveAnchor(active, { status: 'active', archived_at: 'x' }, NOW))
+      .toEqual({ ok: false, reason: 'active memory must not have archived_at set' });
+  });
+
+  it('refuses an explicit anchor alongside a status that cannot hold one', () => {
+    const result = resolveArchiveAnchor(active, { status: 'superseded', archived_at: 'x' }, NOW);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/status superseded must not have archived_at set/);
+  });
+
+  // The C2 defect from a prior round, both directions: an anchor-only patch on
+  // a live row, and a status-only patch onto a row that already has an anchor.
+  // Either one would persist a combination createMemory refuses to read back.
+  it('refuses an anchor-only patch on a row that is not archived', () => {
+    const result = resolveArchiveAnchor(active, { archived_at: 'x' }, NOW);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/memory mem-1 is active; cannot set archived_at without archiving it/);
+  });
+
+  it('refuses a status-only patch to superseded on an already-anchored row', () => {
+    const result = resolveArchiveAnchor(archived, { status: 'superseded' }, NOW);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/must not carry an archive anchor/);
+  });
+
+  it('allows a status-only patch to superseded on an unanchored row', () => {
+    expect(resolveArchiveAnchor(active, { status: 'superseded' }, NOW))
+      .toEqual({ ok: true, archived_at: undefined });
+  });
+
+  it('accepts an explicit anchor when the same patch archives the row', () => {
+    expect(resolveArchiveAnchor(active, { status: 'archived', archived_at: 'stamp' }, NOW))
+      .toEqual({ ok: true, archived_at: 'stamp' });
+  });
+
+  it('reports a missing row by its absent status rather than assuming one', () => {
+    const result = resolveArchiveAnchor({ id: 'gone' }, { archived_at: 'x' }, NOW);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain('memory gone is undefined');
   });
 });
