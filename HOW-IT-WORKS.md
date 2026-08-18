@@ -70,7 +70,7 @@ When your session ends, the hook detaches a background worker (so nothing blocks
 7. **Maintenance (sequential)** — semantic edge classification, then lifecycle (decay/archive/prune), then AI prune. These used to be concurrent detached spawns, but SQLite allows one writer and lifecycle + AI prune both read-modify-write telemetry — so they now run one after another.
 8. **Regenerate surface LAST** — after all archival, so the surface never contains memories archived earlier in the same pipeline; the next session starts fresh
 
-In Pi, `session_shutdown` only starts a detached `ingest-session` worker and then returns. The worker owns all eight ordered steps, so `/new` and `/q` never await transcript extraction, embedding, or maintenance.
+In Pi, `session_shutdown` only starts a detached `ingest-session` worker and then returns. The worker owns all eight ordered steps, so `/new` and `/q` never await transcript extraction, embedding, or maintenance. Ephemeral sessions (subagent spawns run `pi -p --no-session`) have no transcript, so their shutdown spawns nothing at all — no extraction and no maintenance — because nothing new entered the store; the spawning session's ingestion pipeline does the maintaining, and the next session's start refreshes the surface.
 
 The Claude Code hook logs to PID-scoped files under `/tmp` (`cortex-extract`, `cortex-backfill`, and `cortex-maintenance`).
 
@@ -169,7 +169,7 @@ Each new memory keeps at most its 3 strongest edges — a structural guard again
 
 ### Semantic Edge Classification
 
-Jaccard/cosine-created `relates_to` edges are upgraded to typed relationships by the `semantic-edges` pipeline, which runs in the SessionEnd worker: it batches edge pairs to the configured LLM and classifies each pair into a typed relation with a strength score. Calls prefer the **direct OpenAI-compatible endpoint** (`CORTEX_LLM_API_URL`/`CORTEX_LLM_API_KEY`/`CORTEX_LLM_MODEL`, or the pi provider config in `~/.pi/agent/models.json`) with thinking disabled and schema-guided JSON output; the headless CLI (`pi -p` / `claude -p`) is only the fallback. Attempt tracking (`edges.classified_at` + content hash) prevents declined pairs from being re-classified on every run.
+Jaccard/cosine-created `relates_to` edges are upgraded to typed relationships by the `semantic-edges` pipeline, which runs in the SessionEnd worker: it batches edge pairs to the configured LLM and classifies each pair into a typed relation with a strength score. Calls prefer the **direct OpenAI-compatible endpoint** (`CORTEX_LLM_API_URL`/`CORTEX_LLM_API_KEY`/`CORTEX_LLM_MODEL`, or the pi provider config in `~/.pi/agent/models.json`) with thinking disabled and schema-guided JSON output; the headless CLI (`pi -p` / `claude -p`) is only the fallback. A single direct failure still falls back, but after the saturation threshold (default 3 consecutive failures, `CORTEX_LLM_MAX_DIRECT_FAILURES`) the fallback is suppressed and the batch fails cleanly so unmarked edges stay retryable instead of escalating load on a saturated server. Every LLM call across the engine (this step, extraction, AI prune, subprocess fallbacks) also acquires a slot from a per-process pool capped at `CORTEX_LLM_MAX_CONCURRENCY` (default 2), so background work occupies a bounded share of a server that live agents already use. Attempt tracking (`edges.classified_at` + content hash) prevents declined pairs from being re-classified on every run, and failed attempts carry a 24h backoff (`edges.last_failed_at`) so an unhealthy server is not re-hammered with the same failed batch on every maintenance run — a content change resets the backoff immediately.
 
 ### Edge Types
 
@@ -197,7 +197,7 @@ If decayed confidence drops below 0.3 AND the memory hasn't been accessed in 14+
 If a memory has been archived for 30+ days with no access → status changes to `pruned`. Pruned memories are effectively deleted (still in DB but invisible to all queries).
 
 ### AI Prune
-On top of decay, an AI prune pass has the LLM review active memories in batches and archive stale, redundant, or low-value ones. It runs in the SessionEnd worker when 5+ sessions have passed since the last prune, or when the active count reaches max(50, 1.25 × the count at the last prune) — the growth backoff stops it firing every session.
+On top of decay, an AI prune pass has the LLM review active memories in batches and archive stale, redundant, or low-value ones. It runs in the SessionEnd worker on a watermark trigger: when 20+ active memories were created since the last successful prune (telemetry `last_ai_prune_at`), or when that successful prune is 7+ days old (staleness floor) — subject to a 6h minimum interval. The watermark advances only on a fully successful run, so a failed prune retries its review next pass; session count no longer triggers it, since subagent-heavy runs end many sessions per hour.
 
 **Escape hatch**: Accessing a memory (via `/recall`) resets its access timestamp and boosts it back above the threshold.
 
