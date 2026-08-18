@@ -6,8 +6,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Database } from 'bun:sqlite';
 import { openDatabase, insertMemory, insertEdge } from '../infra/db.js';
-import { createMemory, createEdge } from '../core/types.js';
-import { executeTraverse, formatTraverseResult, formatTraverseError } from './traverse.js';
+import { createMemory, createEdge, type Memory } from '../core/types.js';
+import { executeTraverse, formatTraverseResult, formatTraverseError, toTraverseMemory } from './traverse.js';
 
 describe('traverse command', () => {
   let db: Database;
@@ -832,6 +832,70 @@ describe('traverse command', () => {
       const formatted = formatTraverseResult(result);
       expect(formatted).toContain('"id": "m1"');
       expect(formatted).toContain('"results": {}');
+    });
+
+    it('strips embedding vectors from the JSON output', () => {
+      // Regression: a depth-2 walk over connected memories used to serialize
+      // ~7KB of 512-dim vectors per node (1.5MB for one real graph), which
+      // truncates mid-JSON past any tool-output cap. Graph output never needed
+      // vectors — consumers read them from the DB.
+      const withVector = (id: string): Memory =>
+        createMemory({
+          id,
+          content: `Content ${id}`,
+          summary: `Summary ${id}`,
+          memory_type: 'pattern',
+          scope: 'project',
+          confidence: 0.9,
+          priority: 5,
+          source_type: 'manual',
+          source_session: 'test',
+          source_context: '{}',
+          embedding: new Float64Array([0.1, 0.2, 0.3]),
+          local_embedding: new Float32Array(new Array(512).fill(0.05)),
+        });
+
+      const formatted = formatTraverseResult({
+        start: withVector('m1'),
+        results: { 1: [withVector('m2')] },
+      });
+
+      expect(formatted).not.toContain('"local_embedding"');
+      expect(formatted).not.toContain('"embedding"');
+      expect(formatted).toContain('"id": "m1"');
+      expect(formatted).toContain('"id": "m2"');
+      expect(formatted).toContain('Content m2');
+      // The projection keeps the fields readers actually use.
+      const parsed = JSON.parse(formatted) as {
+        start: { memory_type: string; tags: readonly string[] };
+        results: { 1: Array<{ id: string }> };
+      };
+      expect(parsed.start.memory_type).toBe('pattern');
+      expect(parsed.results[1]).toHaveLength(1);
+    });
+
+    it('toTraverseMemory is a pure projection (input memory untouched)', () => {
+      const memory = createMemory({
+        id: 'm1',
+        content: 'Test',
+        summary: 'Test',
+        memory_type: 'pattern',
+        scope: 'project',
+        confidence: 0.9,
+        priority: 5,
+        source_type: 'manual',
+        source_session: 'test',
+        source_context: '{}',
+        local_embedding: new Float32Array([0.1]),
+      });
+
+      const projected = toTraverseMemory(memory);
+      expect('local_embedding' in projected).toBe(false);
+      expect('embedding' in projected).toBe(false);
+      // Original keeps its vectors.
+      expect(memory.local_embedding).toBeInstanceOf(Float32Array);
+      expect(projected.id).toBe('m1');
+      expect(projected.content).toBe('Test');
     });
   });
 

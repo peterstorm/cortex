@@ -476,6 +476,21 @@ async function handleRemember(args: string[]): Promise<CommandResult> {
         embedFn: LOCAL_COSINE_CALIBRATED ? embedLocal : null,
         projectName: getProjectName(cwd),
         cwd,
+        // Drain the embedding queue NOW instead of at the next session start
+        // (FR-046): an explicit remember should be semantically searchable
+        // immediately. backfill is idempotent and also clears any older queued
+        // vectors. Incomplete flushes are non-fatal — the queue catches up.
+        flushEmbedding: (db, _memory) =>
+          backfill(db, getProjectName(cwd)).then((r) => {
+            if (!r.ok) {
+              throw new Error(r.error);
+            }
+            if (r.failed > 0) {
+              process.stderr.write(
+                `[cortex:remember] WARN: embedding flush incomplete (${r.failed} failed); memory stays queued for next backfill\n`
+              );
+            }
+          }),
       }
     );
 

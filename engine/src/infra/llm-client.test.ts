@@ -13,6 +13,9 @@ import * as nodePath from 'node:path';
 import {
   resolveOpenAiCompatEndpoint,
   chatCompletionText,
+  findServedModelMismatch,
+  resetServedModelCheck,
+  THINKING_DISABLED_KWARGS,
   type LlmEndpoint,
 } from './llm-client.js';
 
@@ -333,9 +336,12 @@ describe('chatCompletionText', () => {
     }
   }
 
-  it('posts the thinking-disabled body and returns content', async () => {
+  it('posts the thinking-disabled body (both chat-template conventions) and returns content', async () => {
     let captured: { url: string; headers: Headers; body: unknown } | null = null;
     await withStubbedFetch(async (url, init) => {
+      if (String(url).endsWith('/models')) {
+        return new Response(JSON.stringify({ data: [{ id: 'm' }] }), { status: 200 });
+      }
       captured = { url: String(url), headers: new Headers(init?.headers), body: JSON.parse(String(init?.body)) };
       return new Response(JSON.stringify({
         choices: [{ message: { content: '{"edges":[]}' }, finish_reason: 'stop' }],
@@ -353,14 +359,24 @@ describe('chatCompletionText', () => {
       model: 'm',
       max_tokens: 512,
       temperature: 0,
-      chat_template_kwargs: { thinking: false },
+      // DeepSeek-style templates read `thinking`, Qwen3-style read `enable_thinking`;
+      // both must be sent because the served model's family is not known in advance.
+      chat_template_kwargs: { thinking: false, enable_thinking: false },
       response_format: { type: 'json_schema' },
     });
   });
 
+  it('disables thinking under both known chat-template conventions in the shared constant', () => {
+    expect(THINKING_DISABLED_KWARGS).toEqual({ thinking: false, enable_thinking: false });
+    expect(Object.isFrozen(THINKING_DISABLED_KWARGS)).toBe(true);
+  });
+
   it('uses json_object mode when jsonSchema is not supplied', async () => {
     const bodies: unknown[] = [];
-    await withStubbedFetch(async (_url, init) => {
+    await withStubbedFetch(async (url, init) => {
+      if (String(url).endsWith('/models')) {
+        return new Response(JSON.stringify({ data: [{ id: 'm' }] }), { status: 200 });
+      }
       bodies.push(JSON.parse(String(init?.body)));
       return new Response(JSON.stringify({ choices: [{ message: { content: '{}' }, finish_reason: 'stop' }] }), { status: 200 });
     }, async () => {
@@ -383,6 +399,25 @@ describe('chatCompletionText', () => {
     });
   });
 
+  it('names the thinking-model failure when only reasoning_content is returned', async () => {
+    // A thinking model that ignored the disable kwargs burns its budget on
+    // reasoning and returns empty content — this must not read like a network glitch.
+    await withStubbedFetch(async (url) => {
+      if (String(url).endsWith('/models')) {
+        return new Response(JSON.stringify({ data: [{ id: 'm' }] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        choices: [{
+          message: { content: '', reasoning_content: 'We need to respond with a single word' },
+          finish_reason: 'length',
+        }],
+      }), { status: 200 });
+    }, async () => {
+      await expect(chatCompletionText(endpoint, 'x', { maxTokens: 8 }))
+        .rejects.toThrow(/only reasoning_content.*thinking/s);
+    });
+  });
+
   it('names max_tokens truncation instead of a generic parse error', async () => {
     await withStubbedFetch(async () => new Response(JSON.stringify({
       choices: [{ message: { content: '{"edges": [' }, finish_reason: 'length' }],
@@ -392,15 +427,68 @@ describe('chatCompletionText', () => {
   });
 
   it('throws a timeout-named error when the request exceeds timeoutMs', async () => {
-    // A fetch stub that never settles: only the AbortController can release it.
-    await withStubbedFetch((_url, init) => new Promise((_resolve, reject) => {
-      init?.signal?.addEventListener('abort', () => {
-        reject(init.signal?.reason ?? new Error('aborted'));
+    // A fetch stub that never settles for the completion: only the AbortController
+    // can release it. The /models probe answers fast so the 2s probe budget does
+    // not inflate this test.
+    await withStubbedFetch((url, init) => {
+      if (String(url).endsWith('/models')) {
+        return Promise.resolve(new Response(JSON.stringify({ data: [{ id: 'm' }] }), { status: 200 }));
+      }
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          reject(init.signal?.reason ?? new Error('aborted'));
+        });
       });
-    }), async () => {
+    }, async () => {
       await expect(chatCompletionText(endpoint, 'x', { timeoutMs: 10 }))
         .rejects.toThrow(/timed out after 10ms/);
     });
+  });
+
+  it('warns once when the endpoint does not serve the requested model', async () => {
+    // Local routing servers accept any model name; the one-shot probe surfaces
+    // the stale configured name where the operator is already looking.
+    resetServedModelCheck();
+    const modelCalls: string[] = [];
+    const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    await withStubbedFetch(async (url) => {
+      const u = String(url);
+      if (u.endsWith('/models')) {
+        modelCalls.push(u);
+        return new Response(JSON.stringify({ data: [{ id: 'qwen3.8-27b' }] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }] }), { status: 200 });
+    }, async () => {
+      expect(await chatCompletionText(endpoint, 'first')).toBe('ok');
+      expect(await chatCompletionText(endpoint, 'second')).toBe('ok');
+    });
+    // One probe per process, not one per completion call.
+    expect(modelCalls).toHaveLength(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/not in the served model list/));
+    warn.mockRestore();
+  });
+
+  it('lets the probe fail (500 /models) without breaking the completion', async () => {
+    resetServedModelCheck();
+    await withStubbedFetch(async (url) => {
+      if (String(url).endsWith('/models')) return new Response('boom', { status: 500 });
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }] }), { status: 200 });
+    }, async () => {
+      await expect(chatCompletionText(endpoint, 'x')).resolves.toBe('ok');
+    });
+  });
+
+  it('stays quiet when the served list does not contain the requested name but /models is unreadable', async () => {
+    resetServedModelCheck();
+    const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    await withStubbedFetch(async (url) => {
+      if (String(url).endsWith('/models')) return new Response('<html>error</html>', { status: 200 });
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }] }), { status: 200 });
+    }, async () => {
+      await expect(chatCompletionText(endpoint, 'x')).resolves.toBe('ok');
+    });
+    expect(warn).not.toHaveBeenCalledWith(expect.stringMatching(/not in the served model list/));
+    warn.mockRestore();
   });
 
   it('throws a readable error when the response body is not JSON', async () => {
@@ -409,5 +497,20 @@ describe('chatCompletionText', () => {
         /Unexpected token|Unexpected end|JSON/
       );
     });
+  });
+});
+
+describe('findServedModelMismatch', () => {
+  it('returns null when the requested model is served', () => {
+    expect(findServedModelMismatch('m', ['other', 'm'])).toBeNull();
+  });
+
+  it('returns null when the served list is empty (inconclusive)', () => {
+    expect(findServedModelMismatch('m', [])).toBeNull();
+  });
+
+  it('names both sides when the requested model is not served', () => {
+    expect(findServedModelMismatch('deepseek-v4-flash', ['qwen3.8-27b']))
+      .toMatch(/deepseek-v4-flash.*qwen3\.8-27b/s);
   });
 });

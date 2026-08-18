@@ -7,7 +7,10 @@
  * - FR-042: Global vs project scope specification
  * - FR-043: Pin memories to prevent confidence decay
  * - FR-044: Tag memories with arbitrary labels
- * - FR-045: Queue embeddings (embedding=null, local_embedding=null)
+ * - FR-045: Queue embeddings (embedding=null, local_embedding=null) — drained
+ *   at the next session start (FR-046), OR immediately when the composition
+ *   root injects flushEmbedding (an explicit remember should be recallable
+ *   without waiting for the next session)
  */
 
 import { randomUUID } from 'crypto';
@@ -303,6 +306,15 @@ export interface RememberOptions {
   readonly projectName?: string;
   /** Project root; when provided, the surface cache is invalidated after insert */
   readonly cwd?: string;
+  /**
+   * Post-insert embedding flush. The standard queue is drained at the next
+   * session start (FR-046); an explicit remember should be semantically
+   * searchable NOW, so the composition root injects the backfill here.
+   * Omitted (tests, non-CLI entry points) = legacy queue-only behavior.
+   * Best-effort by contract: a flush failure is logged, never fatal — the
+   * memory stays queued and the next backfill picks it up.
+   */
+  readonly flushEmbedding?: (db: Database, memory: Memory) => Promise<void>;
 }
 
 /**
@@ -395,6 +407,21 @@ export async function executeRemember(
   // Invalidate cached surfaces: the visible memory set changed (I/O)
   if (options.cwd !== undefined) {
     invalidateSurfaceCache(options.cwd);
+  }
+
+  // Make the new memory searchable immediately: the embedding queue is
+  // normally drained at the next session start (FR-046), but an explicit
+  // remember should be recallable without waiting. Best-effort — on failure
+  // the memory stays queued and the next backfill catches up.
+  if (options.flushEmbedding !== undefined) {
+    try {
+      await options.flushEmbedding(targetDb, memory);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `[cortex:remember] WARN: post-insert embedding flush failed (memory stays queued for next backfill): ${message}\n`
+      );
+    }
   }
 
   // Format success result (pure)
