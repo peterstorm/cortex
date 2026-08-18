@@ -6,6 +6,8 @@
 
 import { Database } from 'bun:sqlite';
 import { randomUUID } from 'crypto';
+import { tmpdir } from 'node:os';
+import { join as joinPath } from 'node:path';
 import type {
   Memory,
   Edge,
@@ -16,7 +18,7 @@ import type {
   SourceType,
   EdgeRelation,
 } from '../core/types.js';
-import { createMemory, createEdge, createExtractionCheckpoint, isEdgeRelation, isMemoryType, isMemoryStatus, isMemoryScope } from '../core/types.js';
+import { createMemory, createEdge, createExtractionCheckpoint, isEdgeRelation, isEdgeStatus, isMemoryType, isMemoryStatus, isMemoryScope, resolveArchiveAnchor } from '../core/types.js';
 import type { Entity, Fact, EntityType } from '../core/entities.js';
 import { createEntity, createFact, isEntityType } from '../core/entities.js';
 import { LOCAL_EMBED_MODEL } from '../config.js';
@@ -63,6 +65,7 @@ CREATE TABLE IF NOT EXISTS edges (
   created_at TEXT NOT NULL,
   classified_at TEXT,
   classify_hash TEXT,
+  last_failed_at TEXT,
   FOREIGN KEY (source_id) REFERENCES memories(id) ON DELETE CASCADE,
   FOREIGN KEY (target_id) REFERENCES memories(id) ON DELETE CASCADE,
   UNIQUE (source_id, target_id, relation_type)
@@ -237,10 +240,13 @@ function migrateArchivedAt(db: Database): void {
 }
 
 /**
- * Idempotent migration: add edges.classified_at / edges.classify_hash for
- * existing databases. Records when an edge was last attempted by the
- * semantic-edges LLM pass (and the endpoint content hash at that time) so
- * declined/typed edges are not re-classified on every maintenance run.
+ * Idempotent migration: add edges.classified_at / edges.classify_hash /
+ * edges.last_failed_at for existing databases. classified_at + classify_hash
+ * record when an edge was last answered by the semantic-edges LLM pass (and
+ * the endpoint content hash at that time) so declined/typed edges are not
+ * re-classified on every maintenance run. last_failed_at records the last
+ * FAILED attempt so a same-content failure is not re-asked within the backoff
+ * window (an unhealthy server is not re-hammered every run).
  */
 function migrateEdgeClassifiedAt(db: Database): void {
   const columns = db.prepare(`PRAGMA table_info(edges)`).all() as { name: string }[];
@@ -250,6 +256,9 @@ function migrateEdgeClassifiedAt(db: Database): void {
   }
   if (!names.has('classify_hash')) {
     db.run(`ALTER TABLE edges ADD COLUMN classify_hash TEXT`);
+  }
+  if (!names.has('last_failed_at')) {
+    db.run(`ALTER TABLE edges ADD COLUMN last_failed_at TEXT`);
   }
 }
 
@@ -402,10 +411,46 @@ type MemoryRow = {
 };
 
 /**
+ * Read a JSON-serialized string array out of a TEXT cell, falling back to `[]`
+ * with a diagnostic when the cell is corrupt.
+ *
+ * One corrupt cell must not abort every read that maps rows: the corrupt-row
+ * precedent in this file is warn-with-row-identity and continue (see the
+ * local_embedding guard in collectMemoriesWithEmbeddings). The row itself is
+ * still readable, so its list field falls back to none.
+ *
+ * Both corruption shapes warn, which is the whole point of sharing this: a
+ * cell holding valid JSON that is not an array (`5`, `null`, `{}`) never
+ * enters the catch, and warning only there would degrade silently while
+ * claiming parity with a guard that warns unconditionally.
+ *
+ * @param rowLabel - Row identity for the diagnostic, e.g. `Memory mem-1`.
+ * @param column - Column name for the diagnostic, e.g. `tags`.
+ */
+function parseJsonStringArray(cell: string, rowLabel: string, column: string): readonly string[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cell);
+  } catch {
+    console.warn(`[cortex:db] ${rowLabel}: ${column} deserialized to invalid JSON; falling back to []`);
+    return [];
+  }
+  if (!Array.isArray(parsed)) {
+    console.warn(
+      `[cortex:db] ${rowLabel}: ${column} deserialized to ${parsed === null ? 'null' : typeof parsed}, not an array; falling back to []`
+    );
+    return [];
+  }
+  return parsed as string[];
+}
+
+/**
  * Convert a raw database row to a Memory domain object.
  * Pure helper — centralizes the row-to-Memory mapping used by all query functions.
  */
 function rowToMemory(row: MemoryRow): Memory {
+  const tags = parseJsonStringArray(row.tags, `Memory ${row.id}`, 'tags');
+
   return createMemory({
     id: row.id,
     content: row.content,
@@ -420,7 +465,7 @@ function rowToMemory(row: MemoryRow): Memory {
     source_type: row.source_type,
     source_session: row.source_session,
     source_context: row.source_context,
-    tags: JSON.parse(row.tags),
+    tags,
     access_count: row.access_count,
     last_accessed_at: row.last_accessed_at,
     created_at: row.created_at,
@@ -524,28 +569,25 @@ function validateMemoryFields(fields: Partial<Memory>, operation: string): void 
  * @param fields - Partial memory fields to update
  */
 export function updateMemory(db: Database, id: string, fields: Partial<Memory>): void {
-  if (fields.status === 'active' && fields.archived_at !== undefined && fields.archived_at !== null) {
-    throw new Error('updateMemory: active memory must not have archived_at set');
+  // Load the row's current coupling state once, decide purely, then persist.
+  // The decision itself lives in resolveArchiveAnchor (core/types.ts) because
+  // a partial patch can leave either half of the pair implicit, so the rule
+  // needs both the patch and the stored row to be evaluated at all.
+  const touchesAnchor = fields.status !== undefined || fields.archived_at !== undefined;
+  const currentRow = touchesAnchor
+    ? db.prepare('SELECT status, archived_at FROM memories WHERE id = ?').get(id) as
+        { status?: MemoryStatus; archived_at?: string | null } | null
+    : null;
+  const resolved = resolveArchiveAnchor(
+    { id, status: currentRow?.status, archived_at: currentRow?.archived_at },
+    { status: fields.status, archived_at: fields.archived_at },
+    new Date()
+  );
+  if (!resolved.ok) {
+    throw new Error(`updateMemory: ${resolved.reason}`);
   }
-  if (fields.archived_at !== undefined && fields.archived_at !== null &&
-      fields.status !== undefined && fields.status !== 'archived' && fields.status !== 'pruned') {
-    throw new Error(`updateMemory: status ${fields.status} must not have archived_at set (only archived/pruned memories anchor an archive timestamp)`);
-  }
-  // An archived_at-only update on a live row would persist the exact state
-  // createMemory refuses to read back. The coupling guard needs the row's
-  // CURRENT status when the update itself doesn't change it.
-  if (fields.archived_at !== undefined && fields.archived_at !== null && fields.status === undefined) {
-    const row = db.prepare('SELECT status FROM memories WHERE id = ?').get(id) as { status?: unknown } | null;
-    const current = row?.status;
-    if (current !== 'archived' && current !== 'pruned') {
-      throw new Error(`updateMemory: memory ${id} is ${String(current)}; cannot set archived_at without archiving it`);
-    }
-  }
-  if (fields.status === 'archived' && fields.archived_at === undefined) {
-    fields = { ...fields, archived_at: new Date().toISOString() };
-  }
-  if (fields.status === 'active' && fields.archived_at === undefined) {
-    fields = { ...fields, archived_at: null };
+  if (resolved.archived_at !== fields.archived_at) {
+    fields = { ...fields, archived_at: resolved.archived_at };
   }
   validateMemoryFields(fields, 'updateMemory');
   const updates: string[] = [];
@@ -643,7 +685,7 @@ export function getMemory(db: Database, id: string): Memory | null {
     SELECT * FROM memories WHERE id = ?
   `);
 
-  const row = stmt.get(id) as any;
+  const row = stmt.get(id) as MemoryRow | undefined;
   if (!row) {
     return null;
   }
@@ -688,7 +730,7 @@ export function getMemoriesByIds(
   `);
 
   const params = statuses === 'any' ? [...ids] : [...ids, ...statuses];
-  const rows = stmt.all(...params) as any[];
+  const rows = stmt.all(...params) as MemoryRow[];
 
   return rows.map(rowToMemory);
 }
@@ -705,52 +747,63 @@ export function getActiveMemories(db: Database): readonly Memory[] {
     SELECT * FROM memories WHERE status = 'active'
   `);
 
-  const rows = stmt.all() as any[];
+  const rows = stmt.all() as MemoryRow[];
+
+  return rows.map(rowToMemory);
+}
+
+/**
+ * Get active memories of the given type matching a file path in source_context.
+ * I/O: Reads from database
+ *
+ * source_context is stored as JSON (serializeSourceContext), so the lookup
+ * parses it at the query boundary with json_extract instead of pattern-
+ * matching the serialized text: a LIKE over the JSON breaks on paths that
+ * contain a backslash or a double quote (their JSON-escaped forms), silently
+ * matching no row — and a backslash path could even match a different file's
+ * collapsed form. json_extract is exact and parameterized. createMemory does
+ * not validate source_context, so a corrupt cell is reachable; json_valid
+ * guards it so malformed rows are skipped (no match), never a throw — one
+ * bad row must not break a whole index pass.
+ */
+function getActiveMemoriesByFilePath(
+  db: Database,
+  memoryType: 'code' | 'code_description',
+  filePath: string
+): readonly Memory[] {
+  const stmt = db.prepare(`
+    SELECT * FROM memories
+    WHERE status = 'active'
+      AND memory_type = ?
+      AND CASE WHEN json_valid(source_context)
+               THEN json_extract(source_context, '$.file_path') END = ?
+  `);
+  const rows = stmt.all(memoryType, filePath) as MemoryRow[];
 
   return rows.map(rowToMemory);
 }
 
 /**
  * Get active code memories matching a file path in source_context.
- * Uses SQL LIKE on source_context JSON to avoid full table scan.
+ * I/O: Reads from database
  */
 export function getActiveCodeMemoriesByFilePath(
   db: Database,
   filePath: string
 ): readonly Memory[] {
-  // Escape LIKE wildcards and double quotes in file path
-  const escaped = filePath.replace(/"/g, '\\"').replace(/%/g, '\\%').replace(/_/g, '\\_');
-  const pattern = `%"file_path":"${escaped}"%`;
-  const stmt = db.prepare(`
-    SELECT * FROM memories
-    WHERE status = 'active'
-      AND memory_type = 'code'
-      AND source_context LIKE ? ESCAPE '\\'
-  `);
-  const rows = stmt.all(pattern) as any[];
-
-  return rows.map(rowToMemory);
+  return getActiveMemoriesByFilePath(db, 'code', filePath);
 }
 
 /**
  * Get active code_description (prose) memories matching a file path in source_context.
  * Used for superseding old prose memories on re-index.
+ * I/O: Reads from database
  */
 export function getActiveProseMemoriesByFilePath(
   db: Database,
   filePath: string
 ): readonly Memory[] {
-  const escaped = filePath.replace(/"/g, '\\"').replace(/%/g, '\\%').replace(/_/g, '\\_');
-  const pattern = `%"file_path":"${escaped}"%`;
-  const stmt = db.prepare(`
-    SELECT * FROM memories
-    WHERE status = 'active'
-      AND memory_type = 'code_description'
-      AND source_context LIKE ? ESCAPE '\\'
-  `);
-  const rows = stmt.all(pattern) as any[];
-
-  return rows.map(rowToMemory);
+  return getActiveMemoriesByFilePath(db, 'code_description', filePath);
 }
 
 /**
@@ -765,7 +818,7 @@ export function getArchivedMemories(db: Database): readonly Memory[] {
     SELECT * FROM memories WHERE status = 'archived'
   `);
 
-  const rows = stmt.all() as any[];
+  const rows = stmt.all() as MemoryRow[];
 
   return rows.map(rowToMemory);
 }
@@ -807,7 +860,20 @@ export function getMemoriesWithEmbedding(
     `SELECT * FROM memories WHERE ${pred.sql} AND status = 'active'`
   );
 
-  const rows = stmt.all(...pred.params) as any[];
+  const rows = stmt.all(...pred.params) as MemoryRow[];
+
+  return collectMemoriesWithEmbeddings(rows);
+}
+
+/**
+ * Shared row loop for the two embedding read paths: map each row, skip rows
+ * whose local_embedding cannot deserialize (with the #9 diagnostic), keep the
+ * rest. Both paths must apply the same skip policy — a row skipped in one
+ * path and returned in the other would rank differently by query shape.
+ */
+function collectMemoriesWithEmbeddings(
+  rows: readonly MemoryRow[]
+): { memory: Memory; embedding: Float32Array }[] {
   const results: { memory: Memory; embedding: Float32Array }[] = [];
 
   for (const row of rows) {
@@ -840,30 +906,9 @@ export function searchByKeyword(
   query: string,
   limit: number
 ): readonly Memory[] {
-  const stmt = db.prepare(`
-    SELECT m.*
-    FROM memories m
-    JOIN memories_fts fts ON m.id = fts.id
-    WHERE memories_fts MATCH ?
-    AND m.status = 'active'
-    ORDER BY rank
-    LIMIT ?
-  `);
-
-  // Quote each token individually to prevent FTS5 syntax injection (e.g. hyphens
-  // in UUIDs being parsed as column/NOT operators) while preserving AND semantics.
-  const safeQuery = query
-    .split(/\s+/)
-    .filter(t => t.length > 0)
-    .map(t => '"' + t.replace(/"/g, '""') + '"')
-    .join(' ');
-
-  // MATCH '' is an FTS5 syntax error — empty/whitespace query means no results
-  if (safeQuery.length === 0) return [];
-
-  const rows = stmt.all(safeQuery, limit) as any[];
-
-  return rows.map(rowToMemory);
+  // Split into tokens and search with FTS5 implicit-AND semantics (the same
+  // joiner as searchByKeywordAnd); token quoting is buildFts5Query's job.
+  return searchByKeywordWithJoiner(db, query.split(/\s+/), limit, ' ');
 }
 
 /**
@@ -919,16 +964,28 @@ function searchByKeywordWithJoiner(
     LIMIT ?
   `);
 
-  const safeQuery = tokens
+  const safeQuery = buildFts5Query(tokens, joiner);
+
+  // MATCH '' is an FTS5 syntax error — empty/whitespace tokens mean no results
+  if (safeQuery.length === 0) return [];
+
+  const rows = stmt.all(safeQuery, limit) as MemoryRow[];
+
+  return rows.map(rowToMemory);
+}
+
+/**
+ * Build a safe FTS5 MATCH expression from raw tokens: each token is
+ * double-quote-escaped and wrapped in quotes, so FTS5 syntax operators (e.g.
+ * hyphens in UUIDs being parsed as column/NOT operators) can never be
+ * injected. The joiner picks the semantics: ' ' is FTS5 implicit AND,
+ * ' OR ' is OR. Pure; shared by every FTS5 MATCH builder in this file.
+ */
+function buildFts5Query(tokens: readonly string[], joiner: ' ' | ' OR '): string {
+  return tokens
     .filter(t => t.length > 0)
     .map(t => '"' + t.replace(/"/g, '""') + '"')
     .join(joiner);
-
-  if (safeQuery.length === 0) return [];
-
-  const rows = stmt.all(safeQuery, limit) as any[];
-
-  return rows.map(rowToMemory);
 }
 
 /**
@@ -948,20 +1005,9 @@ export function getMemoriesWithEmbeddingByIds(
     SELECT * FROM memories WHERE id IN (${placeholders}) AND ${pred.sql} AND status = 'active'
   `);
 
-  const rows = stmt.all(...ids, ...pred.params) as any[];
-  const results: { memory: Memory; embedding: Float32Array }[] = [];
+  const rows = stmt.all(...ids, ...pred.params) as MemoryRow[];
 
-  for (const row of rows) {
-    const memory = rowToMemory(row);
-    const memoryEmbedding = memory.local_embedding;
-    if (!memoryEmbedding) {
-      console.warn(`[cortex:db] Skipping memory ${memory.id}: local_embedding deserialized to null`);
-      continue;
-    }
-    results.push({ memory, embedding: memoryEmbedding });
-  }
-
-  return results;
+  return collectMemoriesWithEmbeddings(rows);
 }
 
 /**
@@ -989,15 +1035,16 @@ export function getLatestMemoryTimestamp(db: Database): string | null {
  * I/O: Writes to database
  *
  * @param db - Database instance
- * @param edge - Edge to insert (without id and created_at)
+ * @param edge - Edge to insert (without id and created_at; classified_at/classify_hash/last_failed_at optional, default null)
  * @returns Generated edge ID
  * @throws If unique constraint violated (duplicate edge)
  */
 export function insertEdge(
   db: Database,
-  edge: Omit<Edge, 'id' | 'created_at' | 'classified_at' | 'classify_hash'> & {
+  edge: Omit<Edge, 'id' | 'created_at' | 'classified_at' | 'classify_hash' | 'last_failed_at'> & {
     classified_at?: string | null;
     classify_hash?: string | null;
+    last_failed_at?: string | null;
   }
 ): string {
   const id = randomUUID();
@@ -1014,11 +1061,12 @@ export function insertEdge(
     created_at,
     classified_at: edge.classified_at ?? null,
     classify_hash: edge.classify_hash ?? null,
+    last_failed_at: edge.last_failed_at ?? null,
   });
 
   const stmt = db.prepare(`
-    INSERT INTO edges (id, source_id, target_id, relation_type, strength, bidirectional, status, created_at, classified_at, classify_hash)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO edges (id, source_id, target_id, relation_type, strength, bidirectional, status, created_at, classified_at, classify_hash, last_failed_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   stmt.run(
@@ -1031,7 +1079,8 @@ export function insertEdge(
     validated.status,
     validated.created_at,
     validated.classified_at,
-    validated.classify_hash
+    validated.classify_hash,
+    validated.last_failed_at
   );
 
   return validated.id;
@@ -1052,26 +1101,9 @@ export function getEdgesForMemory(db: Database, memoryId: string): readonly Edge
     AND status IN ('active', 'suggested')
   `);
 
-  const rows = stmt.all(memoryId, memoryId) as any[];
+  const rows = stmt.all(memoryId, memoryId) as unknown as EdgeRow[];
 
-  return rows.flatMap(row => {
-    if (!isEdgeRelation(row.relation_type)) {
-      console.warn(`[cortex:db] Skipping edge ${row.id}: invalid relation_type '${row.relation_type}'`);
-      return [];
-    }
-    return [createEdge({
-      id: row.id,
-      source_id: row.source_id,
-      target_id: row.target_id,
-      relation_type: row.relation_type,
-      strength: row.strength,
-      bidirectional: row.bidirectional === 1,
-      status: row.status,
-      created_at: row.created_at,
-      classified_at: (row.classified_at ?? null) as string | null,
-      classify_hash: (row.classify_hash ?? null) as string | null,
-    })];
-  });
+  return edgeRowsToEdges(rows);
 }
 
 /**
@@ -1084,26 +1116,9 @@ export function getEdgesForMemory(db: Database, memoryId: string): readonly Edge
  */
 export function getAllEdges(db: Database): readonly Edge[] {
   const stmt = db.prepare(`SELECT * FROM edges WHERE status IN ('active', 'suggested')`);
-  const rows = stmt.all() as unknown as Array<Record<string, unknown>>;
+  const rows = stmt.all() as unknown as EdgeRow[];
 
-  return rows.flatMap(row => {
-    if (!isEdgeRelation(asString(row.relation_type))) {
-      console.warn(`[cortex:db] Skipping edge ${row.id}: invalid relation_type '${row.relation_type}'`);
-      return [];
-    }
-    return [createEdge({
-      id: asString(row.id),
-      source_id: asString(row.source_id),
-      target_id: asString(row.target_id),
-      relation_type: asString(row.relation_type) as EdgeRelation,
-      strength: Number(row.strength),
-      bidirectional: row.bidirectional === 1,
-      status: asString(row.status) as Edge['status'],
-      created_at: asString(row.created_at),
-      classified_at: (row.classified_at ?? null) as string | null,
-      classify_hash: (row.classify_hash ?? null) as string | null,
-    })];
-  });
+  return edgeRowsToEdges(rows);
 }
 
 /**
@@ -1119,13 +1134,16 @@ export function getRelatesToEdges(db: Database): readonly Edge[] {
     SELECT * FROM edges WHERE relation_type = 'relates_to' AND status IN ('active', 'suggested')
   `);
 
-  return edgeRowsToEdges(stmt.all() as unknown as Array<Record<string, unknown>>);
+  return edgeRowsToEdges(stmt.all() as unknown as EdgeRow[]);
 }
 
 /**
  * Slim endpoint-memory projection used by the classification pre-filter.
- * memory_type comes from a memories row (createMemory-validated); the cast
- * is the domain union, matching Memory.memory_type.
+ *
+ * memory_type is read straight off the joined memories row, NOT through
+ * rowToMemory, so nothing on this path re-checks it — the value is validated
+ * here at the boundary (see getRelatesToEdgesWithMemories) rather than assumed
+ * from the insert-time createMemory call.
  */
 export interface EdgeEndpointMemory {
   readonly id: string;
@@ -1162,37 +1180,40 @@ export function getRelatesToEdgesWithMemories(db: Database): readonly EdgeWithMe
     ORDER BY e.created_at
   `);
 
-  const rows = stmt.all() as unknown as Array<Record<string, unknown>>;
+  const rows = stmt.all() as unknown as Array<EdgeRow & {
+    s_content: string; s_summary: string; s_memory_type: string;
+    t_content: string; t_summary: string; t_memory_type: string;
+  }>;
   return rows.flatMap((row) => {
-    if (!isEdgeRelation(asString(row.relation_type))) return [];
+    const edge = rowToEdge(row);
+    if (edge === null) return [];
 
-    const edge = createEdge({
-      id: asString(row.id),
-      source_id: asString(row.source_id),
-      target_id: asString(row.target_id),
-      relation_type: asString(row.relation_type) as EdgeRelation,
-      strength: Number(row.strength),
-      bidirectional: row.bidirectional === 1,
-      status: asString(row.status) as Edge['status'],
-      created_at: asString(row.created_at),
-      classified_at: (row.classified_at ?? null) as string | null,
-      classify_hash: (row.classify_hash ?? null) as string | null,
-    });
+    // The endpoint memory_type values bypass rowToMemory entirely on this raw
+    // JOIN, so they get the same validate-and-drop treatment rowToEdge gives
+    // relation_type one function below. Feeding an out-of-domain type into a
+    // classification prompt with no diagnostic is the failure this prevents.
+    if (!isMemoryType(row.s_memory_type) || !isMemoryType(row.t_memory_type)) {
+      console.warn(
+        `[cortex:db] Skipping edge ${row.id}: invalid endpoint memory_type ` +
+        `(source '${row.s_memory_type}', target '${row.t_memory_type}')`
+      );
+      return [];
+    }
 
     return [
       {
         edge,
         source: {
-          id: asString(row.source_id),
-          content: asString(row.s_content),
-          summary: asString(row.s_summary),
-          memory_type: asString(row.s_memory_type) as MemoryType,
+          id: row.source_id,
+          content: row.s_content,
+          summary: row.s_summary,
+          memory_type: row.s_memory_type,
         },
         target: {
-          id: asString(row.target_id),
-          content: asString(row.t_content),
-          summary: asString(row.t_summary),
-          memory_type: asString(row.t_memory_type) as MemoryType,
+          id: row.target_id,
+          content: row.t_content,
+          summary: row.t_summary,
+          memory_type: row.t_memory_type,
         },
       },
     ];
@@ -1210,33 +1231,151 @@ export function markEdgeClassified(
   at: string,
   contentHash: string
 ): void {
-  db.prepare(`UPDATE edges SET classified_at = ?, classify_hash = ? WHERE id = ?`).run(
+  // An answered edge clears any prior failure record: the backoff only makes
+  // sense while the edge is still unclassified.
+  db.prepare(`UPDATE edges SET classified_at = ?, classify_hash = ?, last_failed_at = NULL WHERE id = ?`).run(
     at,
     contentHash,
     edgeId
   );
 }
 
-function edgeRowsToEdges(rows: Array<Record<string, unknown>>): readonly Edge[] {
+/**
+ * Record a FAILED semantic-classification attempt for an edge: the failure
+ * timestamp plus the endpoint content hash at failure time, so candidate
+ * selection can apply the failure backoff (skip while the content is
+ * unchanged and the failure is recent; re-ask once the backoff elapses, and
+ * immediately when the content changed, since that is new information).
+ * Never sets classified_at — a failure must not make the edge look answered.
+ */
+export function markEdgeFailed(
+  db: Database,
+  edgeId: string,
+  at: string,
+  contentHash: string
+): void {
+  db.prepare(`UPDATE edges SET last_failed_at = ?, classify_hash = ? WHERE id = ?`).run(
+    at,
+    contentHash,
+    edgeId
+  );
+}
+
+/**
+ * Count active memories created after the given ISO8601 timestamp.
+ * This is the AI-prune watermark: "new work since the last successful
+ * prune". Archived memories are excluded (they are not in the review
+ * population); the watermark timestamp comes from telemetry.
+ */
+export function countActiveMemoriesCreatedAfter(db: Database, sinceIso: string): number {
+  const row = db.prepare(
+    `SELECT COUNT(*) AS n FROM memories WHERE status = 'active' AND created_at > ?`
+  ).get(sinceIso) as { n: number };
+  return row.n;
+}
+
+/**
+ * Raw edges-table row shape, the counterpart to MemoryRow. Declared for the
+ * same reason: an untyped `Record<string, unknown>` lets a column addition or
+ * rename drift past the compiler and surface as a silent runtime miscoercion.
+ * That is exactly the class of defect r44's dropped last_failed_at belonged
+ * to. `relation_type` and `status` stay `string` here because they are the
+ * unvalidated cell values — rowToEdge narrows them to the domain unions.
+ */
+type EdgeRow = {
+  id: string;
+  source_id: string;
+  target_id: string;
+  relation_type: string;
+  strength: number;
+  bidirectional: number;
+  status: string;
+  created_at: string;
+  classified_at: string | null;
+  classify_hash: string | null;
+  last_failed_at: string | null;
+};
+
+/**
+ * Map one edges-table row to an Edge, or null (with a stderr diagnostic) when
+ * relation_type is not a domain value. Every edge read path routes through
+ * this single mapper: r44's last_failed_at omission lived in four separate
+ * copies of this mapping, where one drifted copy silently falsified the
+ * failure-backoff signal — a shared mapper makes that drift structurally
+ * impossible and keeps the invalid-row drop diagnosable in every path.
+ */
+function rowToEdge(row: EdgeRow): Edge | null {
+  // Narrowed into consts because the guards below do not survive into the
+  // readRow closure — a property narrowing is discarded at the callback
+  // boundary, and re-casting there would undo the parsing these guards do.
+  const relationType = row.relation_type;
+  const status = row.status;
+  if (!isEdgeRelation(relationType)) {
+    console.warn(`[cortex:db] Skipping edge ${row.id}: invalid relation_type '${relationType}'`);
+    return null;
+  }
+  // status gets the same treatment as relation_type rather than a cast: both
+  // are unvalidated cell values, and createEdge throws on an invalid status.
+  // A cast would turn one corrupt cell into an exception thrown out of every
+  // edge read in the process — none of the four callers catch it — instead of
+  // dropping the one unreadable row the way this mapper already promises.
+  if (!isEdgeStatus(status)) {
+    console.warn(`[cortex:db] Skipping edge ${row.id}: invalid status '${status}'`);
+    return null;
+  }
+  return readRow(`edge ${row.id}`, () =>
+    createEdge({
+      id: row.id,
+      source_id: row.source_id,
+      target_id: row.target_id,
+      relation_type: relationType,
+      strength: Number(row.strength),
+      bidirectional: row.bidirectional === 1,
+      status,
+      created_at: row.created_at,
+      classified_at: row.classified_at ?? null,
+      classify_hash: row.classify_hash ?? null,
+      last_failed_at: row.last_failed_at ?? null,
+    })
+  );
+}
+
+/**
+ * Construct a domain object from a row, dropping the row (with a diagnostic)
+ * when its constructor refuses it.
+ *
+ * The union-cell guards in the mappers below parse what the TYPE system needs —
+ * a `string` column narrowed to `EdgeStatus`/`EntityType` before it reaches a
+ * factory that demands one. They cannot cover the VALUE invariants the factory
+ * also enforces (empty name, empty predicate, confidence outside [0,1],
+ * strength outside [0,1]), and re-stating those in each mapper would put the
+ * same rules in two places for the same rows.
+ *
+ * So the factory stays the single owner of the invariants and this turns its
+ * refusal into the outcome every read path here already promises: one
+ * unreadable row is skipped and named, not an exception thrown out of every
+ * read in the process. The scope is deliberately one constructor call — this is
+ * a corrupt-cell boundary, not a catch-all around I/O.
+ */
+function readRow<T>(rowLabel: string, construct: () => T): T | null {
+  try {
+    return construct();
+  } catch (err) {
+    console.warn(`[cortex:db] Skipping ${rowLabel}: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
+/** Map rows through a mapper that drops unreadable ones. */
+function readRows<R, T>(rows: readonly R[], map: (row: R) => T | null): readonly T[] {
   return rows.flatMap((row) => {
-    if (!isEdgeRelation(asString(row.relation_type))) {
-      return [];
-    }
-    return [
-      createEdge({
-        id: asString(row.id),
-        source_id: asString(row.source_id),
-        target_id: asString(row.target_id),
-        relation_type: asString(row.relation_type) as EdgeRelation,
-        strength: Number(row.strength),
-        bidirectional: row.bidirectional === 1,
-        status: asString(row.status) as Edge['status'],
-        created_at: asString(row.created_at),
-        classified_at: (row.classified_at ?? null) as string | null,
-        classify_hash: (row.classify_hash ?? null) as string | null,
-      }),
-    ];
+    const mapped = map(row);
+    return mapped === null ? [] : [mapped];
   });
+}
+
+function edgeRowsToEdges(rows: readonly EdgeRow[]): readonly Edge[] {
+  return readRows(rows, rowToEdge);
 }
 
 /** Narrow a SQLite cell to a string (columns are NOT NULL by schema). */
@@ -1386,6 +1525,21 @@ export function vacuumPrunedMemories(db: Database, retentionDays: number): numbe
 // ============================================================================
 
 /**
+ * Raw extraction_checkpoints row shape. Declared for the same reason as
+ * MemoryRow and EdgeRow: an `as any` here lets a column rename drift past the
+ * compiler and reach createExtractionCheckpoint as undefined, which is exactly
+ * the silent-column-drift class the typed rows exist to prevent.
+ */
+type ExtractionCheckpointRow = {
+  id: string;
+  session_id: string;
+  cursor_position: number;
+  extracted_at: string;
+  transcript_length: number | null;
+  projection_version: number | null;
+};
+
+/**
  * Get extraction checkpoint for session
  * I/O: Reads from database
  *
@@ -1401,7 +1555,7 @@ export function getExtractionCheckpoint(
     SELECT * FROM extraction_checkpoints WHERE session_id = ?
   `);
 
-  const row = stmt.get(sessionId) as any;
+  const row = stmt.get(sessionId) as ExtractionCheckpointRow | null;
   if (!row) {
     return null;
   }
@@ -1465,7 +1619,13 @@ export function saveExtractionCheckpoint(
 }
 
 // ============================================================================
-// CHECKPOINT/RESTORE FOR CONSOLIDATION SAFETY
+// WHOLE-DATABASE SNAPSHOT/RESTORE FOR CONSOLIDATION SAFETY
+//
+// Named "snapshot", not "checkpoint": an ExtractionCheckpoint is a transcript
+// resume cursor, and these are a full-database VACUUM INTO backup. They are
+// unrelated concepts, and while both wore the word "checkpoint" as sibling
+// exports of this module nothing in the names told a reader — or a future
+// edit — which of the two it was touching.
 // ============================================================================
 
 /**
@@ -1479,37 +1639,32 @@ function validatePath(path: string): void {
 }
 
 /**
- * Create database checkpoint (backup)
+ * Create a whole-database snapshot (backup).
  * I/O: Creates backup file using VACUUM INTO
  *
+ * Only the DESTINATION differs between an on-disk database and an in-memory
+ * one; the timestamp, the injection check and the VACUUM are the same work, so
+ * the branch picks a path and the single write below runs it.
+ *
  * @param db - Database instance
- * @returns Path to checkpoint file
+ * @returns Path to the snapshot file
  */
-export function createCheckpoint(db: Database): string {
+export function createDbSnapshot(db: Database): string {
   const filename = db.filename;
-
-  // Guard: :memory: or empty filename → use temp directory
-  if (!filename || filename === ':memory:' || filename === '') {
-    const os = require('node:os');
-    const path = require('node:path');
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const checkpointPath = path.join(os.tmpdir(), `cortex-checkpoint-${timestamp}.db`);
-
-    validatePath(checkpointPath);
-    db.run(`VACUUM INTO '${checkpointPath}'`);
-    return checkpointPath;
-  }
-
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const checkpointPath = `${filename}.checkpoint-${timestamp}`;
+  const isInMemory = !filename || filename === ':memory:';
+
+  const snapshotPath = isInMemory
+    ? joinPath(tmpdir(), `cortex-snapshot-${timestamp}.db`)
+    : `${filename}.snapshot-${timestamp}`;
 
   // Validate path to prevent SQL injection
-  validatePath(checkpointPath);
+  validatePath(snapshotPath);
 
   // Use VACUUM INTO to create a backup
-  db.run(`VACUUM INTO '${checkpointPath}'`);
+  db.run(`VACUUM INTO '${snapshotPath}'`);
 
-  return checkpointPath;
+  return snapshotPath;
 }
 
 /**
@@ -1528,26 +1683,26 @@ function validateTableName(name: string): void {
 }
 
 /**
- * Restore database from checkpoint.
+ * Restore the database from a whole-database snapshot.
  *
- * Validates and attaches the checkpoint to the open database, validates every
+ * Validates and attaches the snapshot to the open database, validates every
  * copied table, transactionally replaces main-table contents and cleans FTS
- * orphans, then detaches the checkpoint even when restoration fails.
+ * orphans, then detaches the snapshot even when restoration fails.
  *
  * @param db - Database instance
- * @param checkpointPath - Path to checkpoint file
+ * @param snapshotPath - Path to the snapshot file
  */
-export function restoreCheckpoint(db: Database, checkpointPath: string): void {
+export function restoreDbSnapshot(db: Database, snapshotPath: string): void {
   // Validate path to prevent SQL injection
-  validatePath(checkpointPath);
+  validatePath(snapshotPath);
 
-  // Attach the checkpoint database and copy all data
-  db.run(`ATTACH DATABASE '${checkpointPath}' AS checkpoint`);
+  // Attach the snapshot database and copy all data
+  db.run(`ATTACH DATABASE '${snapshotPath}' AS snapshot`);
 
   try {
-    // Get all regular table names from checkpoint (exclude FTS tables)
+    // Get all regular table names from the snapshot (exclude FTS tables)
     const tables = db.query(`
-      SELECT name FROM checkpoint.sqlite_master
+      SELECT name FROM snapshot.sqlite_master
       WHERE type='table'
         AND name NOT LIKE 'sqlite_%'
         AND name NOT LIKE '%_fts%'
@@ -1564,7 +1719,7 @@ export function restoreCheckpoint(db: Database, checkpointPath: string): void {
       for (const { name } of tables) {
         // Use double quotes for table identifiers (SQL standard)
         db.run(`DELETE FROM main."${name}"`);
-        db.run(`INSERT INTO main."${name}" SELECT * FROM checkpoint."${name}"`);
+        db.run(`INSERT INTO main."${name}" SELECT * FROM snapshot."${name}"`);
       }
 
       // The insert triggers resync FTS rows for restored ids, but FTS rows
@@ -1576,8 +1731,8 @@ export function restoreCheckpoint(db: Database, checkpointPath: string): void {
     tx();
   } finally {
     // Always detach — a stuck ATTACH makes every retry fail with
-    // "database checkpoint is already in use".
-    db.run('DETACH DATABASE checkpoint');
+    // "database snapshot is already in use".
+    db.run('DETACH DATABASE snapshot');
   }
 }
 
@@ -1617,10 +1772,11 @@ export function upsertEntity(
   entityType: EntityType,
   aliases: readonly string[] = []
 ): string {
-  // Try exact match first (case-insensitive)
+  // Try exact match first (case-insensitive). Only the id is read back, so the
+  // row is narrowed to the one column this path uses rather than cast to `any`.
   const existing = db.prepare(
-    `SELECT * FROM entities WHERE LOWER(name) = LOWER(?) AND entity_type = ?`
-  ).get(name, entityType) as any;
+    `SELECT id FROM entities WHERE LOWER(name) = LOWER(?) AND entity_type = ?`
+  ).get(name, entityType) as { id: string } | null;
 
   if (existing) {
     return existing.id;
@@ -1652,18 +1808,11 @@ export function upsertEntity(
 export function getEntityByName(db: Database, name: string): Entity | null {
   const row = db.prepare(
     `SELECT * FROM entities WHERE LOWER(name) = LOWER(?)`
-  ).get(name) as any;
+  ).get(name) as Record<string, unknown> | undefined;
 
   if (!row) return null;
 
-  return createEntity({
-    id: row.id,
-    name: row.name,
-    entity_type: row.entity_type,
-    aliases: JSON.parse(row.aliases),
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-  });
+  return rowToEntity(row);
 }
 
 /**
@@ -1675,11 +1824,7 @@ export function searchEntities(
   query: string,
   limit: number = 10
 ): readonly Entity[] {
-  const safeQuery = query
-    .split(/\s+/)
-    .filter(t => t.length > 0)
-    .map(t => '"' + t.replace(/"/g, '""') + '"')
-    .join(' OR ');
+  const safeQuery = buildFts5Query(query.split(/\s+/), ' OR ');
 
   if (safeQuery.length === 0) return [];
 
@@ -1689,16 +1834,9 @@ export function searchEntities(
     JOIN entities_fts fts ON e.id = fts.id
     WHERE entities_fts MATCH ?
     LIMIT ?
-  `).all(safeQuery, limit) as any[];
+  `).all(safeQuery, limit) as unknown as Array<Record<string, unknown>>;
 
-  return rows.map(row => createEntity({
-    id: row.id,
-    name: row.name,
-    entity_type: row.entity_type,
-    aliases: JSON.parse(row.aliases),
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-  }));
+  return readRows(rows, rowToEntity);
 }
 
 /**
@@ -1708,21 +1846,93 @@ export function searchEntities(
 export function getAllEntities(db: Database): readonly Entity[] {
   const rows = db.prepare(
     `SELECT * FROM entities ORDER BY name`
-  ).all() as any[];
+  ).all() as unknown as Array<Record<string, unknown>>;
 
-  return rows.map(row => createEntity({
-    id: row.id,
-    name: row.name,
-    entity_type: row.entity_type,
-    aliases: JSON.parse(row.aliases),
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-  }));
+  return readRows(rows, rowToEntity);
+}
+
+/**
+ * Centralizes the row-to-Entity mapping used by all entity query functions
+ * (the same convention as rowToMemory and the edge mappers).
+ *
+ * `aliases` goes through the same corrupt-cell guard as Memory.tags: this
+ * mapper backs getEntityByName, searchEntities and getAllEntities, so an
+ * unguarded JSON.parse would let one bad cell throw a context-free SyntaxError
+ * out of every entity read rather than degrade that one row.
+ *
+ * `entity_type` gets the treatment rowToEdge's status does, for the same
+ * reason: it is an unvalidated cell that createEntity refuses, and a cast would
+ * turn one corrupt row into an exception thrown out of all three readers —
+ * none of which catch it — instead of dropping the row it belongs to. There is
+ * no CHECK constraint on the column, so the guard is the only thing standing
+ * between a hand-edited or migrated cell and every entity read.
+ */
+function rowToEntity(row: Record<string, unknown>): Entity | null {
+  const id = asString(row.id);
+  const entityType = asString(row.entity_type);
+  if (!isEntityType(entityType)) {
+    console.warn(`[cortex:db] Skipping entity ${id}: invalid entity_type '${entityType}'`);
+    return null;
+  }
+  return readRow(`entity ${id}`, () =>
+    createEntity({
+      id,
+      name: asString(row.name),
+      entity_type: entityType,
+      aliases: parseJsonStringArray(asString(row.aliases), `Entity ${id}`, 'aliases'),
+      created_at: asString(row.created_at),
+      updated_at: asString(row.updated_at),
+    })
+  );
 }
 
 // ============================================================================
 // FACT CRUD OPERATIONS
 // ============================================================================
+
+/**
+ * Raw facts-table row shape, and the one mapper every fact read goes through.
+ *
+ * The three readers below (`getCurrentFacts`, `getAllFacts`,
+ * `getFactsByMemory`) each carried their own copy of this nine-field mapping
+ * over an `any[]`, which is the same shape of hazard `rowToEdge` was extracted
+ * to end: three copies of one mapping is three places a new column can be
+ * added to two of them.
+ */
+type FactRow = {
+  id: string;
+  entity_id: string;
+  predicate: string;
+  object: string;
+  source_memory_id: string;
+  confidence: number;
+  valid_from: string;
+  valid_to: string | null;
+  created_at: string;
+};
+
+/**
+ * Facts have no union-typed cell, but createFact still refuses an empty
+ * predicate/object and a confidence outside [0,1] — none of which the schema
+ * constrains. Unguarded, one such row threw out of all three readers below;
+ * dropping it names the row and leaves the rest of the entity's knowledge
+ * readable.
+ */
+function rowToFact(row: FactRow): Fact | null {
+  return readRow(`fact ${row.id}`, () =>
+    createFact({
+      id: row.id,
+      entity_id: row.entity_id,
+      predicate: row.predicate,
+      object: row.object,
+      source_memory_id: row.source_memory_id,
+      confidence: row.confidence,
+      valid_from: row.valid_from,
+      valid_to: row.valid_to,
+      created_at: row.created_at,
+    })
+  );
+}
 
 /**
  * Insert a new fact.
@@ -1763,19 +1973,9 @@ export function getCurrentFacts(db: Database, entityId: string): readonly Fact[]
      WHERE f.entity_id = ? AND f.valid_to IS NULL
        AND (m.id IS NULL OR m.status = 'active')
      ORDER BY f.created_at DESC`
-  ).all(entityId) as any[];
+  ).all(entityId) as FactRow[];
 
-  return rows.map(row => createFact({
-    id: row.id,
-    entity_id: row.entity_id,
-    predicate: row.predicate,
-    object: row.object,
-    source_memory_id: row.source_memory_id,
-    confidence: row.confidence,
-    valid_from: row.valid_from,
-    valid_to: row.valid_to,
-    created_at: row.created_at,
-  }));
+  return readRows(rows, rowToFact);
 }
 
 /**
@@ -1785,19 +1985,9 @@ export function getCurrentFacts(db: Database, entityId: string): readonly Fact[]
 export function getAllFacts(db: Database, entityId: string): readonly Fact[] {
   const rows = db.prepare(
     `SELECT * FROM facts WHERE entity_id = ? ORDER BY created_at DESC`
-  ).all(entityId) as any[];
+  ).all(entityId) as FactRow[];
 
-  return rows.map(row => createFact({
-    id: row.id,
-    entity_id: row.entity_id,
-    predicate: row.predicate,
-    object: row.object,
-    source_memory_id: row.source_memory_id,
-    confidence: row.confidence,
-    valid_from: row.valid_from,
-    valid_to: row.valid_to,
-    created_at: row.created_at,
-  }));
+  return readRows(rows, rowToFact);
 }
 
 /**
@@ -1832,17 +2022,7 @@ export function supersedeFactsForMemory(db: Database, memoryId: string): number 
 export function getFactsByMemory(db: Database, memoryId: string): readonly Fact[] {
   const rows = db.prepare(
     `SELECT * FROM facts WHERE source_memory_id = ?`
-  ).all(memoryId) as any[];
+  ).all(memoryId) as FactRow[];
 
-  return rows.map(row => createFact({
-    id: row.id,
-    entity_id: row.entity_id,
-    predicate: row.predicate,
-    object: row.object,
-    source_memory_id: row.source_memory_id,
-    confidence: row.confidence,
-    valid_from: row.valid_from,
-    valid_to: row.valid_to,
-    created_at: row.created_at,
-  }));
+  return readRows(rows, rowToFact);
 }

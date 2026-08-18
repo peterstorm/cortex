@@ -4,8 +4,18 @@
  * Prefers the direct OpenAI-compatible endpoint (see llm-client.ts — ~30x
  * faster with thinking disabled). Callers request either JSON mode or strict
  * schema-guided decoding as appropriate. Falls back to the `claude -p` /
- * `pi -p` subprocess path when no endpoint is configured or the direct call
- * fails.
+ * `pi -p` subprocess path when no endpoint is configured or a single direct
+ * call fails. Once consecutive direct failures reach the saturation threshold
+ * (default 3, CORTEX_LLM_MAX_DIRECT_FAILURES) the fallback is suppressed and
+ * the call throws instead: a saturated server answers with empty content or
+ * timeouts, and escalating to a full agent-loop subprocess would only consume
+ * more of the same capacity. Callers defer the work (unmarked edges,
+ * un-advanced checkpoints) and retry on the next run.
+ *
+ * Concurrency: every LLM call (direct or subprocess) acquires a slot from a
+ * process-wide pool (default 2, CORTEX_LLM_MAX_CONCURRENCY), so cortex's
+ * background work can never occupy more than a bounded share of a model
+ * server that live agents already rely on.
  *
  * FR-001: Extract memories automatically at session end
  * FR-009: Complete extraction within 30 seconds (p95)
@@ -16,6 +26,7 @@ import type { EdgeRelation, MemoryType } from '../core/types.js';
 import { isEdgeRelation, EDGE_RELATIONS } from '../core/types.js';
 import { extractJsonSlice } from '../core/json-utils.js';
 import { resolveOpenAiCompatEndpoint, chatCompletionText } from './llm-client.js';
+import { readFileSync } from 'node:fs';
 
 const EXTRACTION_TIMEOUT_MS = 90_000;
 const EDGE_CLASSIFICATION_TIMEOUT_MS = 90_000;
@@ -93,7 +104,7 @@ function getDefaultProvider(env: NodeJS.ProcessEnv): string | undefined {
   try {
     const home = env.HOME || env.USERPROFILE || '';
     const settingsPath = `${home}/.pi/agent/settings.json`;
-    const content = require('fs').readFileSync(settingsPath, 'utf-8');
+    const content = readFileSync(settingsPath, 'utf-8');
     const settings = JSON.parse(content) as { defaultProvider?: unknown };
     return typeof settings.defaultProvider === 'string' ? settings.defaultProvider : undefined;
   } catch (err) {
@@ -164,7 +175,7 @@ export function isClaudeLlmAvailable(): boolean {
  * @param prompt - Prompt to send via stdin
  * @param timeoutMs - Timeout in milliseconds
  * @returns Raw response text
- * @throws Error if binary not found, non-zero exit, or timeout
+ * @throws Error if binary not found, non-zero exit, timeout, or empty response
  */
 export async function runLlmPrompt(prompt: string, timeoutMs: number): Promise<string> {
   const env = typeof Bun !== 'undefined' ? Bun.env : process.env;
@@ -233,6 +244,110 @@ export async function runLlmPrompt(prompt: string, timeoutMs: number): Promise<s
   return stdout;
 }
 
+/** Shared option shape for the direct-endpoint LLM calls and their fallback. */
+export type DirectLlmOptions = {
+  jsonMode?: boolean;
+  jsonSchema?: object;
+  maxTokens?: number;
+};
+
+/** Transport used by the classification call; injectable so tests can drive
+ * the strict/tolerant routing without shelling out. */
+export type LlmPromptTransport = (
+  prompt: string,
+  timeoutMs: number,
+  options?: DirectLlmOptions
+) => Promise<{ text: string; direct: boolean }>;
+
+/**
+ * Process-wide LLM slot pool.
+ *
+ * Every LLM consumer (extraction, edge classification, AI pruning, and the
+ * subprocess fallback) funnels through runLlmPromptDirect, so capping slots
+ * here bounds how much of the shared model server cortex's background work
+ * can occupy at once — critical when live agents already hold most of the
+ * server's concurrent slots. Waiters queue in arrival order; a woken waiter
+ * re-checks the limit so a slot taken by a synchronous caller in the gap can
+ * never be double-grabbed (no lost wake credits: each release resolves
+ * exactly one waiter, and a re-queued waiter waits for a later release).
+ */
+const llmSlots = { active: 0, waiters: [] as Array<() => void> };
+
+/** Test hook: reset the per-process LLM slot pool. */
+export function resetLlmConcurrencyForTests(): void {
+  llmSlots.active = 0;
+  llmSlots.waiters = [];
+}
+
+/**
+ * Shared env-int parser for the LLM guardrail knobs: a positive integer
+ * wins; absent, non-integer, or below 1 falls back to the default.
+ */
+function envPositiveInt(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const raw = env[name];
+  if (raw === undefined) return fallback;
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed >= 1 ? parsed : fallback;
+}
+
+/**
+ * Max in-flight LLM calls per process. Background work must be a polite
+ * straggler on a shared server, so the default is small; 1 is the most
+ * conservative setting, values below 1 are rejected and fall back to 2.
+ */
+function maxConcurrentLlmCalls(env: NodeJS.ProcessEnv): number {
+  return envPositiveInt(env, 'CORTEX_LLM_MAX_CONCURRENCY', 2);
+}
+
+async function acquireLlmSlot(): Promise<void> {
+  const limit = maxConcurrentLlmCalls(process.env);
+  while (llmSlots.active >= limit) {
+    await new Promise<void>((resolve) => llmSlots.waiters.push(resolve));
+  }
+  llmSlots.active++;
+}
+
+function releaseLlmSlot(): void {
+  llmSlots.active--;
+  const next = llmSlots.waiters.shift();
+  if (next) next();
+}
+
+/** Per-process consecutive direct-endpoint failures; gives the operator a recurrence signal. */
+let consecutiveDirectFailures = 0;
+
+/** Test hook: reset the per-process consecutive-failure counter. */
+export function resetConsecutiveDirectFailuresForTests(): void {
+  consecutiveDirectFailures = 0;
+}
+
+/**
+ * Consecutive direct-endpoint failures after which the CLI-subprocess
+ * fallback is suppressed. Below the threshold a transient failure still
+ * falls back, because the subprocess path can genuinely differ (different
+ * model, prompt, timeout); at/above it the server is saturated or
+ * misconfigured and escalation would amplify the outage.
+ */
+function getDirectFailureFallbackThreshold(env: NodeJS.ProcessEnv): number {
+  return envPositiveInt(env, 'CORTEX_LLM_MAX_DIRECT_FAILURES', 3);
+}
+
+export async function runLlmPromptDirect(
+  prompt: string,
+  timeoutMs: number,
+  direct: DirectLlmOptions = {}
+): Promise<{ text: string; direct: boolean }> {
+  // The slot covers BOTH the direct attempt and any subprocess fallback: a
+  // `claude -p` / `pi -p` agent loop is one background job from the server's
+  // point of view, and it must not stack on top of other in-flight calls.
+  await acquireLlmSlot();
+  try {
+    return await runLlmPromptDirectUnbounded(prompt, timeoutMs, direct);
+  } finally {
+    releaseLlmSlot();
+  }
+}
+
 /**
  * Run a prompt through the LLM, preferring the direct OpenAI-compatible
  * endpoint (thinking disabled — ~30x faster on reasoning models) and
@@ -243,21 +358,10 @@ export async function runLlmPrompt(prompt: string, timeoutMs: number): Promise<s
  * strict parsing is only safe for the direct endpoint's guided decoding;
  * subprocess output is not schema-guided and needs the tolerant parser.
  */
-/** Transport used by the classification call; injectable so tests can drive
- * the strict/tolerant routing without shelling out. */
-export type LlmPromptTransport = (
+async function runLlmPromptDirectUnbounded(
   prompt: string,
   timeoutMs: number,
-  options?: { jsonMode?: boolean; jsonSchema?: object; maxTokens?: number }
-) => Promise<{ text: string; direct: boolean }>;
-
-/** Per-process consecutive direct-endpoint failures; gives the operator a recurrence signal. */
-let consecutiveDirectFailures = 0;
-
-export async function runLlmPromptDirect(
-  prompt: string,
-  timeoutMs: number,
-  direct: { jsonMode?: boolean; jsonSchema?: object; maxTokens?: number } = {}
+  direct: DirectLlmOptions = {}
 ): Promise<{ text: string; direct: boolean }> {
   const endpoint = resolveOpenAiCompatEndpoint();
   if (endpoint) {
@@ -274,8 +378,27 @@ export async function runLlmPromptDirect(
       consecutiveDirectFailures++;
       const count = consecutiveDirectFailures;
       const recurrence = count === 1 ? '' : ` (${count} consecutive direct-endpoint failures)`;
+      const failureDetail = (err as Error).message ?? err;
+      const threshold = getDirectFailureFallbackThreshold(process.env);
+      if (count >= threshold) {
+        // The direct endpoint keeps failing: the server is saturated or
+        // misconfigured. Spawning `claude -p` / `pi -p` here would start full
+        // agent loops that consume even more of the same saturated capacity,
+        // so fail now and let the caller defer (edges stay unmarked,
+        // checkpoints stay put, the next run retries).
+        process.stderr.write(
+          `[cortex:llm] ERROR: direct LLM call failed (${failureDetail})${recurrence}; ` +
+            `suppressing ${getLlmBinary(process.env)} subprocess fallback after ${threshold} consecutive ` +
+            `failure(s) — deferring work to the next run instead of escalating load ` +
+            `(adjust CORTEX_LLM_MAX_DIRECT_FAILURES to change the threshold)\n`
+        );
+        throw new Error(
+          `direct LLM endpoint saturated: ${count} consecutive failure(s); ` +
+            `subprocess fallback suppressed to avoid escalating server load`
+        );
+      }
       process.stderr.write(
-        `[cortex:llm] WARNING: direct LLM call failed (${(err as Error).message ?? err})${recurrence}; ` +
+        `[cortex:llm] WARNING: direct LLM call failed (${failureDetail})${recurrence}; ` +
           `falling back to ${getLlmBinary(process.env)} subprocess\n`
       );
     }
@@ -293,7 +416,8 @@ export async function runLlmPromptDirect(
  *
  * @param prompt - Extraction prompt (from buildExtractionPrompt)
  * @returns Raw LLM response text
- * @throws Error if the LLM binary not found, non-zero exit, or timeout
+ * @throws Error if the LLM binary not found, non-zero exit, timeout, empty
+ * response, or the direct endpoint is saturated (subprocess fallback suppressed)
  */
 export async function extractMemories(prompt: string): Promise<string> {
   const { text } = await runLlmPromptDirect(prompt, EXTRACTION_TIMEOUT_MS, {
@@ -465,38 +589,18 @@ export function parseEdgeClassificationResponse(
         `Edge classification response is not valid JSON (probably truncated): ${(e as Error).message}`
       );
     }
-    // Accept both the bare array and the schema-guided {"edges": [...]} shape
-    const array =
-      Array.isArray(parsed)
-        ? parsed
-        : Array.isArray((parsed as { edges?: unknown })?.edges)
-          ? (parsed as { edges: unknown[] }).edges
-          : null;
-    if (array === null) {
-      throw new Error(
-        `Edge classification response has no edges array: ${String(response).slice(0, 200)}`
-      );
-    }
-    const valid = array.filter(isValidEdgeClassification);
-    if (valid.length !== array.length) {
+    const checked = checkEdgesArray(parsed, 'strict mode');
+    if (!checked.ok) {
       // A dropped item must never degrade into a permanent "declined" verdict:
       // schema-guided decoding makes invalid items a decoder/server anomaly,
       // so the batch fails and the edges are retried instead of retired.
       throw new Error(
-        `Edge classification response contained ${array.length - valid.length} of ` +
-          `${array.length} items with invalid shape (strict mode)`
+        checked.reason === NO_EDGES_ARRAY
+          ? `Edge classification response has no edges array: ${String(response).slice(0, 200)}`
+          : `Edge classification response contained ${checked.reason}`
       );
     }
-    return {
-      kind: 'ok',
-      classifications: valid.map((c) => ({
-        ...(c.pair_index !== undefined ? { pair_index: c.pair_index } : {}),
-        source_id: String(c.source_id),
-        target_id: String(c.target_id),
-        relation_type: c.relation_type,
-        strength: Number(c.strength),
-      })),
-    };
+    return { kind: 'ok', classifications: normalizeClassifications(checked.valid) };
   }
 
   try {
@@ -507,46 +611,85 @@ export function parseEdgeClassificationResponse(
 
     const parsed: unknown = JSON.parse(jsonText.trim());
 
-    // Accept both the bare array and the schema-guided {"edges": [...]} shape
-    const array =
-      Array.isArray(parsed)
-        ? parsed
-        : Array.isArray((parsed as { edges?: unknown })?.edges)
-          ? (parsed as { edges: unknown[] }).edges
-          : null;
-    if (array === null) {
-      return {
-        kind: 'unparseable',
-        reason: 'response contains no edges array',
-      };
-    }
-
-    const valid = array.filter(isValidEdgeClassification);
-    if (valid.length !== array.length) {
+    const checked = checkEdgesArray(parsed, 'tolerant response');
+    if (!checked.ok) {
       // Any dropped item can correspond to a pair the shell would otherwise
       // retire as an implicit decline. Fail the whole tolerant batch so every
       // edge remains unmarked and retryable.
       return {
         kind: 'unparseable',
-        reason: `${array.length - valid.length} of ${array.length} items had invalid shape (tolerant response)`,
+        reason: checked.reason === NO_EDGES_ARRAY
+          ? 'response contains no edges array'
+          : checked.reason,
       };
     }
-    return {
-      kind: 'ok',
-      classifications: valid.map((c) => ({
-        ...(c.pair_index !== undefined ? { pair_index: c.pair_index } : {}),
-        source_id: String(c.source_id),
-        target_id: String(c.target_id),
-        relation_type: c.relation_type,
-        strength: Number(c.strength),
-      })),
-    };
+    return { kind: 'ok', classifications: normalizeClassifications(checked.valid) };
   } catch (e) {
     return {
       kind: 'unparseable',
       reason: `failed to parse edge classification response: ${(e as Error).message}`,
     };
   }
+}
+
+/** Sentinel for the one rejection whose wording differs between the modes. */
+const NO_EDGES_ARRAY = 'no-edges-array';
+
+/**
+ * The shared half of both parse modes: unwrap the envelope and require EVERY
+ * item to be schema-valid.
+ *
+ * Only what the two modes genuinely disagree about is left to them — strict
+ * throws where tolerant returns, and each phrases the missing-array case for
+ * its own caller. The rule itself ("any invalid item fails the whole batch,
+ * so no pair can be mistaken for a decline") is stated once, because two
+ * copies of it are two places it can be weakened to a filter.
+ */
+function checkEdgesArray(
+  parsed: unknown,
+  mode: string
+): Readonly<{ ok: true; valid: readonly EdgeClassification[] }> | Readonly<{ ok: false; reason: string }> {
+  const array = unwrapEdgesArray(parsed);
+  if (array === null) return { ok: false, reason: NO_EDGES_ARRAY };
+
+  const valid = array.filter(isValidEdgeClassification);
+  if (valid.length !== array.length) {
+    return {
+      ok: false,
+      reason: `${array.length - valid.length} of ${array.length} items with invalid shape (${mode})`,
+    };
+  }
+  return { ok: true, valid };
+}
+
+/**
+ * Unwrap the classification envelope: accept either the bare array or the
+ * schema-guided {"edges": [...]} shape (legacy compatibility). Returns null
+ * when the response carries no edges array at all.
+ */
+function unwrapEdgesArray(parsed: unknown): unknown[] | null {
+  if (Array.isArray(parsed)) return parsed;
+  if (Array.isArray((parsed as { edges?: unknown })?.edges)) {
+    return (parsed as { edges: unknown[] }).edges;
+  }
+  return null;
+}
+
+/**
+ * Normalize schema-valid classification items into the domain shape. Coerces
+ * the ID/strength fields defensively (the type guard already checked types,
+ * so this is belt-and-suspenders) and keeps pair_index optional for legacy
+ * responses. Shared by strict and tolerant modes: the only difference
+ * between those modes is the failure channel (throw vs unparseable).
+ */
+function normalizeClassifications(valid: readonly EdgeClassification[]): readonly EdgeClassification[] {
+  return valid.map((c) => ({
+    ...(c.pair_index !== undefined ? { pair_index: c.pair_index } : {}),
+    source_id: String(c.source_id),
+    target_id: String(c.target_id),
+    relation_type: c.relation_type,
+    strength: Number(c.strength),
+  }));
 }
 
 /**

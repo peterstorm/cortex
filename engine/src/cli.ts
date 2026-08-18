@@ -78,20 +78,34 @@ import {
   type SessionIngestionRetryPolicy,
 } from './commands/ingest-session.js';
 import { disposeLocalModel, embedLocal } from './infra/local-embed.js';
+import { ensureNativeLibraryPath } from './infra/native-library-path.js';
 
 // ============================================================================
 // TYPES
 // ============================================================================
 
-export type CommandResult = {
-  readonly success: boolean;
-  readonly output?: string;
-  readonly error?: string;
+/**
+ * The outcome of one CLI command — exactly one of three things happened.
+ *
+ * This was a flat bag: a `success` boolean beside independent optional
+ * `deferred` and `retryable` flags. Nothing in that shape stopped a handler
+ * from returning `success: true` and `deferred: true` at once (which
+ * extractionToCommandResult in fact did), or a failure with no error to
+ * report, and commandToIngestionStep had to recover the real outcome by
+ * testing `deferred` BEFORE `success` — an ordering the compiler could not
+ * see, let alone enforce. The union makes those states unrepresentable and
+ * turns that recovery into a total switch.
+ *
+ * It sits between two ADTs on either side (ExtractionResult in,
+ * IngestionStepResult out); it is now the same kind of thing they are.
+ */
+export type CommandResult =
+  /** The command did its work. */
+  | Readonly<{ kind: 'succeeded'; output?: string }>
   /** The command did no work yet and should be attempted again. */
-  readonly deferred?: boolean;
-  /** A failed command may succeed unchanged on a bounded retry. */
-  readonly retryable?: boolean;
-};
+  | Readonly<{ kind: 'deferred'; output?: string }>
+  /** The command failed. `retryable` marks a failure a bounded retry may fix. */
+  | Readonly<{ kind: 'failed'; error: string; output?: string; retryable?: boolean }>;
 
 // ============================================================================
 // STDIN PARSING
@@ -128,6 +142,42 @@ export function parseHookInput(jsonText: string): HookInput | null {
 }
 
 /**
+ * Drain stdin to text, or null when nothing was piped in.
+ *
+ * The one place that knows how bytes arrive. Both stdin readers below used to
+ * carry their own copy of the reader/concat/decode sequence and diverge only
+ * in how they parsed the result — two copies of plumbing that has to change
+ * together (a size cap, a different encoding) and no reason for either copy to
+ * know that.
+ *
+ * @returns The decoded text, or null when stdin was empty.
+ */
+async function readStdinText(): Promise<string | null> {
+  const reader = Bun.stdin.stream().getReader();
+  const chunks: Uint8Array[] = [];
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+
+  if (chunks.length === 0) {
+    return null;
+  }
+
+  const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const buffer = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    buffer.set(chunk, offset);
+    offset += chunk.length;
+  }
+
+  return new TextDecoder().decode(buffer);
+}
+
+/**
  * Read and parse JSON input from stdin
  * Used by hooks to pass structured data (FR-119)
  *
@@ -135,30 +185,11 @@ export function parseHookInput(jsonText: string): HookInput | null {
  */
 async function readStdinJson(): Promise<HookInput | null> {
   try {
-    const stdin = Bun.stdin.stream();
-    const reader = stdin.getReader();
-    const chunks: Uint8Array[] = [];
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-    }
-
-    if (chunks.length === 0) {
+    const text = await readStdinText();
+    if (text === null) {
       return null;
     }
 
-    // Concatenate chunks
-    const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const buffer = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      buffer.set(chunk, offset);
-      offset += chunk.length;
-    }
-
-    const text = new TextDecoder().decode(buffer);
     const hookInput = parseHookInput(text);
 
     if (!hookInput) {
@@ -212,6 +243,42 @@ export function validateCwd(cwd: string): string | null {
   return null;
 }
 
+/** Create a database file's parent directory if it is not already there. */
+function ensureDbDir(dbPath: string): void {
+  const dbDir = dirname(dbPath);
+  if (!existsSync(dbDir)) {
+    mkdirSync(dbDir, { recursive: true });
+  }
+}
+
+/**
+ * Make a project's `.memory/` usable: directory present, patterns gitignored.
+ *
+ * Shared by the two entry points that need it — initDatabases, which also
+ * wants the global database, and handleConsolidate, which is project-scoped
+ * and used to carry its own copy of these steps. A change to how a project
+ * root is prepared (a permission mode, another gitignore pattern) now lands in
+ * one place instead of one obvious place and one buried in a command handler.
+ *
+ * Callers validate cwd first; the two disagree about what to do when it is
+ * invalid (exit vs. return a failure), so that decision stays with them.
+ *
+ * @param cwd - Project root directory, already validated.
+ * @returns The project database path.
+ */
+function prepareProjectDbDir(cwd: string): string {
+  const projectDbPath = getProjectDbPath(cwd);
+  ensureDbDir(projectDbPath);
+
+  try {
+    ensureGitignored(cwd, GITIGNORE_PATTERNS);
+  } catch (err) {
+    logError(`Failed to update .gitignore: ${err}`);
+  }
+
+  return projectDbPath;
+}
+
 /**
  * Open or create project and global databases
  * Ensures .memory/ directory exists and is gitignored
@@ -229,26 +296,9 @@ function initDatabases(cwd: string): [Database, Database] {
     process.exit(1);
   }
 
-  const projectDbPath = getProjectDbPath(cwd);
+  const projectDbPath = prepareProjectDbDir(cwd);
   const globalDbPath = getGlobalDbPath();
-
-  // Ensure parent directories exist
-  const projectDbDir = dirname(projectDbPath);
-  if (!existsSync(projectDbDir)) {
-    mkdirSync(projectDbDir, { recursive: true });
-  }
-
-  const globalDbDir = dirname(globalDbPath);
-  if (!existsSync(globalDbDir)) {
-    mkdirSync(globalDbDir, { recursive: true });
-  }
-
-  // Ensure .gitignore patterns
-  try {
-    ensureGitignored(cwd, GITIGNORE_PATTERNS);
-  } catch (err) {
-    logError(`Failed to update .gitignore: ${err}`);
-  }
+  ensureDbDir(globalDbPath);
 
   // Open databases
   const projectDb = openDatabase(projectDbPath);
@@ -261,20 +311,24 @@ function initDatabases(cwd: string): [Database, Database] {
 // COMMAND HANDLERS
 // ============================================================================
 
-/** Translate the extraction ADT into the CLI command protocol. */
+/**
+ * Translate the extraction ADT into the CLI command protocol.
+ *
+ * Both sides are three-arm unions over the same three outcomes, so this is a
+ * total mapping with nothing to flatten. It used to report a deferral as
+ * `success: true, deferred: true` — two flags for one state, which is what
+ * forced the downstream reader to guess which of them meant more.
+ */
 export function extractionToCommandResult(result: ExtractionResult): CommandResult {
-  if (result.kind === 'succeeded') {
-    return { success: true, output: JSON.stringify(result) };
+  const output = JSON.stringify(result);
+  switch (result.kind) {
+    case 'succeeded':
+      return { kind: 'succeeded', output };
+    case 'deferred':
+      return { kind: 'deferred', output };
+    case 'failed':
+      return { kind: 'failed', retryable: result.retryable, output, error: result.error };
   }
-  if (result.kind === 'deferred') {
-    return { success: true, deferred: true, output: JSON.stringify(result) };
-  }
-  return {
-    success: false,
-    retryable: result.retryable,
-    output: JSON.stringify(result),
-    error: result.error,
-  };
 }
 
 /** Execute extraction for already-parsed session metadata. */
@@ -295,7 +349,7 @@ async function handleExtractInput(input: HookInput): Promise<CommandResult> {
     return extractionToCommandResult(result);
   } catch (err) {
     return {
-      success: false,
+      kind: 'failed',
       retryable: true,
       error: `Extract failed: ${err}`,
     };
@@ -314,7 +368,7 @@ async function handleExtract(): Promise<CommandResult> {
   return input
     ? handleExtractInput(input)
     : {
-        success: false,
+        kind: 'failed',
         error: 'No stdin input provided (expected JSON with session_id, transcript_path, cwd)',
       };
 }
@@ -327,7 +381,7 @@ async function handleGenerate(args: string[]): Promise<CommandResult> {
   // Args: [cwd]
   if (args.length === 0) {
     return {
-      success: false,
+      kind: 'failed',
       error: 'Usage: generate <cwd>',
     };
   }
@@ -346,12 +400,12 @@ async function handleGenerate(args: string[]): Promise<CommandResult> {
     });
 
     return {
-      success: true,
+      kind: 'succeeded',
       output: JSON.stringify(result),
     };
   } catch (err) {
     return {
-      success: false,
+      kind: 'failed',
       error: `Generate failed: ${err}`,
     };
   } finally {
@@ -419,7 +473,7 @@ async function handleRecall(args: string[]): Promise<CommandResult> {
   const parsed = parseRecallArgs(args);
   if (!parsed.success) {
     return {
-      success: false,
+      kind: 'failed',
       error: parsed.error,
     };
   }
@@ -430,12 +484,12 @@ async function handleRecall(args: string[]): Promise<CommandResult> {
   try {
     const result = await executeRecall(projectDb, globalDb, options);
     return {
-      success: true,
+      kind: 'succeeded',
       output: formatRecallResult(result),
     };
   } catch (err) {
     return {
-      success: false,
+      kind: 'failed',
       error: `Recall failed: ${err}`,
     };
   } finally {
@@ -452,7 +506,7 @@ async function handleRemember(args: string[]): Promise<CommandResult> {
   // Args: [cwd, content, ...options]
   if (args.length < 2) {
     return {
-      success: false,
+      kind: 'failed',
       error: 'Usage: remember <cwd> <content> [--type=TYPE] [--priority=N] [--scope=SCOPE] [--pinned] [--tags=tag1,tag2]',
     };
   }
@@ -479,14 +533,12 @@ async function handleRemember(args: string[]): Promise<CommandResult> {
       }
     );
 
-    return {
-      success: result.success,
-      output: result.success ? `Created memory: ${result.memory_id}` : undefined,
-      error: result.error,
-    };
+    return result.success
+      ? { kind: 'succeeded', output: `Created memory: ${result.memory_id}` }
+      : { kind: 'failed', error: result.error };
   } catch (err) {
     return {
-      success: false,
+      kind: 'failed',
       error: `Remember failed: ${err}`,
     };
   } finally {
@@ -503,7 +555,7 @@ async function handleIndexCode(args: string[]): Promise<CommandResult> {
   // Args: [cwd, filePath, summary, ...flags]
   if (args.length < 3) {
     return {
-      success: false,
+      kind: 'failed',
       error: 'Usage: index-code <cwd> <filePath> <summary> [--start=N] [--end=N] [--scope=project|global] [--tags=tag1,tag2] [--session=ID]',
     };
   }
@@ -521,14 +573,15 @@ async function handleIndexCode(args: string[]): Promise<CommandResult> {
       getProjectName(cwd)
     );
 
-    return {
-      success: result.success,
-      output: result.success && 'code_memory_id' in result ? `Indexed code: ${result.code_memory_id}` : undefined,
-      error: !result.success ? result.error : undefined,
-    };
+    if (!result.success) {
+      return { kind: 'failed', error: result.error };
+    }
+    return 'code_memory_id' in result
+      ? { kind: 'succeeded', output: `Indexed code: ${result.code_memory_id}` }
+      : { kind: 'succeeded' };
   } catch (err) {
     return {
-      success: false,
+      kind: 'failed',
       error: `Index-code failed: ${err}`,
     };
   } finally {
@@ -545,7 +598,7 @@ async function handleForget(args: string[]): Promise<CommandResult> {
   // Args: [cwd, idOrQuery]
   if (args.length < 2) {
     return {
-      success: false,
+      kind: 'failed',
       error: 'Usage: forget <cwd> <idOrQuery>',
     };
   }
@@ -571,7 +624,7 @@ async function handleForget(args: string[]): Promise<CommandResult> {
 
     if (result.status === 'archived') {
       return {
-        success: true,
+        kind: 'succeeded',
         output: `Archived memory: ${result.memoryId}`,
       };
     } else if (result.status === 'candidates' && result.memories.length === 1) {
@@ -584,26 +637,26 @@ async function handleForget(args: string[]): Promise<CommandResult> {
       );
       if (archiveResult.status === 'archived') {
         return {
-          success: true,
+          kind: 'succeeded',
           output: `Archived memory: ${archiveResult.memoryId}`,
         };
       }
-      return { success: false, output: `Failed to archive ${candidate.id}` };
+      return { kind: 'failed', error: `Failed to archive ${candidate.id}` };
     } else if (result.status === 'candidates' && result.memories.length > 1) {
       const list = result.memories.map(m => `  ${m.id} - ${m.summary}`).join('\n');
       return {
-        success: true,
+        kind: 'succeeded',
         output: `Found ${result.memories.length} candidate(s):\n${list}`,
       };
     } else {
       return {
-        success: false,
-        output: 'Memory not found',
+        kind: 'failed',
+        error: 'Memory not found',
       };
     }
   } catch (err) {
     return {
-      success: false,
+      kind: 'failed',
       error: `Forget failed: ${err}`,
     };
   } finally {
@@ -623,7 +676,7 @@ async function handleForget(args: string[]): Promise<CommandResult> {
 async function handleConsolidate(args: string[]): Promise<CommandResult> {
   if (args.length < 1) {
     return {
-      success: false,
+      kind: 'failed',
       error: 'Usage: consolidate <cwd> [--threshold=N] | consolidate <cwd> --merge --a=<idA> --b=<idB> --summary=<text> --content=<text>',
     };
   }
@@ -631,20 +684,10 @@ async function handleConsolidate(args: string[]): Promise<CommandResult> {
   const cwd = args[0];
   const cwdError = validateCwd(cwd);
   if (cwdError !== null) {
-    return { success: false, error: cwdError };
+    return { kind: 'failed', error: cwdError };
   }
   // Only open project DB - consolidate operates on project scope only
-  const projectDbPath = getProjectDbPath(cwd);
-  const projectDbDir = dirname(projectDbPath);
-  if (!existsSync(projectDbDir)) {
-    mkdirSync(projectDbDir, { recursive: true });
-  }
-
-  try {
-    ensureGitignored(cwd, GITIGNORE_PATTERNS);
-  } catch (err) {
-    logError(`Failed to update .gitignore: ${err}`);
-  }
+  const projectDbPath = prepareProjectDbDir(cwd);
 
   const projectDb = openDatabase(projectDbPath);
 
@@ -660,7 +703,7 @@ async function handleConsolidate(args: string[]): Promise<CommandResult> {
       const content = flagValue('content');
       if (!idA || !idB || !summary || !content) {
         return {
-          success: false,
+          kind: 'failed',
           error: 'Usage: consolidate <cwd> --merge --a=<idA> --b=<idB> --summary=<text> --content=<text>',
         };
       }
@@ -672,7 +715,7 @@ async function handleConsolidate(args: string[]): Promise<CommandResult> {
       const memoryB = found.find(m => m.id === idB);
       if (!memoryA || !memoryB) {
         const missing = [!memoryA && idA, !memoryB && idB].filter(Boolean).join(', ');
-        return { success: false, error: `Memory not found: ${missing}` };
+        return { kind: 'failed', error: `Memory not found: ${missing}` };
       }
 
       const mergeResult = mergePair(
@@ -685,12 +728,12 @@ async function handleConsolidate(args: string[]): Promise<CommandResult> {
       );
       if (mergeResult.kind === 'skipped') {
         return {
-          success: false,
+          kind: 'failed',
           error: `Merge skipped: ${mergeResult.reason}`,
         };
       }
       return {
-        success: true,
+        kind: 'succeeded',
         output: `Merged ${idA} + ${idB} -> ${mergeResult.mergedId} (both originals superseded). Run backfill + generate to refresh embeddings and surface.`,
       };
     }
@@ -698,25 +741,25 @@ async function handleConsolidate(args: string[]): Promise<CommandResult> {
     const thresholdArg = args.find(a => a.startsWith('--threshold='));
     const threshold = thresholdArg ? Number.parseFloat(thresholdArg.slice('--threshold='.length)) : undefined;
     if (threshold !== undefined && (Number.isNaN(threshold) || threshold <= 0 || threshold > 1)) {
-      return { success: false, error: '--threshold must be a number in (0, 1]' };
+      return { kind: 'failed', error: '--threshold must be a number in (0, 1]' };
     }
 
     const memories = getActiveMemories(projectDb);
     const pairs = findSimilarPairs(memories, threshold);
 
     if (pairs.length === 0) {
-      return { success: true, output: 'Found 0 similar pairs' };
+      return { kind: 'succeeded', output: 'Found 0 similar pairs' };
     }
 
     const sections = pairs.map(formatPairForReview);
     const header = `Found ${pairs.length} similar pair(s). To merge one:\n  consolidate <cwd> --merge --a=<idA> --b=<idB> --summary=<merged summary> --content=<merged content>\n`;
     return {
-      success: true,
+      kind: 'succeeded',
       output: [header, ...sections].join('\n'),
     };
   } catch (err) {
     return {
-      success: false,
+      kind: 'failed',
       error: `Consolidate failed: ${err}`,
     };
   } finally {
@@ -733,7 +776,7 @@ async function handleLifecycle(args: string[]): Promise<CommandResult> {
   // Args: [cwd] [--if-needed]
   if (args.length < 1) {
     return {
-      success: false,
+      kind: 'failed',
       error: 'Usage: lifecycle <cwd> [--if-needed]',
     };
   }
@@ -746,10 +789,10 @@ async function handleLifecycle(args: string[]): Promise<CommandResult> {
     if (ifNeeded) {
       const result = runLifecycleIfNeeded(projectDb, globalDb, getTelemetryPath(cwd), cwd);
       if (result.skipped) {
-        return { success: true, output: 'Lifecycle skipped (no changes needed)' };
+        return { kind: 'succeeded', output: 'Lifecycle skipped (no changes needed)' };
       }
       return {
-        success: true,
+        kind: 'succeeded',
         output: `Lifecycle complete: archived ${result.archived}, pruned ${result.pruned}`,
       };
     }
@@ -760,12 +803,12 @@ async function handleLifecycle(args: string[]): Promise<CommandResult> {
     const result = runFullLifecycle(projectDb, globalDb, cwd);
 
     return {
-      success: true,
+      kind: 'succeeded',
       output: `Lifecycle complete: archived ${result.archived}, pruned ${result.pruned}`,
     };
   } catch (err) {
     return {
-      success: false,
+      kind: 'failed',
       error: `Lifecycle failed: ${err}`,
     };
   } finally {
@@ -781,7 +824,7 @@ async function handleLifecycle(args: string[]): Promise<CommandResult> {
 async function handleAiPrune(args: string[]): Promise<CommandResult> {
   if (args.length < 1) {
     return {
-      success: false,
+      kind: 'failed',
       error: 'Usage: ai-prune <cwd> [--if-needed]',
     };
   }
@@ -792,8 +835,8 @@ async function handleAiPrune(args: string[]): Promise<CommandResult> {
   const lock = acquireLock(lockFile);
   if (!lock.acquired) {
     return lock.reason === 'held'
-      ? { success: true, output: 'AI prune skipped (another run is active)' }
-      : { success: false, error: 'AI prune failed: could not acquire lock' };
+      ? { kind: 'succeeded', output: 'AI prune skipped (another run is active)' }
+      : { kind: 'failed', error: 'AI prune failed: could not acquire lock' };
   }
 
   try {
@@ -803,19 +846,19 @@ async function handleAiPrune(args: string[]): Promise<CommandResult> {
         ? await runAiPruneIfNeeded(projectDb, globalDb, getTelemetryPath(cwd), cwd)
         : await runAiPrune(projectDb, globalDb, getTelemetryPath(cwd), cwd);
 
-      if (result.skipped) {
-        return { success: true, output: 'AI prune skipped (thresholds not met)' };
+      if (result.kind === 'skipped') {
+        return { kind: 'succeeded', output: `AI prune skipped: ${result.reason}` };
       }
-      if (result.error) {
-        return { success: false, error: `AI prune failed: ${result.error}` };
+      if (result.kind === 'failed') {
+        return { kind: 'failed', error: `AI prune failed: ${result.error}` };
       }
       return {
-        success: true,
+        kind: 'succeeded',
         output: `AI prune complete: archived ${result.archived} of ${result.reviewed} reviewed`,
       };
     } catch (err) {
       return {
-        success: false,
+        kind: 'failed',
         error: `AI prune failed: ${err}`,
       };
     } finally {
@@ -838,7 +881,7 @@ async function handleTraverse(args: string[]): Promise<CommandResult> {
 
   if (positional.length < 2) {
     return {
-      success: false,
+      kind: 'failed',
       error: 'Usage: traverse <cwd> <memoryId> [maxDepth] [--include-archived]',
     };
   }
@@ -858,18 +901,18 @@ async function handleTraverse(args: string[]): Promise<CommandResult> {
 
     if (!result.success) {
       return {
-        success: false,
+        kind: 'failed',
         error: JSON.stringify(result.error),
       };
     }
 
     return {
-      success: true,
+      kind: 'succeeded',
       output: JSON.stringify(result.result),
     };
   } catch (err) {
     return {
-      success: false,
+      kind: 'failed',
       error: `Traverse failed: ${err}`,
     };
   } finally {
@@ -886,7 +929,7 @@ async function handleInspect(args: string[]): Promise<CommandResult> {
   // Args: [cwd]
   if (args.length < 1) {
     return {
-      success: false,
+      kind: 'failed',
       error: 'Usage: inspect <cwd>',
     };
   }
@@ -903,11 +946,11 @@ async function handleInspect(args: string[]): Promise<CommandResult> {
     );
 
     return {
-      success: true,
+      kind: 'succeeded',
     };
   } catch (err) {
     return {
-      success: false,
+      kind: 'failed',
       error: `Inspect failed: ${err}`,
     };
   } finally {
@@ -915,6 +958,19 @@ async function handleInspect(args: string[]): Promise<CommandResult> {
     globalDb.close();
   }
 }
+
+/**
+ * A command outcome plus the per-memory warnings the caller should print.
+ *
+ * Paired rather than intersected with CommandResult: warnings are orthogonal
+ * to which arm the outcome is (a partial success and a total failure both
+ * carry them), and `CommandResult & { warnings }` distributes over the union,
+ * so every reader had to destructure it before it could see `error` at all.
+ */
+export type BackfillSummary = Readonly<{
+  result: CommandResult;
+  warnings: readonly string[];
+}>;
 
 /**
  * Summarize project + global backfill results into a CommandResult.
@@ -928,12 +984,12 @@ async function handleInspect(args: string[]): Promise<CommandResult> {
 export function summarizeBackfillResults(
   projectResult: BackfillResult,
   globalResult: BackfillResult
-): CommandResult & { readonly warnings: readonly string[] } {
+): BackfillSummary {
   const results = [projectResult, globalResult];
   const hardErrors = results.flatMap((r) => (r.ok ? [] : [r.error]));
 
   if (hardErrors.length > 0) {
-    return { success: false, error: hardErrors.join('; '), warnings: [] };
+    return { result: { kind: 'failed', error: hardErrors.join('; ') }, warnings: [] };
   }
 
   const okResults = results.filter((r): r is Extract<BackfillResult, { ok: true }> => r.ok);
@@ -943,18 +999,19 @@ export function summarizeBackfillResults(
 
   if (failed > 0 && processed === 0) {
     return {
-      success: false,
-      error: `Backfill failed: all ${failed} embedding(s) failed`,
+      result: { kind: 'failed', error: `Backfill failed: all ${failed} embedding(s) failed` },
       warnings,
     };
   }
 
   return {
-    success: true,
-    output:
-      failed > 0
-        ? `Backfill complete: processed ${processed} memories, ${failed} failed`
-        : `Backfill complete: processed ${processed} memories`,
+    result: {
+      kind: 'succeeded',
+      output:
+        failed > 0
+          ? `Backfill complete: processed ${processed} memories, ${failed} failed`
+          : `Backfill complete: processed ${processed} memories`,
+    },
     warnings,
   };
 }
@@ -967,7 +1024,7 @@ async function handleBackfill(args: string[]): Promise<CommandResult> {
   // Args: [cwd]
   if (args.length < 1) {
     return {
-      success: false,
+      kind: 'failed',
       error: 'Usage: backfill <cwd>',
     };
   }
@@ -978,14 +1035,14 @@ async function handleBackfill(args: string[]): Promise<CommandResult> {
     const projectResult = await backfill(projectDb, getProjectName(cwd));
     const globalResult = await backfill(globalDb, 'global');
 
-    const { warnings, ...result } = summarizeBackfillResults(projectResult, globalResult);
+    const { result, warnings } = summarizeBackfillResults(projectResult, globalResult);
     for (const warning of warnings) {
       logError(warning);
     }
     return result;
   } catch (err) {
     return {
-      success: false,
+      kind: 'failed',
       error: `Backfill failed: ${err}`,
     };
   } finally {
@@ -1002,7 +1059,7 @@ async function handleBackfill(args: string[]): Promise<CommandResult> {
 async function handleSemanticEdges(args: string[]): Promise<CommandResult> {
   if (args.length < 1) {
     return {
-      success: false,
+      kind: 'failed',
       error: 'Usage: semantic-edges <cwd>',
     };
   }
@@ -1020,23 +1077,23 @@ async function handleSemanticEdges(args: string[]): Promise<CommandResult> {
     return { invalid: false as const, value: parsed };
   })();
   if (limit.invalid) {
-    return { success: false, error: '--limit must be a non-negative integer' };
+    return { kind: 'failed', error: '--limit must be a non-negative integer' };
   }
 
   try {
     const result = await executeSemanticEdges(projectDb, { limit: limit.value, lockDir: getLockDir(cwd) });
 
     if (!result.ok) {
-      return { success: false, error: result.error };
+      return { kind: 'failed', error: result.error };
     }
 
     return {
-      success: true,
+      kind: 'succeeded',
       output: `Semantic edges: classified=${result.classified}, failed=${result.failed}`,
     };
   } catch (err) {
     return {
-      success: false,
+      kind: 'failed',
       error: `Semantic edges failed: ${err}`,
     };
   } finally {
@@ -1053,7 +1110,7 @@ async function handleLoadSurface(args: string[]): Promise<CommandResult> {
   // Args: [cwd]
   if (args.length < 1) {
     return {
-      success: false,
+      kind: 'failed',
       error: 'Usage: load-surface <cwd>',
     };
   }
@@ -1066,7 +1123,7 @@ async function handleLoadSurface(args: string[]): Promise<CommandResult> {
     // projects is not ok — and without a project DB the cache fingerprint
     // can't be validated anyway.
     if (!existsSync(getProjectDbPath(cwd))) {
-      return { success: true, output: 'No cached surface available' };
+      return { kind: 'succeeded', output: 'No cached surface available' };
     }
 
     const [projectDb, globalDb] = initDatabases(cwd);
@@ -1081,7 +1138,7 @@ async function handleLoadSurface(args: string[]): Promise<CommandResult> {
         // marker-splicing path as generation — a bare writeFileSync here
         // bypassed the surface lock and clobbered user content.
         writeSurface(getSurfaceOutputPath(cwd), wrapInMarkers(result.surface), getLockDir(cwd));
-        return { success: true, output: 'Loaded cached surface' };
+        return { kind: 'succeeded', output: 'Loaded cached surface' };
       }
 
       // Cache miss or stale: regenerate from the database
@@ -1094,7 +1151,7 @@ async function handleLoadSurface(args: string[]): Promise<CommandResult> {
         lockDir: getLockDir(cwd),
       });
       return {
-        success: true,
+        kind: 'succeeded',
         output: result === null
           ? 'Regenerated surface (cache miss)'
           : `Regenerated surface (cache stale: ${result.staleness.age_hours.toFixed(1)}h old)`,
@@ -1105,7 +1162,7 @@ async function handleLoadSurface(args: string[]): Promise<CommandResult> {
     }
   } catch (err) {
     return {
-      success: false,
+      kind: 'failed',
       error: `Load-surface failed: ${err}`,
     };
   }
@@ -1118,7 +1175,7 @@ async function handleLoadSurface(args: string[]): Promise<CommandResult> {
 async function handleEntityQuery(args: string[]): Promise<CommandResult> {
   if (args.length < 2) {
     return {
-      success: false,
+      kind: 'failed',
       error: 'Usage: entity-query <cwd> <query> [--history] [--limit=N]',
     };
   }
@@ -1139,12 +1196,12 @@ async function handleEntityQuery(args: string[]): Promise<CommandResult> {
     });
 
     return {
-      success: true,
+      kind: 'succeeded',
       output: formatEntityQueryResult(result),
     };
   } catch (err) {
     return {
-      success: false,
+      kind: 'failed',
       error: `Entity query failed: ${err}`,
     };
   } finally {
@@ -1194,29 +1251,11 @@ export function openPromptRecallDatabase(
  */
 async function handlePromptRecall(): Promise<CommandResult> {
   try {
-    // Read raw stdin
-    const stdin = Bun.stdin.stream();
-    const reader = stdin.getReader();
-    const chunks: Uint8Array[] = [];
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
+    const text = await readStdinText();
+    if (text === null) {
+      return { kind: 'succeeded' };
     }
 
-    if (chunks.length === 0) {
-      return { success: true };
-    }
-
-    const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const buffer = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      buffer.set(chunk, offset);
-      offset += chunk.length;
-    }
-
-    const text = new TextDecoder().decode(buffer);
     const parsed = JSON.parse(text);
 
     const prompt = parsed?.prompt;
@@ -1225,7 +1264,7 @@ async function handlePromptRecall(): Promise<CommandResult> {
       process.stderr.write(
         '[cortex] WARN: prompt-recall ignored malformed input: expected string prompt and cwd\n'
       );
-      return { success: true };
+      return { kind: 'succeeded' };
     }
 
     // Check DBs exist — don't create empty ones for a read-only hook
@@ -1235,7 +1274,7 @@ async function handlePromptRecall(): Promise<CommandResult> {
     const hasGlobalDb = existsSync(globalDbPath);
 
     if (!hasProjectDb && !hasGlobalDb) {
-      return { success: true };
+      return { kind: 'succeeded' };
     }
 
     // Read surface file for dedup
@@ -1270,7 +1309,7 @@ async function handlePromptRecall(): Promise<CommandResult> {
       const output = formatPromptRecall(memories);
 
       return {
-        success: true,
+        kind: 'succeeded',
         output: output || undefined,
       };
     } finally {
@@ -1285,7 +1324,7 @@ async function handlePromptRecall(): Promise<CommandResult> {
       `[cortex] WARN: prompt-recall failed (best-effort, continuing): ` +
         `${err instanceof Error ? err.message : String(err)}\n`
     );
-    return { success: true };
+    return { kind: 'succeeded' };
   }
 }
 
@@ -1295,7 +1334,7 @@ async function handlePromptRecall(): Promise<CommandResult> {
  */
 async function handleMaintenance(args: string[]): Promise<CommandResult> {
   if (args.length < 1) {
-    return { success: false, error: 'Usage: maintenance <cwd>' };
+    return { kind: 'failed', error: 'Usage: maintenance <cwd>' };
   }
 
   const cwd = args[0];
@@ -1303,8 +1342,8 @@ async function handleMaintenance(args: string[]): Promise<CommandResult> {
   const lock = acquireLock(lockFile);
   if (!lock.acquired) {
     return lock.reason === 'held'
-      ? { success: true, output: 'Maintenance skipped (another run is active)' }
-      : { success: false, error: 'Maintenance failed: could not acquire lock' };
+      ? { kind: 'succeeded', output: 'Maintenance skipped (another run is active)' }
+      : { kind: 'failed', error: 'Maintenance failed: could not acquire lock' };
   }
 
   try {
@@ -1318,15 +1357,17 @@ async function handleMaintenance(args: string[]): Promise<CommandResult> {
     for (const runStep of steps) results.push(await runStep());
 
     const output = results
-      .map((result) => result.output ?? result.error)
+      .map((result) => result.output ?? (result.kind === 'failed' ? result.error : undefined))
       .filter((line): line is string => Boolean(line))
       .join('\n');
-    const failures = results.filter((result) => !result.success);
+    // A deferred step did no work but did not fail — it is retried on the next
+    // run, so it must not turn the whole maintenance pass into a failure.
+    const failures = results.filter((result) => result.kind === 'failed');
 
     return failures.length === 0
-      ? { success: true, output }
+      ? { kind: 'succeeded', output }
       : {
-          success: false,
+          kind: 'failed',
           output,
           error: `Maintenance completed with ${failures.length} failed step(s)`,
         };
@@ -1346,19 +1387,29 @@ export type IngestSessionCommandOperations = Readonly<{
   maintenance: (cwd: string) => Promise<CommandResult>;
 }>;
 
-/** Parse one CLI command result into the detached ingestion protocol. */
+/**
+ * Parse one CLI command result into the detached ingestion protocol.
+ *
+ * A total switch over the arm. It used to be an ordered chain that had to test
+ * `deferred` before `success` because a deferral set both; swapping the two
+ * checks silently reclassified every deferral as a success, and nothing in the
+ * types said so.
+ */
 export function commandToIngestionStep(result: CommandResult): IngestionStepResult {
-  if (result.deferred) {
-    return { kind: 'deferred', reason: result.error ?? result.output ?? 'command deferred' };
-  }
-  return result.success
-    ? { kind: 'succeeded', ...(result.output === undefined ? {} : { output: result.output }) }
-    : {
+  const withOutput = result.output === undefined ? {} : { output: result.output };
+  switch (result.kind) {
+    case 'succeeded':
+      return { kind: 'succeeded', ...withOutput };
+    case 'deferred':
+      return { kind: 'deferred', reason: result.output ?? 'command deferred' };
+    case 'failed':
+      return {
         kind: 'failed',
         retryable: result.retryable === true,
-        error: result.error ?? 'command failed without an error',
-        ...(result.output === undefined ? {} : { output: result.output }),
+        error: result.error,
+        ...withOutput,
       };
+  }
 }
 
 /** Injectable shell boundary for the complete detached ingestion pipeline. */
@@ -1377,12 +1428,10 @@ export async function runIngestSessionInput(
     maintenance: async () => commandToIngestionStep(await operations.maintenance(input.cwd)),
   }, retryPolicy);
 
-  const success = isSessionIngestionSuccessful(result);
-  return {
-    success,
-    output: formatSessionIngestionResult(result),
-    error: success ? undefined : 'Session ingestion completed with failed step(s)',
-  };
+  const output = formatSessionIngestionResult(result);
+  return isSessionIngestionSuccessful(result)
+    ? { kind: 'succeeded', output }
+    : { kind: 'failed', output, error: 'Session ingestion completed with failed step(s)' };
 }
 
 async function handleIngestSession(): Promise<CommandResult> {
@@ -1390,7 +1439,7 @@ async function handleIngestSession(): Promise<CommandResult> {
   return input
     ? runIngestSessionInput(input)
     : {
-        success: false,
+        kind: 'failed',
         error: 'No stdin input provided (expected JSON with session_id, transcript_path, cwd)',
       };
 }
@@ -1404,6 +1453,12 @@ async function handleIngestSession(): Promise<CommandResult> {
  * Parses subcommand and dispatches to appropriate handler
  */
 async function main() {
+  // Before any subcommand runs, because the loader reads LD_LIBRARY_PATH once
+  // at process start: where onnxruntime's libstdc++ is off the default path,
+  // this re-runs the process with it and never returns. A no-op everywhere
+  // else, including the hook scripts that already set the path themselves.
+  ensureNativeLibraryPath();
+
   const args = process.argv.slice(2);
 
   if (args.length === 0) {
@@ -1475,13 +1530,13 @@ async function main() {
         break;
       default:
         result = {
-          success: false,
+          kind: 'failed',
           error: `Unknown subcommand: ${subcommand}`,
         };
     }
   } catch (err) {
     result = {
-      success: false,
+      kind: 'failed',
       error: `Unhandled error: ${err}`,
     };
   }
@@ -1494,10 +1549,10 @@ async function main() {
   // Dispose ONNX model resources before exit
   await disposeLocalModel();
 
-  if (!result.success) {
-    if (result.error) {
-      logError(result.error);
-    }
+  // A deferral is not a failure: the command did no work yet and the caller is
+  // expected to run it again, so it exits 0 like a success.
+  if (result.kind === 'failed') {
+    logError(result.error);
     process.exit(1);
   }
 

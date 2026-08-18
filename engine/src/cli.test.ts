@@ -19,6 +19,7 @@ import {
   summarizeBackfillResults,
   validateCwd,
 } from './cli.js';
+import type { CommandResult } from './cli.js';
 import { openDatabase, insertMemory } from './infra/db.js';
 import { createMemory } from './core/types.js';
 import { getProjectName } from './config.js';
@@ -661,8 +662,8 @@ describe('cli - detached ingestion adapter', () => {
               cursor_position: 150_000,
             });
       },
-      backfill: async () => { calls.push('backfill'); return { success: true, output: 'embedded' }; },
-      maintenance: async () => { calls.push('maintenance'); return { success: true, output: 'maintained' }; },
+      backfill: async () => { calls.push('backfill'); return { kind: 'succeeded', output: 'embedded' }; },
+      maintenance: async () => { calls.push('maintenance'); return { kind: 'succeeded', output: 'maintained' }; },
     }, {
       maxExtractionAttempts: 2,
       retryDelayMs: () => 0,
@@ -670,7 +671,7 @@ describe('cli - detached ingestion adapter', () => {
     });
 
     expect(calls).toEqual(['extract', 'extract', 'backfill', 'maintenance']);
-    expect(result.success).toBe(true);
+    expect(result.kind).toBe('succeeded');
     expect(result.output).toContain('extract:');
   });
 
@@ -701,8 +702,8 @@ describe('cli - detached ingestion adapter', () => {
               cursor_position: 10,
             });
       },
-      backfill: async () => { calls.push('backfill'); return { success: true }; },
-      maintenance: async () => { calls.push('maintenance'); return { success: true }; },
+      backfill: async () => { calls.push('backfill'); return { kind: 'succeeded' }; },
+      maintenance: async () => { calls.push('maintenance'); return { kind: 'succeeded' }; },
     }, {
       maxExtractionAttempts: 2,
       retryDelayMs: () => 0,
@@ -710,66 +711,75 @@ describe('cli - detached ingestion adapter', () => {
     });
 
     expect(calls).toEqual(['extract', 'extract', 'backfill', 'maintenance']);
-    expect(result.success).toBe(true);
+    expect(result.kind).toBe('succeeded');
   });
 });
 
 describe('cli - summarizeBackfillResults', () => {
   const okEmpty = { ok: true as const, processed: 0, failed: 0, errors: [], method: 'local' as const };
 
+  /** Narrow to the failed arm so a test can read `error` — and fail loudly if
+   *  the outcome was not a failure at all, rather than reading undefined. */
+  function failedResult(result: CommandResult): Extract<CommandResult, { kind: 'failed' }> {
+    if (result.kind !== 'failed') {
+      throw new Error(`expected a failed CommandResult, got '${result.kind}'`);
+    }
+    return result;
+  }
+
   it('propagates hard failure when one backfill returns ok:false', () => {
-    const result = summarizeBackfillResults(
+    const summary = summarizeBackfillResults(
       { ok: false, error: 'project db exploded' },
       okEmpty
     );
 
-    expect(result.success).toBe(false);
-    expect(result.error).toContain('project db exploded');
+    expect(summary.result.kind).toBe('failed');
+    expect(failedResult(summary.result).error).toContain('project db exploded');
   });
 
   it('joins errors when both backfills return ok:false', () => {
-    const result = summarizeBackfillResults(
+    const summary = summarizeBackfillResults(
       { ok: false, error: 'project failed' },
       { ok: false, error: 'global failed' }
     );
 
-    expect(result.success).toBe(false);
-    expect(result.error).toContain('project failed');
-    expect(result.error).toContain('global failed');
+    expect(summary.result.kind).toBe('failed');
+    expect(failedResult(summary.result).error).toContain('project failed');
+    expect(failedResult(summary.result).error).toContain('global failed');
   });
 
   it('fails when everything failed (failed > 0, processed === 0)', () => {
-    const result = summarizeBackfillResults(
+    const summary = summarizeBackfillResults(
       { ok: true, processed: 0, failed: 3, errors: ['e1', 'e2', 'e3'], method: 'gemini' },
       okEmpty
     );
 
-    expect(result.success).toBe(false);
-    expect(result.error).toContain('all 3');
-    expect(result.warnings).toEqual(['e1', 'e2', 'e3']);
+    expect(summary.result.kind).toBe('failed');
+    expect(failedResult(summary.result).error).toContain('all 3');
+    expect(summary.warnings).toEqual(['e1', 'e2', 'e3']);
   });
 
   it('partial failure succeeds but surfaces counts and warnings', () => {
-    const result = summarizeBackfillResults(
+    const summary = summarizeBackfillResults(
       { ok: true, processed: 3, failed: 2, errors: ['embed timeout', 'embed 500'], method: 'gemini' },
       { ok: true, processed: 1, failed: 0, errors: [], method: 'local' }
     );
 
-    expect(result.success).toBe(true);
-    expect(result.output).toContain('processed 4');
-    expect(result.output).toContain('2 failed');
-    expect(result.warnings).toEqual(['embed timeout', 'embed 500']);
+    expect(summary.result.kind).toBe('succeeded');
+    expect(summary.result.output).toContain('processed 4');
+    expect(summary.result.output).toContain('2 failed');
+    expect(summary.warnings).toEqual(['embed timeout', 'embed 500']);
   });
 
   it('full success reports processed count with no warnings', () => {
-    const result = summarizeBackfillResults(
+    const summary = summarizeBackfillResults(
       { ok: true, processed: 5, failed: 0, errors: [], method: 'gemini' },
       { ok: true, processed: 2, failed: 0, errors: [], method: 'local' }
     );
 
-    expect(result.success).toBe(true);
-    expect(result.output).toContain('processed 7');
-    expect(result.output).not.toContain('failed');
-    expect(result.warnings).toEqual([]);
+    expect(summary.result.kind).toBe('succeeded');
+    expect(summary.result.output).toContain('processed 7');
+    expect(summary.result.output).not.toContain('failed');
+    expect(summary.warnings).toEqual([]);
   });
 });

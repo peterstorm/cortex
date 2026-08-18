@@ -11,8 +11,10 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { withBunWhichUnavailable } from './llm-test-helpers.js';
 import {
   classifyEdges,
+  resetConsecutiveDirectFailuresForTests,
   runLlmPromptDirect,
   type LlmPromptTransport,
 } from './claude-llm.js';
@@ -44,6 +46,9 @@ describe('classifyEdges transport routing', () => {
   beforeEach(() => {
     mockResolveOpenAiCompatEndpoint.mockReset();
     mockChatCompletionText.mockReset();
+    // The consecutive-failure counter is per-process module state; tests must
+    // not inherit saturation state from an earlier test in this file.
+    resetConsecutiveDirectFailuresForTests();
   });
 
   afterEach(() => {
@@ -111,18 +116,10 @@ describe('classifyEdges transport routing', () => {
     mockResolveOpenAiCompatEndpoint.mockReturnValue(FAKE_ENDPOINT);
     mockChatCompletionText.mockRejectedValue(new Error('LLM API 503'));
     const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    // Stub the CLI lookup so the subprocess fallback fails fast with a typed
-    // error instead of spawning. (globalThis cast avoids a Bun-global typing
-    // dependency in this file.)
-    const bunGlobal = (globalThis as { Bun?: { which: (bin: string) => string | null } }).Bun;
-    const originalWhich = bunGlobal!.which;
-    bunGlobal!.which = () => null;
-    try {
+    await withBunWhichUnavailable(async () => {
       await expect(runLlmPromptDirect('prompt', 1000)).rejects.toThrow(/CLI not found/);
       await expect(runLlmPromptDirect('prompt', 1000)).rejects.toThrow(/CLI not found/);
-    } finally {
-      bunGlobal!.which = originalWhich;
-    }
+    });
     // The second failure warning carries the recurrence signal.
     expect(warn).toHaveBeenCalledWith(expect.stringMatching(/2 consecutive direct-endpoint failures/));
     warn.mockRestore();
@@ -137,17 +134,12 @@ describe('classifyEdges transport routing', () => {
       .mockResolvedValueOnce('{"edges": []}')
       .mockRejectedValueOnce(new Error('LLM API 503'));
     const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    const bunGlobal = (globalThis as { Bun?: { which: (bin: string) => string | null } }).Bun;
-    const originalWhich = bunGlobal!.which;
-    bunGlobal!.which = () => null;
-    try {
+    await withBunWhichUnavailable(async () => {
       await expect(runLlmPromptDirect('prompt', 1000)).rejects.toThrow(/CLI not found/);
       const success = await runLlmPromptDirect('prompt', 1000);
       expect(success).toEqual({ text: '{"edges": []}', direct: true });
       await expect(runLlmPromptDirect('prompt', 1000)).rejects.toThrow(/CLI not found/);
-    } finally {
-      bunGlobal!.which = originalWhich;
-    }
+    });
     // Warning 1 = first failure (no suffix); warning 2 = the third call's
     // failure, which must carry no recurrence suffix because the middle
     // success reset the counter.
@@ -155,5 +147,111 @@ describe('classifyEdges transport routing', () => {
     expect(warn).toHaveBeenNthCalledWith(1, expect.stringMatching(/LLM API 503/));
     expect(warn).toHaveBeenNthCalledWith(2, expect.not.stringMatching(/consecutive/));
     warn.mockRestore();
+  });
+
+  it('suppresses the subprocess fallback once consecutive direct failures reach the threshold', async () => {
+    // A saturated local server (empty content, timeouts) must not escalate
+    // into `claude -p` / `pi -p` agent loops: below the threshold a single
+    // transient failure still falls back, but at the default threshold of 3
+    // the call throws so the caller defers the work to the next run.
+    mockResolveOpenAiCompatEndpoint.mockReturnValue(FAKE_ENDPOINT);
+    mockChatCompletionText.mockRejectedValue(new Error('LLM API returned empty content'));
+    const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    await withBunWhichUnavailable(async () => {
+      await expect(runLlmPromptDirect('prompt', 1000)).rejects.toThrow(/CLI not found/);
+      await expect(runLlmPromptDirect('prompt', 1000)).rejects.toThrow(/CLI not found/);
+      await expect(runLlmPromptDirect('prompt', 1000))
+        .rejects.toThrow(/direct LLM endpoint saturated: 3 consecutive failure/);
+    });
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringMatching(/suppressing \S+ subprocess fallback after 3 consecutive failure\(s\)/),
+    );
+    warn.mockRestore();
+  });
+
+  it('honors CORTEX_LLM_MAX_DIRECT_FAILURES to tighten the suppression threshold', async () => {
+    mockResolveOpenAiCompatEndpoint.mockReturnValue(FAKE_ENDPOINT);
+    mockChatCompletionText.mockRejectedValue(new Error('LLM request timed out after 1000ms'));
+    const original = process.env.CORTEX_LLM_MAX_DIRECT_FAILURES;
+    process.env.CORTEX_LLM_MAX_DIRECT_FAILURES = '1';
+    const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      await expect(runLlmPromptDirect('prompt', 1000))
+        .rejects.toThrow(/direct LLM endpoint saturated: 1 consecutive failure/);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringMatching(/suppressing \S+ subprocess fallback after 1 consecutive failure\(s\)/),
+      );
+    } finally {
+      if (original === undefined) delete process.env.CORTEX_LLM_MAX_DIRECT_FAILURES;
+      else process.env.CORTEX_LLM_MAX_DIRECT_FAILURES = original;
+      warn.mockRestore();
+    }
+  });
+
+  it('falls back to the default threshold for invalid CORTEX_LLM_MAX_DIRECT_FAILURES values', async () => {
+    // 'abc' → NaN → default 3: the first failure still escalates to the
+    // subprocess fallback (which fails fast here, CLI stubbed away) instead
+    // of throwing the saturation error the valid-'1' test asserts.
+    mockResolveOpenAiCompatEndpoint.mockReturnValue(FAKE_ENDPOINT);
+    mockChatCompletionText.mockRejectedValue(new Error('LLM API 503'));
+    const original = process.env.CORTEX_LLM_MAX_DIRECT_FAILURES;
+    process.env.CORTEX_LLM_MAX_DIRECT_FAILURES = 'abc';
+    const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      await withBunWhichUnavailable(async () => {
+        await expect(runLlmPromptDirect('prompt', 1000)).rejects.toThrow(/CLI not found/);
+        expect(warn).not.toHaveBeenCalledWith(expect.stringMatching(/direct LLM endpoint saturated/));
+      });
+    } finally {
+      if (original === undefined) delete process.env.CORTEX_LLM_MAX_DIRECT_FAILURES;
+      else process.env.CORTEX_LLM_MAX_DIRECT_FAILURES = original;
+      warn.mockRestore();
+    }
+  });
+
+  it('returns the subprocess text with direct:false when no endpoint is configured', async () => {
+    // No OpenAI-compatible endpoint → runLlmPromptDirectUnbounded skips the
+    // direct attempt entirely and the real Bun.spawn-based subprocess path
+    // produces the text. The flag must say direct:false so callers route
+    // subprocess output to the tolerant parser.
+    mockResolveOpenAiCompatEndpoint.mockReturnValue(null);
+    const bunGlobal = (globalThis as {
+      Bun?: {
+        which: (bin: string) => string | null;
+        spawn: (args: string[], opts: unknown) => unknown;
+      };
+    }).Bun!;
+    const originalWhich = bunGlobal.which;
+    const originalSpawn = bunGlobal.spawn;
+    const emptyStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.close();
+      },
+    });
+    const stdoutStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('unbounded-fallback-output'));
+        controller.close();
+      },
+    });
+    bunGlobal.which = () => '/fake/llm-cli';
+    bunGlobal.spawn = (() => ({
+      stdin: { write: () => undefined, end: () => undefined },
+      stdout: stdoutStream,
+      stderr: emptyStream,
+      exited: Promise.resolve(0),
+      kill: () => undefined,
+    })) as unknown as typeof originalSpawn;
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      await expect(runLlmPromptDirect('prompt', 1000)).resolves.toEqual({
+        text: 'unbounded-fallback-output',
+        direct: false,
+      });
+    } finally {
+      bunGlobal.which = originalWhich;
+      bunGlobal.spawn = originalSpawn;
+      stderr.mockRestore();
+    }
   });
 });
