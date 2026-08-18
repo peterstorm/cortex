@@ -8,6 +8,20 @@
  * classification don't need hidden reasoning, and skipping it is ~30x faster
  * on reasoning models (a 2-pair classification drops from ~15s to ~0.5s).
  *
+ * Two deployment realities shape the thinking-disabling here:
+ *
+ * - Chat templates name the thinking switch differently by model family:
+ *   DeepSeek-style templates read `thinking`, Qwen3-style templates read
+ *   `enable_thinking`. Extra chat_template_kwargs are inert (Jinja ignores
+ *   unreferenced context variables), so we send both and each template honors
+ *   whichever it knows.
+ * - On local routing servers (vLLM/sglang fronting whatever weights are
+ *   loaded) the model NAME in config is not the model that answers: the server
+ *   accepts any name and serves the loaded weights. The loaded model can
+ *   change underneath a fixed config, which is why a one-shot served-model
+ *   check warns on name mismatch and why an empty-content response that
+ *   carries reasoning_content names the thinking failure explicitly.
+ *
  * Endpoint resolution order:
  *  1. Explicit env: CORTEX_LLM_API_URL + CORTEX_LLM_API_KEY + CORTEX_LLM_MODEL
  *  2. pi's provider config (~/.pi/agent/models.json + settings.json), using
@@ -198,8 +212,83 @@ function warnResolution(reason: string): void {
 }
 
 /**
+ * chat_template_kwargs that disable thinking under every known convention.
+ * Sent on every request: DeepSeek-style templates read `thinking`, Qwen3-style
+ * templates read `enable_thinking`, and templates ignore keys they don't read,
+ * so sending both is safe for every OpenAI-compatible server.
+ */
+export const THINKING_DISABLED_KWARGS: Readonly<Record<string, boolean>> = Object.freeze({
+  thinking: false,
+  enable_thinking: false,
+});
+
+/**
+ * Pure: detect a requested-model / served-model mismatch, or null when the
+ * check is inconclusive (empty served list) or clean (name is served).
+ *
+ * Local routing servers accept ANY model name and serve the loaded weights
+ * regardless, so a stale config name never 404s — it silently changes which
+ * model answers (and which chat-template convention its thinking switch
+ * uses). Surfacing that once is the difference between a readable WARN and a
+ * week of "empty content" failures.
+ */
+export function findServedModelMismatch(
+  requested: string,
+  served: readonly string[]
+): string | null {
+  if (served.length === 0 || served.includes(requested)) return null;
+  return (
+    `requested model '${requested}' is not in the served model list [${served.join(', ')}]; ` +
+    'routing servers serve the loaded weights regardless of the requested name — ' +
+    'check what is actually loaded (its chat template may name the thinking switch differently)'
+  );
+}
+
+/**
+ * One-shot per-process served-model check. Best-effort by contract: an
+ * unreachable /models endpoint, a slow server, or an unexpected payload
+ * degrades to "no warning" — the diagnostic must never break or delay a
+ * completion by more than SERVED_MODEL_CHECK_TIMEOUT_MS.
+ */
+const SERVED_MODEL_CHECK_TIMEOUT_MS = 2000;
+let servedModelCheckDone = false;
+
+/**
+ * Test/reset hook: the one-shot guard is process state; tests that exercise
+ * the probe twice in a row need a way to re-arm it.
+ */
+export function resetServedModelCheck(): void {
+  servedModelCheckDone = false;
+}
+
+async function checkServedModelOnce(endpoint: LlmEndpoint): Promise<void> {
+  if (servedModelCheckDone) return;
+  servedModelCheckDone = true;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), SERVED_MODEL_CHECK_TIMEOUT_MS);
+    const response = await fetch(`${endpoint.baseUrl}/models`, {
+      headers: { Authorization: `Bearer ${endpoint.apiKey}` },
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!response.ok) return;
+    const data = (await response.json()) as { data?: Array<{ id?: unknown }> };
+    const served = (data.data ?? [])
+      .map((entry) => (typeof entry?.id === 'string' ? entry.id : null))
+      .filter((id): id is string => id !== null);
+    const warning = findServedModelMismatch(endpoint.model, served);
+    if (warning !== null) {
+      process.stderr.write(`[cortex:llm] WARN: ${warning}\n`);
+    }
+  } catch {
+    // Best-effort diagnostic: any failure here is not actionable for the caller.
+  }
+}
+
+/**
  * Run a single chat completion and return the assistant's text content.
- * Always disables thinking (chat_template_kwargs.thinking=false).
+ * Always disables thinking (THINKING_DISABLED_KWARGS, both known conventions).
  *
  * @throws Error on HTTP/network/empty-content failures — callers decide
  *         whether to fall back to the subprocess path.
@@ -216,13 +305,18 @@ export async function chatCompletionText(
     timeoutMs = 90_000,
   } = options;
 
+  // One-shot served-model check: on local routing servers the configured name
+  // is not the model that answers, so warn where the operator is already
+  // looking (first LLM call of the process) instead of never.
+  await checkServedModelOnce(endpoint);
+
   const body: Record<string, unknown> = {
     model: endpoint.model,
     messages: [{ role: 'user', content: prompt }],
     max_tokens: maxTokens,
     temperature,
     stream: false,
-    chat_template_kwargs: { thinking: false },
+    chat_template_kwargs: { ...THINKING_DISABLED_KWARGS },
   };
   if (options.jsonSchema) {
     // Request strict schema-guided decoding where the provider supports it;
@@ -262,11 +356,28 @@ export async function chatCompletionText(
     }
 
     const data = (await response.json()) as {
-      choices?: Array<{ message?: { content?: unknown }; finish_reason?: unknown }>;
+      choices?: Array<{
+        message?: { content?: unknown; reasoning_content?: unknown };
+        finish_reason?: unknown;
+      }>;
     };
     const choice = data.choices?.[0];
     const content = choice?.message?.content;
     if (typeof content !== 'string' || content.trim().length === 0) {
+      // A thinking model that ignored both thinking-disable conventions burns
+      // its whole token budget on reasoning_content and returns empty
+      // content. Name that failure mode explicitly: "empty content" otherwise
+      // reads like a network glitch and never gets connected to the served
+      // model's chat template.
+      const reasoning = choice?.message?.reasoning_content;
+      if (typeof reasoning === 'string' && reasoning.trim().length > 0) {
+        throw new Error(
+          'LLM API returned only reasoning_content (content empty): the served model is thinking and ' +
+            `ignored chat_template_kwargs ${JSON.stringify(THINKING_DISABLED_KWARGS)}; check which model ` +
+            'is actually loaded at the endpoint (routing servers serve whatever weights are loaded ' +
+            'regardless of the requested name) and how its chat template names the thinking switch'
+        );
+      }
       throw new Error('LLM API returned empty content');
     }
     if (choice?.finish_reason === 'length') {

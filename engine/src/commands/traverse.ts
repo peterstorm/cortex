@@ -192,11 +192,57 @@ export function executeTraverse(
 }
 
 /**
+ * Output projection of a Memory for graph output.
+ * Pure function — drops the embedding vectors. A 512-dim local_embedding
+ * serializes to ~7KB of JSON per memory, so a depth-2 walk of a connected
+ * graph produced 1.5MB of output that truncates mid-JSON past any tool-output
+ * cap, leaving the caller with unparseable garbage instead of the graph.
+ * Consumers that need vectors read them straight from the DB; graph output
+ * never did.
+ */
+export type TraverseMemory = Omit<Memory, 'embedding' | 'local_embedding'>;
+
+export function toTraverseMemory(memory: Memory): TraverseMemory {
+  return {
+    id: memory.id,
+    content: memory.content,
+    summary: memory.summary,
+    memory_type: memory.memory_type,
+    scope: memory.scope,
+    confidence: memory.confidence,
+    priority: memory.priority,
+    pinned: memory.pinned,
+    source_type: memory.source_type,
+    source_session: memory.source_session,
+    source_context: memory.source_context,
+    tags: memory.tags,
+    access_count: memory.access_count,
+    last_accessed_at: memory.last_accessed_at,
+    created_at: memory.created_at,
+    updated_at: memory.updated_at,
+    status: memory.status,
+    archived_at: memory.archived_at,
+  };
+}
+
+/**
  * Format traverse result as JSON string
- * Pure function - formats data for output
+ * Pure function - formats data for output (embeddings stripped, see toTraverseMemory)
  */
 export function formatTraverseResult(result: TraverseResult): string {
-  return JSON.stringify(result, null, 2);
+  return JSON.stringify(
+    {
+      start: toTraverseMemory(result.start),
+      results: Object.fromEntries(
+        Object.entries(result.results).map(([depth, memories]) => [
+          depth,
+          memories.map(toTraverseMemory),
+        ])
+      ),
+    },
+    null,
+    2
+  );
 }
 
 /**

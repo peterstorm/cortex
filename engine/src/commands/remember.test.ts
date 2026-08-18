@@ -834,4 +834,91 @@ describe('remember surface cache invalidation (finding 1b)', () => {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
   });
+
+  describe('executeRemember — post-insert embedding flush', () => {
+    let projectDb: Database;
+    let globalDb: Database;
+    const sessionId = 'test-session-flush';
+
+    beforeEach(() => {
+      projectDb = openDatabase(':memory:');
+      globalDb = openDatabase(':memory:');
+    });
+
+    it('flushes the embedding queue immediately when flushEmbedding is injected', async () => {
+      const calls: Array<{ db: Database; memoryId: string }> = [];
+      const flush = vi.fn(async (db: Database, memory: Memory) => {
+        calls.push({ db, memoryId: memory.id });
+      });
+
+      const result = await executeRemember(
+        ['flushable memory'],
+        sessionId,
+        projectDb,
+        globalDb,
+        { flushEmbedding: flush }
+      );
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(flush).toHaveBeenCalledTimes(1);
+      expect(calls).toHaveLength(1);
+      // Flushed against the database the memory actually landed in...
+      expect(calls[0].db).toBe(projectDb);
+      // ...with the inserted memory.
+      expect(calls[0].memoryId).toBe(result.memory_id);
+    });
+
+    it('flushes the global database for scope=global memories', async () => {
+      const calls: Array<{ db: Database }> = [];
+      const result = await executeRemember(
+        ['global flushable memory', '--scope=global'],
+        sessionId,
+        projectDb,
+        globalDb,
+        { flushEmbedding: async (db: Database) => { calls.push({ db }); } }
+      );
+
+      expect(result.success).toBe(true);
+      expect(calls).toHaveLength(1);
+      expect(calls[0].db).toBe(globalDb);
+    });
+
+    it('treats a flush failure as non-fatal: memory stays queued, result is success', async () => {
+      const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      try {
+        const result = await executeRemember(
+          ['survives flush failure'],
+          sessionId,
+          projectDb,
+          globalDb,
+          { flushEmbedding: async () => { throw new Error('model load failed'); } }
+        );
+
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        // The memory is persisted — the queue (next backfill) catches up.
+        const memory = getMemory(projectDb, result.memory_id);
+        expect(memory).toBeTruthy();
+        expect(memory?.local_embedding).toBeNull();
+        expect(warn).toHaveBeenCalledWith(expect.stringMatching(/post-insert embedding flush failed.*model load failed/s));
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('skips the flush entirely when no flushEmbedding is injected (legacy queue-only)', async () => {
+      const result = await executeRemember(
+        ['legacy memory'],
+        sessionId,
+        projectDb,
+        globalDb
+      );
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const memory = getMemory(projectDb, result.memory_id);
+      expect(memory?.local_embedding).toBeNull();
+    });
+  });
 });
