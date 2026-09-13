@@ -115,10 +115,12 @@ function getDefaultProvider(env: NodeJS.ProcessEnv): string | undefined {
  * Resolve a headless extraction invocation.
  *
  * Pi does not expose an Anthropic Haiku model through every provider. Prefer
- * the active Pi session's provider, then select its cheap extraction model.
- * Explicit CORTEX_LLM_* values always win. Unknown/custom providers get no
- * model override (the provider's own default is used); the active session's
- * model is reused only when the resolved provider is the active provider.
+ * the active Pi session's provider, then select its cheap extraction model —
+ * cloud parents (GPT/Claude/etc.) always get the cheap map model regardless
+ * of which model the session itself runs. Providers without a map entry
+ * (local vLLM, custom proxies) reuse the active session's model when the
+ * resolved provider is the active provider. Explicit CORTEX_LLM_* values
+ * always win.
  */
 export function buildLlmInvocation(env: NodeJS.ProcessEnv): LlmInvocation {
   const binary = getLlmBinary(env);
