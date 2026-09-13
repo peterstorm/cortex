@@ -28,6 +28,11 @@
  *     CORTEX_LLM_PROVIDER, CORTEX_PI_PROVIDER (the active session selection),
  *     PI_PROVIDER, then settings.defaultProvider.
  *     The provider's `!command` apiKey style is executed via bash.
+ *     When the resolved provider is the active session's own provider
+ *     (CORTEX_PI_PROVIDER/PI_PROVIDER), the session's model
+ *     (CORTEX_PI_MODEL/PI_MODEL) is preferred over models[0]: the live
+ *     session is proof that exact model exists, while models[0] goes stale
+ *     when the served model changes (e.g. a 404 after a vLLM model swap).
  *
  * Falls back to null (caller then uses the legacy subprocess path) whenever
  * an OpenAI-compatible endpoint cannot be resolved.
@@ -152,10 +157,12 @@ export function resolveOpenAiCompatEndpoint(): LlmEndpoint | null {
       ? settings.defaultProvider
       : undefined;
 
+  const explicitProvider = getEnv('CORTEX_LLM_PROVIDER');
+  const activeProvider = getEnv('CORTEX_PI_PROVIDER') || getEnv('PI_PROVIDER');
+  const activeModel = getEnv('CORTEX_PI_MODEL') || getEnv('PI_MODEL');
   const providerId =
-    getEnv('CORTEX_LLM_PROVIDER') ||
-    getEnv('CORTEX_PI_PROVIDER') ||
-    getEnv('PI_PROVIDER') ||
+    explicitProvider ||
+    activeProvider ||
     defaultProvider;
   if (!providerId) return null;
 
@@ -194,10 +201,21 @@ export function resolveOpenAiCompatEndpoint(): LlmEndpoint | null {
   }
 
   const modelsList = providerRecord.models;
-  const model =
+  const models0 =
     Array.isArray(modelsList) && modelsList.length > 0
       ? (modelsList[0] as { id?: unknown })?.id
       : undefined;
+  // Prefer the active session's model when this endpoint is the session's own
+  // provider (mirrors the subprocess path): the live session is actively
+  // using that exact model, so it is guaranteed to exist — unlike models[0],
+  // which can point at a model the server no longer serves.
+  const model =
+    activeProvider !== undefined &&
+    providerId === activeProvider &&
+    typeof activeModel === 'string' &&
+    activeModel.length > 0
+      ? activeModel
+      : models0;
   if (typeof model !== 'string') {
     warnResolution(`provider '${providerId}' has no models[0].id; direct LLM calls disabled, falling back to subprocess`);
     return null;

@@ -26,6 +26,36 @@ describe('buildLlmInvocation', () => {
     });
   });
 
+  it('uses the cheap supported Anthropic model regardless of the session model', () => {
+    const invocation = buildLlmInvocation({
+      PI_CODING_AGENT: 'true',
+      CORTEX_PI_PROVIDER: 'anthropic',
+      CORTEX_PI_MODEL: 'claude-sonnet-5',
+    });
+
+    expect(invocation).toEqual({
+      binary: 'pi',
+      args: ['pi', '-p', '--provider', 'anthropic', '--model', 'claude-haiku-4-5', '--thinking', 'off', '--no-session'],
+      provider: 'anthropic',
+      model: 'claude-haiku-4-5',
+    });
+  });
+
+  it('reuses the active model for a local OpenAI-compatible provider', () => {
+    const invocation = buildLlmInvocation({
+      PI_CODING_AGENT: 'true',
+      CORTEX_PI_PROVIDER: 'desktop-vllm',
+      CORTEX_PI_MODEL: 'glm-5.3-flash-exl3-k4-vision-fp8kv-mtp-359k-v11.1',
+    });
+
+    expect(invocation).toEqual({
+      binary: 'pi',
+      args: ['pi', '-p', '--provider', 'desktop-vllm', '--model', 'glm-5.3-flash-exl3-k4-vision-fp8kv-mtp-359k-v11.1', '--thinking', 'off', '--no-session'],
+      provider: 'desktop-vllm',
+      model: 'glm-5.3-flash-exl3-k4-vision-fp8kv-mtp-359k-v11.1',
+    });
+  });
+
   it('lets explicit extraction settings override automatic Pi selection', () => {
     const invocation = buildLlmInvocation({
       PI_CODING_AGENT: 'true',

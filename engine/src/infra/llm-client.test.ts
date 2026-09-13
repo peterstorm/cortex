@@ -20,7 +20,7 @@ import {
 } from './llm-client.js';
 
 const ENV_KEYS = ['CORTEX_LLM_API_URL', 'CORTEX_LLM_API_KEY', 'CORTEX_LLM_MODEL',
-  'CORTEX_LLM_PROVIDER', 'CORTEX_PI_PROVIDER', 'PI_PROVIDER', 'HOME'];
+  'CORTEX_LLM_PROVIDER', 'CORTEX_PI_PROVIDER', 'CORTEX_PI_MODEL', 'PI_PROVIDER', 'PI_MODEL', 'HOME'];
 
 function withEnv(values: Record<string, string | undefined>): void {
   for (const [key, value] of Object.entries(values)) {
@@ -283,6 +283,67 @@ describe('resolveOpenAiCompatEndpoint', () => {
     fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'settings.json'), JSON.stringify({}));
 
     expect(resolveOpenAiCompatEndpoint()?.model).toBe('selected-model');
+  });
+
+  it('prefers the active session model over models[0] for its own provider', () => {
+    withEnv({
+      PI_PROVIDER: 'compatible',
+      PI_MODEL: 'session-model',
+      HOME: fixtureHome,
+    });
+    fs.mkdirSync(nodePath.join(fixtureHome, '.pi', 'agent'), { recursive: true });
+    fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'models.json'), JSON.stringify({
+      providers: {
+        compatible: {
+          api: 'openai-completions',
+          baseUrl: 'http://fixture:9000/v1',
+          apiKey: 'k',
+          // models[0] is stale — the server no longer serves it; the live
+          // session model is the reliable signal.
+          models: [{ id: 'stale-model' }, { id: 'session-model' }],
+        },
+      },
+    }));
+
+    expect(resolveOpenAiCompatEndpoint()).toEqual({
+      baseUrl: 'http://fixture:9000/v1',
+      apiKey: 'k',
+      model: 'session-model',
+    });
+  });
+
+  it('does not inherit the session model when the resolved provider differs', () => {
+    withEnv({
+      PI_PROVIDER: 'compatible',
+      PI_MODEL: 'session-model',
+      CORTEX_LLM_PROVIDER: 'other',
+      HOME: fixtureHome,
+    });
+    fs.mkdirSync(nodePath.join(fixtureHome, '.pi', 'agent'), { recursive: true });
+    fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'models.json'), JSON.stringify({
+      providers: {
+        compatible: { baseUrl: 'http://fixture:9000/v1', apiKey: 'k', models: [{ id: 'fixture-model' }] },
+        other: { baseUrl: 'http://other:9000/v1', apiKey: 'k2', models: [{ id: 'other-model' }] },
+      },
+    }));
+
+    expect(resolveOpenAiCompatEndpoint()).toEqual({
+      baseUrl: 'http://other:9000/v1',
+      apiKey: 'k2',
+      model: 'other-model',
+    });
+  });
+
+  it('falls back to models[0] when no active session model is known', () => {
+    withEnv({ PI_PROVIDER: 'compatible', HOME: fixtureHome });
+    fs.mkdirSync(nodePath.join(fixtureHome, '.pi', 'agent'), { recursive: true });
+    fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'models.json'), JSON.stringify({
+      providers: {
+        compatible: { baseUrl: 'http://fixture:9000/v1', apiKey: 'k', models: [{ id: 'fixture-model' }] },
+      },
+    }));
+
+    expect(resolveOpenAiCompatEndpoint()?.model).toBe('fixture-model');
   });
 
   it('lets an explicit Cortex provider override the active Pi provider', () => {
