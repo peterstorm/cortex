@@ -37,7 +37,7 @@ engine/src/
 │   ├── lifecycle.ts    Decay + archive + prune pass
 │   ├── ai-prune.ts     LLM-driven pruning of low-value memories
 │   ├── semantic-edges.ts  Typed edge classification via LLM CLI
-│   ├── prompt-recall.ts   UserPromptSubmit keyword recall + semantic fallback
+│   ├── prompt-recall.ts   UserPromptSubmit semantic-first recall + strict keyword AND
 │   ├── entity-query.ts    Entity-first temporal retrieval
 │   ├── index-code.ts   Prose-code memory pairing
 │   ├── traverse.ts     BFS graph walk from memory ID

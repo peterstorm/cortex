@@ -23,7 +23,7 @@
  * - traverse: Graph traversal
  * - inspect: Telemetry display
  * - backfill: Process embedding queue
- * - prompt-recall: Keyword recall from user prompt (UserPromptSubmit hook)
+ * - prompt-recall: Semantic-first recall from user prompt, strict keyword AND supplement (UserPromptSubmit hook)
  * - ai-prune: AI-powered memory pruning
  * - maintenance: Combined lifecycle + ai-prune + semantic-edges maintenance
  * - semantic-edges: Typed-edge classification

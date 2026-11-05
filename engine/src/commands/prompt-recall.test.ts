@@ -15,9 +15,11 @@ import {
   formatPromptRecall,
   isTagOnlyMatch,
   STOP_WORDS,
-  MIN_MEANINGFUL_TOKENS,
-  SEMANTIC_FALLBACK_MIN_UNIGRAMS,
-  SEMANTIC_FALLBACK_COSINE_FLOOR,
+  SEMANTIC_COSINE_FLOOR,
+  SEMANTIC_RELATIVE_BAND,
+  selectSemanticHits,
+  mergePromptRecall,
+  isInSurface,
 } from './prompt-recall.js';
 import { RECALL_MAX_BLOCK_BYTES } from '../config.js';
 
@@ -426,161 +428,326 @@ describe('extractUnigrams', () => {
   });
 });
 
+// Unit-length 512-d vector whose cosine against `queryVec()` is exactly `score`.
+const queryVec = (): Float32Array => {
+  const v = new Float32Array(512);
+  v[0] = 1;
+  return v;
+};
+const vecWithScore = (score: number): Float32Array => {
+  const v = new Float32Array(512);
+  v[0] = score;
+  v[1] = Math.sqrt(1 - score * score);
+  return v;
+};
+
+describe('selectSemanticHits', () => {
+  const mem = (id: string) => createTestMemory({ id });
+
+  test('returns empty for no ranked hits', () => {
+    expect(selectSemanticHits([], SEMANTIC_RELATIVE_BAND)).toEqual([]);
+  });
+
+  test('keeps hits within the band of the best, drops the rest', () => {
+    const ranked = [
+      { memory: mem('top'), score: 0.67 },
+      { memory: mem('near'), score: 0.6 },
+      { memory: mem('far'), score: 0.51 },
+    ];
+    expect(selectSemanticHits(ranked, 0.15).map(m => m.id)).toEqual(['top', 'near']);
+  });
+
+  test('keeps a whole cluster of equally relevant hits', () => {
+    const ranked = [
+      { memory: mem('a'), score: 0.63 },
+      { memory: mem('b'), score: 0.59 },
+      { memory: mem('c'), score: 0.59 },
+    ];
+    expect(selectSemanticHits(ranked, 0.15)).toHaveLength(3);
+  });
+});
+
+describe('mergePromptRecall', () => {
+  const mem = (id: string) => createTestMemory({ id });
+
+  test('semantic hits come first, deduplicated by id against keyword hits', () => {
+    const merged = mergePromptRecall([mem('s1'), mem('shared')], [mem('shared'), mem('k1')], 10);
+    expect(merged.map(m => m.id)).toEqual(['s1', 'shared', 'k1']);
+  });
+
+  test('caps at limit', () => {
+    const merged = mergePromptRecall([mem('a'), mem('b')], [mem('c'), mem('d')], 3);
+    expect(merged.map(m => m.id)).toEqual(['a', 'b', 'c']);
+  });
+});
+
+describe('isInSurface', () => {
+  test('matches only when the summary is present and surface is non-empty', () => {
+    const m = createTestMemory({ summary: 'Already here' });
+    expect(isInSurface(m, 'prefix Already here suffix')).toBe(true);
+    expect(isInSurface(m, 'something else')).toBe(false);
+    expect(isInSurface(m, '')).toBe(false);
+  });
+});
+
 describe('executePromptRecallWithFallback — gates', () => {
   beforeEach(() => {
     mockEmbedLocal.mockReset();
   });
 
-  test('returns keyword results without calling embed when keyword non-empty', async () => {
+  test('skips everything (no embed) when the prompt has too few unigrams', async () => {
     const { projectDb, globalDb } = setupTestDbs();
     insertMemory(projectDb, createTestMemory({
       id: 'mem-1',
-      content: 'Extraction pipeline transcripts',
+      content: 'Extraction pipeline',
+      summary: 'Extraction pipeline',
+      local_embedding: queryVec(),
+    }));
+
+    // "okay do it" → every token is a stop word or a single char
+    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+      prompt: 'okay do it',
+      surfaceContent: '',
+    });
+
+    expect(results).toEqual([]);
+    expect(mockEmbedLocal).not.toHaveBeenCalled();
+
+    projectDb.close();
+    globalDb.close();
+  });
+
+  test('handles null databases', async () => {
+    mockEmbedLocal.mockResolvedValue(queryVec());
+    const results = await executePromptRecallWithFallback(null, null, {
+      prompt: 'extraction pipeline transcripts',
+      surfaceContent: '',
+    });
+    expect(results).toEqual([]);
+  });
+});
+
+describe('executePromptRecallWithFallback — semantic-first', () => {
+  beforeEach(() => {
+    mockEmbedLocal.mockReset();
+  });
+
+  test('semantic hit is returned even when a keyword search would find nothing', async () => {
+    const { projectDb, globalDb } = setupTestDbs();
+    insertMemory(projectDb, createTestMemory({
+      id: 'mem-semantic',
+      content: 'Anchor content',
+      summary: 'Anchor summary',
+      local_embedding: vecWithScore(0.7),
+    }));
+    mockEmbedLocal.mockResolvedValue(queryVec());
+
+    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+      prompt: 'truly novel xyzzy plugh frobnicate',
+      surfaceContent: '',
+    });
+
+    expect(mockEmbedLocal).toHaveBeenCalledOnce();
+    expect(results.map(r => r.id)).toEqual(['mem-semantic']);
+
+    projectDb.close();
+    globalDb.close();
+  });
+
+  test('REGRESSION: a generic-word keyword hit is NOT injected when semantic is healthy', async () => {
+    // Broad OR search used to inject any memory sharing one generic token
+    // ("problem") with the prompt, on every turn, regardless of relevance.
+    const { projectDb, globalDb } = setupTestDbs();
+    insertMemory(projectDb, createTestMemory({
+      id: 'mem-noise',
+      content: 'GPU power cabling problem notes',
+      summary: 'GPU power problem',
+      local_embedding: vecWithScore(0.2), // far below the floor
+    }));
+    mockEmbedLocal.mockResolvedValue(queryVec());
+
+    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+      prompt: 'what was the watch sync problem again',
+      surfaceContent: '',
+    });
+
+    expect(results).toEqual([]);
+
+    projectDb.close();
+    globalDb.close();
+  });
+
+  test('drops hits below the cosine floor', async () => {
+    const { projectDb, globalDb } = setupTestDbs();
+    insertMemory(projectDb, createTestMemory({
+      id: 'mem-below',
+      content: 'Below floor',
+      summary: 'Below floor',
+      local_embedding: vecWithScore(SEMANTIC_COSINE_FLOOR - 0.05),
+    }));
+    mockEmbedLocal.mockResolvedValue(queryVec());
+
+    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+      prompt: 'truly novel xyzzy plugh frobnicate',
+      surfaceContent: '',
+    });
+
+    expect(results).toEqual([]);
+
+    projectDb.close();
+    globalDb.close();
+  });
+
+  test('drops a barely-passing neighbour of a strong match (relative band)', async () => {
+    const { projectDb, globalDb } = setupTestDbs();
+    insertMemory(projectDb, createTestMemory({ id: 'strong', content: 'a', summary: 'strong', local_embedding: vecWithScore(0.8) }));
+    insertMemory(projectDb, createTestMemory({ id: 'weak', content: 'b', summary: 'weak', local_embedding: vecWithScore(0.55) }));
+    mockEmbedLocal.mockResolvedValue(queryVec());
+
+    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+      prompt: 'truly novel xyzzy plugh frobnicate',
+      surfaceContent: '',
+    });
+
+    expect(results.map(r => r.id)).toEqual(['strong']);
+
+    projectDb.close();
+    globalDb.close();
+  });
+
+  test('ranks across BOTH databases', async () => {
+    const { projectDb, globalDb } = setupTestDbs();
+    insertMemory(projectDb, createTestMemory({ id: 'proj', content: 'p', summary: 'proj', local_embedding: vecWithScore(0.6) }));
+    insertMemory(globalDb, createTestMemory({ id: 'glob', content: 'g', summary: 'glob', scope: 'global', local_embedding: vecWithScore(0.7) }));
+    mockEmbedLocal.mockResolvedValue(queryVec());
+
+    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+      prompt: 'truly novel xyzzy plugh frobnicate',
+      surfaceContent: '',
+    });
+
+    expect(results.map(r => r.id)).toEqual(['glob', 'proj']);
+
+    projectDb.close();
+    globalDb.close();
+  });
+
+  test('surface repeats are removed BEFORE ranking so they cannot starve real matches', async () => {
+    const { projectDb, globalDb } = setupTestDbs();
+    // Four surface-resident memories outrank the real match; the semantic
+    // limit is 3, so post-rank filtering would return nothing.
+    for (let i = 0; i < 4; i++) {
+      insertMemory(projectDb, createTestMemory({
+        id: `in-surface-${i}`,
+        content: `c${i}`,
+        summary: `Already in surface ${i}`,
+        local_embedding: vecWithScore(0.9),
+      }));
+    }
+    insertMemory(projectDb, createTestMemory({
+      id: 'fresh',
+      content: 'fresh',
+      summary: 'Fresh relevant memory',
+      local_embedding: vecWithScore(0.7),
+    }));
+    mockEmbedLocal.mockResolvedValue(queryVec());
+
+    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+      prompt: 'truly novel xyzzy plugh frobnicate',
+      surfaceContent: 'Already in surface 0 Already in surface 1 Already in surface 2 Already in surface 3',
+    });
+
+    expect(results.map(r => r.id)).toEqual(['fresh']);
+
+    projectDb.close();
+    globalDb.close();
+  });
+
+  test('strict keyword AND hits supplement semantic hits, deduplicated by id', async () => {
+    const { projectDb, globalDb } = setupTestDbs();
+    insertMemory(projectDb, createTestMemory({
+      id: 'both',
+      content: 'extraction pipeline transcripts',
       summary: 'Extraction pipeline transcripts',
+      local_embedding: vecWithScore(0.7),
     }));
-
-    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
-      prompt: 'extraction pipeline transcripts running',
-      surfaceContent: '',
-    });
-
-    expect(results.length).toBeGreaterThan(0);
-    expect(mockEmbedLocal).not.toHaveBeenCalled();
-
-    projectDb.close();
-    globalDb.close();
-  });
-
-  test('skips fallback when prompt has too few unigrams', async () => {
-    const { projectDb, globalDb } = setupTestDbs();
-    // 3 unigrams (< SEMANTIC_FALLBACK_MIN_UNIGRAMS=4); each is non-stopword and >1 char
-    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
-      prompt: 'completely unmatched zxqdpr',
-      surfaceContent: '',
-    });
-
-    expect(results.length).toBe(0);
-    expect(mockEmbedLocal).not.toHaveBeenCalled();
-
-    projectDb.close();
-    globalDb.close();
-  });
-
-  test('keyword path runs without embedding when keyword has results', async () => {
-    const { projectDb, globalDb } = setupTestDbs();
+    // No embedding, but contains every prompt keyword → strict AND hit.
     insertMemory(projectDb, createTestMemory({
-      id: 'mem-1',
-      content: 'Extraction pipeline content',
-      summary: 'Extraction pipeline summary',
+      id: 'keyword-only',
+      content: 'extraction pipeline transcripts retries',
+      summary: 'Retry notes',
     }));
+    mockEmbedLocal.mockResolvedValue(queryVec());
 
     const results = await executePromptRecallWithFallback(projectDb, globalDb, {
-      prompt: 'extraction pipeline content keywords',
+      prompt: 'extraction pipeline transcripts',
       surfaceContent: '',
     });
 
-    expect(results.length).toBeGreaterThan(0);
-    expect(mockEmbedLocal).not.toHaveBeenCalled();
+    const ids = results.map(r => r.id);
+    expect(ids[0]).toBe('both');
+    expect(ids).toContain('keyword-only');
+    expect(new Set(ids).size).toBe(ids.length);
+
+    projectDb.close();
+    globalDb.close();
+  });
+
+  test('respects limit', async () => {
+    const { projectDb, globalDb } = setupTestDbs();
+    for (let i = 0; i < 3; i++) {
+      insertMemory(projectDb, createTestMemory({ id: `m${i}`, content: `c${i}`, summary: `s${i}`, local_embedding: vecWithScore(0.7) }));
+    }
+    mockEmbedLocal.mockResolvedValue(queryVec());
+
+    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+      prompt: 'truly novel xyzzy plugh frobnicate',
+      surfaceContent: '',
+      limit: 2,
+    });
+
+    expect(results).toHaveLength(2);
 
     projectDb.close();
     globalDb.close();
   });
 });
 
-describe('executePromptRecallWithFallback — semantic firing', () => {
+describe('executePromptRecallWithFallback — degraded path', () => {
   beforeEach(() => {
     mockEmbedLocal.mockReset();
   });
 
-  test('fires semantic fallback when keyword empty + gates pass', async () => {
+  test('falls back to keyword-only recall when the embedder throws', async () => {
     const { projectDb, globalDb } = setupTestDbs();
-    // Memory with content/summary that has zero overlap with the query tokens
-    // Embedding [1, 0, 0, ...] gives cosine 1.0 against the same query embedding
-    const embedding = new Float32Array(512);
-    embedding[0] = 1.0;
     insertMemory(projectDb, createTestMemory({
-      id: 'mem-semantic',
-      content: 'Anchor content',
-      summary: 'Anchor summary',
-      local_embedding: embedding,
+      id: 'mem-keyword',
+      content: 'Extraction pipeline transcripts',
+      summary: 'Extraction pipeline transcripts',
     }));
-
-    mockEmbedLocal.mockResolvedValue(embedding);
+    mockEmbedLocal.mockRejectedValue(new Error('model failed to load'));
 
     const results = await executePromptRecallWithFallback(projectDb, globalDb, {
-      prompt: 'truly novel xyzzy plugh frobnicate quux blorpify',
+      prompt: 'extraction pipeline transcripts running',
       surfaceContent: '',
     });
 
-    expect(mockEmbedLocal).toHaveBeenCalledOnce();
-    expect(results.length).toBe(1);
-    expect(results[0].id).toBe('mem-semantic');
+    expect(results.map(r => r.id)).toEqual(['mem-keyword']);
 
     projectDb.close();
     globalDb.close();
   });
 
-  test('filters out memories below cosine floor', async () => {
-    const { projectDb, globalDb } = setupTestDbs();
-    // Below-floor memory: orthogonal embedding gives cosine 0
-    const memEmbedding = new Float32Array(512);
-    memEmbedding[1] = 1.0;
-    insertMemory(projectDb, createTestMemory({
-      id: 'mem-orthogonal',
-      content: 'Orthogonal content',
-      summary: 'Orthogonal summary',
-      local_embedding: memEmbedding,
-    }));
-
-    const queryEmbedding = new Float32Array(512);
-    queryEmbedding[0] = 1.0;
-    mockEmbedLocal.mockResolvedValue(queryEmbedding);
-
-    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
-      prompt: 'truly novel xyzzy plugh frobnicate quux blorpify',
-      surfaceContent: '',
-    });
-
-    expect(results.length).toBe(0);
-
-    projectDb.close();
-    globalDb.close();
-  });
-
-  test('returns empty when embed call throws', async () => {
+  test('returns empty when the embedder throws and keyword finds nothing', async () => {
     const { projectDb, globalDb } = setupTestDbs();
     mockEmbedLocal.mockRejectedValue(new Error('Network failure'));
 
     const results = await executePromptRecallWithFallback(projectDb, globalDb, {
-      prompt: 'truly novel xyzzy plugh frobnicate quux blorpify',
+      prompt: 'truly novel xyzzy plugh frobnicate',
       surfaceContent: '',
     });
 
-    expect(results.length).toBe(0);
-
-    projectDb.close();
-    globalDb.close();
-  });
-
-  test('respects surface dedup in semantic fallback', async () => {
-    const { projectDb, globalDb } = setupTestDbs();
-    const embedding = new Float32Array(512);
-    embedding[0] = 1.0;
-    insertMemory(projectDb, createTestMemory({
-      id: 'mem-dup',
-      content: 'Duplicated anchor content',
-      summary: 'Already in surface',
-      local_embedding: embedding,
-    }));
-
-    mockEmbedLocal.mockResolvedValue(embedding);
-
-    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
-      prompt: 'truly novel xyzzy plugh frobnicate quux blorpify',
-      surfaceContent: 'Already in surface',
-    });
-
-    expect(results.length).toBe(0);
+    expect(results).toEqual([]);
 
     projectDb.close();
     globalDb.close();

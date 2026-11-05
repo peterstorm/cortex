@@ -846,6 +846,38 @@ function embeddingPredicate(): {
 }
 
 /**
+ * Fetch active memories that recall cannot see: no vector, or a vector from a
+ * model other than the current one (e.g. legacy vectors stored with a NULL
+ * model from before local_embedding_model existed).
+ *
+ * This is the exact complement of `embeddingPredicate()` — whatever recall
+ * skips is what backfill must (re)embed. Keying backfill on "vector is NULL"
+ * instead strands stale-model rows forever: they hold a vector so backfill
+ * skips them, and recall filters them out. `code` memories are unembedded by
+ * design (FR-053) and excluded.
+ *
+ * The predicate is wrapped in COALESCE(..., 0): for an untagged row
+ * `local_embedding_model = ?` is NULL (not false), and `NOT NULL` is NULL —
+ * SQL would drop exactly the legacy rows this query exists to find.
+ * I/O: Reads from database
+ */
+export function getActiveMemoriesNeedingEmbedding(
+  db: Database
+): readonly Memory[] {
+  const pred = embeddingPredicate();
+  const rows = db
+    .prepare(
+      `SELECT * FROM memories
+       WHERE status = 'active'
+         AND memory_type != 'code'
+         AND NOT COALESCE((${pred.sql}), 0)`
+    )
+    .all(...pred.params) as MemoryRow[];
+
+  return rows.map(rowToMemory);
+}
+
+/**
  * Fetch all active memories that carry a usable embedding.
  * I/O only — returns raw candidates for pure ranking in core/similarity.ts.
  *

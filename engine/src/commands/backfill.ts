@@ -12,7 +12,7 @@
 import { Database } from 'bun:sqlite';
 import type { Memory } from '../core/types.js';
 import { buildEmbeddingText } from '../core/extraction.js';
-import { getActiveMemories, updateMemory } from '../infra/db.js';
+import { getActiveMemoriesNeedingEmbedding, updateMemory } from '../infra/db.js';
 import { embedLocal, ensureModelLoaded } from '../infra/local-embed.ts';
 
 
@@ -22,16 +22,6 @@ import { embedLocal, ensureModelLoaded } from '../infra/local-embed.ts';
 export type BackfillResult =
   | { ok: true; processed: number; failed: number; errors: readonly string[]; method: 'local' }
   | { ok: false; error: string };
-
-/**
- * Functional Core: filter memories missing local embedding
- * FR-053: `code` memories are created unembedded BY DESIGN — raw source is
- * retrieved via its paired code_description, and its summary is just the first
- * 200 chars of raw code — so they are never embedded.
- */
-function filterLocalUnembedded(memories: readonly Memory[]): readonly Memory[] {
-  return memories.filter((m) => m.local_embedding === null && m.memory_type !== 'code');
-}
 
 /**
  * Functional Core: build embedding texts with metadata prefix
@@ -104,7 +94,9 @@ async function backfillLocal(
  * Backfill missing embeddings for memories.
  *
  * Strategy:
- * 1. Query DB for memories with no local embedding
+ * 1. Query DB for active memories recall cannot see: no vector, or a vector
+ *    from another model (getActiveMemoriesNeedingEmbedding). `code` memories
+ *    are excluded by design (FR-053).
  * 2. Embed them with the local static model, update local_embedding
  * 3. Return summary: { processed, failed, method }
  *
@@ -118,16 +110,15 @@ export async function backfill(
 ): Promise<BackfillResult> {
   try {
     // Imperative Shell: fetch data (I/O)
-    const allMemories = getActiveMemories(db);
 
     let totalProcessed = 0;
     let totalFailed = 0;
     const allErrors: string[] = [];
-    // Embed every memory that lacks a vector. These are consumed by recall and
+    // Embed every memory recall cannot see. These are consumed by recall and
     // prompt-recall, which is the whole point of storing them; dedup and
     // consolidation deliberately do NOT use cosine (see LOCAL_COSINE_CALIBRATED),
     // but that no longer makes the vectors unread.
-    const localUnembedded = filterLocalUnembedded(allMemories);
+    const localUnembedded = getActiveMemoriesNeedingEmbedding(db);
     if (localUnembedded.length > 0) {
       const texts = buildEmbeddingTexts(localUnembedded, projectName);
       process.stderr.write(`[cortex:backfill] INFO: Backfilling local embeddings for ${localUnembedded.length} memories\n`);
