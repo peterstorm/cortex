@@ -1,14 +1,20 @@
 /**
  * Prompt-aware recall for UserPromptSubmit hook
  *
- * Extracts keywords from the user's prompt, runs FTS5 OR search across
- * both project and global DBs, deduplicates against the static surface.
- * If the keyword path returns nothing AND the prompt has enough unigrams,
- * falls back to a single-shot local semantic search with a conservative cosine
- * floor. Outputs compact markdown for context injection.
+ * Runs on EVERY prompt, so precision beats recall: a false positive costs
+ * context on every turn, a false negative costs nothing (the user can /recall).
  *
- * Design: Pure functions (extractUnigrams, extractKeywords, formatPromptRecall)
- * + sync I/O boundary (executePromptRecall) + async I/O wrapper
+ * Ranking is semantic-first: embed the prompt, score every active memory in
+ * both DBs by cosine, keep hits above a floor and within a band of the best
+ * hit. Strict keyword AND matches (every prompt keyword present) supplement
+ * it. Broad keyword OR search is NOT used on the healthy path — it matches on
+ * any single generic word, ignores score, and injected unrelated memories.
+ * OR survives only as the degraded path when embedding fails.
+ * Results already in the static surface are deduplicated away before ranking.
+ *
+ * Design: Pure functions (extractUnigrams, extractKeywords, selectSemanticHits,
+ * mergePromptRecall, formatPromptRecall) + sync I/O boundary
+ * (executePromptRecall, keyword only) + async I/O wrapper
  * (executePromptRecallWithFallback). Always succeeds — returns empty on errors.
  */
 
@@ -40,23 +46,28 @@ export const MIN_MEANINGFUL_TOKENS = 2;
 /** Maximum results to return */
 export const PROMPT_RECALL_LIMIT = 5;
 
-/** Minimum unigram count required to attempt semantic fallback when keyword path is empty */
-export const SEMANTIC_FALLBACK_MIN_UNIGRAMS = 4;
+/** Minimum unigram count required to run the semantic path (below this a prompt is "ok do it"-grade noise) */
+export const SEMANTIC_MIN_UNIGRAMS = 2;
 
 /**
- * Cosine floor for the semantic fallback, deliberately stricter than
- * MIN_COSINE_SCORE (0.45).
+ * Cosine floor for prompt injection, stricter than MIN_COSINE_SCORE (0.45).
  *
- * This path injects into EVERY prompt without being asked, so a false positive
- * costs context on every turn while a false negative costs nothing — the user
- * can still run /recall. Measured on the real corpus, on-topic queries reach
- * top1 0.577-0.749 while off-topic top1 tops out at 0.514, so 0.65 admits only
- * strong matches and rejects every off-topic query outright.
+ * Measured on the live corpus (34 embedded memories across project + global,
+ * 10 on-topic and 7 off-topic prompts): on-topic top1 0.44-0.67 (9 of 10 at
+ * or above 0.50), off-topic top1 at most 0.43. 0.50 sits 0.07 above the
+ * worst off-topic score. The sample is small — revisit when the corpus grows.
  */
-export const SEMANTIC_FALLBACK_COSINE_FLOOR = 0.65;
+export const SEMANTIC_COSINE_FLOOR = 0.5;
 
-/** Max results from semantic fallback (intentionally smaller than keyword limit — fallback noise tolerance is lower) */
-export const SEMANTIC_FALLBACK_LIMIT = 3;
+/**
+ * Keep only hits within this cosine distance of the best hit. A strong match
+ * (0.67) should not drag in barely-passing neighbours (0.51), while a cluster
+ * of equally relevant memories (0.59-0.63) is kept whole.
+ */
+export const SEMANTIC_RELATIVE_BAND = 0.15;
+
+/** Max semantic hits (keyword AND hits can fill the rest of PROMPT_RECALL_LIMIT) */
+export const SEMANTIC_LIMIT = 3;
 
 /** Min unigrams required to attempt strict AND search before falling back to OR */
 export const AND_FIRST_MIN_UNIGRAMS = 2;
@@ -94,6 +105,48 @@ export function isTagOnlyMatch(memory: Memory, tokens: readonly string[]): boole
   if (tokens.length === 0) return false;
   const haystack = `${memory.content} ${memory.summary}`.toLowerCase();
   return !tokens.some(tok => haystack.includes(tok));
+}
+
+/**
+ * True when the memory's summary already appears in the static surface, i.e.
+ * injecting it again would repeat what is in context. Applied BEFORE semantic
+ * ranking so surface hits do not consume the limit and starve real matches.
+ */
+export function isInSurface(memory: Memory, surfaceContent: string): boolean {
+  return surfaceContent !== '' && surfaceContent.includes(memory.summary);
+}
+
+/**
+ * Keep ranked hits within `band` of the best score. Expects `ranked` sorted
+ * by descending score (rankBySimilarity's contract).
+ */
+export function selectSemanticHits(
+  ranked: readonly { readonly memory: Memory; readonly score: number }[],
+  band: number,
+): readonly Memory[] {
+  if (ranked.length === 0) return [];
+  const cutoff = ranked[0].score - band;
+  return ranked.filter(({ score }) => score >= cutoff).map(({ memory }) => memory);
+}
+
+/**
+ * Merge semantic hits (first: ranked by relevance) with strict keyword hits,
+ * deduplicated by id and capped at `limit`.
+ */
+export function mergePromptRecall(
+  semantic: readonly Memory[],
+  keyword: readonly Memory[],
+  limit: number,
+): readonly Memory[] {
+  const seen = new Set<string>();
+  const merged: Memory[] = [];
+  for (const mem of [...semantic, ...keyword]) {
+    if (seen.has(mem.id)) continue;
+    seen.add(mem.id);
+    merged.push(mem);
+    if (merged.length >= limit) break;
+  }
+  return merged;
 }
 
 /**
@@ -151,7 +204,30 @@ export type PromptRecallOptions = {
 };
 
 /**
- * Execute prompt-aware keyword recall across both databases
+ * Strict keyword AND search across both databases: a memory matches only when
+ * EVERY unigram appears. High precision; empty when the prompt has too few or
+ * too many unigrams for AND to be meaningful.
+ * I/O: Reads from databases
+ */
+function searchStrictKeyword(
+  projectDb: Database | null,
+  globalDb: Database | null,
+  unigrams: readonly string[],
+  limit: number,
+): readonly Memory[] {
+  const andEligible =
+    unigrams.length >= AND_FIRST_MIN_UNIGRAMS &&
+    unigrams.length <= AND_FIRST_MAX_UNIGRAMS;
+  if (!andEligible) return [];
+  return [
+    ...(projectDb ? searchByKeywordAnd(projectDb, unigrams, limit) : []),
+    ...(globalDb ? searchByKeywordAnd(globalDb, unigrams, limit) : []),
+  ];
+}
+
+/**
+ * Keyword-only prompt recall across both databases (strict AND, then broad OR).
+ * This is the DEGRADED path: it runs only when the embedder is unavailable.
  * I/O: Reads from databases
  *
  * @param projectDb - Project-scoped database (or null if unavailable)
@@ -173,19 +249,10 @@ export function executePromptRecall(
   const limit = options.limit ?? PROMPT_RECALL_LIMIT;
   const unigrams = extractUnigrams(options.prompt);
 
-  // Tier 1: strict AND over unigrams, when we have enough but not too many.
-  // Returns precise multi-token matches; misses are common, so OR still runs as fallback.
-  const andEligible =
-    unigrams.length >= AND_FIRST_MIN_UNIGRAMS &&
-    unigrams.length <= AND_FIRST_MAX_UNIGRAMS;
-  const projectAnd = andEligible && projectDb
-    ? searchByKeywordAnd(projectDb, unigrams, limit)
-    : [];
-  const globalAnd = andEligible && globalDb
-    ? searchByKeywordAnd(globalDb, unigrams, limit)
-    : [];
+  // Tier 1: strict AND over unigrams. Misses are common, so OR still runs.
+  const strict = searchStrictKeyword(projectDb, globalDb, unigrams, limit);
 
-  // Tier 2: broad OR over unigrams + bigrams (preserves prior behaviour).
+  // Tier 2: broad OR over unigrams + bigrams.
   const projectOr = projectDb ? searchByKeywordOr(projectDb, tokens, limit) : [];
   const globalOr = globalDb ? searchByKeywordOr(globalDb, tokens, limit) : [];
 
@@ -195,15 +262,12 @@ export function executePromptRecall(
   const seenIds = new Set<string>();
   const merged: Memory[] = [];
 
-  for (const mem of [...projectAnd, ...globalAnd, ...projectOr, ...globalOr]) {
+  for (const mem of [...strict, ...projectOr, ...globalOr]) {
     if (seenIds.has(mem.id)) continue;
     seenIds.add(mem.id);
 
     if (isTagOnlyMatch(mem, unigrams)) continue;
-
-    if (options.surfaceContent && options.surfaceContent.includes(mem.summary)) {
-      continue;
-    }
+    if (isInSurface(mem, options.surfaceContent)) continue;
 
     merged.push(mem);
     if (merged.length >= limit) break;
@@ -213,36 +277,34 @@ export function executePromptRecall(
 }
 
 /**
- * Async wrapper: keyword recall first, semantic fallback when keyword returns empty.
+ * Async prompt recall: semantic-first, keyword-AND supplemented, keyword-only
+ * when the embedder fails.
  *
- * Triggered only when:
- *   1. Keyword path returned 0 results
- *   2. Prompt has >= SEMANTIC_FALLBACK_MIN_UNIGRAMS distinct unigrams
- *      (bigrams are excluded from the count — short metaphor prompts shouldn't qualify)
- *
- * Errors during embedding never propagate — fallback is best-effort.
+ * 1. Fewer than SEMANTIC_MIN_UNIGRAMS unigrams → nothing ("ok do it" prompts).
+ * 2. Embed the prompt; rank active memories from both DBs that are NOT already
+ *    in the surface; keep hits above SEMANTIC_COSINE_FLOOR and within
+ *    SEMANTIC_RELATIVE_BAND of the best.
+ * 3. Add strict keyword AND hits (tag-only matches and surface repeats dropped).
+ * 4. Embedding/ranking failure → degrade to keyword-only executePromptRecall.
  *
  * @param projectDb - Project-scoped database (or null if unavailable)
  * @param globalDb - Global database (or null if unavailable)
  * @param options - Prompt text, surface content for dedup, optional limit
- * @returns Deduplicated array of relevant memories (keyword OR semantic fallback)
+ * @returns Deduplicated array of relevant memories, best first
  */
 export async function executePromptRecallWithFallback(
   projectDb: Database | null,
   globalDb: Database | null,
   options: PromptRecallOptions,
 ): Promise<readonly Memory[]> {
-  const keywordResults = executePromptRecall(projectDb, globalDb, options);
-
-  if (keywordResults.length > 0) {
-    return keywordResults;
-  }
-
-  // Fallback gates
   const unigrams = extractUnigrams(options.prompt);
-  if (unigrams.length < SEMANTIC_FALLBACK_MIN_UNIGRAMS) {
-    return keywordResults;
+  if (unigrams.length < SEMANTIC_MIN_UNIGRAMS) {
+    return [];
   }
+
+  const limit = options.limit ?? PROMPT_RECALL_LIMIT;
+
+  let semantic: readonly Memory[];
   try {
     // Same [query] [project:name] prefix as recall.ts — memories were
     // embedded with a metadata prefix, so an unprefixed query lands in a
@@ -250,32 +312,23 @@ export async function executePromptRecallWithFallback(
     const queryEmbedding = await embedLocal(
       buildQueryEmbeddingText(options.prompt, options.projectName),
     );
-    const projectCandidates = projectDb
-      ? getMemoriesWithEmbedding(projectDb)
-      : [];
-    const globalCandidates = globalDb
-      ? getMemoriesWithEmbedding(globalDb)
-      : [];
+    const candidates = [
+      ...(projectDb ? getMemoriesWithEmbedding(projectDb) : []),
+      ...(globalDb ? getMemoriesWithEmbedding(globalDb) : []),
+    ].filter(({ memory }) => !isInSurface(memory, options.surfaceContent));
 
-    const ranked = rankBySimilarity(
-      [...projectCandidates, ...globalCandidates],
-      queryEmbedding,
-      SEMANTIC_FALLBACK_LIMIT,
-      SEMANTIC_FALLBACK_COSINE_FLOOR,
+    semantic = selectSemanticHits(
+      rankBySimilarity(candidates, queryEmbedding, SEMANTIC_LIMIT, SEMANTIC_COSINE_FLOOR),
+      SEMANTIC_RELATIVE_BAND,
     );
-
-    // Dedup against the static surface — same rule as keyword path
-    const filtered: Memory[] = [];
-    for (const { memory } of ranked) {
-      if (options.surfaceContent && options.surfaceContent.includes(memory.summary)) {
-        continue;
-      }
-      filtered.push(memory);
-    }
-
-    return filtered;
   } catch {
-    // Best-effort: any embedding/network/DB error returns the (empty) keyword result
-    return keywordResults;
+    // Best-effort: embedder/DB failure degrades to keyword-only recall.
+    return executePromptRecall(projectDb, globalDb, options);
   }
+
+  const strict = searchStrictKeyword(projectDb, globalDb, unigrams, limit).filter(
+    (mem) => !isTagOnlyMatch(mem, unigrams) && !isInSurface(mem, options.surfaceContent),
+  );
+
+  return mergePromptRecall(semantic, strict, limit);
 }

@@ -29,7 +29,7 @@ Claude Code reads `.claude/cortex-memory.local.md` as context, giving it "memory
 
 ### Session Start
 
-A `SessionStart` hook loads a cached "surface" — a compact markdown summary of the most relevant memories. The cache is keyed by `sha256(branch:cwd)` and valid for 24 hours. If stale or missing, it regenerates from the database — but only for projects that already have a `.memory/cortex.db` (the hook never creates databases in untouched projects). In Pi, this cache refresh is detached so startup and `/new` do not wait on the engine CLI; an existing surface remains readable until the atomic refresh completes. Additionally, a `UserPromptSubmit` hook pipes the surface file contents on every prompt, and a second `UserPromptSubmit` hook (`prompt-recall.sh`) runs keyword recall against your prompt — strict AND search over prompt keywords first, OR fallback, plus a conservative semantic fallback (0.65 cosine floor) when keywords find nothing.
+A `SessionStart` hook loads a cached "surface" — a compact markdown summary of the most relevant memories. The cache is keyed by `sha256(branch:cwd)` and valid for 24 hours. If stale or missing, it regenerates from the database — but only for projects that already have a `.memory/cortex.db` (the hook never creates databases in untouched projects). In Pi, this cache refresh is detached so startup and `/new` do not wait on the engine CLI; an existing surface remains readable until the atomic refresh completes. Additionally, a `UserPromptSubmit` hook pipes the surface file contents on every prompt, and a second `UserPromptSubmit` hook (`prompt-recall.sh`) runs recall against your prompt — semantic-first (cosine floor 0.50, within a 0.15 band of the best hit, memories already in the surface excluded before ranking), supplemented by strict keyword AND matches. Broad keyword OR search only runs as the degraded path when the embedder is unavailable.
 
 ### During a Session
 
@@ -435,7 +435,7 @@ Extraction, AI pruning, and edge classification prefer a **direct OpenAI-compati
         scripts/
           extract-and-generate.sh   # SessionEnd hook
           load-surface.sh           # SessionStart hook
-          prompt-recall.sh          # UserPromptSubmit hook (keyword recall)
+          prompt-recall.sh          # UserPromptSubmit hook (semantic-first recall)
       engine/src/               # TypeScript source
       commands/                 # Skill markdown files
 

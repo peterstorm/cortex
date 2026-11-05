@@ -217,6 +217,54 @@ embedLocalSpy
     });
   });
 
+  describe('stale-model vectors', () => {
+    it('re-embeds active memories whose vector is from another model or untagged', async () => {
+      // Regression: legacy rows hold a vector but a NULL model tag. Recall
+      // filters them out; backfill used to skip them because the vector was
+      // non-null, stranding them invisible to semantic search forever.
+      const db = openDatabase(':memory:');
+      ensureModelLoadedSpy.mockResolvedValue(true);
+      embedLocalSpy.mockResolvedValue(new Float32Array(384).fill(0.5));
+
+      const make = (id: string) =>
+        createMemory({
+          id,
+          content: `content ${id}`,
+          summary: `summary ${id}`,
+          memory_type: 'decision',
+          scope: 'project',
+          confidence: 0.9,
+          priority: 5,
+          source_type: 'extraction',
+          source_session: 'session-1',
+          source_context: JSON.stringify({ branch: 'main' }),
+          local_embedding: new Float32Array(384).fill(0.1),
+        });
+
+      insertMemory(db, make('legacy-null'));
+      insertMemory(db, make('other-model'));
+      insertMemory(db, make('current'));
+      db.run('UPDATE memories SET local_embedding_model = NULL WHERE id = ?', ['legacy-null']);
+      db.run('UPDATE memories SET local_embedding_model = ? WHERE id = ?', ['some/other-model', 'other-model']);
+
+      const result = await backfill(db, 'test-project');
+
+      expect(result).toEqual({ ok: true, processed: 2, failed: 0, errors: [], method: 'local' });
+      expect(embedLocalSpy).toHaveBeenCalledTimes(2);
+
+      const models = db
+        .prepare('SELECT local_embedding_model m FROM memories')
+        .all() as { m: string | null }[];
+      expect(new Set(models.map((r) => r.m)).size).toBe(1);
+
+      // Idempotent: a second run has nothing left to do.
+      embedLocalSpy.mockClear();
+      const again = await backfill(db, 'test-project');
+      expect(again).toEqual({ ok: true, processed: 0, failed: 0, errors: [], method: 'local' });
+      expect(embedLocalSpy).not.toHaveBeenCalled();
+    });
+  });
+
   describe('code memories (FR-053)', () => {
     it('never embeds code memories', async () => {
       const db = openDatabase(':memory:');

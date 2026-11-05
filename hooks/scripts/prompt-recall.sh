@@ -2,7 +2,8 @@
 # Prompt Recall Hook Shim (UserPromptSubmit Hook)
 #
 # Reads the user's prompt from stdin JSON, pipes it to the prompt-recall
-# CLI command which extracts keywords and runs FTS5 search for relevant memories.
+# CLI command which ranks memories semantically against the prompt (strict keyword
+# AND matches supplement; keyword OR only when the embedder is unavailable).
 #
 # Architecture:
 # Thin shell orchestrator - pipes stdin to CLI command.
