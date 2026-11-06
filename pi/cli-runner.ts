@@ -79,6 +79,15 @@ export function nodeCliRunner(cliPath: string, baseEnv: NodeJS.ProcessEnv): CliR
           cwd: options?.cwd,
           encoding: "utf-8",
           env: childEnv(options?.env),
+          // Piped EXPLICITLY. With no `stdio` option, execFileSync inherits the
+          // child's stderr, so every warning the engine's libraries emit lands
+          // on the host's terminal — a live TUI, for this extension.
+          // prompt-recall loads the embedding model in a fresh process on
+          // EVERY prompt, so that is not an occasional stray line but a block
+          // of onnx/model2vec chatter on every prompt submitted. Piping keeps
+          // the child's diagnostics out of the UI and still populates
+          // `failure.stderr` for the failure branch below.
+          stdio: ["pipe", "pipe", "pipe"],
         }).trim();
         return { ok: true, output };
       } catch (error) {

@@ -25,7 +25,12 @@
  *   tokens concatenated) plus `offsets` (start index per sequence). The
  *   `pipeline('feature-extraction')` helper supplies neither, and fails with
  *   "Missing the following inputs: offsets" — hence the explicit
- *   AutoModel/AutoTokenizer path below.
+ *   PreTrainedModel/AutoTokenizer path below.
+ * - `PreTrainedModel` rather than `AutoModel`: model2vec is not a registered
+ *   architecture, so AutoModel falls through to the base class anyway — after
+ *   printing `Unknown model class "model2vec", attempting to construct from
+ *   base class`. Asking for the base class directly is the same load without
+ *   the warning, and it survives a model swap that *is* a registered class.
  *
  * Model and dimensionality come from config, never inlined: an earlier version
  * hardcoded both the model id and a `!== 384` check, which pinned the module to
@@ -102,7 +107,7 @@ async function loadModel(): Promise<ModelAvailabilityResult> {
   }
 
   try {
-    const { AutoModel, AutoTokenizer } = await getTransformers();
+    const { PreTrainedModel, AutoTokenizer } = await getTransformers();
     // transformers.js overloads these factories across every task, producing
     // union types large enough that TypeScript gives up (TS2590) before they
     // can be narrowed. Cast once, here, to the contract this module actually
@@ -110,9 +115,16 @@ async function loadModel(): Promise<ModelAvailabilityResult> {
     cachedTokenizer = (await AutoTokenizer.from_pretrained(
       LOCAL_EMBED_MODEL
     )) as unknown as StaticTokenizer;
-    cachedModel = (await AutoModel.from_pretrained(
-      LOCAL_EMBED_MODEL
-    )) as unknown as EmbeddingBagModel;
+    // `dtype` and `logSeverityLevel` are set explicitly, not left to the
+    // library's defaults, because both defaults are announced on stderr and
+    // this module is loaded in a fresh process on every user prompt:
+    //   - unset `dtype` warns `dtype not specified for "model" ...`
+    //   - unset severity lets onnxruntime log graph-rewrite warnings
+    // Neither is actionable, and both read as errors to anyone watching.
+    cachedModel = (await PreTrainedModel.from_pretrained(LOCAL_EMBED_MODEL, {
+      dtype: 'fp32',
+      session_options: { logSeverityLevel: 3 },
+    })) as unknown as EmbeddingBagModel;
     return { ok: true };
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);

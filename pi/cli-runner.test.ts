@@ -102,6 +102,35 @@ describe('nodeCliRunner.run', () => {
     if (result.ok) expect(result.output).toContain(workdir.split('/').pop()!);
   });
 
+  it('keeps a successful child\'s stderr off the host\'s stderr', () => {
+    const dir = tempDir();
+    // The shape that caused the bug: a library writes a warning to stderr while
+    // the command still succeeds. execFileSync's default stdio inherits the
+    // child's stderr, so this line used to land on the terminal of a live TUI
+    // on every prompt.
+    const cli = nodeCliRunner(
+      script(dir, 'process.stderr.write("onnx noise\\n"); console.log("ok");'),
+      {},
+    );
+
+    const written: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      written.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+
+    let result: ReturnType<typeof cli.run>;
+    try {
+      result = cli.run(['prompt-recall'], { cwd: dir });
+    } finally {
+      process.stderr.write = original;
+    }
+
+    expect(result).toEqual({ ok: true, output: 'ok' });
+    expect(written.join('')).not.toContain('onnx noise');
+  });
+
   it('reports a failing command with its status and stderr instead of empty output', () => {
     const dir = tempDir();
     const cli = nodeCliRunner(

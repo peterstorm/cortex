@@ -5,6 +5,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterAll } from 'vitest';
+import { LOCAL_EMBEDDING_DIMENSIONS } from '../config.js';
 import {
   embedLocal,
   isLocalModelAvailable,
@@ -73,7 +74,7 @@ describe('local-embed', () => {
   });
 
   describe('embedLocal - when model available', () => {
-    it('returns Float32Array of length 384', async () => {
+    it(`returns Float32Array of length ${LOCAL_EMBEDDING_DIMENSIONS}`, async () => {
       const available = await ensureModelLoaded();
       if (!available) {
         await expect(embedLocal('test text')).rejects.toThrow(/Failed to load local embedding model/);
@@ -82,7 +83,10 @@ describe('local-embed', () => {
 
       const embedding = await embedLocal('test text');
       expect(embedding).toBeInstanceOf(Float32Array);
-      expect(embedding.length).toBe(384);
+      // The configured dimension, never a literal: the constant is what stored
+      // vectors are validated against, so a model swap that changed the width
+      // fails in one place (config) instead of here.
+      expect(embedding.length).toBe(LOCAL_EMBEDDING_DIMENSIONS);
     });
 
     it('returns deterministic embeddings for same text', async () => {
@@ -115,8 +119,8 @@ describe('local-embed', () => {
       const embedding1 = await embedLocal(text1);
       const embedding2 = await embedLocal(text2);
 
-      expect(embedding1.length).toBe(384);
-      expect(embedding2.length).toBe(384);
+      expect(embedding1.length).toBe(LOCAL_EMBEDDING_DIMENSIONS);
+      expect(embedding2.length).toBe(LOCAL_EMBEDDING_DIMENSIONS);
 
       // Check at least some values differ
       let differenceCount = 0;
@@ -152,7 +156,7 @@ describe('local-embed', () => {
       const embedding = await embedLocal(longText);
 
       expect(embedding).toBeInstanceOf(Float32Array);
-      expect(embedding.length).toBe(384);
+      expect(embedding.length).toBe(LOCAL_EMBEDDING_DIMENSIONS);
     });
 
     it('embeddings have reasonable magnitude', async () => {
@@ -173,6 +177,24 @@ describe('local-embed', () => {
       // Norm should be positive and not excessively large
       expect(norm).toBeGreaterThan(0);
       expect(norm).toBeLessThan(1000);
+    });
+  });
+
+  describe('load noise', () => {
+    // The model is loaded in a fresh process on every user prompt, and the host
+    // is a live TUI. Anything the load writes to the console is seen by the
+    // user, so a zero-length warning list is the contract, not a nicety.
+    it('loads without writing anything to the console', async () => {
+      const warnings: unknown[][] = [];
+      const original = console.warn;
+      console.warn = (...args: unknown[]) => { warnings.push(args); };
+      try {
+        await ensureModelLoaded();
+      } finally {
+        console.warn = original;
+      }
+
+      expect(warnings).toEqual([]);
     });
   });
 
