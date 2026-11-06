@@ -322,6 +322,37 @@ describe('Database Layer', () => {
       }
     });
 
+    // A source_type outside the current union is metadata, not a corrupt row:
+    // older Cortex versions accepted custom origins, and letting createMemory
+    // reject it made one such row throw out of EVERY read that maps rows —
+    // lifecycle, backfill and recall all died on a database whose only fault
+    // was a provenance label.
+    it('reads a row whose source_type predates the union instead of throwing', () => {
+      insertMemory(db, makeMemory('mem-legacy-source'));
+      db.prepare('UPDATE memories SET source_type = ? WHERE id = ?').run('librarian', 'mem-legacy-source');
+
+      expect(() => getActiveMemories(db)).not.toThrow();
+      expect(getMemory(db, 'mem-legacy-source')?.source_type).toBe('manual');
+    });
+
+    it('maps an unrecognised source_type to manual and reports it once', () => {
+      insertMemory(db, makeMemory('mem-odd-source'));
+      db.prepare('UPDATE memories SET source_type = ? WHERE id = ?').run('made-up-origin', 'mem-odd-source');
+
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      try {
+        expect(getMemory(db, 'mem-odd-source')?.source_type).toBe('manual');
+        expect(warn).toHaveBeenCalledWith(
+          "[cortex:db] Memory mem-odd-source: unknown source_type 'made-up-origin'; treating it as 'manual'"
+        );
+        // Once per value per process, not once per row read.
+        getMemory(db, 'mem-odd-source');
+        expect(warn).toHaveBeenCalledTimes(1);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
     it('gets only active memories', () => {
       const active1 = makeMemory('mem-active-1', {
         content: 'Active memory 1',

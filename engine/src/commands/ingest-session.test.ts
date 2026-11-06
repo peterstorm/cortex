@@ -66,15 +66,15 @@ describe('runSessionIngestion', () => {
     const calls: string[] = [];
     const result = await runSessionIngestion({
       extract: async () => { calls.push('extract'); return deferred('lock held'); },
-      backfill: async () => { calls.push('backfill'); return succeeded('unexpected'); },
+      backfill: async () => { calls.push('backfill'); return succeeded('embedded'); },
       maintenance: async () => { calls.push('maintenance'); return succeeded('surface refreshed'); },
     }, immediateRetryPolicy(2));
 
-    expect(calls).toEqual(['extract', 'extract', 'maintenance']);
+    expect(calls).toEqual(['extract', 'extract', 'backfill', 'maintenance']);
     expect(isSessionIngestionSuccessful(result)).toBe(false);
     expect(result).toMatchObject({
       extraction: { kind: 'failed', error: expect.stringContaining('remained retryable after 2 attempt') },
-      backfill: { kind: 'skipped', reason: 'extraction failed' },
+      backfill: { kind: 'succeeded', output: 'embedded' },
     });
   });
 
@@ -104,26 +104,31 @@ describe('runSessionIngestion', () => {
     const calls: string[] = [];
     const result = await runSessionIngestion({
       extract: async () => { calls.push('extract'); return failed('invalid transcript path'); },
-      backfill: async () => { calls.push('backfill'); return succeeded('unexpected'); },
+      backfill: async () => { calls.push('backfill'); return succeeded('embedded'); },
       maintenance: async () => { calls.push('maintenance'); return succeeded('surface refreshed'); },
     }, immediateRetryPolicy(3));
 
-    expect(calls).toEqual(['extract', 'maintenance']);
+    expect(calls).toEqual(['extract', 'backfill', 'maintenance']);
     expect(result.extraction).toMatchObject({ kind: 'failed', retryable: false });
   });
 
-  it('skips backfill after extraction failure but still runs maintenance', async () => {
+  // Backfill's work is "embed memories that already exist and recall cannot
+  // see" — entirely independent of this session's transcript. Gating it on
+  // extraction meant a deferred or failed extraction stalled embedding repair
+  // for the whole run, which is how a database ends up with hundreds of
+  // unembedded rows while every shutdown reports "processed 0 memories".
+  it('runs backfill after a failed extraction, then maintenance', async () => {
     const calls: string[] = [];
     const result = await runSessionIngestion({
       extract: async () => { calls.push('extract'); return failed('LLM unavailable'); },
-      backfill: async () => { calls.push('backfill'); return succeeded('unexpected'); },
+      backfill: async () => { calls.push('backfill'); return succeeded('embedded 12'); },
       maintenance: async () => { calls.push('maintenance'); return succeeded('surface refreshed'); },
     });
 
-    expect(calls).toEqual(['extract', 'maintenance']);
+    expect(calls).toEqual(['extract', 'backfill', 'maintenance']);
     expect(isSessionIngestionSuccessful(result)).toBe(false);
     expect(result).toMatchObject({
-      backfill: { kind: 'skipped', reason: 'extraction failed' },
+      backfill: { kind: 'succeeded', output: 'embedded 12' },
       maintenance: { kind: 'succeeded' },
     });
   });

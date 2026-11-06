@@ -18,7 +18,7 @@ import type {
   SourceType,
   EdgeRelation,
 } from '../core/types.js';
-import { createMemory, createEdge, createExtractionCheckpoint, isEdgeRelation, isEdgeStatus, isMemoryType, isMemoryStatus, isMemoryScope, resolveArchiveAnchor } from '../core/types.js';
+import { createMemory, createEdge, createExtractionCheckpoint, isEdgeRelation, isEdgeStatus, isMemoryType, isMemoryStatus, isMemoryScope, isSourceType, resolveArchiveAnchor } from '../core/types.js';
 import type { Entity, Fact, EntityType } from '../core/entities.js';
 import { createEntity, createFact, isEntityType } from '../core/entities.js';
 import { LOCAL_EMBED_MODEL } from '../config.js';
@@ -398,7 +398,10 @@ type MemoryRow = {
   confidence: number;
   priority: number;
   pinned: number;
-  source_type: SourceType;
+  // Deliberately `string`, like EdgeRow.relation_type: this is the unvalidated
+  // cell, narrowed by parseSourceType in rowToMemory. Typing it as the union
+  // asserted a guarantee SQLite does not provide.
+  source_type: string;
   source_session: string;
   source_context: string;
   tags: string;
@@ -445,6 +448,46 @@ function parseJsonStringArray(cell: string, rowLabel: string, column: string): r
 }
 
 /**
+ * Source origins older Cortex versions wrote that the current union does not
+ * carry. They are real provenance from a schema that accepted custom origins,
+ * not corrupt data, so they map onto the closest surviving origin instead of
+ * costing the whole row.
+ */
+const LEGACY_SOURCE_TYPES: Readonly<Record<string, SourceType>> = {
+  librarian: 'manual',
+  skill: 'manual',
+};
+
+/** Unknown values already reported, so a legacy DB warns once per value. */
+const reportedSourceTypes = new Set<string>();
+
+/**
+ * Parse a stored source_type into the domain union.
+ *
+ * This belongs at the read boundary, not in the invariant: every write path
+ * states source_type from a literal inside the union, but a row can predate the
+ * union or be written by another tool. Letting createMemory reject it made one
+ * old row kill EVERY read that maps rows — lifecycle, backfill and recall all
+ * threw on a project whose only fault was memories tagged `librarian`, so a
+ * whole database lost its lifecycle over a provenance label. Metadata gets
+ * parsed; the row survives.
+ */
+function parseSourceType(raw: string, memoryId: string): SourceType {
+  if (isSourceType(raw)) return raw;
+
+  const legacy = LEGACY_SOURCE_TYPES[raw];
+  if (legacy !== undefined) return legacy;
+
+  if (!reportedSourceTypes.has(raw)) {
+    reportedSourceTypes.add(raw);
+    console.warn(
+      `[cortex:db] Memory ${memoryId}: unknown source_type '${raw}'; treating it as 'manual'`
+    );
+  }
+  return 'manual';
+}
+
+/**
  * Convert a raw database row to a Memory domain object.
  * Pure helper — centralizes the row-to-Memory mapping used by all query functions.
  */
@@ -462,7 +505,7 @@ function rowToMemory(row: MemoryRow): Memory {
     confidence: row.confidence,
     priority: row.priority,
     pinned: row.pinned === 1,
-    source_type: row.source_type,
+    source_type: parseSourceType(row.source_type, row.id),
     source_session: row.source_session,
     source_context: row.source_context,
     tags,

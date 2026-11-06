@@ -46,4 +46,28 @@ describe('PID lock', () => {
 
     expect(readFileSync(path, 'utf8')).toBe('2');
   });
+
+  // A lock file with no PID in it — left by a process killed between open and
+  // write, or hand-edited — used to read as `io-error` forever: not "held", so
+  // no holder to wait for, and yet never reclaimed. Extraction skipped on every
+  // run and the only cure was deleting the file by hand.
+  it('reclaims an empty lock file', () => {
+    const path = lockPath();
+    expect(acquireLock(path)).toEqual({ acquired: true });
+    releaseLock(path);
+    writeFileSync(path, '', 'utf8');
+
+    expect(acquireLock(path)).toEqual({ acquired: true });
+    expect(readFileSync(path, 'utf8')).toBe(String(process.pid));
+  });
+
+  it('reclaims a lock whose contents are not a PID', () => {
+    const path = lockPath();
+    expect(acquireLock(path)).toEqual({ acquired: true });
+    releaseLock(path);
+    writeFileSync(path, 'not-a-pid', 'utf8');
+
+    expect(acquireLock(path)).toEqual({ acquired: true });
+    expect(readFileSync(path, 'utf8')).toBe(String(process.pid));
+  });
 });

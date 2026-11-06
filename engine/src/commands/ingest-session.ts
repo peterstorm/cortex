@@ -82,9 +82,12 @@ async function runExtractionWithRetry(
  * Run extract → backfill → maintenance in order.
  *
  * Lock-deferred extraction is retried in this detached worker before backfill.
- * Backfill is skipped after an exhausted or failed extraction. Maintenance
- * still runs so an earlier successful extraction can finish lifecycle work and
- * refresh the surface even when the current transcript cannot be ingested.
+ * Backfill runs whatever the extraction did: it embeds memories that ALREADY
+ * exist and recall cannot see (no vector, or a vector from a retired model),
+ * which is work this session's transcript has no bearing on. Gating it on
+ * extraction's outcome meant one lock-deferred session stalled embedding
+ * repair for the whole run, for a reason that had nothing to do with backfill.
+ * Maintenance runs last so it sees whatever the two steps above wrote.
  */
 export async function runSessionIngestion(
   operations: SessionIngestionOperations,
@@ -92,12 +95,10 @@ export async function runSessionIngestion(
 ): Promise<SessionIngestionResult> {
   const extraction = await runExtractionWithRetry(operations.extract, retryPolicy);
 
-  const backfill: IngestionStepOutcome = extraction.kind === 'succeeded'
-    ? await runStep(operations.backfill).then((result) =>
-        result.kind === 'deferred'
-          ? { kind: 'failed', retryable: false, error: `backfill unexpectedly deferred: ${result.reason}` }
-          : result)
-    : { kind: 'skipped', reason: 'extraction failed' };
+  const backfillResult = await runStep(operations.backfill);
+  const backfill: IngestionStepOutcome = backfillResult.kind === 'deferred'
+    ? { kind: 'failed', retryable: false, error: `backfill unexpectedly deferred: ${backfillResult.reason}` }
+    : backfillResult;
 
   const maintenanceResult = await runStep(operations.maintenance);
   const maintenance: IngestionStepOutcome = maintenanceResult.kind === 'deferred'
