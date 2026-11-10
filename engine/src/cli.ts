@@ -37,7 +37,6 @@ import { dirname, isAbsolute, join } from 'node:path';
 import type { HookInput } from './core/types.js';
 import {
   getProjectDbPath,
-  getGlobalDbPath,
   getSurfaceCacheDir,
   getSurfaceOutputPath,
   getLockDir,
@@ -49,6 +48,7 @@ import {
 } from './config.js';
 import { openDatabase, openDatabaseReadOnly, getActiveMemories, getMemoriesByIds } from './infra/db.js';
 import { ensureGitignored, writeSurface } from './infra/filesystem.js';
+import { resolveGlobalDbPath } from './infra/global-db.js';
 import { acquireLock, releaseLock } from './infra/lock.js';
 
 // Command imports
@@ -297,7 +297,7 @@ function initDatabases(cwd: string): [Database, Database] {
   }
 
   const projectDbPath = prepareProjectDbDir(cwd);
-  const globalDbPath = getGlobalDbPath();
+  const globalDbPath = resolveGlobalDbPath();
   ensureDbDir(globalDbPath);
 
   // Open databases
@@ -1282,9 +1282,11 @@ async function handlePromptRecall(): Promise<CommandResult> {
       return { kind: 'succeeded' };
     }
 
-    // Check DBs exist — don't create empty ones for a read-only hook
+    // Check DBs exist — don't create empty ones for a read-only hook. Resolving
+    // may merge the legacy per-harness global DBs (once, ever); that moves
+    // existing memories rather than creating a database.
     const projectDbPath = getProjectDbPath(cwd);
-    const globalDbPath = getGlobalDbPath();
+    const globalDbPath = resolveGlobalDbPath();
     const hasProjectDb = existsSync(projectDbPath);
     const hasGlobalDb = existsSync(globalDbPath);
 

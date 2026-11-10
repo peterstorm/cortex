@@ -395,7 +395,7 @@ SessionStart fast path. Checks cache and serves if fresh (<24h); on cache miss o
 | File | Location | Gitignored |
 |---|---|---|
 | Project DB | `<project>/.memory/cortex.db` | Yes |
-| Global DB | `~/.claude/memory/cortex-global.db` | N/A |
+| Global DB | `${XDG_DATA_HOME:-~/.local/share}/cortex/global.db` (shared by every harness; `CORTEX_GLOBAL_DB` overrides) | N/A |
 | Surface | `<project>/.claude/cortex-memory.local.md` | Yes |
 | Cache | `<project>/.memory/surface-cache/{hash}.json` | Yes |
 | Locks | `<project>/.memory/locks/` | Yes |

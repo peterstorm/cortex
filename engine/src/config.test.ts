@@ -7,6 +7,7 @@ import { describe, it, expect } from 'vitest';
 import {
   getProjectDbPath,
   getGlobalDbPath,
+  getLegacyGlobalDbPaths,
   getSurfaceCacheDir,
   getSurfaceOutputPath,
   getLockDir,
@@ -30,10 +31,29 @@ describe('config - path resolution', () => {
     expect(result).toBe('/home/user/myproject/.memory/cortex.db');
   });
 
-  it('getGlobalDbPath returns path in home directory', () => {
-    const result = getGlobalDbPath();
-    // Harness-dependent: .claude or .pi/agent
-    expect(result).toMatch(/\.(claude|pi\/agent)\/memory\/cortex-global\.db/);
+  it('getGlobalDbPath is the same for every harness: the XDG data dir, under home by default', () => {
+    expect(getGlobalDbPath({}, '/home/u')).toBe('/home/u/.local/share/cortex/global.db');
+    expect(getGlobalDbPath({ PI_CODING_AGENT_DIR: '/home/u/.pi/agent' }, '/home/u')).toBe(
+      '/home/u/.local/share/cortex/global.db',
+    );
+  });
+
+  it('getGlobalDbPath honours XDG_DATA_HOME, ignoring a relative one as the spec requires', () => {
+    expect(getGlobalDbPath({ XDG_DATA_HOME: '/data' }, '/home/u')).toBe('/data/cortex/global.db');
+    expect(getGlobalDbPath({ XDG_DATA_HOME: 'relative/data' }, '/home/u')).toBe(
+      '/home/u/.local/share/cortex/global.db',
+    );
+  });
+
+  it('getGlobalDbPath lets CORTEX_GLOBAL_DB override everything', () => {
+    expect(getGlobalDbPath({ CORTEX_GLOBAL_DB: '/x/m.db', XDG_DATA_HOME: '/data' }, '/home/u')).toBe('/x/m.db');
+  });
+
+  it('getLegacyGlobalDbPaths lists the old per-harness files, Claude first', () => {
+    expect(getLegacyGlobalDbPaths('/home/u')).toEqual([
+      { harness: 'claude', path: '/home/u/.claude/memory/cortex-global.db' },
+      { harness: 'pi', path: '/home/u/.pi/agent/memory/cortex-global.db' },
+    ]);
   });
 
   it('getSurfaceCacheDir returns correct path', () => {

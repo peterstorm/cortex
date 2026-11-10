@@ -20,9 +20,9 @@ Cortex maintains **two** SQLite databases:
 | Database | Location | Scope |
 |---|---|---|
 | **Project** | `<project>/.memory/cortex.db` | Project-specific memories (default) |
-| **Global** | Claude: `~/.claude/memory/cortex-global.db`; Pi: `~/.pi/agent/memory/cortex-global.db` | Cross-project knowledge |
+| **Global** | `${XDG_DATA_HOME:-~/.local/share}/cortex/global.db` (override: `CORTEX_GLOBAL_DB`) | Cross-project knowledge |
 
-During extraction, candidates the LLM classifies as scope "global" (e.g., "TypeScript generics work like this" vs "our API uses X pattern") are routed to the active harness's **global** database; everything else lands in the project database.
+During extraction, candidates the LLM classifies as scope "global" (e.g., "TypeScript generics work like this" vs "our API uses X pattern") are routed to the **global** database; everything else lands in the project database. Every harness reads and writes the same two databases. The per-harness global databases of earlier versions are merged into the shared one, once, by the first command after upgrading (see the README's "Two Databases").
 
 ---
 
@@ -236,9 +236,10 @@ Memories are inserted without embeddings (to avoid blocking extraction). A backg
   .claude/
     cortex-memory.local.md # The surface file Claude reads
 
+~/.local/share/cortex/     # ($XDG_DATA_HOME/cortex when set)
+  global.db                # Global SQLite database, shared by every harness
+
 ~/.claude/
-  memory/
-    cortex-global.db       # Claude global SQLite database
   plugins/
     cortex/
       .claude-plugin/
@@ -251,10 +252,6 @@ Memories are inserted without embeddings (to avoid blocking extraction). A backg
           prompt-recall.sh         # UserPromptSubmit hook (semantic-first recall)
       engine/src/          # TypeScript source
       commands/            # Skill markdown files
-
-~/.pi/agent/
-  memory/
-    cortex-global.db       # Pi global SQLite database
 ```
 
 ---
@@ -264,6 +261,7 @@ Memories are inserted without embeddings (to avoid blocking extraction). A backg
 | Variable | Purpose | Required |
 |---|---|---|
 | `CORTEX_ONNX_LD_PATH` | Directory holding a 64-bit `libstdc++.so.6` for onnxruntime. Hooks probe the nix store when unset; needed on NixOS, a no-op elsewhere | No |
+| `CORTEX_GLOBAL_DB` | Path of the global database shared by every harness (default `${XDG_DATA_HOME:-~/.local/share}/cortex/global.db`) | No |
 | `CORTEX_LLM_API_URL` | Base URL (or `/chat/completions` URL) for an explicit OpenAI-compatible LLM endpoint | No |
 | `CORTEX_LLM_API_KEY` | API key for the explicit OpenAI-compatible LLM endpoint | Required with `CORTEX_LLM_API_URL` |
 | `CORTEX_LLM_BINARY` | Force the headless LLM binary (`claude` or `pi`) | No (auto-detected) |

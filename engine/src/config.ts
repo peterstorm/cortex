@@ -4,7 +4,7 @@
  * No side effects - callers handle file I/O
  */
 
-import { join, basename } from 'node:path';
+import { join, basename, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import type { SimilaritySpace } from './core/types.js';
 
@@ -12,13 +12,19 @@ import type { SimilaritySpace } from './core/types.js';
 // ENVIRONMENT VARIABLES
 // ============================================================================
 
+export type Env = Readonly<Record<string, string | undefined>>;
+
+function currentEnv(): Env {
+  return typeof Bun !== 'undefined' ? Bun.env : process.env;
+}
+
 /**
  * Get plugin root directory from environment.
  * Supports both Claude Code (CLAUDE_PLUGIN_ROOT) and pi (CORTEX_PLUGIN_ROOT).
  * Returns undefined if not set.
  */
 export function getPluginRoot(): string | undefined {
-  const env = typeof Bun !== 'undefined' ? Bun.env : process.env;
+  const env = currentEnv();
   return env.CLAUDE_PLUGIN_ROOT ?? env.CORTEX_PLUGIN_ROOT;
 }
 
@@ -38,15 +44,40 @@ export function getProjectDbPath(projectRoot: string): string {
 }
 
 /**
- * Resolve global database path
- * Pure function - returns path in user home directory
+ * Resolve the global database path — one database for every harness.
+ *
+ * Global memories are about the user, not about the tool they are typing into,
+ * so Claude Code and pi read and write the same file. It lives under the XDG
+ * data directory rather than either harness's own directory, because it
+ * belongs to neither. `CORTEX_GLOBAL_DB` overrides the location.
+ *
+ * Pure given its arguments; the defaults read the process environment.
  *
  * @returns Absolute path to global database
  */
-export function getGlobalDbPath(): string {
-  const dir = detectHarness() === "pi" ? '.pi/agent' : '.claude';
-  return join(homedir(), dir, 'memory', 'cortex-global.db');
+export function getGlobalDbPath(env: Env = currentEnv(), home: string = homedir()): string {
+  if (env.CORTEX_GLOBAL_DB) return env.CORTEX_GLOBAL_DB;
+  // The XDG spec says a relative value is invalid and must be ignored.
+  const dataHome =
+    env.XDG_DATA_HOME && isAbsolute(env.XDG_DATA_HOME)
+      ? env.XDG_DATA_HOME
+      : join(home, '.local', 'share');
+  return join(dataHome, 'cortex', 'global.db');
 }
+
+/**
+ * Where each harness kept its own global database before they were unified,
+ * in merge-precedence order: on an id clash the first one's row is kept.
+ * Read only by the one-time merge (infra/global-db.ts).
+ */
+export function getLegacyGlobalDbPaths(home: string = homedir()): readonly LegacyGlobalDb[] {
+  return [
+    { harness: 'claude', path: join(home, '.claude', 'memory', 'cortex-global.db') },
+    { harness: 'pi', path: join(home, '.pi', 'agent', 'memory', 'cortex-global.db') },
+  ];
+}
+
+export type LegacyGlobalDb = Readonly<{ harness: 'claude' | 'pi'; path: string }>;
 
 /**
  * Resolve surface cache directory
@@ -61,7 +92,7 @@ export function getSurfaceCacheDir(projectRoot: string): string {
 
 /** Detect which harness is active */
 export function detectHarness(): "claude" | "pi" {
-  const env = typeof Bun !== 'undefined' ? Bun.env : process.env;
+  const env = currentEnv();
   if (env.PI_CODING_AGENT_DIR || env.PI_CODING_AGENT) return "pi";
   return "claude";
 }

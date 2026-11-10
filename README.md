@@ -180,9 +180,19 @@ Cortex follows a **Functional Core / Imperative Shell** design:
 | Database | Location | Scope |
 |---|---|---|
 | **Project** | `<project>/.memory/cortex.db` | Project-specific memories (default) |
-| **Global** | Claude: `~/.claude/memory/cortex-global.db`; Pi: `~/.pi/agent/memory/cortex-global.db` | Cross-project knowledge |
+| **Global** | `${XDG_DATA_HOME:-~/.local/share}/cortex/global.db` (override: `CORTEX_GLOBAL_DB`) | Cross-project knowledge |
 
-During extraction, candidates the LLM classifies as scope `"global"` are routed to the active harness's global database; everything else lands in the project database.
+During extraction, candidates the LLM classifies as scope `"global"` are routed to the global database; everything else lands in the project database. Both databases are shared by every harness: a fact learned in a pi session is recalled in Claude Code, and the other way round.
+
+**Migrating from per-harness global databases.** Earlier versions kept one global database per harness (`~/.claude/memory/cortex-global.db` and `~/.pi/agent/memory/cortex-global.db`). The first cortex command to run after upgrading merges both into the shared one and logs what it copied:
+
+- **All rows are copied.** That includes memories of every status, edges, entities, facts and extraction checkpoints. Search indexes are rebuilt as rows arrive.
+- **Clashes keep the Claude Code copy.** If the same memory id is in both databases, the Claude Code row is kept. An entity that clashes by name and type is collapsed into one, and its facts are pointed at the survivor.
+- **The old files are kept.** They are renamed to `*.merged-<timestamp>`, never deleted.
+- **A merge happens once.** It is built in a staging file and renamed into place, so an interrupted merge is retried on the next run. A present shared database is never merged into again.
+- **A failed merge loses nothing.** If the merge cannot run, cortex keeps using the current harness's old database and retries next time. Opening the shared path anyway would create it empty, and the old memories would then never be merged.
+
+Upgrade the plugin for every harness at once. An old version still running writes to its old path, and those writes stay in the renamed file instead of the shared database.
 
 ### External Services
 
@@ -384,6 +394,7 @@ The LLM evaluates active memories in batches and archives low-value ones. Trigge
 | Variable | Purpose | Required |
 |---|---|---|
 | `CORTEX_ONNX_LD_PATH` | Directory holding a 64-bit `libstdc++.so.6` for onnxruntime. Hooks probe the nix store when unset; needed on NixOS, a no-op elsewhere | No |
+| `CORTEX_GLOBAL_DB` | Path of the global database shared by every harness (default `${XDG_DATA_HOME:-~/.local/share}/cortex/global.db`) | No |
 | `CORTEX_LLM_API_URL` | Base URL (or `/chat/completions` URL) for an explicit OpenAI-compatible LLM endpoint | No |
 | `CORTEX_LLM_API_KEY` | API key for the explicit OpenAI-compatible LLM endpoint | Required with `CORTEX_LLM_API_URL` |
 | `CORTEX_LLM_BINARY` | Force the headless LLM binary (`claude` or `pi`) | No (auto-detected) |
@@ -423,9 +434,10 @@ Extraction, AI pruning, and edge classification prefer a **direct OpenAI-compati
   .claude/
     cortex-memory.local.md      # Surface file Claude reads
 
+~/.local/share/cortex/          # ($XDG_DATA_HOME/cortex when set)
+  global.db                     # Global SQLite database, shared by every harness
+
 ~/.claude/
-  memory/
-    cortex-global.db            # Claude global SQLite database
   plugins/
     cortex/
       .claude-plugin/
@@ -438,10 +450,6 @@ Extraction, AI pruning, and edge classification prefer a **direct OpenAI-compati
           prompt-recall.sh          # UserPromptSubmit hook (semantic-first recall)
       engine/src/               # TypeScript source
       commands/                 # Skill markdown files
-
-~/.pi/agent/
-  memory/
-    cortex-global.db            # Pi global SQLite database
 ```
 
 All `.memory/` contents and `cortex-memory.local.md` are gitignored automatically.

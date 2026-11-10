@@ -43,7 +43,7 @@ db.close();
 "
 ```
 
-Also check the global DB at `~/.claude/memory/cortex-global.db` with the same query.
+Also check the global DB at `${XDG_DATA_HOME:-~/.local/share}/cortex/global.db` (or `$CORTEX_GLOBAL_DB` when set) with the same query.
 
 ### Step 2: Evaluate each memory
 
