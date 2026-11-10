@@ -49,5 +49,8 @@ jobs:
           path: engine/node_modules/@huggingface/transformers/.cache
           key: hf-model-${{ runner.os }}-${{ hashFiles('engine/src/config.ts') }}
       - name: Test
+        # The script runs `bun test --isolate`: the suite mocks modules with
+        # vi.mock, which Bun applies process-wide, so without per-file
+        # isolation one file's mock leaks into every file that runs after it.
         working-directory: engine
-        run: bun test
+        run: bun run test

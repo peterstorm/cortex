@@ -2,12 +2,12 @@
 /**
  * End-to-end integration tests for Cortex memory system
  *
- * NOTE: These tests may fail when run with the full suite due to mock pollution
- * from backfill.test.ts. Run in isolation for accurate results:
- *   bun test src/commands/e2e.test.ts
- *
- * The tests exercise the full pipeline without requiring API keys by using
- * keyword search instead of semantic search (no embeddings needed).
+ * The tests exercise the full pipeline through keyword search: every recall
+ * passes `keyword: true`, so the result does not depend on whether the local
+ * embedding model can load on the machine running the suite. (Omitting it no
+ * longer forces keyword search: recall goes semantic whenever the model loads.)
+ * The suite runs with `bun test --isolate`, so module mocks in other test
+ * files cannot leak in.
  */
 
 import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -61,7 +61,7 @@ describe('Cortex E2E Integration Tests', () => {
     const recallResult1 = await executeRecall(projectDb, globalDb, {
       query: 'database architecture',
       limit: 10,
-      // No geminiApiKey - forces keyword search
+      keyword: true,
     });
 
     expect(recallResult1.success).toBe(true);
@@ -86,6 +86,7 @@ describe('Cortex E2E Integration Tests', () => {
     const recallResult2 = await executeRecall(projectDb, globalDb, {
       query: 'database architecture',
       limit: 10,
+      keyword: true,
     });
 
     expect(recallResult2.success).toBe(true);
@@ -241,6 +242,7 @@ describe('Cortex E2E Integration Tests', () => {
     const recallResult = await executeRecall(projectDb, globalDb, {
       query: 'database configuration',
       limit: 10,
+      keyword: true,
     });
 
     expect(recallResult.success).toBe(true);
@@ -257,6 +259,7 @@ describe('Cortex E2E Integration Tests', () => {
     const globalRecallResult = await executeRecall(projectDb, globalDb, {
       query: 'design pattern',
       limit: 10,
+      keyword: true,
     });
 
     expect(globalRecallResult.success).toBe(true);
@@ -292,6 +295,7 @@ describe('Cortex E2E Integration Tests', () => {
     const recallResult = await executeRecall(projectDb, globalDb, {
       query: 'pattern',
       limit: 10,
+      keyword: true,
     });
 
     expect(recallResult.success).toBe(true);
@@ -363,6 +367,7 @@ describe('Cortex E2E Integration Tests', () => {
     const recallResult = await executeRecall(projectDb, globalDb, {
       query: 'nonexistent',
       limit: 10,
+      keyword: true,
     });
 
     expect(recallResult.success).toBe(true);
@@ -422,6 +427,7 @@ describe('Cortex E2E Integration Tests', () => {
     const recallResult = await executeRecall(projectDb, globalDb, {
       query: 'versioning',
       limit: 10,
+      keyword: true,
     });
 
     expect(recallResult.success).toBe(true);
