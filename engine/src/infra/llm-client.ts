@@ -316,6 +316,35 @@ export async function chatCompletionText(
   prompt: string,
   options: ChatCompletionOptions = {}
 ): Promise<string> {
+  return (await chatCompletion(endpoint, prompt, options)).content;
+}
+
+/** A completion with the identity of the model that actually answered. */
+export interface ChatCompletion {
+  readonly content: string;
+  /**
+   * The model the provider reports, falling back to the requested name. On
+   * routing servers this is the evidence of which weights answered.
+   */
+  readonly model: string;
+  readonly promptTokens: number | null;
+  readonly completionTokens: number | null;
+}
+
+const tokenCount = (value: unknown): number | null =>
+  typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : null;
+
+/**
+ * chatCompletionText's contract, plus the reported model and token usage —
+ * what an evaluation records to keep its runs comparable.
+ *
+ * @throws Error on HTTP/network/empty-content failures.
+ */
+export async function chatCompletion(
+  endpoint: LlmEndpoint,
+  prompt: string,
+  options: ChatCompletionOptions = {}
+): Promise<ChatCompletion> {
   const {
     jsonMode = false,
     maxTokens = 2048,
@@ -374,6 +403,8 @@ export async function chatCompletionText(
     }
 
     const data = (await response.json()) as {
+      model?: unknown;
+      usage?: { prompt_tokens?: unknown; completion_tokens?: unknown };
       choices?: Array<{
         message?: { content?: unknown; reasoning_content?: unknown };
         finish_reason?: unknown;
@@ -407,7 +438,12 @@ export async function chatCompletionText(
           `raise maxTokens or reduce prompt size`
       );
     }
-    return content;
+    return {
+      content,
+      model: typeof data.model === 'string' && data.model !== '' ? data.model : endpoint.model,
+      promptTokens: tokenCount(data.usage?.prompt_tokens),
+      completionTokens: tokenCount(data.usage?.completion_tokens),
+    };
   } catch (err) {
     // The timeout aborts with a reason; surface it as a timeout-named error
     // so operators can distinguish "prompt exceeded the deadline" from a

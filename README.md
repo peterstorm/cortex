@@ -21,6 +21,7 @@ Claude Code reads `.claude/cortex-memory.local.md` as context, giving it "memory
 - [Similarity & Deduplication](#similarity--deduplication)
 - [Semantic Search](#semantic-search)
 - [Memory Lifecycle](#memory-lifecycle)
+- [Evaluation](#evaluation)
 - [Configuration](#configuration)
 - [File Layout](#file-layout)
 - [Development](#development)
@@ -33,7 +34,7 @@ A `SessionStart` hook loads a cached "surface" — a compact markdown summary of
 
 ### During a Session
 
-Seven slash commands let you interact with memory directly: `/remember`, `/recall`, `/forget`, `/consolidate`, `/inspect`, `/prune`, and `/index-code`.
+Seven slash commands let you interact with memory directly: `/remember`, `/recall`, `/forget`, `/consolidate`, `/inspect`, `/prune`, and `/index-code`. An eighth, `/eval`, measures whether any of it helps (see [Evaluation](#evaluation)).
 
 ### Session End
 
@@ -97,6 +98,7 @@ Then install engine dependencies inside the installed plugin's `engine/` directo
 | `/inspect` | View memory health & stats | Diagnostics — counts, queue sizes, extraction stats, graph metrics |
 | `/prune` | AI-powered pruning pass | Periodically to keep memory lean and high-signal |
 | `/index-code` | Pair prose with source code | When important code is written — creates a searchable code memory |
+| `/eval <validate\|answer\|score>` | Score agent answers from memory against a test set of real cases | Before and after any change to extraction, ranking or pruning |
 
 ### `/remember`
 
@@ -149,6 +151,9 @@ Cortex follows a **Functional Core / Imperative Shell** design:
 │  ranking.ts     Composite rank, budget selection      │
 │  surface.ts     Markdown generation, token budgets    │
 │  decay.ts       Exponential decay, lifecycle rules    │
+│  eval-set.ts    Eval cases, answers, labels (parsing) │
+│  eval-rubric.ts Answer/judge prompts, report          │
+│  eval-run.ts    Run identity, resume rules, ports     │
 └───────────────────────────────────────────────────────┘
                           ↕
 ┌───────────────────────────────────────────────────────┐
@@ -171,7 +176,7 @@ Cortex follows a **Functional Core / Imperative Shell** design:
 │  extract.ts, generate.ts, remember.ts, recall.ts,     │
 │  forget.ts, consolidate.ts, lifecycle.ts, ai-prune.ts │
 │  index-code.ts, backfill.ts, semantic-edges.ts,       │
-│  inspect.ts, traverse.ts                              │
+│  inspect.ts, traverse.ts, eval.ts, eval-adapters.ts   │
 └───────────────────────────────────────────────────────┘
 ```
 
@@ -377,6 +382,60 @@ Archived memories with no access for 30+ days → status changes to `pruned` (ef
 
 The LLM evaluates active memories in batches and archives low-value ones. Triggered by a watermark: it runs when **20+ active memories were created since the last successful prune** (telemetry `last_ai_prune_at`) or when that successful prune is **7+ days old** (staleness floor), subject to a 6h minimum interval between runs. The watermark advances only on a fully successful run, so a failed prune keeps the review owed and retries on the next maintenance pass. Session *count* deliberately no longer triggers it — subagent-heavy runs end many sessions per hour, which used to turn a full multi-batch LLM re-review into a per-session tax. It runs inside the per-project-locked maintenance pipeline and also holds an AI-prune-specific lock.
 
+## Evaluation
+
+Every change to extraction, ranking or pruning feels like progress. `/eval` tells a better memory from a busier one. It applies Team0's [Measure before you build](https://team0.ai/learn/measure-before-you-build) to cortex: about 20 questions from your real work, each with what is true now and which outdated values must not be presented as current. A third of them are held out from tuning. The judge's five measures are Team0's (`correct_current`, `relevant`, `missed`, `ordered`, `context_complete`, each 0-1; rubric ported from their MIT `score.py`).
+
+**What it measures.** The read path, exactly as the hooks inject it: for each question the answering model gets the push surface plus the prompt-recall block cortex would add for that prompt, and nothing else. It has no tools, so the score is what the memory delivers unprompted, not what an agent could dig up with `/recall`. The `none` condition gives the same prompt with no memory. That is the baseline that says whether memory helps at all.
+
+**The eval directory** (default `<project>/.memory/eval`, gitignored with `.memory/`):
+
+```
+eval.json                 {"authoring_sessions": ["<session id>", ...]}
+questions.jsonl           one confirmed case per line
+labels.jsonl              optional: your own scores, to check the judge
+runs/<run>/run.json       the run's identity (condition, answer model, prompt digest, snapshot)
+runs/<run>/memory/        frozen copy of the project + global DBs the run answers from
+runs/<run>/answers.jsonl  appended as each case is answered
+runs/<run>/scores.jsonl   appended as each answer is judged
+```
+
+A case:
+
+```json
+{"id": "q01", "split": "practice", "kind": "changed_value", "asked_on": "2026-10-26",
+ "question": "Which model does reclaw run pi on?",
+ "true_now": ["claude-sonnet-5.5, committed 2026-10-26"], "stale": ["claude-sonnet-5"]}
+```
+
+`kind` is one of the five memory failures the method probes: `changed_value`, `same_entity`, `unheard_decision`, `commitment`, `non_fact`. Unknown fields are rejected, so a typo like `true_nwo` cannot pass silently. Keep unresolved drafts out of `questions.jsonl` until their truth is confirmed.
+
+**Authoring sessions.** The session where you write or review the eval set will itself be extracted into memory, and its memories hold the answer key. List those session ids in `eval.json`. Every eval read then refuses memories from those sessions, along with entity facts sourced from them. The run records how many it refused. `eval.json` is required, even as `{"authoring_sessions": []}`, so leaving this out is a deliberate choice.
+
+**Workflow:**
+
+```bash
+bun engine/src/cli.ts eval validate --cwd=<project>                     # coverage + method warnings, no model call
+bun engine/src/cli.ts eval answer none-1 --condition=none --cwd=<project>
+bun engine/src/cli.ts eval answer cortex-2026-11-09 --cwd=<project>     # snapshot memory, answer every case
+bun engine/src/cli.ts eval score none-1 cortex-2026-11-09 --dry-run --cwd=<project>
+bun engine/src/cli.ts eval score none-1 cortex-2026-11-09 --cwd=<project>
+```
+
+The report has one table per split over the cases both runs scored, with the change per measure, mean prompt tokens, a per-kind `correct_current/missed` view, which model answered each run, and anything left out. After a change to cortex, answer a new run and score it against the old one. Never delete the "before".
+
+**Comparability, enforced.**
+- A run answers from a `VACUUM INTO` snapshot taken at its start. Surface ranking also depends on the branch and on time (recency decay), so the run pins both.
+- An interrupted run resumes with the same command and fills only the missing answers. A resume under a different condition, answer model, answer prompt or authoring-session list is refused: that is a new experiment and needs a new run name.
+- A judgement is stored under the hash of its exact judge prompt (rubric, case and answer) plus the requested judge model. Re-scoring reuses it, while editing a truth or switching the judge re-judges.
+- Each answer records the model the provider reported, and the report flags a run that a routing server answered with several models.
+
+**Check the judge.** Score about ten answers yourself into `labels.jsonl` (`{"run": "cortex-2026-11-09", "id": "q01", "correct_current": 0, "missed": 0.5}`). `score` then prints the judge's mean gap per measure and flags gaps above 0.2. Fix the judge or score that measure by hand before trusting it.
+
+**Endpoints.** The answering and judging models are OpenAI-compatible endpoints: `CORTEX_EVAL_ANSWER_{API_URL,API_KEY,MODEL}` and `CORTEX_EVAL_JUDGE_{API_URL,API_KEY,MODEL}` (all three or none). Unset, both use cortex's own direct endpoint. There is deliberately no fallback to the `claude`/`pi` CLI: a run must name the model it measured, and a CLI session would fire cortex's own hooks into the answer. Scoring sends the questions, expected truth and answers to the judge endpoint.
+
+**Not yet covered.** The harness scores the read path over whatever the DB holds. Measuring a change to *extraction* means rebuilding a DB from the same transcripts with the old and new extractor, then answering each. That transcript-replay step is not built yet.
+
 ## Configuration
 
 ### Environment Variables
@@ -390,6 +449,8 @@ The LLM evaluates active memories in batches and archives low-value ones. Trigge
 | `CORTEX_LLM_MODEL` | Model for explicit direct endpoint configuration, or override passed to the fallback LLM binary | Required with explicit direct endpoint config; otherwise no (`haiku` for claude; none for pi) |
 | `CORTEX_LLM_MAX_DIRECT_FAILURES` | Consecutive direct-endpoint failures after which the headless-CLI fallback is suppressed (work is deferred instead of escalating load on a saturated server) | No (default 3) |
 | `CORTEX_LLM_MAX_CONCURRENCY` | Max in-flight LLM calls per engine process (extraction, edge classification, AI prune, and any subprocess fallback share the pool) so background work stays a bounded share of a server live agents rely on | No (default 2; 1 is most conservative) |
+| `CORTEX_EVAL_ANSWER_API_URL` / `_API_KEY` / `_MODEL` | Endpoint for the `/eval` answering model | No (all three or none; default: cortex's direct endpoint) |
+| `CORTEX_EVAL_JUDGE_API_URL` / `_API_KEY` / `_MODEL` | Endpoint for the `/eval` judge | No (all three or none; default: cortex's direct endpoint) |
 | `CLAUDE_PLUGIN_ROOT` | Plugin directory | Auto-set by Claude Code |
 
 Extraction, AI pruning, and edge classification prefer a **direct OpenAI-compatible endpoint** when one is configured: `CORTEX_LLM_API_URL`, `CORTEX_LLM_API_KEY`, and `CORTEX_LLM_MODEL` (or the pi provider config in `~/.pi/agent/models.json` — the active provider's `baseUrl`/`apiKey`/first model). Calls disable model thinking and use schema-guided JSON output where supported. Without a configured endpoint they fall back to a headless coding-agent CLI: `claude -p --model haiku` by default, or `pi -p --thinking off` when running under the pi agent. A single direct-call failure still falls back, but once failures reach the saturation threshold (default 3, `CORTEX_LLM_MAX_DIRECT_FAILURES`) the fallback is suppressed and the call throws: a saturated local server (empty content, timeouts) would only get worse from full agent-loop subprocesses, so the caller defers the work (unmarked edges, un-advanced checkpoints) and retries on the next run. All LLM calls also draw from a per-process concurrency pool (default 2, `CORTEX_LLM_MAX_CONCURRENCY`), so background work cannot flood a shared server — even when the server merely queues rather than errors.
@@ -420,6 +481,7 @@ Extraction, AI pruning, and edge classification prefer a **direct OpenAI-compati
     locks/                      # PID lock files
     cortex-status.json          # Generated health telemetry (extraction stats, timing)
     telemetry.json              # Maintenance and AI-prune cadence state
+    eval/                       # Eval set and runs (see Evaluation)
   .claude/
     cortex-memory.local.md      # Surface file Claude reads
 
@@ -483,6 +545,11 @@ bun engine/src/cli.ts consolidate <cwd> --merge --a=<idA> --b=<idB> --summary=<t
 bun engine/src/cli.ts inspect <cwd>
 bun engine/src/cli.ts index-code <cwd> <proseId> <codePath>
 bun engine/src/cli.ts traverse <cwd> <memoryId> [maxDepth]
+
+# Evaluation (defaults: --cwd=., --dir=<cwd>/.memory/eval)
+bun engine/src/cli.ts eval validate [--cwd=<project>]
+bun engine/src/cli.ts eval answer <run> [--condition=cortex|none] [--cwd=<project>]
+bun engine/src/cli.ts eval score <run> [<run>] [--dry-run] [--cwd=<project>]
 ```
 
 ### Testing Strategy
