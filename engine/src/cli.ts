@@ -29,6 +29,7 @@
  * - semantic-edges: Typed-edge classification
  * - load-surface: Surface load cache
  * - entity-query: Entity/fact graph queries
+ * - eval: Score agent answers from memory against an eval set
  */
 
 import { Database } from 'bun:sqlite';
@@ -77,6 +78,32 @@ import {
   type IngestionStepResult,
   type SessionIngestionRetryPolicy,
 } from './commands/ingest-session.js';
+import {
+  answerCases,
+  evalPaths,
+  loadEvalSet,
+  loadLabels,
+  openRun,
+  parseEvalArgs,
+  scoreRuns,
+  scoringPlan,
+  type EvalCommand,
+  type EvalPaths,
+} from './commands/eval.js';
+import {
+  ANSWER_COMPLETION,
+  JUDGE_COMPLETION,
+  countRefused,
+  endpointLlm,
+  excludeSessions,
+  noMemoryContext,
+  openSnapshotContext,
+  resolveEvalEndpoint,
+  snapshotMemory,
+} from './commands/eval-adapters.js';
+import { describeEvalSet, type EvalCase, type EvalSettings } from './core/eval-set.js';
+import { judgeAgreement, renderAgreement, renderReport } from './core/eval-rubric.js';
+import { getCurrentBranch } from './infra/git-context.js';
 import { disposeLocalModel, embedLocal } from './infra/local-embed.js';
 import { ensureNativeLibraryPath } from './infra/native-library-path.js';
 
@@ -1449,6 +1476,132 @@ export async function runIngestSessionInput(
     : { kind: 'failed', output, error: 'Session ingestion completed with failed step(s)' };
 }
 
+/**
+ * Handle 'eval' subcommand: score what an agent answers from cortex's memory
+ * against the project's eval set. See commands/eval.ts for the method and
+ * the eval directory layout.
+ */
+async function handleEval(args: string[]): Promise<CommandResult> {
+  const command = parseEvalArgs(args, process.cwd());
+  if (typeof command === 'string') return { kind: 'failed', error: command };
+
+  const paths = evalPaths(command.dir);
+  const log = (line: string) => process.stderr.write(`[cortex:eval] ${line}\n`);
+  try {
+    const { cases, settings } = loadEvalSet(paths);
+    switch (command.kind) {
+      case 'validate':
+        return { kind: 'succeeded', output: describeEvalSet(cases, settings) };
+      case 'answer':
+        return await handleEvalAnswer(command, paths, cases, settings, log);
+      case 'score':
+        return await handleEvalScore(command, paths, cases, log);
+    }
+  } catch (err) {
+    return { kind: 'failed', error: `Eval failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
+async function handleEvalAnswer(
+  command: Extract<EvalCommand, { kind: 'answer' }>,
+  paths: EvalPaths,
+  cases: readonly EvalCase[],
+  settings: EvalSettings,
+  log: (line: string) => void,
+): Promise<CommandResult> {
+  const resolved = resolveEvalEndpoint('answer', process.env);
+  if (resolved.kind === 'err') return { kind: 'failed', error: resolved.message };
+
+  const admit = excludeSessions(settings.authoringSessions);
+  const runPaths = paths.run(command.run);
+  const manifest = openRun(
+    runPaths,
+    {
+      run: command.run,
+      condition: command.condition,
+      project: getProjectName(command.cwd),
+      requestedModel: resolved.endpoint.model,
+      branch: getCurrentBranch(command.cwd),
+      authoringSessions: settings.authoringSessions,
+      now: new Date(),
+    },
+    (snapshotDir) => {
+      snapshotMemory(command.cwd, snapshotDir);
+      return countRefused(snapshotDir, admit);
+    },
+  );
+
+  const memory =
+    manifest.memory.kind === 'snapshot'
+      ? openSnapshotContext({
+          snapshotDir: runPaths.snapshot,
+          projectName: manifest.project,
+          branch: manifest.memory.branch,
+          asOf: new Date(manifest.createdAt),
+          admit,
+        })
+      : { context: noMemoryContext, close: () => {} };
+
+  log(`answering with ${resolved.endpoint.model} at ${resolved.endpoint.baseUrl}`);
+  try {
+    const outcome = await answerCases({
+      cases,
+      manifest,
+      paths: runPaths,
+      llm: endpointLlm(resolved.endpoint, ANSWER_COMPLETION),
+      context: memory.context,
+      log,
+    });
+    const excluded =
+      manifest.memory.kind === 'snapshot'
+        ? `; ${manifest.memory.excludedMemories} authoring-session memories excluded`
+        : '';
+    const output =
+      `run ${command.run} (${manifest.condition}): ${outcome.answered} answered now, ` +
+      `${outcome.alreadyAnswered} already answered${excluded}`;
+    return outcome.failed.length === 0
+      ? { kind: 'succeeded', output }
+      : {
+          kind: 'failed',
+          output,
+          error: `${outcome.failed.length} case(s) failed; run the same command again to retry them`,
+        };
+  } finally {
+    memory.close();
+  }
+}
+
+async function handleEvalScore(
+  command: Extract<EvalCommand, { kind: 'score' }>,
+  paths: EvalPaths,
+  cases: readonly EvalCase[],
+  log: (line: string) => void,
+): Promise<CommandResult> {
+  const resolved = resolveEvalEndpoint('judge', process.env);
+  if (resolved.kind === 'err') return { kind: 'failed', error: resolved.message };
+  const { endpoint } = resolved;
+
+  if (command.dryRun) {
+    return { kind: 'succeeded', output: scoringPlan(cases, paths, command.runs, endpoint.model) };
+  }
+
+  log(`judging with ${endpoint.model} at ${endpoint.baseUrl}: questions, expected truth and answers are sent there`);
+  const results = await scoreRuns({
+    cases,
+    paths,
+    runs: command.runs,
+    judge: endpointLlm(endpoint, JUDGE_COMPLETION),
+    judgeRequested: endpoint.model,
+    log,
+  });
+
+  const labels = loadLabels(paths);
+  const agreements = results
+    .filter((r) => labels.some((l) => l.run === r.run))
+    .map((r) => renderAgreement(r.run, judgeAgreement(r, labels)));
+  return { kind: 'succeeded', output: [renderReport(cases, results), ...agreements].join('\n') };
+}
+
 async function handleIngestSession(): Promise<CommandResult> {
   const input = await readStdinJson();
   return input
@@ -1499,7 +1652,7 @@ async function main(): Promise<ExitCode> {
 
   if (args.length === 0) {
     logError('Usage: cli.ts <subcommand> [args...]');
-    logError('Subcommands: extract, ingest-session, generate, recall, remember, index-code, forget, consolidate, lifecycle, ai-prune, maintenance, traverse, inspect, backfill, semantic-edges, load-surface, prompt-recall, entity-query');
+    logError('Subcommands: extract, ingest-session, generate, recall, remember, index-code, forget, consolidate, lifecycle, ai-prune, maintenance, traverse, inspect, backfill, semantic-edges, load-surface, prompt-recall, entity-query, eval');
     return 1;
   }
 
@@ -1563,6 +1716,9 @@ async function main(): Promise<ExitCode> {
         break;
       case 'entity-query':
         result = await handleEntityQuery(subcommandArgs);
+        break;
+      case 'eval':
+        result = await handleEval(subcommandArgs);
         break;
       default:
         result = {
