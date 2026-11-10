@@ -419,9 +419,16 @@ Extraction, AI prune, and edge classification shell out to a headless coding-age
 ## Testing
 
 ```bash
-cd engine && bun test          # vitest run
-cd engine && bun test:watch    # vitest watch
+cd engine && bun run test         # bun test --isolate (the vitest API, run by Bun)
+cd engine && bun run test:watch   # same, in watch mode
 ```
+
+Use the scripts, not a bare `bun test`: `vi.mock` is process-wide under Bun, so
+per-file `--isolate` is what keeps one file's module mocks out of the others.
+
+The engine pins `onnxruntime-node` to 1.24.3 through `overrides` in
+`package.json`: earlier versions make Bun panic at process exit (status 134)
+once the embedding model has loaded.
 
 Dependencies: `vitest`, `fast-check` (property-based). All core/ functions testable with plain data — no mocks needed.
 

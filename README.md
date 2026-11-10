@@ -450,16 +450,20 @@ All `.memory/` contents and `cortex-memory.local.md` are gitignored automaticall
 
 ### Prerequisites
 
-- [Bun](https://bun.sh) >= 1.0
+- [Bun](https://bun.sh) at the version pinned in `.bun-version` (the test runner needs `bun test --isolate`)
 
 ### Install & Test
 
 ```bash
 cd engine
 bun install
-bun test          # vitest run
-bun test:watch    # vitest watch mode
+bun run test         # bun test --isolate (the vitest API, run by Bun)
+bun run test:watch   # same, in watch mode
 ```
+
+Run the suite through these scripts, not a bare `bun test`: tests mock modules
+with `vi.mock`, which Bun applies process-wide, so only `--isolate` keeps one
+file's mocks out of the others. CI runs the same script on Ubuntu and macOS.
 
 ### CLI Usage
 

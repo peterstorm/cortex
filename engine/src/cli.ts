@@ -1463,11 +1463,32 @@ async function handleIngestSession(): Promise<CommandResult> {
 // MAIN DISPATCH
 // ============================================================================
 
+/** Process exit status for the CLI. */
+export type ExitCode = 0 | 1;
+
+/**
+ * The exit status a command's result maps to.
+ *
+ * A deferral is not a failure: the command did no work yet and the caller is
+ * expected to run it again, so it exits 0 like a success.
+ */
+export function exitCodeFor(result: CommandResult): ExitCode {
+  return result.kind === 'failed' ? 1 : 0;
+}
+
 /**
  * Main CLI entry point
- * Parses subcommand and dispatches to appropriate handler
+ * Parses subcommand and dispatches to appropriate handler.
+ *
+ * Returns the exit status instead of calling `process.exit`, so the entry
+ * point can set `process.exitCode` and let the event loop drain: buffered
+ * stdout reaches a pipe in full, and native teardown runs on a normal exit.
+ * onnxruntime-node before 1.24 made Bun panic under `process.exit()` ("A C++
+ * exception occurred", status 134) even after `disposeLocalModel()`; the
+ * engine pins 1.24.3 through package.json `overrides`, and the regression
+ * test in cli-exit.test.ts covers both.
  */
-async function main() {
+async function main(): Promise<ExitCode> {
   // Before any subcommand runs, because the loader reads LD_LIBRARY_PATH once
   // at process start: where onnxruntime's libstdc++ is off the default path,
   // this re-runs the process with it and never returns. A no-op everywhere
@@ -1479,7 +1500,7 @@ async function main() {
   if (args.length === 0) {
     logError('Usage: cli.ts <subcommand> [args...]');
     logError('Subcommands: extract, ingest-session, generate, recall, remember, index-code, forget, consolidate, lifecycle, ai-prune, maintenance, traverse, inspect, backfill, semantic-edges, load-surface, prompt-recall, entity-query');
-    process.exit(1);
+    return 1;
   }
 
   const subcommand = args[0];
@@ -1564,14 +1585,11 @@ async function main() {
   // Dispose ONNX model resources before exit
   await disposeLocalModel();
 
-  // A deferral is not a failure: the command did no work yet and the caller is
-  // expected to run it again, so it exits 0 like a success.
   if (result.kind === 'failed') {
     logError(result.error);
-    process.exit(1);
   }
 
-  process.exit(0);
+  return exitCodeFor(result);
 }
 
 // ============================================================================
@@ -1585,10 +1603,17 @@ function logError(message: string): void {
   console.error(`[cortex] ${message}`);
 }
 
-// Run main only when executed directly (not imported by tests)
+// Run main only when executed directly (not imported by tests).
+// Never `process.exit()` here: see main() for why the exit status is set and
+// the event loop left to drain instead.
 if (import.meta.main) {
-  main().catch((err) => {
-    logError(`Fatal error: ${err}`);
-    process.exit(1);
-  });
+  main().then(
+    (code) => {
+      process.exitCode = code;
+    },
+    (err) => {
+      logError(`Fatal error: ${err}`);
+      process.exitCode = 1;
+    },
+  );
 }
