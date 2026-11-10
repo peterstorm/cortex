@@ -40,13 +40,28 @@ function storeWith(versions: readonly string[], elfClass: 1 | 2 = 2): string {
   return store;
 }
 
+/**
+ * No system default directories: these tests decide everything the loader can
+ * see. With the real defaults, a stock distribution (libstdc++ in
+ * /usr/lib/x86_64-linux-gnu) resolves natively whatever LD_LIBRARY_PATH says.
+ */
+const NO_SYSTEM_DIRECTORIES: readonly string[] = [];
+
 describe('resolving libstdc++ before onnxruntime needs it', () => {
   it('sees a library the loader would already find through LD_LIBRARY_PATH', () => {
     const directory = scratch('cortex-lib-');
     writeElf(join(directory, 'libstdc++.so.6'), 2);
 
-    expect(resolvesNatively({ LD_LIBRARY_PATH: directory })).toBe(true);
-    expect(resolvesNatively({ LD_LIBRARY_PATH: `${directory}-absent` })).toBe(false);
+    expect(resolvesNatively({ LD_LIBRARY_PATH: directory }, NO_SYSTEM_DIRECTORIES)).toBe(true);
+    expect(resolvesNatively({ LD_LIBRARY_PATH: `${directory}-absent` }, NO_SYSTEM_DIRECTORIES)).toBe(false);
+  });
+
+  it('also searches the loader default directories after LD_LIBRARY_PATH', () => {
+    const system = scratch('cortex-system-lib-');
+    writeElf(join(system, 'libstdc++.so.6'), 2);
+
+    expect(resolvesNatively({}, [system])).toBe(true);
+    expect(resolvesNatively({}, NO_SYSTEM_DIRECTORIES)).toBe(false);
   });
 
   it('rejects a 32-bit library rather than letting dlopen fail on ELF class', () => {
@@ -56,7 +71,7 @@ describe('resolving libstdc++ before onnxruntime needs it', () => {
     // Accepting this is the failure the ELF check exists to prevent: dlopen
     // reports "wrong ELF class: ELFCLASS32", which reaches the caller as the
     // same generic embedding failure as a missing library.
-    expect(resolvesNatively({ LD_LIBRARY_PATH: directory })).toBe(false);
+    expect(resolvesNatively({ LD_LIBRARY_PATH: directory }, NO_SYSTEM_DIRECTORIES)).toBe(false);
   });
 
   it('picks the newest gcc output, not whichever hash sorts first', () => {
