@@ -1,0 +1,53 @@
+name: Verification
+
+on:
+  pull_request:
+  push:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      # A red macOS run must not cancel the Linux run: the native ONNX runtime
+      # and its libstdc++ resolution differ per platform, so each failure is
+      # its own diagnosis.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+      - name: Required tools
+        run: |
+          set -euo pipefail
+          test "$(bun --version)" = "$(cat .bun-version)"
+      - name: Install locked engine dependencies
+        working-directory: engine
+        run: bun install --frozen-lockfile
+      - name: Require the pinned ONNX runtime
+        # onnxruntime-node < 1.24 makes Bun panic at process exit (status 134);
+        # the engine pins 1.24.3 through package.json overrides.
+        working-directory: engine
+        run: |
+          set -euo pipefail
+          version="$(bun -e 'console.log(require("./node_modules/onnxruntime-node/package.json").version)')"
+          echo "onnxruntime-node $version"
+          test "$version" = "1.24.3"
+      - name: Cache the local embedding model
+        uses: actions/cache@v4
+        with:
+          path: engine/node_modules/@huggingface/transformers/.cache
+          key: hf-model-${{ runner.os }}-${{ hashFiles('engine/src/config.ts') }}
+      - name: Test
+        working-directory: engine
+        run: bun test
