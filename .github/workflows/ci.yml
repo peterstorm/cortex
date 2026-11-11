@@ -43,6 +43,13 @@ jobs:
           version="$(bun -e 'console.log(require("./node_modules/onnxruntime-node/package.json").version)')"
           echo "onnxruntime-node $version"
           test "$version" = "1.24.3"
+      - name: Typecheck
+        # Bun runs the sources without checking them, so a test whose types no
+        # longer match the code keeps passing while it asserts on `undefined`.
+        # Runs on both platforms: @types/bun and @types/node resolve the same
+        # everywhere, and the step costs seconds.
+        working-directory: engine
+        run: bun run typecheck
       - name: Cache the local embedding model
         uses: actions/cache@v4
         with:

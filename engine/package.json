@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "test": "bun test --isolate",
-    "test:watch": "bun test --isolate --watch"
+    "test:watch": "bun test --isolate --watch",
+    "typecheck": "tsc --noEmit -p ."
   },
   "dependencies": {
     "@huggingface/transformers": "^3.0.0",
