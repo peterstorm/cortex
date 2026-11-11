@@ -1,11 +1,10 @@
 /**
- * Tests for the shared global database and the one-time merge of the legacy
- * per-harness databases. Real SQLite files in a temp directory throughout:
- * the merge is SQL, and its failure modes are file-level.
+ * Tests for the shared global database and the merge of the legacy
+ * per-harness databases into it. Real SQLite files in a temp directory
+ * throughout: the merge is SQL, and its failure modes are file-level.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import * as fc from 'fast-check';
 import { Database } from 'bun:sqlite';
 import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -23,13 +22,7 @@ import {
   searchByKeyword,
   upsertEntity,
 } from './db.js';
-import {
-  copyStatement,
-  migrateGlobalDb,
-  resolveGlobalDbPath,
-  sharedColumns,
-  type GlobalDbMigration,
-} from './global-db.js';
+import { migrateGlobalDb, resolveGlobalDbPath, type GlobalDbMigration } from './global-db.js';
 
 function makeMemory(id: string, overrides: Partial<Parameters<typeof createMemory>[0]> = {}): Memory {
   return createMemory({
@@ -51,6 +44,7 @@ let home: string;
 let target: string;
 let legacy: readonly LegacyGlobalDb[];
 const NOW = new Date('2026-11-10T12:00:00.000Z');
+const LATER = new Date('2026-11-11T12:00:00.000Z');
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'cortex-global-db-'));
@@ -62,9 +56,11 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true });
 });
 
+const legacyPath = (harness: 'claude' | 'pi') => legacy.find((l) => l.harness === harness)!.path;
+
 /** Create a legacy DB at the harness's old path, run `seed` on it, close it. */
 function seedLegacy(harness: 'claude' | 'pi', seed: (db: Database) => void): string {
-  const path = legacy.find((l) => l.harness === harness)!.path;
+  const path = legacyPath(harness);
   mkdirSync(dirname(path), { recursive: true });
   const db = openDatabase(path);
   try {
@@ -75,12 +71,24 @@ function seedLegacy(harness: 'claude' | 'pi', seed: (db: Database) => void): str
   return path;
 }
 
-function migrate(waitMs?: number): GlobalDbMigration {
-  return migrateGlobalDb({ target, legacy, now: NOW, waitMs });
+function corruptLegacy(harness: 'claude' | 'pi'): string {
+  const path = legacyPath(harness);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, 'this is not a sqlite database, just some bytes that are long enough');
+  return path;
+}
+
+function migrate(options: { waitMs?: number; now?: Date } = {}): GlobalDbMigration {
+  return migrateGlobalDb({ target, legacy, now: options.now ?? NOW, waitMs: options.waitMs });
 }
 
 function merged(migration: GlobalDbMigration) {
   if (migration.kind !== 'merged') throw new Error(`expected merged, got ${JSON.stringify(migration)}`);
+  return migration;
+}
+
+function failed(migration: GlobalDbMigration) {
+  if (migration.kind !== 'failed') throw new Error(`expected failed, got ${JSON.stringify(migration)}`);
   return migration;
 }
 
@@ -93,20 +101,13 @@ function withTarget<T>(read: (db: Database) => T): T {
   }
 }
 
+const keptCopies = (original: string) =>
+  readdirSync(dirname(original)).filter((f) => f.startsWith('cortex-global.db.merged-') && !/-(wal|shm|journal)$/.test(f));
+
 describe('migrateGlobalDb', () => {
   it('does nothing and creates nothing when no legacy database exists', () => {
-    expect(migrate()).toEqual({ kind: 'fresh' });
-    expect(existsSync(target)).toBe(false);
-  });
-
-  it('leaves a present target and the legacy databases alone', () => {
-    const claude = seedLegacy('claude', (db) => insertMemory(db, makeMemory('c1')));
-    mkdirSync(dirname(target), { recursive: true });
-    openDatabase(target).close();
-
     expect(migrate()).toEqual({ kind: 'current' });
-    expect(existsSync(claude)).toBe(true);
-    expect(withTarget((db) => getMemory(db, 'c1'))).toBeNull();
+    expect(existsSync(target)).toBe(false);
   });
 
   it('merges both harnesses into one database and keeps the originals aside', () => {
@@ -119,9 +120,8 @@ describe('migrateGlobalDb', () => {
 
     const result = merged(migrate());
 
-    // Checked before anything opens the target: only the database itself is
-    // there, with no staging, WAL or snapshot files left by the merge.
-    expect(readdirSync(dirname(target))).toEqual(['global.db']);
+    // Only the database and its own WAL files: no snapshot or lock left behind.
+    expect(readdirSync(dirname(target)).filter((f) => !/^global\.db(-wal|-shm)?$/.test(f))).toEqual([]);
     expect(result.sources.map((s) => [s.source.harness, s.copied.memories, s.duplicates.memories])).toEqual([
       ['claude', 2, 0],
       ['pi', 1, 0],
@@ -136,17 +136,50 @@ describe('migrateGlobalDb', () => {
     });
     for (const original of [claude, pi]) {
       expect(existsSync(original)).toBe(false);
-      expect(readdirSync(dirname(original)).some((f) => f.startsWith('cortex-global.db.merged-'))).toBe(true);
+      expect(keptCopies(original)).toHaveLength(1);
     }
     expect(result.sources[0].keptAs).toBe(`${claude}.merged-2026-11-10T12-00-00-000Z`);
   });
 
-  it('is idempotent: a second run finds the target and changes nothing', () => {
+  it('merges into a shared database that already exists: an empty one cannot hide unmerged memories', () => {
+    mkdirSync(dirname(target), { recursive: true });
+    withTarget((db) => insertMemory(db, makeMemory('already-shared')));
+    const claude = seedLegacy('claude', (db) => insertMemory(db, makeMemory('c1')));
+
+    expect(merged(migrate()).sources[0].copied.memories).toBe(1);
+    withTarget((db) => {
+      expect(getMemory(db, 'already-shared')).not.toBeNull();
+      expect(getMemory(db, 'c1')).not.toBeNull();
+    });
+    expect(existsSync(claude)).toBe(false);
+  });
+
+  it('is idempotent: once every legacy file is aside, a run changes nothing', () => {
     seedLegacy('claude', (db) => insertMemory(db, makeMemory('c1')));
     merged(migrate());
 
     expect(migrate()).toEqual({ kind: 'current' });
     expect(withTarget((db) => getMemory(db, 'c1'))).not.toBeNull();
+  });
+
+  it('merges a legacy file an older harness recreated after the merge, keeping both kept copies', () => {
+    const claude = seedLegacy('claude', (db) => insertMemory(db, makeMemory('c1')));
+    merged(migrate());
+    seedLegacy('claude', (db) => insertMemory(db, makeMemory('c2-written-later')));
+
+    expect(merged(migrate({ now: LATER })).sources[0].copied.memories).toBe(1);
+    withTarget((db) => expect(getMemory(db, 'c2-written-later')).not.toBeNull());
+    expect(keptCopies(claude)).toHaveLength(2);
+  });
+
+  it('never overwrites a kept copy when the same file is merged twice at the same instant', () => {
+    const claude = seedLegacy('claude', (db) => insertMemory(db, makeMemory('c1')));
+    const first = merged(migrate()).sources[0].keptAs;
+    seedLegacy('claude', (db) => insertMemory(db, makeMemory('c2')));
+    const second = merged(migrate()).sources[0].keptAs;
+
+    expect(second).not.toBe(first);
+    expect(keptCopies(claude)).toHaveLength(2);
   });
 
   it('merges a single legacy database when only one harness was used', () => {
@@ -263,28 +296,35 @@ describe('migrateGlobalDb', () => {
     expect(withTarget((db) => getMemory(db, 'old'))).toMatchObject({ content: 'from an old schema', archived_at: null });
   });
 
-  it('fails without creating the target or touching the legacy files when a source is unreadable', () => {
-    seedLegacy('claude', (db) => insertMemory(db, makeMemory('c1')));
-    const pi = legacy[1].path;
-    mkdirSync(dirname(pi), { recursive: true });
-    writeFileSync(pi, 'this is not a sqlite database, just some bytes that are long enough');
+  it('keeps what merged before an unreadable source and leaves that source in place', () => {
+    const claude = seedLegacy('claude', (db) => insertMemory(db, makeMemory('c1')));
+    const pi = corruptLegacy('pi');
 
-    const result = migrate();
-    expect(result.kind).toBe('failed');
-    expect(existsSync(target)).toBe(false);
-    expect(existsSync(legacy[0].path)).toBe(true);
+    const result = failed(migrate());
+    expect(result.error).toContain(pi);
+    expect(result.merged.map((m) => m.source.harness)).toEqual(['claude']);
+    expect(existsSync(claude)).toBe(false);
     expect(existsSync(pi)).toBe(true);
-    // No staging leftovers beside the target.
-    expect(readdirSync(dirname(target)).filter((f) => f.includes('merging'))).toEqual([]);
+    expect(withTarget((db) => getMemory(db, 'c1'))).not.toBeNull();
+    expect(readdirSync(dirname(target)).filter((f) => f.includes('.source-'))).toEqual([]);
   });
 
-  it('reports busy when another live process holds the merge lock and never finishes', () => {
+  it('stops at the first unreadable source, so a later one cannot take its clashes', () => {
+    const claude = corruptLegacy('claude');
+    const pi = seedLegacy('pi', (db) => insertMemory(db, makeMemory('p1')));
+
+    expect(failed(migrate()).merged).toEqual([]);
+    expect(existsSync(claude)).toBe(true);
+    expect(existsSync(pi)).toBe(true);
+  });
+
+  it('reports busy when another live process holds the merge lock past the wait', () => {
     seedLegacy('claude', (db) => insertMemory(db, makeMemory('c1')));
     mkdirSync(dirname(target), { recursive: true });
     // This process's PID is alive, so the lock reads as held by another merge.
     writeFileSync(`${target}.lock`, String(process.pid));
 
-    expect(migrate(150)).toEqual({ kind: 'busy' });
+    expect(migrate({ waitMs: 150 })).toEqual({ kind: 'busy' });
     expect(existsSync(target)).toBe(false);
     expect(existsSync(legacy[0].path)).toBe(true);
   });
@@ -311,49 +351,33 @@ describe('resolveGlobalDbPath', () => {
     expect(lines).toEqual([]);
   });
 
-  it("falls back to this harness's legacy database when the merge fails, so the shared one is never created empty", () => {
+  it("falls back to this harness's own database while it is still unmerged, else to the shared one", () => {
     seedLegacy('claude', (db) => insertMemory(db, makeMemory('c1')));
-    mkdirSync(dirname(legacy[1].path), { recursive: true });
-    writeFileSync(legacy[1].path, 'not a database');
+    const pi = corruptLegacy('pi');
     const { lines, log } = quiet();
 
-    expect(resolveGlobalDbPath({ env: {}, home, harness: 'pi', log })).toBe(legacy[1].path);
-    expect(resolveGlobalDbPath({ env: {}, home, harness: 'claude', log })).toBe(legacy[0].path);
-    expect(existsSync(target)).toBe(false);
-    expect(lines[0]).toMatch(/^WARN: merging .* failed: .*; using .*cortex-global\.db for now$/);
+    // Claude merges, pi fails: pi keeps its own file in view until the retry.
+    expect(resolveGlobalDbPath({ env: {}, home, harness: 'pi', log })).toBe(pi);
+    expect(lines[0]).toMatch(/^WARN: merging .* failed: .*\nmerged before the failure:\n {2}claude: memories \+1/);
+    expect(lines[0]).toMatch(/; using .*cortex-global\.db for now$/);
+    // Claude's own file is already merged, so the shared one holds its memories.
+    expect(resolveGlobalDbPath({ env: {}, home, harness: 'claude', log })).toBe(target);
   });
 
-  it('merges into CORTEX_GLOBAL_DB when it is set', () => {
-    seedLegacy('claude', (db) => insertMemory(db, makeMemory('c1')));
+  it('uses CORTEX_GLOBAL_DB as it is, and never reads or moves the legacy files', () => {
+    const claude = seedLegacy('claude', (db) => insertMemory(db, makeMemory('c1')));
     const custom = join(home, 'custom', 'memory.db');
 
     expect(resolveGlobalDbPath({ env: { CORTEX_GLOBAL_DB: custom }, home, log: () => {} })).toBe(custom);
-    expect(existsSync(custom)).toBe(true);
-  });
-});
-
-describe('merge SQL', () => {
-  it('sharedColumns keeps the target order and only columns both sides have', () => {
-    const columnList = fc.uniqueArray(fc.constantFrom<string>('a', 'b', 'c', 'd', 'e', 'f'));
-    fc.assert(
-      fc.property(
-        columnList,
-        columnList,
-        (targetCols, legacyCols) => {
-          const shared = sharedColumns(targetCols, legacyCols);
-          expect(shared.every((c) => targetCols.includes(c) && legacyCols.includes(c))).toBe(true);
-          expect(shared).toEqual(targetCols.filter((c) => legacyCols.includes(c)));
-        },
-      ),
-    );
+    expect(existsSync(custom)).toBe(false);
+    expect(existsSync(claude)).toBe(true);
   });
 
-  it('copies columns by name, and only a fact repoints its entity', () => {
-    expect(copyStatement('memories', ['id', 'content'])).toBe(
-      'INSERT OR IGNORE INTO main.memories (id, content) SELECT src.id, src.content FROM legacy.memories AS src',
-    );
-    expect(copyStatement('facts', ['id', 'entity_id'])).toMatch(
-      /SELECT src\.id, \(SELECT kept\.id FROM main\.entities kept JOIN legacy\.entities own/,
-    );
+  it('finds the legacy databases under $HOME, not the account home Bun reports', () => {
+    seedLegacy('claude', (db) => insertMemory(db, makeMemory('c1')));
+    const { log } = quiet();
+
+    expect(resolveGlobalDbPath({ env: { HOME: home }, log })).toBe(target);
+    expect(withTarget((db) => getMemory(db, 'c1'))).not.toBeNull();
   });
 });

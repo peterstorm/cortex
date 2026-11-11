@@ -1534,7 +1534,9 @@ async function handleEvalAnswer(
       now: new Date(),
     },
     (snapshotDir) => {
-      const sources = snapshotMemory({ cwd: command.cwd, globalDbPath: getGlobalDbPath(), snapshotDir });
+      // The same global DB every other command opens, merged from the
+      // per-harness ones first if that has not happened yet.
+      const sources = snapshotMemory({ cwd: command.cwd, globalDbPath: resolveGlobalDbPath(), snapshotDir });
       return { sources, excludedMemories: countRefused(snapshotDir, admit) };
     },
   );

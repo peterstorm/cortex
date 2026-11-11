@@ -1,0 +1,3 @@
+[test]
+# Keeps every test, and every CLI a test spawns, off the real global database.
+preload = ["./src/test-preload.ts"]

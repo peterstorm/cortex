@@ -189,15 +189,16 @@ Cortex follows a **Functional Core / Imperative Shell** design:
 
 During extraction, candidates the LLM classifies as scope `"global"` are routed to the global database; everything else lands in the project database. Both databases are shared by every harness: a fact learned in a pi session is recalled in Claude Code, and the other way round.
 
-**Migrating from per-harness global databases.** Earlier versions kept one global database per harness (`~/.claude/memory/cortex-global.db` and `~/.pi/agent/memory/cortex-global.db`). The first cortex command to run after upgrading merges both into the shared one and logs what it copied:
+**Migrating from per-harness global databases.** Earlier versions kept one global database per harness (`~/.claude/memory/cortex-global.db` and `~/.pi/agent/memory/cortex-global.db`). Any cortex command that finds one of them still at its old path merges it into the shared one and logs what it copied:
 
 - **All rows are copied.** That includes memories of every status, edges, entities, facts and extraction checkpoints. Search indexes are rebuilt as rows arrive.
 - **Clashes keep the Claude Code copy.** If the same memory id is in both databases, the Claude Code row is kept. An entity that clashes by name and type is collapsed into one, and its facts are pointed at the survivor.
 - **The old files are kept.** They are renamed to `*.merged-<timestamp>`, never deleted.
-- **A merge happens once.** It is built in a staging file and renamed into place, so an interrupted merge is retried on the next run. A present shared database is never merged into again.
-- **A failed merge loses nothing.** If the merge cannot run, cortex keeps using the current harness's old database and retries next time. Opening the shared path anyway would create it empty, and the old memories would then never be merged.
-
-Upgrade the plugin for every harness at once. An old version still running writes to its old path, and those writes stay in the renamed file instead of the shared database.
+- **An old file at its old path means "not merged yet".** Once a file is renamed it is never read again, so the merge runs once per file. Whether the shared database already exists does not matter: an empty one cannot hide unmerged memories.
+- **Each file is merged in one transaction.** It is renamed only after that commits, so an interrupted merge leaves it in place, and the retry skips the rows already copied.
+- **A failed merge loses nothing.** Files are merged Claude Code first and the merge stops at the first failure, so a later file can never take an earlier one's clashes. Until the retry succeeds, a harness whose own file is still unmerged keeps using it.
+- **A harness still on an old version is caught up.** It writes to its old path, which recreates the file there, and the next command merges it. Writes it makes to a file that is open while that file is renamed stay in the renamed copy. That copy is kept and can be merged again by moving it back to the old path.
+- **`CORTEX_GLOBAL_DB` turns the merge off.** A database named there is used exactly as it is, and the old files are never read or moved. The test suite sets it, so no test can touch your real databases.
 
 ### External Services
 

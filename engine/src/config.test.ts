@@ -8,6 +8,8 @@ import {
   getProjectDbPath,
   getGlobalDbPath,
   getLegacyGlobalDbPaths,
+  homeDir,
+  locateGlobalDb,
   getSurfaceCacheDir,
   getSurfaceOutputPath,
   getLockDir,
@@ -47,6 +49,17 @@ describe('config - path resolution', () => {
 
   it('getGlobalDbPath lets CORTEX_GLOBAL_DB override everything', () => {
     expect(getGlobalDbPath({ CORTEX_GLOBAL_DB: '/x/m.db', XDG_DATA_HOME: '/data' }, '/home/u')).toBe('/x/m.db');
+  });
+
+  it('locateGlobalDb tells an explicit override from the default, which is the one merged into', () => {
+    expect(locateGlobalDb({ CORTEX_GLOBAL_DB: '/x/m.db' }, '/home/u')).toEqual({ kind: 'override', path: '/x/m.db' });
+    expect(locateGlobalDb({}, '/home/u')).toEqual({ kind: 'default', path: '/home/u/.local/share/cortex/global.db' });
+  });
+
+  it('homeDir takes an absolute $HOME and ignores a relative one', () => {
+    expect(homeDir({ HOME: '/tmp/isolated-home' })).toBe('/tmp/isolated-home');
+    expect(homeDir({ HOME: 'relative' })).not.toBe('relative');
+    expect(getGlobalDbPath({ HOME: '/tmp/isolated-home' })).toBe('/tmp/isolated-home/.local/share/cortex/global.db');
   });
 
   it('getLegacyGlobalDbPaths lists the old per-harness files, Claude first', () => {

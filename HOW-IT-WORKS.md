@@ -22,7 +22,7 @@ Cortex maintains **two** SQLite databases:
 | **Project** | `<project>/.memory/cortex.db` | Project-specific memories (default) |
 | **Global** | `${XDG_DATA_HOME:-~/.local/share}/cortex/global.db` (override: `CORTEX_GLOBAL_DB`) | Cross-project knowledge |
 
-During extraction, candidates the LLM classifies as scope "global" (e.g., "TypeScript generics work like this" vs "our API uses X pattern") are routed to the **global** database; everything else lands in the project database. Every harness reads and writes the same two databases. The per-harness global databases of earlier versions are merged into the shared one, once, by the first command after upgrading (see the README's "Two Databases").
+During extraction, candidates the LLM classifies as scope "global" (e.g., "TypeScript generics work like this" vs "our API uses X pattern") are routed to the **global** database; everything else lands in the project database. Every harness reads and writes the same two databases. The per-harness global databases of earlier versions are merged into the shared one by any command that finds them still at their old paths, then renamed aside (see the README's "Two Databases").
 
 ---
 

@@ -14,8 +14,19 @@ import type { SimilaritySpace } from './core/types.js';
 
 export type Env = Readonly<Record<string, string | undefined>>;
 
-function currentEnv(): Env {
+export function currentEnv(): Env {
   return typeof Bun !== 'undefined' ? Bun.env : process.env;
+}
+
+/**
+ * The user's home directory: `$HOME` when it is an absolute path, as POSIX
+ * shells and Node resolve it, else the account's entry.
+ *
+ * Not `os.homedir()` alone: under Bun it ignores `$HOME`, so a test that set
+ * HOME for a child CLI still had that CLI read and write the real home.
+ */
+export function homeDir(env: Env = currentEnv()): string {
+  return env.HOME && isAbsolute(env.HOME) ? env.HOME : homedir();
 }
 
 /**
@@ -44,33 +55,42 @@ export function getProjectDbPath(projectRoot: string): string {
 }
 
 /**
- * Resolve the global database path — one database for every harness.
+ * Where the global database lives — one database for every harness.
  *
  * Global memories are about the user, not about the tool they are typing into,
- * so Claude Code and pi read and write the same file. It lives under the XDG
- * data directory rather than either harness's own directory, because it
- * belongs to neither. `CORTEX_GLOBAL_DB` overrides the location.
- *
- * Pure given its arguments; the defaults read the process environment.
- *
- * @returns Absolute path to global database
+ * so Claude Code and pi read and write the same file. By default it lives
+ * under the XDG data directory rather than either harness's own directory,
+ * because it belongs to neither, and the per-harness databases are merged
+ * into it. `CORTEX_GLOBAL_DB` names a file to use exactly as it is instead.
  */
-export function getGlobalDbPath(env: Env = currentEnv(), home: string = homedir()): string {
-  if (env.CORTEX_GLOBAL_DB) return env.CORTEX_GLOBAL_DB;
+export type GlobalDbLocation =
+  /** `CORTEX_GLOBAL_DB`: used as it is; nothing is merged into it. */
+  | Readonly<{ kind: 'override'; path: string }>
+  /** The XDG default, which the per-harness databases are merged into. */
+  | Readonly<{ kind: 'default'; path: string }>;
+
+/** Pure given its arguments; the defaults read the process environment. */
+export function locateGlobalDb(env: Env = currentEnv(), home: string = homeDir(env)): GlobalDbLocation {
+  if (env.CORTEX_GLOBAL_DB) return { kind: 'override', path: env.CORTEX_GLOBAL_DB };
   // The XDG spec says a relative value is invalid and must be ignored.
   const dataHome =
     env.XDG_DATA_HOME && isAbsolute(env.XDG_DATA_HOME)
       ? env.XDG_DATA_HOME
       : join(home, '.local', 'share');
-  return join(dataHome, 'cortex', 'global.db');
+  return { kind: 'default', path: join(dataHome, 'cortex', 'global.db') };
+}
+
+/** The global database's path, wherever it is configured to live. */
+export function getGlobalDbPath(env: Env = currentEnv(), home: string = homeDir(env)): string {
+  return locateGlobalDb(env, home).path;
 }
 
 /**
  * Where each harness kept its own global database before they were unified,
  * in merge-precedence order: on an id clash the first one's row is kept.
- * Read only by the one-time merge (infra/global-db.ts).
+ * Read only by the merge (infra/global-db.ts).
  */
-export function getLegacyGlobalDbPaths(home: string = homedir()): readonly LegacyGlobalDb[] {
+export function getLegacyGlobalDbPaths(home: string = homeDir()): readonly LegacyGlobalDb[] {
   return [
     { harness: 'claude', path: join(home, '.claude', 'memory', 'cortex-global.db') },
     { harness: 'pi', path: join(home, '.pi', 'agent', 'memory', 'cortex-global.db') },
