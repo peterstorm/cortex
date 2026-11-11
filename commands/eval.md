@@ -55,4 +55,5 @@ bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts eval score <run> [<run>] [--dry-run]
 - `correct_current` and `missed` should rise **together** on held_out. Memory that says little is rarely wrong and misses everything.
 - `relevant` falling as memory grows means junk is getting in.
 - A `<- mixed models` flag means a routing server swapped weights mid-run, so the run is not a clean comparison.
+- A `<- the runs read different ... databases` flag means the two snapshots came from different project or global databases (another harness, another machine), so the change measures the data, not cortex.
 - A `<- check the judge` flag on a measure means its scores can't be trusted until the judge is fixed or that measure is scored by hand.

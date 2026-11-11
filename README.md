@@ -394,7 +394,7 @@ Every change to extraction, ranking or pruning feels like progress. `/eval` tell
 eval.json                 {"authoring_sessions": ["<session id>", ...]}
 questions.jsonl           one confirmed case per line
 labels.jsonl              optional: your own scores, to check the judge
-runs/<run>/run.json       the run's identity (condition, answer model, prompt digest, snapshot)
+runs/<run>/run.json       the run's identity (condition, answer model, prompt digest, snapshot and the DBs it was copied from)
 runs/<run>/memory/        frozen copy of the project + global DBs the run answers from
 runs/<run>/answers.jsonl  appended as each case is answered
 runs/<run>/scores.jsonl   appended as each answer is judged
@@ -422,13 +422,14 @@ bun engine/src/cli.ts eval score none-1 cortex-2026-11-09 --dry-run --cwd=<proje
 bun engine/src/cli.ts eval score none-1 cortex-2026-11-09 --cwd=<project>
 ```
 
-The report has one table per split over the cases both runs scored, with the change per measure, mean prompt tokens, a per-kind `correct_current/missed` view, which model answered each run, and anything left out. After a change to cortex, answer a new run and score it against the old one. Never delete the "before".
+The report has one table per split over the cases both runs scored, with the change per measure, mean prompt tokens, a per-kind `correct_current/missed` view, which model answered each run, which memory each run read, and anything left out. After a change to cortex, answer a new run and score it against the old one. Never delete the "before".
 
 **Comparability, enforced.**
 - A run answers from a `VACUUM INTO` snapshot taken at its start. Surface ranking also depends on the branch and on time (recency decay), so the run pins both.
 - An interrupted run resumes with the same command and fills only the missing answers. A resume under a different condition, answer model, answer prompt or authoring-session list is refused: that is a new experiment and needs a new run name.
 - A judgement is stored under the hash of its exact judge prompt (rubric, case and answer) plus the requested judge model. Re-scoring reuses it, while editing a truth or switching the judge re-judges.
 - Each answer records the model the provider reported, and the report flags a run that a routing server answered with several models.
+- Each snapshot records the project and global database it was copied from, and the report flags two snapshot runs that read different ones: a run taken under another harness or machine read other global memory, so it is not a before and after.
 
 **Check the judge.** Score about ten answers yourself into `labels.jsonl` (`{"run": "cortex-2026-11-09", "id": "q01", "correct_current": 0, "missed": 0.5}`). `score` then prints the judge's mean gap per measure and flags gaps above 0.2. Fix the judge or score that measure by hand before trusting it.
 
