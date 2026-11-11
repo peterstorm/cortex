@@ -21,6 +21,7 @@ Claude Code reads `.claude/cortex-memory.local.md` as context, giving it "memory
 - [Similarity & Deduplication](#similarity--deduplication)
 - [Semantic Search](#semantic-search)
 - [Memory Lifecycle](#memory-lifecycle)
+- [Evaluation](#evaluation)
 - [Configuration](#configuration)
 - [File Layout](#file-layout)
 - [Development](#development)
@@ -29,11 +30,11 @@ Claude Code reads `.claude/cortex-memory.local.md` as context, giving it "memory
 
 ### Session Start
 
-A `SessionStart` hook loads a cached "surface" — a compact markdown summary of the most relevant memories. The cache is keyed by `sha256(branch:cwd)` and valid for 24 hours. If stale or missing, it regenerates from the database — but only for projects that already have a `.memory/cortex.db` (the hook never creates databases in untouched projects). In Pi, this cache refresh is detached so startup and `/new` do not wait on the engine CLI; an existing surface remains readable until the atomic refresh completes. Additionally, a `UserPromptSubmit` hook pipes the surface file contents on every prompt, and a second `UserPromptSubmit` hook (`prompt-recall.sh`) runs recall against your prompt — semantic-first (cosine floor 0.50, within a 0.15 band of the best hit, memories already in the surface excluded before ranking), supplemented by strict keyword AND matches. Broad keyword OR search only runs as the degraded path when the embedder is unavailable.
+A `SessionStart` hook loads a cached "surface" — a compact markdown summary of the most relevant memories. The cache is keyed by `sha256(branch:cwd)` and valid for 24 hours. If stale or missing, it regenerates from the database — but only for projects that already have a project database, or a stray one waiting to be merged (the hook never creates databases in untouched projects). In Pi, this cache refresh is detached so startup and `/new` do not wait on the engine CLI; an existing surface remains readable until the atomic refresh completes. Additionally, a `UserPromptSubmit` hook pipes the surface file contents on every prompt, and a second `UserPromptSubmit` hook (`prompt-recall.sh`) runs recall against your prompt — semantic-first (cosine floor 0.50, within a 0.15 band of the best hit, memories already in the surface excluded before ranking), supplemented by strict keyword AND matches. Broad keyword OR search only runs as the degraded path when the embedder is unavailable.
 
 ### During a Session
 
-Seven slash commands let you interact with memory directly: `/remember`, `/recall`, `/forget`, `/consolidate`, `/inspect`, `/prune`, and `/index-code`.
+Seven slash commands let you interact with memory directly: `/remember`, `/recall`, `/forget`, `/consolidate`, `/inspect`, `/prune`, and `/index-code`. An eighth, `/eval`, measures whether any of it helps (see [Evaluation](#evaluation)).
 
 ### Session End
 
@@ -97,6 +98,7 @@ Then install engine dependencies inside the installed plugin's `engine/` directo
 | `/inspect` | View memory health & stats | Diagnostics — counts, queue sizes, extraction stats, graph metrics |
 | `/prune` | AI-powered pruning pass | Periodically to keep memory lean and high-signal |
 | `/index-code` | Pair prose with source code | When important code is written — creates a searchable code memory |
+| `/eval <validate\|answer\|score>` | Score agent answers from memory against a test set of real cases | Before and after any change to extraction, ranking or pruning |
 
 ### `/remember`
 
@@ -149,6 +151,9 @@ Cortex follows a **Functional Core / Imperative Shell** design:
 │  ranking.ts     Composite rank, budget selection      │
 │  surface.ts     Markdown generation, token budgets    │
 │  decay.ts       Exponential decay, lifecycle rules    │
+│  eval-set.ts    Eval cases, answers, labels (parsing) │
+│  eval-rubric.ts Answer/judge prompts, report          │
+│  eval-run.ts    Run identity, resume rules, ports     │
 └───────────────────────────────────────────────────────┘
                           ↕
 ┌───────────────────────────────────────────────────────┐
@@ -171,7 +176,7 @@ Cortex follows a **Functional Core / Imperative Shell** design:
 │  extract.ts, generate.ts, remember.ts, recall.ts,     │
 │  forget.ts, consolidate.ts, lifecycle.ts, ai-prune.ts │
 │  index-code.ts, backfill.ts, semantic-edges.ts,       │
-│  inspect.ts, traverse.ts                              │
+│  inspect.ts, traverse.ts, eval.ts, eval-adapters.ts   │
 └───────────────────────────────────────────────────────┘
 ```
 
@@ -179,10 +184,39 @@ Cortex follows a **Functional Core / Imperative Shell** design:
 
 | Database | Location | Scope |
 |---|---|---|
-| **Project** | `<project>/.memory/cortex.db` | Project-specific memories (default) |
-| **Global** | Claude: `~/.claude/memory/cortex-global.db`; Pi: `~/.pi/agent/memory/cortex-global.db` | Cross-project knowledge |
+| **Project** | `<repository root>/.memory/cortex.db`: the main worktree of the git repository the session is in, or the directory itself outside git | Project-specific memories (default) |
+| **Global** | `${XDG_DATA_HOME:-~/.local/share}/cortex/global.db` (override: `CORTEX_GLOBAL_DB`) | Cross-project knowledge |
 
-During extraction, candidates the LLM classifies as scope `"global"` are routed to the active harness's global database; everything else lands in the project database.
+During extraction, candidates the LLM classifies as scope `"global"` are routed to the global database; everything else lands in the project database. Both databases are shared by every harness: a fact learned in a pi session is recalled in Claude Code, and the other way round.
+
+**A project is a repository, not a directory.** A session started anywhere inside a git repository uses one project database, in the repository's main worktree. That includes a subdirectory or a linked worktree on another branch.
+- **Branches never split memory.** Each memory records the branch it was learned on, and the surface ranks the current branch's memories a little higher.
+- **What stays per session directory:** the surface file `.claude/cortex-memory.local.md`, the branch, and the surface cache key. The cache itself, locks and status files live with the project's memory.
+- **The project's name is its repository's.** A worktree named `loom-security-audit` is project `loom`.
+- **A bare repository's worktrees each keep their own memory.** There is no main checkout to hold it.
+- **Outside git, the directory is the project**, as it was before.
+- **When git is there but cannot answer** (a timeout on a loaded machine, a repository it refuses as "dubious ownership"), the directory is used as the project so the session is not failed, and a `WARN` on stderr says so. Memory written then lands in that directory's own database, apart from the repository's, until a later command merges it back.
+
+**Keeping a directory to itself.** A directory holding `.memory/standalone` (an empty file) keeps its own memory, even inside a repository. Use it for a bot's workspace, whose conversations must not mix into the memory of the people developing the bot. The nearest marker between the session and its checkout's top wins, and the repository never merges a marked directory.
+
+**Merging the old per-directory databases.** Earlier versions keyed memory on the session's directory, so each worktree and each subdirectory a session was started from grew its own database. Every command except the per-prompt recall hook merges the ones it can see into the project's database: the session's own directories between it and the checkout top, and the repository's other worktrees. The rules are the same as for the global merge below:
+- Each database is merged in one transaction, then renamed to `cortex.db.merged-<timestamp>` beside itself. It is kept, never deleted.
+- On a clash the project database's row is kept.
+- A database at its old path is unmerged, so an interrupted merge is simply retried.
+
+A subdirectory database in a directory no session starts from again is not found automatically. Merge it by starting one session there, or by running any command with that directory as `<cwd>`. A deleted worktree's database is in the same position: start a session in the worktree before deleting it.
+
+**Migrating from per-harness global databases.** Earlier versions kept one global database per harness (`~/.claude/memory/cortex-global.db` and `~/.pi/agent/memory/cortex-global.db`). Any cortex command that finds one of them still at its old path merges it into the shared one and logs what it copied:
+
+- **All rows are copied.** That includes memories of every status, edges, entities, facts and extraction checkpoints. Search indexes are rebuilt as rows arrive.
+- **Clashes keep the Claude Code copy.** If the same memory id is in both databases, the Claude Code row is kept. An entity that clashes by name and type is collapsed into one, and its facts are pointed at the survivor.
+- **The old files are kept.** They are renamed to `*.merged-<timestamp>`, never deleted.
+- **An old file at its old path means "not merged yet".** Once a file is renamed it is never read again, so the merge runs once per file. Whether the shared database already exists does not matter: an empty one cannot hide unmerged memories.
+- **Each file is merged in one transaction.** It is renamed only after that commits, so an interrupted merge leaves it in place, and the retry skips the rows already copied.
+- **Only a clash on a key counts as "already present".** A row the shared database refuses for any other reason (a fact whose entity is gone, a missing required value) fails that file's merge, which rolls back and leaves the file at its old path. It is never counted as a duplicate and moved aside.
+- **A failed merge loses nothing.** Files are merged Claude Code first and the merge stops at the first failure, so a later file can never take an earlier one's clashes. Until the retry succeeds, a harness whose own file is still unmerged keeps using it.
+- **A harness still on an old version is caught up.** It writes to its old path, which recreates the file there, and the next command merges it. Writes it makes to a file that is open while that file is renamed stay in the renamed copy. That copy is kept and can be merged again by moving it back to the old path.
+- **`CORTEX_GLOBAL_DB` turns the merge off.** A database named there is used exactly as it is, and the old files are never read or moved. The test suite sets it, so no test can touch your real databases.
 
 ### External Services
 
@@ -377,6 +411,65 @@ Archived memories with no access for 30+ days → status changes to `pruned` (ef
 
 The LLM evaluates active memories in batches and archives low-value ones. Triggered by a watermark: it runs when **20+ active memories were created since the last successful prune** (telemetry `last_ai_prune_at`) or when that successful prune is **7+ days old** (staleness floor), subject to a 6h minimum interval between runs. The watermark advances only on a fully successful run, so a failed prune keeps the review owed and retries on the next maintenance pass. Session *count* deliberately no longer triggers it — subagent-heavy runs end many sessions per hour, which used to turn a full multi-batch LLM re-review into a per-session tax. It runs inside the per-project-locked maintenance pipeline and also holds an AI-prune-specific lock.
 
+## Evaluation
+
+Every change to extraction, ranking or pruning feels like progress. `/eval` tells a better memory from a busier one. It applies Team0's [Measure before you build](https://team0.ai/learn/measure-before-you-build) to cortex: about 20 questions from your real work, each with what is true now and which outdated values must not be presented as current. A third of them are held out from tuning. The judge's five measures are Team0's (`correct_current`, `relevant`, `missed`, `ordered`, `context_complete`, each 0-1; rubric ported from their MIT `score.py`).
+
+**What it measures.** The read path, exactly as the hooks inject it: for each question the answering model gets the push surface plus the prompt-recall block cortex would add for that prompt, and nothing else. It has no tools, so the score is what the memory delivers unprompted, not what an agent could dig up with `/recall`. The `none` condition gives the same prompt with no memory. That is the baseline that says whether memory helps at all.
+
+**The eval directory** (default `<cwd>/.memory/eval`, gitignored with `.memory/`). `<cwd>` is `--cwd`, or the directory the command runs in. The memory a run snapshots is the project's, which lives at the repository root, so from a subdirectory or a linked worktree the two differ: run from the root, or pass `--dir`.
+
+```
+eval.json                 {"authoring_sessions": ["<session id>", ...]}
+questions.jsonl           one confirmed case per line
+labels.jsonl              optional: your own scores, to check the judge
+runs/<run>/run.json       the run's identity (condition, answer model, prompt digest, snapshot and the DBs it was copied from)
+runs/<run>/memory/        frozen copy of the project + global DBs the run answers from
+runs/<run>/answers.jsonl  appended as each case is answered, with the recall path its memory came through
+runs/<run>/scores.jsonl   appended as each answer is judged
+```
+
+Both `.jsonl` files are written one line at a time. A write cut off mid-line (a crash, a full disk) leaves a torn last line; the next `answer` or `score` drops it, says so, and answers or judges that case again. Every complete line before it is kept.
+
+A case:
+
+```json
+{"id": "q01", "split": "practice", "kind": "changed_value", "asked_on": "2026-10-26",
+ "question": "Which model does reclaw run pi on?",
+ "true_now": ["claude-sonnet-5.5, committed 2026-10-26"], "stale": ["claude-sonnet-5"]}
+```
+
+`kind` is one of the five memory failures the method probes: `changed_value`, `same_entity`, `unheard_decision`, `commitment`, `non_fact`. Unknown fields are rejected, so a typo like `true_nwo` cannot pass silently. Keep unresolved drafts out of `questions.jsonl` until their truth is confirmed.
+
+**Authoring sessions.** The session where you write or review the eval set will itself be extracted into memory, and its memories hold the answer key. List those session ids in `eval.json`. Every eval read then refuses memories from those sessions, along with entity facts sourced from them. The run records how many it refused. `eval.json` is required, even as `{"authoring_sessions": []}`, so leaving this out is a deliberate choice.
+
+**Workflow:**
+
+```bash
+bun engine/src/cli.ts eval validate --cwd=<project>                     # coverage + method warnings, no model call
+bun engine/src/cli.ts eval answer none-1 --condition=none --cwd=<project>
+bun engine/src/cli.ts eval answer cortex-2026-11-09 --cwd=<project>     # snapshot memory, answer every case
+bun engine/src/cli.ts eval score none-1 cortex-2026-11-09 --dry-run --cwd=<project>
+bun engine/src/cli.ts eval score none-1 cortex-2026-11-09 --cwd=<project>
+```
+
+The report has one table per split over the cases both runs scored, with the change per measure, mean prompt tokens, a per-kind `correct_current/missed` view, which model answered each run, which memory each run read, and anything left out. After a change to cortex, answer a new run and score it against the old one. Never delete the "before".
+
+**Comparability, enforced.**
+- A run answers from a `VACUUM INTO` snapshot taken at its start. Surface ranking also depends on the branch and on time (recency decay), so the run pins both.
+- An interrupted run resumes with the same command and fills only the missing answers. A resume under a different condition, project name, answer model, answer prompt or authoring-session list is refused: that is a new experiment and needs a new run name. So is a `run.json` whose condition contradicts the memory it records.
+- A run reads exactly the databases its `run.json` records. If it recorded a global database and that snapshot file has since gone missing, answering stops instead of quietly measuring the project's memory alone.
+- Each answer records how prompt recall reached its memory: `semantic`, `keyword-fallback` (the embedder was unavailable, and keyword search ranks differently) or `not-run`. The report flags how many of a run's scored answers came through the fallback, because those are not like for like with the rest.
+- A judgement is stored under the hash of its exact judge prompt (rubric, case and answer) plus the requested judge model. Re-scoring reuses it, while editing a truth or switching the judge re-judges.
+- Each answer records the model the provider reported, and the report flags a run that a routing server answered with several models.
+- Each snapshot records the project and global database it was copied from, and the report flags two snapshot runs that read different ones: a run taken under another harness or machine read other global memory, so it is not a before and after.
+
+**Check the judge.** Score about ten answers yourself into `labels.jsonl` (`{"run": "cortex-2026-11-09", "id": "q01", "correct_current": 0, "missed": 0.5}`). `score` then prints the judge's mean gap per measure and flags gaps above 0.2. Fix the judge or score that measure by hand before trusting it.
+
+**Endpoints.** The answering and judging models are OpenAI-compatible endpoints: `CORTEX_EVAL_ANSWER_{API_URL,API_KEY,MODEL}` and `CORTEX_EVAL_JUDGE_{API_URL,API_KEY,MODEL}` (all three or none). Unset, both use cortex's own direct endpoint. There is deliberately no fallback to the `claude`/`pi` CLI: a run must name the model it measured, and a CLI session would fire cortex's own hooks into the answer. Scoring sends the questions, expected truth and answers to the judge endpoint.
+
+**Not yet covered.** The harness scores the read path over whatever the DB holds. Measuring a change to *extraction* means rebuilding a DB from the same transcripts with the old and new extractor, then answering each. That transcript-replay step is not built yet.
+
 ## Configuration
 
 ### Environment Variables
@@ -384,12 +477,15 @@ The LLM evaluates active memories in batches and archives low-value ones. Trigge
 | Variable | Purpose | Required |
 |---|---|---|
 | `CORTEX_ONNX_LD_PATH` | Directory holding a 64-bit `libstdc++.so.6` for onnxruntime. Hooks probe the nix store when unset; needed on NixOS, a no-op elsewhere | No |
+| `CORTEX_GLOBAL_DB` | Path of the global database shared by every harness (default `${XDG_DATA_HOME:-~/.local/share}/cortex/global.db`) | No |
 | `CORTEX_LLM_API_URL` | Base URL (or `/chat/completions` URL) for an explicit OpenAI-compatible LLM endpoint | No |
 | `CORTEX_LLM_API_KEY` | API key for the explicit OpenAI-compatible LLM endpoint | Required with `CORTEX_LLM_API_URL` |
 | `CORTEX_LLM_BINARY` | Force the headless LLM binary (`claude` or `pi`) | No (auto-detected) |
 | `CORTEX_LLM_MODEL` | Model for explicit direct endpoint configuration, or override passed to the fallback LLM binary | Required with explicit direct endpoint config; otherwise no (`haiku` for claude; none for pi) |
 | `CORTEX_LLM_MAX_DIRECT_FAILURES` | Consecutive direct-endpoint failures after which the headless-CLI fallback is suppressed (work is deferred instead of escalating load on a saturated server) | No (default 3) |
 | `CORTEX_LLM_MAX_CONCURRENCY` | Max in-flight LLM calls per engine process (extraction, edge classification, AI prune, and any subprocess fallback share the pool) so background work stays a bounded share of a server live agents rely on | No (default 2; 1 is most conservative) |
+| `CORTEX_EVAL_ANSWER_API_URL` / `_API_KEY` / `_MODEL` | Endpoint for the `/eval` answering model | No (all three or none; default: cortex's direct endpoint) |
+| `CORTEX_EVAL_JUDGE_API_URL` / `_API_KEY` / `_MODEL` | Endpoint for the `/eval` judge | No (all three or none; default: cortex's direct endpoint) |
 | `CLAUDE_PLUGIN_ROOT` | Plugin directory | Auto-set by Claude Code |
 
 Extraction, AI pruning, and edge classification prefer a **direct OpenAI-compatible endpoint** when one is configured: `CORTEX_LLM_API_URL`, `CORTEX_LLM_API_KEY`, and `CORTEX_LLM_MODEL` (or the pi provider config in `~/.pi/agent/models.json` — the active provider's `baseUrl`/`apiKey`/first model). Calls disable model thinking and use schema-guided JSON output where supported. Without a configured endpoint they fall back to a headless coding-agent CLI: `claude -p --model haiku` by default, or `pi -p --thinking off` when running under the pi agent. A single direct-call failure still falls back, but once failures reach the saturation threshold (default 3, `CORTEX_LLM_MAX_DIRECT_FAILURES`) the fallback is suppressed and the call throws: a saturated local server (empty content, timeouts) would only get worse from full agent-loop subprocesses, so the caller defers the work (unmarked edges, un-advanced checkpoints) and retries on the next run. All LLM calls also draw from a per-process concurrency pool (default 2, `CORTEX_LLM_MAX_CONCURRENCY`), so background work cannot flood a shared server — even when the server merely queues rather than errors.
@@ -420,12 +516,14 @@ Extraction, AI pruning, and edge classification prefer a **direct OpenAI-compati
     locks/                      # PID lock files
     cortex-status.json          # Generated health telemetry (extraction stats, timing)
     telemetry.json              # Maintenance and AI-prune cadence state
+    eval/                       # Eval set and runs (see Evaluation)
   .claude/
     cortex-memory.local.md      # Surface file Claude reads
 
+~/.local/share/cortex/          # ($XDG_DATA_HOME/cortex when set)
+  global.db                     # Global SQLite database, shared by every harness
+
 ~/.claude/
-  memory/
-    cortex-global.db            # Claude global SQLite database
   plugins/
     cortex/
       .claude-plugin/
@@ -438,10 +536,6 @@ Extraction, AI pruning, and edge classification prefer a **direct OpenAI-compati
           prompt-recall.sh          # UserPromptSubmit hook (semantic-first recall)
       engine/src/               # TypeScript source
       commands/                 # Skill markdown files
-
-~/.pi/agent/
-  memory/
-    cortex-global.db            # Pi global SQLite database
 ```
 
 All `.memory/` contents and `cortex-memory.local.md` are gitignored automatically.
@@ -487,6 +581,11 @@ bun engine/src/cli.ts consolidate <cwd> --merge --a=<idA> --b=<idB> --summary=<t
 bun engine/src/cli.ts inspect <cwd>
 bun engine/src/cli.ts index-code <cwd> <proseId> <codePath>
 bun engine/src/cli.ts traverse <cwd> <memoryId> [maxDepth]
+
+# Evaluation (defaults: --cwd=., --dir=<cwd>/.memory/eval)
+bun engine/src/cli.ts eval validate [--cwd=<project>]
+bun engine/src/cli.ts eval answer <run> [--condition=cortex|none] [--cwd=<project>]
+bun engine/src/cli.ts eval score <run> [<run>] [--dry-run] [--cwd=<project>]
 ```
 
 ### Testing Strategy

@@ -600,3 +600,16 @@ export const isEdgeRelation = unionGuard(EDGE_RELATIONS);
 
 /** Type guard for MemoryStatus. */
 export const isMemoryStatus = unionGuard(MEMORY_STATUSES);
+
+/**
+ * How a prompt's recall was produced. The two real paths rank differently,
+ * so anything comparing recalls (the eval) must know which one it got:
+ * - `semantic`: the healthy path — embedding ranking plus strict keyword AND.
+ * - `keyword-fallback`: the embedder failed; keyword AND, then broad OR.
+ * - `not-run`: nothing was searched (too few meaningful words, or no memory).
+ */
+export const RECALL_PATHS = ['semantic', 'keyword-fallback', 'not-run'] as const;
+export type RecallPath = (typeof RECALL_PATHS)[number];
+
+/** Type guard for RecallPath. */
+export const isRecallPath = unionGuard(RECALL_PATHS);

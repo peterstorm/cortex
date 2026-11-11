@@ -9,7 +9,7 @@ import type { Database } from 'bun:sqlite';
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import type { Memory } from '../core/types.js';
+import { admitAll, type MemoryAdmission } from '../core/admission.js';
 import type { RankedMemory } from '../core/surface.js';
 import type { EntityProfile } from '../core/entities.js';
 import { SURFACE_STALE_HOURS, SURFACE_OVERHEAD_TOKENS } from '../config.js';
@@ -23,7 +23,14 @@ import { getCurrentBranch } from '../infra/git-context.js';
 export interface GenerateOptions {
   readonly projectDb: Database;
   readonly globalDb: Database;
+  /** Where the session runs: the branch, the surface file and the cache key. */
   readonly cwd: string;
+  /**
+   * Where the project's `.memory/` lives: cache, locks and status. Required,
+   * so a caller cannot fall back to the session directory by omission and
+   * split the project's memory per directory again.
+   */
+  readonly root: string;
   readonly surfacePath?: string;
   readonly cachePath?: string;
   readonly lockDir?: string;
@@ -56,25 +63,85 @@ export function runGenerate(options: GenerateOptions): GenerateResult {
   const startTime = Date.now();
 
   // Default paths
+  const { root } = options;
   const surfacePath = options.surfacePath ?? path.join(options.cwd, '.claude', 'cortex-memory.local.md');
-  const cachePath = options.cachePath ?? path.join(options.cwd, '.memory', 'surface-cache');
-  const lockDir = options.lockDir ?? path.join(options.cwd, '.memory', 'locks');
+  const cachePath = options.cachePath ?? path.join(root, '.memory', 'surface-cache');
+  const lockDir = options.lockDir ?? path.join(root, '.memory', 'locks');
 
   // I/O: Get current branch
   const branch = getCurrentBranch(options.cwd);
 
+  const surface = composeSurface(options.projectDb, options.globalDb, branch);
+
+  // Pure: Wrap in markers
+  const markedContent = wrapInMarkers(surface.content);
+
+  // I/O: Write surface with PID lock
+  writeSurface(surfacePath, markedContent, lockDir);
+
+  // I/O: Write cache (fingerprinted against both DBs so archives/merges
+  // that don't go through invalidateSurfaceCache still miss the cache)
+  const fingerprint = computeDbFingerprint(options.projectDb, options.globalDb);
+  writeCache(cachePath, branch, options.cwd, surface.content, fingerprint);
+
+  // I/O: Write telemetry
+  const durationMs = Date.now() - startTime;
+  const telemetryPath = path.join(root, '.memory', 'cortex-status.json');
+  writeTelemetry(telemetryPath, {
+    last_generation: new Date().toISOString(),
+    branch,
+    memory_count: surface.memoryCount,
+    selected_count: surface.selectedCount,
+    duration_ms: durationMs,
+  });
+
+  return {
+    memoryCount: surface.memoryCount,
+    selectedCount: surface.selectedCount,
+    branch,
+    cached: false, // Fresh generation, not served from cache
+    durationMs,
+  };
+}
+
+export interface ComposedSurface {
+  /** Surface markdown, not yet wrapped in markers. */
+  readonly content: string;
+  readonly memoryCount: number;
+  readonly selectedCount: number;
+}
+
+/**
+ * Compose the push surface from both DBs without writing anything — what
+ * runGenerate persists and what the eval harness injects.
+ *
+ * Data flow:
+ * 1. getActiveMemories from both DBs, filtered by `admit` (I/O)
+ * 2. entity profiles, minus facts whose source memory was refused (I/O)
+ * 3. getAllEdges for centrality (I/O)
+ * 4. computeAllCentrality (pure)
+ * 5. selectForSurface → RankedMemory[] (pure, single ranking pass)
+ * 6. generateSurface (pure)
+ */
+export function composeSurface(
+  projectDb: Database,
+  globalDb: Database,
+  branch: string,
+  options: { readonly admit?: MemoryAdmission; readonly now?: Date } = {},
+): ComposedSurface {
+  const admit = options.admit ?? admitAll;
   // I/O: Fetch active memories from both DBs
-  const projectMemories = getActiveMemories(options.projectDb);
-  const globalMemories = getActiveMemories(options.globalDb);
-  const allMemories = [...projectMemories, ...globalMemories];
+  const active = [...getActiveMemories(projectDb), ...getActiveMemories(globalDb)];
+  // `admit` is asked once per memory; the admitted list is derived from the
+  // refused set, so the two cannot disagree.
+  const refused = new Set(active.filter((mem) => !admit(mem)).map((mem) => mem.id));
+  const allMemories = active.filter((mem) => !refused.has(mem.id));
 
   // I/O: Fetch entities and current facts for surface entity section
-  const entityProfiles = buildEntityProfiles(options.projectDb, options.globalDb);
+  const entityProfiles = buildEntityProfiles(projectDb, globalDb, refused);
 
   // I/O: Fetch all edges for centrality computation
-  const projectEdges = getAllEdges(options.projectDb);
-  const globalEdges = getAllEdges(options.globalDb);
-  const allEdges = [...projectEdges, ...globalEdges];
+  const allEdges = [...getAllEdges(projectDb), ...getAllEdges(globalDb)];
 
   // Pure: Compute centrality for all memories
   const centralityMap = computeAllCentrality(allEdges);
@@ -95,43 +162,18 @@ export function runGenerate(options: GenerateOptions): GenerateResult {
   // Reserve SURFACE_OVERHEAD_TOKENS for markdown formatting (headers, markers)
   // plus the measured entity section cost. Floor at 200 tokens so a huge
   // entity section can't zero out memory selection entirely.
-  const rankedMemories: RankedMemory[] = selectForSurface(memoriesWithCentrality, {
+  const rankedMemories: readonly RankedMemory[] = selectForSurface(memoriesWithCentrality, {
     currentBranch: branch,
     targetTokens: Math.max(200, 1500 - SURFACE_OVERHEAD_TOKENS - entityTokens),
     maxTokens: Math.max(200, 2000 - SURFACE_OVERHEAD_TOKENS - entityTokens),
+    now: options.now,
   });
 
   // Pure: Generate surface markdown (includes entity profiles section)
-  const surfaceContent = generateSurface(rankedMemories, branch, null, {}, entityProfiles);
-
-  // Pure: Wrap in markers
-  const markedContent = wrapInMarkers(surfaceContent);
-
-  // I/O: Write surface with PID lock
-  writeSurface(surfacePath, markedContent, lockDir);
-
-  // I/O: Write cache (fingerprinted against both DBs so archives/merges
-  // that don't go through invalidateSurfaceCache still miss the cache)
-  const fingerprint = computeDbFingerprint(options.projectDb, options.globalDb);
-  writeCache(cachePath, branch, options.cwd, surfaceContent, fingerprint);
-
-  // I/O: Write telemetry
-  const durationMs = Date.now() - startTime;
-  const telemetryPath = path.join(options.cwd, '.memory', 'cortex-status.json');
-  writeTelemetry(telemetryPath, {
-    last_generation: new Date().toISOString(),
-    branch,
-    memory_count: allMemories.length,
-    selected_count: rankedMemories.length,
-    duration_ms: durationMs,
-  });
-
   return {
+    content: generateSurface(rankedMemories, branch, null, {}, entityProfiles),
     memoryCount: allMemories.length,
     selectedCount: rankedMemories.length,
-    branch,
-    cached: false, // Fresh generation, not served from cache
-    durationMs,
   };
 }
 
@@ -265,10 +307,15 @@ function computeCacheKey(branch: string, cwd: string): string {
 
 /**
  * Build entity profiles from both DBs for surface rendering.
- * Deduplicates by entity name (case-insensitive). Skips entities with no current facts.
+ * Deduplicates by entity name (case-insensitive). Skips entities with no
+ * current facts, after dropping facts sourced from a refused memory.
  * I/O: Reads from database.
  */
-function buildEntityProfiles(projectDb: Database, globalDb: Database): readonly EntityProfile[] {
+function buildEntityProfiles(
+  projectDb: Database,
+  globalDb: Database,
+  refusedMemoryIds: ReadonlySet<string>,
+): readonly EntityProfile[] {
   const profiles: EntityProfile[] = [];
   const seen = new Set<string>();
 
@@ -279,7 +326,9 @@ function buildEntityProfiles(projectDb: Database, globalDb: Database): readonly 
       if (seen.has(key)) continue;
       seen.add(key);
 
-      const facts = getCurrentFacts(db, entity.id);
+      const facts = getCurrentFacts(db, entity.id).filter(
+        (fact) => !refusedMemoryIds.has(fact.source_memory_id),
+      );
       if (facts.length === 0) continue;
 
       profiles.push({
@@ -296,9 +345,13 @@ function buildEntityProfiles(projectDb: Database, globalDb: Database): readonly 
 /**
  * Invalidate all cached surfaces (FR-022).
  * Called after extraction inserts new memories, since any branch surface may be stale.
+ * The cache lives with the project's memory, so this clears every worktree's
+ * and every subdirectory's cached surface of the project at once.
+ *
+ * @param projectRoot - where the project's `.memory/` lives
  */
-export function invalidateSurfaceCache(cwd: string, cachePath?: string): void {
-  const cacheDir = cachePath ?? path.join(cwd, '.memory', 'surface-cache');
+export function invalidateSurfaceCache(projectRoot: string, cachePath?: string): void {
+  const cacheDir = cachePath ?? path.join(projectRoot, '.memory', 'surface-cache');
   try {
     const files = fs.readdirSync(cacheDir);
     for (const file of files) {

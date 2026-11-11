@@ -19,12 +19,13 @@
  */
 
 import type { Database } from 'bun:sqlite';
-import type { Memory } from '../core/types.js';
+import type { Memory, RecallPath } from '../core/types.js';
 import { searchByKeywordOr, searchByKeywordAnd, getMemoriesWithEmbedding } from '../infra/db.js';
 import { embedLocal } from '../infra/local-embed.ts';
 import { rankBySimilarity, STOP_WORDS, extractUnigrams } from '../core/similarity.js';
 import { buildQueryEmbeddingText } from './recall.js';
 import { sanitizeSurfaceText } from '../core/surface.js';
+import { admitAll, type MemoryAdmission } from '../core/admission.js';
 import {
   RECALL_MAX_BLOCK_BYTES,
   SUMMARY_MAX_CHARS,
@@ -201,7 +202,12 @@ export type PromptRecallOptions = {
   readonly limit?: number;
   /** Project name for the [query] [project:name] embedding prefix (FR-039) */
   readonly projectName?: string;
+  /** Which memories recall may return; the hook admits all of them. */
+  readonly admit?: MemoryAdmission;
 };
+
+/** The recalled memories, best first, and the path that produced them. */
+export type PromptRecall = Readonly<{ path: RecallPath; memories: readonly Memory[] }>;
 
 /**
  * Strict keyword AND search across both databases: a memory matches only when
@@ -262,10 +268,12 @@ export function executePromptRecall(
   const seenIds = new Set<string>();
   const merged: Memory[] = [];
 
+  const admit = options.admit ?? admitAll;
   for (const mem of [...strict, ...projectOr, ...globalOr]) {
     if (seenIds.has(mem.id)) continue;
     seenIds.add(mem.id);
 
+    if (!admit(mem)) continue;
     if (isTagOnlyMatch(mem, unigrams)) continue;
     if (isInSurface(mem, options.surfaceContent)) continue;
 
@@ -290,19 +298,20 @@ export function executePromptRecall(
  * @param projectDb - Project-scoped database (or null if unavailable)
  * @param globalDb - Global database (or null if unavailable)
  * @param options - Prompt text, surface content for dedup, optional limit
- * @returns Deduplicated array of relevant memories, best first
+ * @returns The memories, best first, and the path that produced them
  */
-export async function executePromptRecallWithFallback(
+export async function recallForPrompt(
   projectDb: Database | null,
   globalDb: Database | null,
   options: PromptRecallOptions,
-): Promise<readonly Memory[]> {
+): Promise<PromptRecall> {
   const unigrams = extractUnigrams(options.prompt);
   if (unigrams.length < SEMANTIC_MIN_UNIGRAMS) {
-    return [];
+    return { path: 'not-run', memories: [] };
   }
 
   const limit = options.limit ?? PROMPT_RECALL_LIMIT;
+  const admit = options.admit ?? admitAll;
 
   let semantic: readonly Memory[];
   try {
@@ -315,7 +324,7 @@ export async function executePromptRecallWithFallback(
     const candidates = [
       ...(projectDb ? getMemoriesWithEmbedding(projectDb) : []),
       ...(globalDb ? getMemoriesWithEmbedding(globalDb) : []),
-    ].filter(({ memory }) => !isInSurface(memory, options.surfaceContent));
+    ].filter(({ memory }) => admit(memory) && !isInSurface(memory, options.surfaceContent));
 
     semantic = selectSemanticHits(
       rankBySimilarity(candidates, queryEmbedding, SEMANTIC_LIMIT, SEMANTIC_COSINE_FLOOR),
@@ -323,12 +332,22 @@ export async function executePromptRecallWithFallback(
     );
   } catch {
     // Best-effort: embedder/DB failure degrades to keyword-only recall.
-    return executePromptRecall(projectDb, globalDb, options);
+    return { path: 'keyword-fallback', memories: executePromptRecall(projectDb, globalDb, options) };
   }
 
   const strict = searchStrictKeyword(projectDb, globalDb, unigrams, limit).filter(
-    (mem) => !isTagOnlyMatch(mem, unigrams) && !isInSurface(mem, options.surfaceContent),
+    (mem) =>
+      admit(mem) && !isTagOnlyMatch(mem, unigrams) && !isInSurface(mem, options.surfaceContent),
   );
 
-  return mergePromptRecall(semantic, strict, limit);
+  return { path: 'semantic', memories: mergePromptRecall(semantic, strict, limit) };
+}
+
+/** recallForPrompt for callers that only inject the memories: the hook. */
+export async function executePromptRecallWithFallback(
+  projectDb: Database | null,
+  globalDb: Database | null,
+  options: PromptRecallOptions,
+): Promise<readonly Memory[]> {
+  return (await recallForPrompt(projectDb, globalDb, options)).memories;
 }

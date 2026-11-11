@@ -178,7 +178,7 @@ describe('Cortex E2E Integration Tests', () => {
     const generateResult = runGenerate({
       projectDb,
       globalDb,
-      cwd: tempDir,
+      cwd: tempDir, root: tempDir,
       surfacePath: path.join(claudeDir, 'cortex-memory.local.md'),
       cachePath: path.join(tempDir, '.memory', 'surface-cache'),
       lockDir: path.join(tempDir, '.memory', 'locks'),
@@ -388,7 +388,7 @@ describe('Cortex E2E Integration Tests', () => {
     const generateResult = runGenerate({
       projectDb,
       globalDb,
-      cwd: tempDir,
+      cwd: tempDir, root: tempDir,
       surfacePath: path.join(claudeDir, 'cortex-memory.local.md'),
       lockDir: path.join(tempDir, '.memory', 'locks'),
     });

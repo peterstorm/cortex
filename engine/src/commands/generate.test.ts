@@ -77,7 +77,7 @@ describe('generate command', () => {
     const result = runGenerate({
       projectDb,
       globalDb,
-      cwd: tempDir,
+      cwd: tempDir, root: tempDir,
     });
 
     // Assert: Result metadata
@@ -134,7 +134,7 @@ describe('generate command', () => {
     const result = runGenerate({
       projectDb,
       globalDb,
-      cwd: tempDir,
+      cwd: tempDir, root: tempDir,
     });
 
     // Assert: Both memories considered
@@ -177,7 +177,7 @@ describe('generate command', () => {
     const result = runGenerate({
       projectDb,
       globalDb,
-      cwd: tempDir,
+      cwd: tempDir, root: tempDir,
     });
 
     // Assert: Surface generated
@@ -241,7 +241,7 @@ describe('generate command', () => {
     const result = runGenerate({
       projectDb,
       globalDb,
-      cwd: tempDir,
+      cwd: tempDir, root: tempDir,
     });
 
     // Assert
@@ -269,7 +269,7 @@ describe('generate command', () => {
     runGenerate({
       projectDb,
       globalDb,
-      cwd: tempDir,
+      cwd: tempDir, root: tempDir,
     });
 
     // Assert: Cache file exists
@@ -310,7 +310,7 @@ describe('generate command', () => {
     });
 
     insertMemory(projectDb, mem);
-    runGenerate({ projectDb, globalDb, cwd: tempDir });
+    runGenerate({ projectDb, globalDb, cwd: tempDir, root: tempDir });
 
     // Act: Load cached surface
     const cached = loadCachedSurface(tempDir);
@@ -339,7 +339,7 @@ describe('generate command', () => {
     });
 
     insertMemory(projectDb, mem);
-    runGenerate({ projectDb, globalDb, cwd: tempDir });
+    runGenerate({ projectDb, globalDb, cwd: tempDir, root: tempDir });
 
     // Manually modify cache timestamp to be >24h old
     const cacheDir = path.join(tempDir, '.memory', 'surface-cache');
@@ -386,7 +386,7 @@ describe('generate command', () => {
     insertMemory(projectDb, mem);
 
     // Act
-    runGenerate({ projectDb, globalDb, cwd: tempDir });
+    runGenerate({ projectDb, globalDb, cwd: tempDir, root: tempDir });
 
     // Assert: Telemetry file exists
     const telemetryPath = path.join(tempDir, '.memory', 'cortex-status.json');
@@ -420,7 +420,7 @@ describe('generate command', () => {
     }
 
     // Act
-    const result = runGenerate({ projectDb, globalDb, cwd: tempDir });
+    const result = runGenerate({ projectDb, globalDb, cwd: tempDir, root: tempDir });
 
     // Assert: Duration is reasonable (FR-027: <5s p95)
     expect(result.durationMs).toBeLessThan(5000);
@@ -431,7 +431,7 @@ describe('generate command', () => {
     const result = runGenerate({
       projectDb,
       globalDb,
-      cwd: tempDir,
+      cwd: tempDir, root: tempDir,
     });
 
     // Assert
@@ -476,7 +476,7 @@ describe('generate command', () => {
     insertMemory(projectDb, normalMem);
 
     // Act
-    runGenerate({ projectDb, globalDb, cwd: tempDir });
+    runGenerate({ projectDb, globalDb, cwd: tempDir, root: tempDir });
 
     // Assert: Code memory excluded from surface
     const surfacePath = path.join(tempDir, '.claude', 'cortex-memory.local.md');
@@ -502,7 +502,7 @@ describe('generate command', () => {
     });
 
     insertMemory(projectDb, mem1);
-    runGenerate({ projectDb, globalDb, cwd: tempDir });
+    runGenerate({ projectDb, globalDb, cwd: tempDir, root: tempDir });
 
     // Verify cache exists
     const cacheDir = path.join(tempDir, '.memory', 'surface-cache');
@@ -579,7 +579,7 @@ describe('DB-fingerprinted surface cache (finding 2)', () => {
 
   test('cache hit when nothing changed (fingerprint matches)', () => {
     insertTestMemory(projectDb, randomUUID(), 'Stable memory');
-    runGenerate({ projectDb, globalDb, cwd: tempDir });
+    runGenerate({ projectDb, globalDb, cwd: tempDir, root: tempDir });
 
     const fingerprint = computeDbFingerprint(projectDb, globalDb);
     const cached = loadCachedSurface(tempDir, undefined, fingerprint);
@@ -591,7 +591,7 @@ describe('DB-fingerprinted surface cache (finding 2)', () => {
   test('cache miss after archiving a memory (fingerprint changed)', () => {
     const id = randomUUID();
     insertTestMemory(projectDb, id, 'Soon archived');
-    runGenerate({ projectDb, globalDb, cwd: tempDir });
+    runGenerate({ projectDb, globalDb, cwd: tempDir, root: tempDir });
 
     // Archive AFTER caching — the cached surface still contains the memory
     updateMemory(projectDb, id, { status: 'archived', archived_at: new Date().toISOString() });
@@ -604,7 +604,7 @@ describe('DB-fingerprinted surface cache (finding 2)', () => {
 
   test('cache miss for a legacy cache without a fingerprint when one is expected', () => {
     insertTestMemory(projectDb, randomUUID(), 'Legacy cached memory');
-    runGenerate({ projectDb, globalDb, cwd: tempDir });
+    runGenerate({ projectDb, globalDb, cwd: tempDir, root: tempDir });
 
     // Strip the fingerprint to simulate a pre-upgrade cache file
     const cacheDir = path.join(tempDir, '.memory', 'surface-cache');
@@ -621,7 +621,7 @@ describe('DB-fingerprinted surface cache (finding 2)', () => {
 
   test('symlinked cwd hits the cache written via the real path (finding 9)', () => {
     insertTestMemory(projectDb, randomUUID(), 'Symlink memory');
-    runGenerate({ projectDb, globalDb, cwd: tempDir });
+    runGenerate({ projectDb, globalDb, cwd: tempDir, root: tempDir });
 
     const linkPath = path.join(os.tmpdir(), `cortex-fp-link-${randomUUID().slice(0, 8)}`);
     fs.symlinkSync(tempDir, linkPath);
@@ -694,7 +694,7 @@ describe('surface token budget with entities (finding 7)', () => {
         }));
       }
 
-      runGenerate({ projectDb, globalDb, cwd: tempDir });
+      runGenerate({ projectDb, globalDb, cwd: tempDir, root: tempDir });
 
       const surfacePath = path.join(tempDir, '.claude', 'cortex-memory.local.md');
       const content = fs.readFileSync(surfacePath, 'utf8');

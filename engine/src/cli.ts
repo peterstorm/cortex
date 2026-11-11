@@ -29,33 +29,41 @@
  * - semantic-edges: Typed-edge classification
  * - load-surface: Surface load cache
  * - entity-query: Entity/fact graph queries
+ * - eval: Score agent answers from memory against an eval set
  */
 
 import { Database } from 'bun:sqlite';
 import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
+import { match } from 'ts-pattern';
 import type { HookInput } from './core/types.js';
 import {
   getProjectDbPath,
-  getGlobalDbPath,
   getSurfaceCacheDir,
   getSurfaceOutputPath,
   getLockDir,
   getTelemetryPath,
-  getProjectName,
   DEFAULT_SEARCH_LIMIT,
   GITIGNORE_PATTERNS,
   LOCAL_COSINE_CALIBRATED,
 } from './config.js';
 import { openDatabase, openDatabaseReadOnly, getActiveMemories, getMemoriesByIds } from './infra/db.js';
 import { ensureGitignored, writeSurface } from './infra/filesystem.js';
+import { resolveGlobalDbPath } from './infra/global-db.js';
 import { acquireLock, releaseLock } from './infra/lock.js';
+import {
+  describeProjectMigration,
+  hasProjectMemory,
+  migrateProjectDb,
+  resolveProjectLocation,
+} from './infra/project-db.js';
+import type { ProjectLocation } from './core/project-location.js';
 
 // Command imports
 import { executeExtract, type ExtractionResult } from './commands/extract.js';
 import { runGenerate, loadCachedSurface, computeDbFingerprint } from './commands/generate.js';
 import { wrapInMarkers } from './core/surface.js';
-import { executeRecall, formatRecallResult, formatRecallError } from './commands/recall.js';
+import { executeRecall, formatRecallResult } from './commands/recall.js';
 import type { RecallOptions } from './commands/recall.js';
 import { executeRemember } from './commands/remember.js';
 import { executeIndexCode } from './commands/index-code.js';
@@ -77,6 +85,34 @@ import {
   type IngestionStepResult,
   type SessionIngestionRetryPolicy,
 } from './commands/ingest-session.js';
+import {
+  answerCases,
+  evalPaths,
+  loadEvalSet,
+  loadLabels,
+  openRun,
+  parseEvalArgs,
+  renderAgreements,
+  scoreRuns,
+  scoringPlan,
+  summarizeAnswering,
+  type EvalCommand,
+  type EvalPaths,
+} from './commands/eval.js';
+import {
+  ANSWER_COMPLETION,
+  JUDGE_COMPLETION,
+  countRefused,
+  endpointLlm,
+  excludeSessions,
+  noMemoryContext,
+  openSnapshotContext,
+  resolveEvalEndpoint,
+  snapshotMemory,
+} from './commands/eval-adapters.js';
+import { describeEvalSet, type EvalCase, type EvalSettings } from './core/eval-set.js';
+import { renderReport } from './core/eval-rubric.js';
+import { getCurrentBranch } from './infra/git-context.js';
 import { disposeLocalModel, embedLocal } from './infra/local-embed.js';
 import { ensureNativeLibraryPath } from './infra/native-library-path.js';
 
@@ -252,6 +288,37 @@ function ensureDbDir(dbPath: string): void {
 }
 
 /**
+ * Find the project `cwd` belongs to (see core/project-location.ts).
+ *
+ * Validates cwd first (single choke point) — exits 1 with a usage error on
+ * an invalid cwd so no phantom directories are ever created.
+ */
+function locate(cwd: string): ProjectLocation {
+  const cwdError = validateCwd(cwd);
+  if (cwdError !== null) {
+    logError(cwdError);
+    process.exit(1);
+  }
+  return resolveProjectLocation(cwd);
+}
+
+/**
+ * Merge the project's stray databases (its worktrees', and the session's
+ * subdirectories') into its own, and say what moved. One that cannot be
+ * merged now stays where it is and is retried next time.
+ */
+function mergeStrayProjectDbs(project: ProjectLocation): void {
+  const migration = migrateProjectDb(project, new Date());
+  match(migration)
+    .with({ kind: 'current' }, () => {})
+    .with({ kind: 'merged' }, (merged) => logError(`INFO: ${describeProjectMigration(merged, project)}`))
+    .with({ kind: 'busy' }, { kind: 'failed' }, (unmerged) =>
+      logError(`WARN: ${describeProjectMigration(unmerged, project)}; retrying next time`),
+    )
+    .exhaustive();
+}
+
+/**
  * Make a project's `.memory/` usable: directory present, patterns gitignored.
  *
  * Shared by the two entry points that need it — initDatabases, which also
@@ -260,44 +327,36 @@ function ensureDbDir(dbPath: string): void {
  * root is prepared (a permission mode, another gitignore pattern) now lands in
  * one place instead of one obvious place and one buried in a command handler.
  *
- * Callers validate cwd first; the two disagree about what to do when it is
- * invalid (exit vs. return a failure), so that decision stays with them.
+ * Both the root and the session's own directory are gitignored: the memory
+ * lives at the root, the surface file in the session's directory.
  *
- * @param cwd - Project root directory, already validated.
  * @returns The project database path.
  */
-function prepareProjectDbDir(cwd: string): string {
-  const projectDbPath = getProjectDbPath(cwd);
+function prepareProjectDbDir(project: ProjectLocation): string {
+  mergeStrayProjectDbs(project);
+  const projectDbPath = getProjectDbPath(project.root);
   ensureDbDir(projectDbPath);
 
-  try {
-    ensureGitignored(cwd, GITIGNORE_PATTERNS);
-  } catch (err) {
-    logError(`Failed to update .gitignore: ${err}`);
+  for (const dir of new Set([project.root, project.cwd])) {
+    try {
+      ensureGitignored(dir, GITIGNORE_PATTERNS);
+    } catch (err) {
+      logError(`Failed to update .gitignore: ${err}`);
+    }
   }
 
   return projectDbPath;
 }
 
 /**
- * Open or create project and global databases
- * Ensures .memory/ directory exists and is gitignored
+ * Open or create the project's and the global database, merging stray
+ * project databases and the per-harness global ones into them first.
  *
- * Validates cwd first (single choke point) — exits 1 with a usage error
- * on invalid cwd so no phantom directories are ever created.
- *
- * @param cwd - Project root directory
  * @returns Tuple of [projectDb, globalDb]
  */
-function initDatabases(cwd: string): [Database, Database] {
-  const cwdError = validateCwd(cwd);
-  if (cwdError !== null) {
-    logError(cwdError);
-    process.exit(1);
-  }
-
-  const projectDbPath = prepareProjectDbDir(cwd);
-  const globalDbPath = getGlobalDbPath();
+function initDatabases(project: ProjectLocation): [Database, Database] {
+  const projectDbPath = prepareProjectDbDir(project);
+  const globalDbPath = resolveGlobalDbPath();
   ensureDbDir(globalDbPath);
 
   // Open databases
@@ -321,14 +380,17 @@ function initDatabases(cwd: string): [Database, Database] {
  */
 export function extractionToCommandResult(result: ExtractionResult): CommandResult {
   const output = JSON.stringify(result);
-  switch (result.kind) {
-    case 'succeeded':
-      return { kind: 'succeeded', output };
-    case 'deferred':
-      return { kind: 'deferred', output };
-    case 'failed':
-      return { kind: 'failed', retryable: result.retryable, output, error: result.error };
-  }
+  return match(result)
+    .returnType<CommandResult>()
+    .with({ kind: 'succeeded' }, () => ({ kind: 'succeeded', output }))
+    .with({ kind: 'deferred' }, () => ({ kind: 'deferred', output }))
+    .with({ kind: 'failed' }, (failed) => ({
+      kind: 'failed',
+      retryable: failed.retryable,
+      output,
+      error: failed.error,
+    }))
+    .exhaustive();
 }
 
 /** Execute extraction for already-parsed session metadata. */
@@ -342,10 +404,11 @@ async function handleExtractInput(input: HookInput): Promise<CommandResult> {
   // Both DBs: extraction classifies candidate scope (FR-008), and
   // global-scoped candidates must land in the global DB to be visible
   // from other projects.
-  const [projectDb, globalDb] = initDatabases(input.cwd);
+  const project = locate(input.cwd);
+  const [projectDb, globalDb] = initDatabases(project);
 
   try {
-    const result = await executeExtract(input, projectDb, globalDb);
+    const result = await executeExtract(input, projectDb, globalDb, project);
     return extractionToCommandResult(result);
   } catch (err) {
     return {
@@ -386,17 +449,18 @@ async function handleGenerate(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = args[0];
-  const [projectDb, globalDb] = initDatabases(cwd);
+  const project = locate(args[0]);
+  const [projectDb, globalDb] = initDatabases(project);
 
   try {
     const result = runGenerate({
       projectDb,
       globalDb,
-      cwd,
-      surfacePath: getSurfaceOutputPath(cwd),
-      cachePath: getSurfaceCacheDir(cwd),
-      lockDir: getLockDir(cwd),
+      cwd: project.cwd,
+      root: project.root,
+      surfacePath: getSurfaceOutputPath(project.cwd),
+      cachePath: getSurfaceCacheDir(project.root),
+      lockDir: getLockDir(project.root),
     });
 
     return {
@@ -453,10 +517,10 @@ export function parseRecallArgs(
     }
   }
 
-  // Construct immutable RecallOptions
+  // Construct immutable RecallOptions. The project name is added by the
+  // handler once the project is located: it is the repository's, not cwd's.
   const options: RecallOptions = {
     query,
-    projectName: getProjectName(cwd),
     limit: limit ?? DEFAULT_SEARCH_LIMIT,
     ...(branch !== undefined && { branch }),
     ...(keyword !== undefined && { keyword }),
@@ -478,11 +542,11 @@ async function handleRecall(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const { cwd, options } = parsed;
-  const [projectDb, globalDb] = initDatabases(cwd);
+  const project = locate(parsed.cwd);
+  const [projectDb, globalDb] = initDatabases(project);
 
   try {
-    const result = await executeRecall(projectDb, globalDb, options);
+    const result = await executeRecall(projectDb, globalDb, { ...parsed.options, projectName: project.name });
     return {
       kind: 'succeeded',
       output: formatRecallResult(result),
@@ -511,8 +575,8 @@ async function handleRemember(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = args[0];
-  const [projectDb, globalDb] = initDatabases(cwd);
+  const project = locate(args[0]);
+  const [projectDb, globalDb] = initDatabases(project);
 
   // Pass args without cwd to runRemember (it expects content first)
   const rememberArgs = args.slice(1);
@@ -528,14 +592,14 @@ async function handleRemember(args: string[]): Promise<CommandResult> {
         // thresholds were calibrated against; otherwise a threshold hit would
         // drop a genuinely new memory as a duplicate. See LOCAL_COSINE_CALIBRATED.
         embedFn: LOCAL_COSINE_CALIBRATED ? embedLocal : null,
-        projectName: getProjectName(cwd),
-        cwd,
+        projectName: project.name,
+        projectRoot: project.root,
         // Drain the embedding queue NOW instead of at the next session start
         // (FR-046): an explicit remember should be semantically searchable
         // immediately. backfill is idempotent and also clears any older queued
         // vectors. Incomplete flushes are non-fatal — the queue catches up.
         flushEmbedding: (db, _memory) =>
-          backfill(db, getProjectName(cwd)).then((r) => {
+          backfill(db, project.name).then((r) => {
             if (!r.ok) {
               throw new Error(r.error);
             }
@@ -575,8 +639,8 @@ async function handleIndexCode(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = args[0];
-  const [projectDb, globalDb] = initDatabases(cwd);
+  const project = locate(args[0]);
+  const [projectDb, globalDb] = initDatabases(project);
 
   try {
     // Forward everything after cwd: filePath, summary, and all flags
@@ -585,7 +649,7 @@ async function handleIndexCode(args: string[]): Promise<CommandResult> {
       'manual-index',
       projectDb,
       globalDb,
-      getProjectName(cwd)
+      project.name
     );
 
     if (!result.success) {
@@ -618,15 +682,15 @@ async function handleForget(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = args[0];
+  const project = locate(args[0]);
   const idOrQuery = args[1];
-  const [projectDb, globalDb] = initDatabases(cwd);
+  const [projectDb, globalDb] = initDatabases(project);
 
   try {
     // Try as ID first (both DBs)
-    let result = forgetById(projectDb, idOrQuery, cwd);
+    let result = forgetById(projectDb, idOrQuery, project.root);
     if (result.status === 'not_found') {
-      result = forgetById(globalDb, idOrQuery, cwd);
+      result = forgetById(globalDb, idOrQuery, project.root);
     }
 
     // If still not found, try as keyword query
@@ -648,7 +712,7 @@ async function handleForget(args: string[]): Promise<CommandResult> {
       const archiveResult = forgetById(
         candidate.scope === 'global' ? globalDb : projectDb,
         candidate.id,
-        cwd,
+        project.root,
       );
       if (archiveResult.status === 'archived') {
         return {
@@ -702,7 +766,8 @@ async function handleConsolidate(args: string[]): Promise<CommandResult> {
     return { kind: 'failed', error: cwdError };
   }
   // Only open project DB - consolidate operates on project scope only
-  const projectDbPath = prepareProjectDbDir(cwd);
+  const project = resolveProjectLocation(cwd);
+  const projectDbPath = prepareProjectDbDir(project);
 
   const projectDb = openDatabase(projectDbPath);
 
@@ -739,7 +804,7 @@ async function handleConsolidate(args: string[]): Promise<CommandResult> {
         summary,
         content,
         'consolidate-session',
-        cwd
+        project.root
       );
       if (mergeResult.kind === 'skipped') {
         return {
@@ -796,13 +861,13 @@ async function handleLifecycle(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = args[0];
+  const project = locate(args[0]);
   const ifNeeded = args.includes('--if-needed');
-  const [projectDb, globalDb] = initDatabases(cwd);
+  const [projectDb, globalDb] = initDatabases(project);
 
   try {
     if (ifNeeded) {
-      const result = runLifecycleIfNeeded(projectDb, globalDb, getTelemetryPath(cwd), cwd);
+      const result = runLifecycleIfNeeded(projectDb, globalDb, getTelemetryPath(project.root), project.root);
       if (result.skipped) {
         return { kind: 'succeeded', output: 'Lifecycle skipped (no changes needed)' };
       }
@@ -815,7 +880,7 @@ async function handleLifecycle(args: string[]): Promise<CommandResult> {
     // Same lifecycle+vacuum sequence as the --if-needed path (minus the
     // skip heuristics) — a manual run must also hard-delete expired
     // pruned rows.
-    const result = runFullLifecycle(projectDb, globalDb, cwd);
+    const result = runFullLifecycle(projectDb, globalDb, project.root);
 
     return {
       kind: 'succeeded',
@@ -844,9 +909,9 @@ async function handleAiPrune(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = args[0];
+  const project = locate(args[0]);
   const ifNeeded = args.includes('--if-needed');
-  const lockFile = join(getLockDir(cwd), 'ai-prune.lock');
+  const lockFile = join(getLockDir(project.root), 'ai-prune.lock');
   const lock = acquireLock(lockFile);
   if (!lock.acquired) {
     return lock.reason === 'held'
@@ -855,11 +920,11 @@ async function handleAiPrune(args: string[]): Promise<CommandResult> {
   }
 
   try {
-    const [projectDb, globalDb] = initDatabases(cwd);
+    const [projectDb, globalDb] = initDatabases(project);
     try {
       const result = ifNeeded
-        ? await runAiPruneIfNeeded(projectDb, globalDb, getTelemetryPath(cwd), cwd)
-        : await runAiPrune(projectDb, globalDb, getTelemetryPath(cwd), cwd);
+        ? await runAiPruneIfNeeded(projectDb, globalDb, getTelemetryPath(project.root), project.root)
+        : await runAiPrune(projectDb, globalDb, getTelemetryPath(project.root), project.root);
 
       if (result.kind === 'skipped') {
         return { kind: 'succeeded', output: `AI prune skipped: ${result.reason}` };
@@ -901,10 +966,9 @@ async function handleTraverse(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = positional[0];
   const memoryId = positional[1];
   const maxDepth = positional.length > 2 ? parseInt(positional[2], 10) : 2;
-  const [projectDb, globalDb] = initDatabases(cwd);
+  const [projectDb, globalDb] = initDatabases(locate(positional[0]));
 
   try {
     // Try project DB first
@@ -949,15 +1013,18 @@ async function handleInspect(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = args[0];
-  const [projectDb, globalDb] = initDatabases(cwd);
+  const project = locate(args[0]);
+  const [projectDb, globalDb] = initDatabases(project);
 
   try {
+    process.stdout.write(
+      `Project: ${project.name} (${project.scope}) — memory at ${getProjectDbPath(project.root)}\n`,
+    );
     runInspect(
       projectDb,
       globalDb,
-      getTelemetryPath(cwd),
-      getSurfaceCacheDir(cwd)
+      getTelemetryPath(project.root),
+      getSurfaceCacheDir(project.root)
     );
 
     return {
@@ -1044,10 +1111,10 @@ async function handleBackfill(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = args[0];
-  const [projectDb, globalDb] = initDatabases(cwd);
+  const project = locate(args[0]);
+  const [projectDb, globalDb] = initDatabases(project);
   try {
-    const projectResult = await backfill(projectDb, getProjectName(cwd));
+    const projectResult = await backfill(projectDb, project.name);
     const globalResult = await backfill(globalDb, 'global');
 
     const { result, warnings } = summarizeBackfillResults(projectResult, globalResult);
@@ -1079,8 +1146,8 @@ async function handleSemanticEdges(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = args[0];
-  const [projectDb, globalDb] = initDatabases(cwd);
+  const project = locate(args[0]);
+  const [projectDb, globalDb] = initDatabases(project);
 
   const limit = (() => {
     const limitArg = args.find(a => a.startsWith('--limit='));
@@ -1096,7 +1163,7 @@ async function handleSemanticEdges(args: string[]): Promise<CommandResult> {
   }
 
   try {
-    const result = await executeSemanticEdges(projectDb, { limit: limit.value, lockDir: getLockDir(cwd) });
+    const result = await executeSemanticEdges(projectDb, { limit: limit.value, lockDir: getLockDir(project.root) });
 
     if (!result.ok) {
       return { kind: 'failed', error: result.error };
@@ -1130,29 +1197,34 @@ async function handleLoadSurface(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = args[0];
+  const project = locate(args[0]);
 
   try {
     // Only act for projects that already use cortex. This hook runs at
     // SessionStart in EVERY project; creating .memory/DBs in untouched
     // projects is not ok — and without a project DB the cache fingerprint
-    // can't be validated anyway.
-    if (!existsSync(getProjectDbPath(cwd))) {
+    // can't be validated anyway. A stray database (a worktree's, a
+    // subdirectory's) counts: opening merges it into the project's.
+    if (!hasProjectMemory(project)) {
       return { kind: 'succeeded', output: 'No cached surface available' };
     }
 
-    const [projectDb, globalDb] = initDatabases(cwd);
+    const [projectDb, globalDb] = initDatabases(project);
     try {
       // Fingerprint the current DBs so a cache written against a different
       // memory set (archives, merges, inserts) is a miss, not a hit.
       const fingerprint = computeDbFingerprint(projectDb, globalDb);
-      const result = loadCachedSurface(cwd, getSurfaceCacheDir(cwd), fingerprint);
+      const result = loadCachedSurface(project.cwd, getSurfaceCacheDir(project.root), fingerprint);
 
       if (result !== null && !result.staleness.stale) {
         // Write cached surface through the same locked, atomic,
         // marker-splicing path as generation — a bare writeFileSync here
         // bypassed the surface lock and clobbered user content.
-        writeSurface(getSurfaceOutputPath(cwd), wrapInMarkers(result.surface), getLockDir(cwd));
+        writeSurface(
+          getSurfaceOutputPath(project.cwd),
+          wrapInMarkers(result.surface),
+          getLockDir(project.root),
+        );
         return { kind: 'succeeded', output: 'Loaded cached surface' };
       }
 
@@ -1160,10 +1232,11 @@ async function handleLoadSurface(args: string[]): Promise<CommandResult> {
       runGenerate({
         projectDb,
         globalDb,
-        cwd,
-        surfacePath: getSurfaceOutputPath(cwd),
-        cachePath: getSurfaceCacheDir(cwd),
-        lockDir: getLockDir(cwd),
+        cwd: project.cwd,
+        root: project.root,
+        surfacePath: getSurfaceOutputPath(project.cwd),
+        cachePath: getSurfaceCacheDir(project.root),
+        lockDir: getLockDir(project.root),
       });
       return {
         kind: 'succeeded',
@@ -1195,13 +1268,12 @@ async function handleEntityQuery(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = args[0];
   const query = args[1];
   const includeHistory = args.includes('--history');
   const limitArg = args.find(a => a.startsWith('--limit='));
   const limit = limitArg ? parseInt(limitArg.split('=')[1], 10) : 5;
 
-  const [projectDb, globalDb] = initDatabases(cwd);
+  const [projectDb, globalDb] = initDatabases(locate(args[0]));
 
   try {
     const result = executeEntityQuery(projectDb, globalDb, {
@@ -1282,9 +1354,15 @@ async function handlePromptRecall(): Promise<CommandResult> {
       return { kind: 'succeeded' };
     }
 
-    // Check DBs exist — don't create empty ones for a read-only hook
-    const projectDbPath = getProjectDbPath(cwd);
-    const globalDbPath = getGlobalDbPath();
+    // Check DBs exist — don't create empty ones for a read-only hook. Resolving
+    // may merge the legacy per-harness global DBs (once, ever); that moves
+    // existing memories rather than creating a database. Stray project
+    // databases are left for the next writing command: this hook runs on every
+    // prompt and must stay fast.
+    if (validateCwd(cwd) !== null) return { kind: 'succeeded' };
+    const project = resolveProjectLocation(cwd);
+    const projectDbPath = getProjectDbPath(project.root);
+    const globalDbPath = resolveGlobalDbPath();
     const hasProjectDb = existsSync(projectDbPath);
     const hasGlobalDb = existsSync(globalDbPath);
 
@@ -1319,7 +1397,7 @@ async function handlePromptRecall(): Promise<CommandResult> {
       const memories = await executePromptRecallWithFallback(projectDb, globalDb, {
         prompt,
         surfaceContent,
-        projectName: getProjectName(cwd),
+        projectName: project.name,
       });
       const output = formatPromptRecall(memories);
 
@@ -1353,7 +1431,7 @@ async function handleMaintenance(args: string[]): Promise<CommandResult> {
   }
 
   const cwd = args[0];
-  const lockFile = join(getLockDir(cwd), 'maintenance.lock');
+  const lockFile = join(getLockDir(locate(cwd).root), 'maintenance.lock');
   const lock = acquireLock(lockFile);
   if (!lock.acquired) {
     return lock.reason === 'held'
@@ -1412,19 +1490,20 @@ export type IngestSessionCommandOperations = Readonly<{
  */
 export function commandToIngestionStep(result: CommandResult): IngestionStepResult {
   const withOutput = result.output === undefined ? {} : { output: result.output };
-  switch (result.kind) {
-    case 'succeeded':
-      return { kind: 'succeeded', ...withOutput };
-    case 'deferred':
-      return { kind: 'deferred', reason: result.output ?? 'command deferred' };
-    case 'failed':
-      return {
-        kind: 'failed',
-        retryable: result.retryable === true,
-        error: result.error,
-        ...withOutput,
-      };
-  }
+  return match(result)
+    .returnType<IngestionStepResult>()
+    .with({ kind: 'succeeded' }, () => ({ kind: 'succeeded', ...withOutput }))
+    .with({ kind: 'deferred' }, (deferred) => ({
+      kind: 'deferred',
+      reason: deferred.output ?? 'command deferred',
+    }))
+    .with({ kind: 'failed' }, (failed) => ({
+      kind: 'failed',
+      retryable: failed.retryable === true,
+      error: failed.error,
+      ...withOutput,
+    }))
+    .exhaustive();
 }
 
 /** Injectable shell boundary for the complete detached ingestion pipeline. */
@@ -1449,6 +1528,123 @@ export async function runIngestSessionInput(
     : { kind: 'failed', output, error: 'Session ingestion completed with failed step(s)' };
 }
 
+/**
+ * Handle 'eval' subcommand: score what an agent answers from cortex's memory
+ * against the project's eval set. See commands/eval.ts for the method and
+ * the eval directory layout.
+ */
+async function handleEval(args: string[]): Promise<CommandResult> {
+  const command = parseEvalArgs(args, process.cwd());
+  if (typeof command === 'string') return { kind: 'failed', error: command };
+
+  const paths = evalPaths(command.dir);
+  const log = (line: string) => process.stderr.write(`[cortex:eval] ${line}\n`);
+  try {
+    const { cases, settings } = loadEvalSet(paths);
+    return await match(command)
+      .returnType<Promise<CommandResult>>()
+      .with({ kind: 'validate' }, async () => ({
+        kind: 'succeeded',
+        output: describeEvalSet(cases, settings),
+      }))
+      .with({ kind: 'answer' }, (answer) => handleEvalAnswer(answer, paths, cases, settings, log))
+      .with({ kind: 'score' }, (score) => handleEvalScore(score, paths, cases, log))
+      .exhaustive();
+  } catch (err) {
+    return { kind: 'failed', error: `Eval failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
+async function handleEvalAnswer(
+  command: Extract<EvalCommand, { kind: 'answer' }>,
+  paths: EvalPaths,
+  cases: readonly EvalCase[],
+  settings: EvalSettings,
+  log: (line: string) => void,
+): Promise<CommandResult> {
+  const resolved = resolveEvalEndpoint('answer', process.env);
+  if (resolved.kind === 'err') return { kind: 'failed', error: resolved.message };
+
+  const admit = excludeSessions(settings.authoringSessions);
+  const runPaths = paths.run(command.run);
+  const project = locate(command.cwd);
+  const manifest = openRun(
+    runPaths,
+    {
+      run: command.run,
+      condition: command.condition,
+      project: project.name,
+      requestedModel: resolved.endpoint.model,
+      branch: getCurrentBranch(command.cwd),
+      authoringSessions: settings.authoringSessions,
+      now: new Date(),
+    },
+    (snapshotDir) => {
+      // The same global DB every other command opens, merged from the
+      // per-harness ones first if that has not happened yet.
+      mergeStrayProjectDbs(project);
+      const sources = snapshotMemory({ projectRoot: project.root, globalDbPath: resolveGlobalDbPath(), snapshotDir });
+      return { sources, excludedMemories: countRefused(snapshotDir, sources, admit) };
+    },
+  );
+
+  const memory =
+    manifest.memory.kind === 'snapshot'
+      ? openSnapshotContext({
+          snapshotDir: runPaths.snapshot,
+          sources: manifest.memory.sources,
+          projectName: manifest.project,
+          branch: manifest.memory.branch,
+          asOf: new Date(manifest.createdAt),
+          admit,
+        })
+      : { context: noMemoryContext, close: () => {} };
+
+  log(`answering with ${resolved.endpoint.model} at ${resolved.endpoint.baseUrl}`);
+  try {
+    const outcome = await answerCases({
+      cases,
+      manifest,
+      paths: runPaths,
+      llm: endpointLlm(resolved.endpoint, ANSWER_COMPLETION),
+      context: memory.context,
+      log,
+    });
+    const { output, failure } = summarizeAnswering(manifest, outcome);
+    return failure === null ? { kind: 'succeeded', output } : { kind: 'failed', output, error: failure };
+  } finally {
+    memory.close();
+  }
+}
+
+async function handleEvalScore(
+  command: Extract<EvalCommand, { kind: 'score' }>,
+  paths: EvalPaths,
+  cases: readonly EvalCase[],
+  log: (line: string) => void,
+): Promise<CommandResult> {
+  const resolved = resolveEvalEndpoint('judge', process.env);
+  if (resolved.kind === 'err') return { kind: 'failed', error: resolved.message };
+  const { endpoint } = resolved;
+
+  if (command.dryRun) {
+    return { kind: 'succeeded', output: scoringPlan(cases, paths, command.runs, endpoint.model) };
+  }
+
+  log(`judging with ${endpoint.model} at ${endpoint.baseUrl}: questions, expected truth and answers are sent there`);
+  const results = await scoreRuns({
+    cases,
+    paths,
+    runs: command.runs,
+    judge: endpointLlm(endpoint, JUDGE_COMPLETION),
+    judgeRequested: endpoint.model,
+    log,
+  });
+
+  const agreements = renderAgreements(results, loadLabels(paths));
+  return { kind: 'succeeded', output: [renderReport(cases, results), ...agreements].join('\n') };
+}
+
 async function handleIngestSession(): Promise<CommandResult> {
   const input = await readStdinJson();
   return input
@@ -1462,6 +1658,36 @@ async function handleIngestSession(): Promise<CommandResult> {
 // ============================================================================
 // MAIN DISPATCH
 // ============================================================================
+
+/**
+ * Every subcommand and its handler. The usage line is derived from the keys,
+ * so the list a user sees cannot drift from the commands that exist.
+ */
+const SUBCOMMANDS = {
+  extract: () => handleExtract(),
+  'ingest-session': () => handleIngestSession(),
+  generate: handleGenerate,
+  recall: handleRecall,
+  remember: handleRemember,
+  'index-code': handleIndexCode,
+  forget: handleForget,
+  consolidate: handleConsolidate,
+  lifecycle: handleLifecycle,
+  'ai-prune': handleAiPrune,
+  maintenance: handleMaintenance,
+  traverse: handleTraverse,
+  inspect: handleInspect,
+  backfill: handleBackfill,
+  'semantic-edges': handleSemanticEdges,
+  'load-surface': handleLoadSurface,
+  'prompt-recall': () => handlePromptRecall(),
+  'entity-query': handleEntityQuery,
+  eval: handleEval,
+} as const satisfies Readonly<Record<string, (args: string[]) => Promise<CommandResult>>>;
+
+type Subcommand = keyof typeof SUBCOMMANDS;
+
+const isSubcommand = (name: string): name is Subcommand => Object.hasOwn(SUBCOMMANDS, name);
 
 /** Process exit status for the CLI. */
 export type ExitCode = 0 | 1;
@@ -1495,81 +1721,20 @@ async function main(): Promise<ExitCode> {
   // else, including the hook scripts that already set the path themselves.
   ensureNativeLibraryPath();
 
-  const args = process.argv.slice(2);
+  const [subcommand, ...subcommandArgs] = process.argv.slice(2);
 
-  if (args.length === 0) {
+  if (subcommand === undefined) {
     logError('Usage: cli.ts <subcommand> [args...]');
-    logError('Subcommands: extract, ingest-session, generate, recall, remember, index-code, forget, consolidate, lifecycle, ai-prune, maintenance, traverse, inspect, backfill, semantic-edges, load-surface, prompt-recall, entity-query');
+    logError(`Subcommands: ${Object.keys(SUBCOMMANDS).join(', ')}`);
     return 1;
   }
-
-  const subcommand = args[0];
-  const subcommandArgs = args.slice(1);
 
   let result: CommandResult;
 
   try {
-    switch (subcommand) {
-      case 'extract':
-        result = await handleExtract();
-        break;
-      case 'ingest-session':
-        result = await handleIngestSession();
-        break;
-      case 'generate':
-        result = await handleGenerate(subcommandArgs);
-        break;
-      case 'recall':
-        result = await handleRecall(subcommandArgs);
-        break;
-      case 'remember':
-        result = await handleRemember(subcommandArgs);
-        break;
-      case 'index-code':
-        result = await handleIndexCode(subcommandArgs);
-        break;
-      case 'forget':
-        result = await handleForget(subcommandArgs);
-        break;
-      case 'consolidate':
-        result = await handleConsolidate(subcommandArgs);
-        break;
-      case 'lifecycle':
-        result = await handleLifecycle(subcommandArgs);
-        break;
-      case 'ai-prune':
-        result = await handleAiPrune(subcommandArgs);
-        break;
-      case 'maintenance':
-        result = await handleMaintenance(subcommandArgs);
-        break;
-      case 'traverse':
-        result = await handleTraverse(subcommandArgs);
-        break;
-      case 'inspect':
-        result = await handleInspect(subcommandArgs);
-        break;
-      case 'backfill':
-        result = await handleBackfill(subcommandArgs);
-        break;
-      case 'semantic-edges':
-        result = await handleSemanticEdges(subcommandArgs);
-        break;
-      case 'load-surface':
-        result = await handleLoadSurface(subcommandArgs);
-        break;
-      case 'prompt-recall':
-        result = await handlePromptRecall();
-        break;
-      case 'entity-query':
-        result = await handleEntityQuery(subcommandArgs);
-        break;
-      default:
-        result = {
-          kind: 'failed',
-          error: `Unknown subcommand: ${subcommand}`,
-        };
-    }
+    result = isSubcommand(subcommand)
+      ? await SUBCOMMANDS[subcommand](subcommandArgs)
+      : { kind: 'failed', error: `Unknown subcommand: ${subcommand}` };
   } catch (err) {
     result = {
       kind: 'failed',

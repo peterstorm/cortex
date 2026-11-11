@@ -6,12 +6,13 @@
 import { describe, it, expect } from 'vitest';
 import {
   getProjectDbPath,
-  getGlobalDbPath,
+  getLegacyGlobalDbPaths,
+  homeDir,
+  locateGlobalDb,
   getSurfaceCacheDir,
   getSurfaceOutputPath,
   getLockDir,
   getTelemetryPath,
-  getProjectName,
   MAX_TRANSCRIPT_BYTES,
   SURFACE_MAX_TOKENS,
   DEFAULT_SEARCH_LIMIT,
@@ -30,10 +31,40 @@ describe('config - path resolution', () => {
     expect(result).toBe('/home/user/myproject/.memory/cortex.db');
   });
 
-  it('getGlobalDbPath returns path in home directory', () => {
-    const result = getGlobalDbPath();
-    // Harness-dependent: .claude or .pi/agent
-    expect(result).toMatch(/\.(claude|pi\/agent)\/memory\/cortex-global\.db/);
+  it('the global DB path is the same for every harness: the XDG data dir, under home by default', () => {
+    expect(locateGlobalDb({}, '/home/u').path).toBe('/home/u/.local/share/cortex/global.db');
+    expect(locateGlobalDb({ PI_CODING_AGENT_DIR: '/home/u/.pi/agent' }, '/home/u').path).toBe(
+      '/home/u/.local/share/cortex/global.db',
+    );
+  });
+
+  it('the global DB path honours XDG_DATA_HOME, ignoring a relative one as the spec requires', () => {
+    expect(locateGlobalDb({ XDG_DATA_HOME: '/data' }, '/home/u').path).toBe('/data/cortex/global.db');
+    expect(locateGlobalDb({ XDG_DATA_HOME: 'relative/data' }, '/home/u').path).toBe(
+      '/home/u/.local/share/cortex/global.db',
+    );
+  });
+
+  it('the global DB path lets CORTEX_GLOBAL_DB override everything', () => {
+    expect(locateGlobalDb({ CORTEX_GLOBAL_DB: '/x/m.db', XDG_DATA_HOME: '/data' }, '/home/u').path).toBe('/x/m.db');
+  });
+
+  it('locateGlobalDb tells an explicit override from the default, which is the one merged into', () => {
+    expect(locateGlobalDb({ CORTEX_GLOBAL_DB: '/x/m.db' }, '/home/u')).toEqual({ kind: 'override', path: '/x/m.db' });
+    expect(locateGlobalDb({}, '/home/u')).toEqual({ kind: 'default', path: '/home/u/.local/share/cortex/global.db' });
+  });
+
+  it('homeDir takes an absolute $HOME and ignores a relative one', () => {
+    expect(homeDir({ HOME: '/tmp/isolated-home' })).toBe('/tmp/isolated-home');
+    expect(homeDir({ HOME: 'relative' })).not.toBe('relative');
+    expect(locateGlobalDb({ HOME: '/tmp/isolated-home' }).path).toBe('/tmp/isolated-home/.local/share/cortex/global.db');
+  });
+
+  it('getLegacyGlobalDbPaths lists the old per-harness files, Claude first', () => {
+    expect(getLegacyGlobalDbPaths('/home/u')).toEqual([
+      { harness: 'claude', path: '/home/u/.claude/memory/cortex-global.db' },
+      { harness: 'pi', path: '/home/u/.pi/agent/memory/cortex-global.db' },
+    ]);
   });
 
   it('getSurfaceCacheDir returns correct path', () => {
@@ -53,28 +84,6 @@ describe('config - path resolution', () => {
   it('getTelemetryPath returns correct path', () => {
     const result = getTelemetryPath('/project');
     expect(result).toBe('/project/.memory/telemetry.json');
-  });
-});
-
-describe('config - project name extraction', () => {
-  it('getProjectName extracts last directory', () => {
-    expect(getProjectName('/home/user/myproject')).toBe('myproject');
-  });
-
-  it('getProjectName handles trailing slash', () => {
-    expect(getProjectName('/home/user/myproject/')).toBe('myproject');
-  });
-
-  it('getProjectName handles root path', () => {
-    expect(getProjectName('/')).toBe('unknown');
-  });
-
-  it('getProjectName handles empty path', () => {
-    expect(getProjectName('')).toBe('unknown');
-  });
-
-  it('getProjectName handles nested path', () => {
-    expect(getProjectName('/a/b/c/d')).toBe('d');
   });
 });
 

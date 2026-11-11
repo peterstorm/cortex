@@ -305,7 +305,7 @@ export interface RememberOptions {
   /** Project name for the embedding metadata prefix (must match backfill's) */
   readonly projectName?: string;
   /** Project root; when provided, the surface cache is invalidated after insert */
-  readonly cwd?: string;
+  readonly projectRoot?: string;
   /**
    * Post-insert embedding flush. The standard queue is drained at the next
    * session start (FR-046); an explicit remember should be semantically
@@ -405,8 +405,8 @@ export async function executeRemember(
   }
 
   // Invalidate cached surfaces: the visible memory set changed (I/O)
-  if (options.cwd !== undefined) {
-    invalidateSurfaceCache(options.cwd);
+  if (options.projectRoot !== undefined) {
+    invalidateSurfaceCache(options.projectRoot);
   }
 
   // Make the new memory searchable immediately: the embedding queue is

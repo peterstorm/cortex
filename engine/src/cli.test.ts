@@ -22,7 +22,6 @@ import {
 import type { CommandResult } from './cli.js';
 import { openDatabase, insertMemory } from './infra/db.js';
 import { createMemory } from './core/types.js';
-import { getProjectName } from './config.js';
 
 const CLI_PATH = join(dirname(fileURLToPath(import.meta.url)), 'cli.ts');
 
@@ -227,38 +226,13 @@ describe('cli - parseRecallArgs', () => {
       // Type system should enforce readonly, but verify returned object structure
       expect(result.options).toHaveProperty('query');
       expect(result.options).toHaveProperty('limit');
-      expect(result.options).toHaveProperty('projectName');
+      // The project name is the located repository's, added by the handler;
+      // the cwd argument alone cannot know it.
+      expect(result.options).not.toHaveProperty('projectName');
     }
   });
 });
 
-describe('config - getProjectName', () => {
-  it('should extract project name from absolute path', () => {
-    const result = getProjectName('/home/user/my-project');
-    expect(result).toBe('my-project');
-  });
-
-  it('should handle path with trailing slash', () => {
-    const result = getProjectName('/home/user/my-project/');
-    expect(result).toBe('my-project');
-  });
-
-  it('should handle single directory', () => {
-    const result = getProjectName('/project');
-    expect(result).toBe('project');
-  });
-
-  it('should handle root directory', () => {
-    const result = getProjectName('/');
-    // basename of '/' is empty string
-    expect(result).toBe('unknown');
-  });
-
-  it('should handle empty string', () => {
-    const result = getProjectName('');
-    expect(result).toBe('unknown');
-  });
-});
 
 describe('cli - database initialization', () => {
   let db: Database;

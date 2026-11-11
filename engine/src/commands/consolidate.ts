@@ -292,7 +292,7 @@ export type MergePairResult =
  * @param mergedSummary - Human-provided merged summary
  * @param mergedContent - Human-provided merged content
  * @param sessionId - Current session ID
- * @param cwd - Project root; when provided, the surface cache is invalidated
+ * @param projectRoot - Project root; when provided, the surface cache is invalidated
  *              after a successful merge (superseded members must not be
  *              served from a stale cached surface)
  * @returns MergePairResult — merged with new ID, or skipped with reason
@@ -303,7 +303,7 @@ export function mergePair(
   mergedSummary: string,
   mergedContent: string,
   sessionId: string,
-  cwd?: string
+  projectRoot?: string
 ): MergePairResult {
   // Pure: Build merged memory (id + timestamp from I/O boundary)
   const mergedMemory = buildMergedMemory(
@@ -373,8 +373,8 @@ export function mergePair(
 
   // Invalidate cached surfaces: two members were superseded and a merged
   // memory was inserted — any cached surface is stale.
-  if (cwd !== undefined) {
-    invalidateSurfaceCache(cwd);
+  if (projectRoot !== undefined) {
+    invalidateSurfaceCache(projectRoot);
   }
 
   return { kind: 'merged', mergedId: mergedMemory.id };

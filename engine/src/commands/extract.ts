@@ -25,9 +25,10 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto';
-import { basename, join } from 'node:path';
+import { join } from 'node:path';
 import type { Database } from 'bun:sqlite';
 import type { GitContext, HookInput, Memory, MemoryCandidate } from '../core/types.js';
+import type { ProjectLocation } from '../core/project-location.js';
 import { createMemory, serializeSourceContext } from '../core/types.js';
 import {
   buildExtractionPrompt,
@@ -121,18 +122,24 @@ export type ExtractionResult =
  *
  * @param input - Hook input from stdin
  * @param projectDb - Project database instance
+ * @param globalDb - Global database, or null to keep global-scoped memories in the project's
+ * @param project - Where the project's memory lives and its name: required, so
+ *   a caller cannot fall back to the session's directory by omission. The
+ *   session's own directory (`input.cwd`) still supplies the git context.
  * @returns Extraction result
  */
 export async function executeExtract(
   input: HookInput,
   projectDb: Database,
-  globalDb: Database | null = null
+  globalDb: Database | null,
+  project: Pick<ProjectLocation, 'root' | 'name'>,
 ): Promise<ExtractionResult> {
   // Concurrency guard: extraction runs detached on SessionEnd with no other
   // coordination — two overlapping runs would snapshot active memories at
   // the same time and double-insert candidates. Same per-project PID-lock
-  // pattern as semantic-edges.
-  const lockFile = join(getLockDir(input.cwd), 'extract.lock');
+  // pattern as semantic-edges. Per project, not per worktree: worktrees of
+  // one repository write the same database.
+  const lockFile = join(getLockDir(project.root), 'extract.lock');
   const lock = acquireLock(lockFile);
   if (!lock.acquired) {
     logInfo(`Extraction skipped: lock ${lock.reason}`);
@@ -227,7 +234,7 @@ export async function executeExtract(
 
     // I/O: chunk-invariant context, fetched once per run
     const gitContext = getGitContext(input.cwd);
-    const projectName = basename(input.cwd);
+    const projectName = project.name;
     const knownEntityProfiles = buildKnownEntityProfiles(projectDb);
     if (knownEntityProfiles.length > 0) {
       logInfo(`Injecting ${knownEntityProfiles.length} known entities into extraction prompt`);
@@ -547,7 +554,7 @@ export async function executeExtract(
     // I/O: Invalidate surface cache since new memories were extracted (FR-022)
     if (totalInserted > 0) {
       try {
-        invalidateSurfaceCache(input.cwd);
+        invalidateSurfaceCache(project.root);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         logError(`Cache invalidation failed: ${message}`);
