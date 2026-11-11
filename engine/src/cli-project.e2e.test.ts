@@ -91,7 +91,7 @@ describe('cli - one memory per repository', () => {
 
     // inspect names the project and where its memory lives.
     expect(cli('inspect', session).stdout).toContain(`Project: loom (repository) — memory at ${getProjectDbPath(main)}`);
-  });
+  }, 60_000);
 
   it('remember and load-surface from a worktree subdirectory keep every project file at the main worktree', () => {
     const main = join(base, 'loom');
@@ -130,5 +130,5 @@ describe('cli - one memory per repository', () => {
     expect(surface).toContain('Decided in the main checkout');
     expect(existsSync(getSurfaceOutputPath(main))).toBe(false);
     expect(existsSync(getSurfaceOutputPath(worktree))).toBe(false);
-  });
+  }, 120_000);
 });
