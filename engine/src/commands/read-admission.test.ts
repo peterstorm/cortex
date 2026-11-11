@@ -6,10 +6,11 @@
 
 import { beforeEach, describe, expect, test, vi } from 'vitest';
 import type { Database } from 'bun:sqlite';
+import type { MemoryAdmission } from '../core/admission.js';
 import { createMemory } from '../core/types.js';
 import { insertFact, insertMemory, openDatabase, upsertEntity } from '../infra/db.js';
-import { composeSurface, type MemoryAdmission } from './generate.js';
-import { executePromptRecall, executePromptRecallWithFallback } from './prompt-recall.js';
+import { composeSurface } from './generate.js';
+import { executePromptRecall, executePromptRecallWithFallback, recallForPrompt } from './prompt-recall.js';
 
 const mockEmbedLocal = vi.fn();
 vi.mock('../infra/local-embed.ts', () => ({
@@ -83,6 +84,26 @@ describe('composeSurface', () => {
     expect(surface.content).not.toContain('answer key');
     expect(surface.content).not.toContain('from-the-answer-key');
   });
+
+  test('an entity with one admitted and one refused fact keeps the admitted fact only', () => {
+    insertFact(projectDb, {
+      id: 'f-kept',
+      entity_id: upsertEntity(projectDb, 'pilot', 'project'),
+      predicate: 'owned-by',
+      object: 'from-the-work-session',
+      source_memory_id: 'kept',
+      confidence: 0.7,
+      valid_from: '2026-11-01T00:00:00.000Z',
+      valid_to: null,
+      created_at: '2026-11-01T00:00:00.000Z',
+    });
+
+    const surface = composeSurface(projectDb, globalDb, 'main', { admit: refuseAuthor });
+
+    expect(surface.content).toContain('from-the-work-session');
+    expect(surface.content).not.toContain('from-the-answer-key');
+    expect(composeSurface(projectDb, globalDb, 'main').content).toContain('from-the-answer-key');
+  });
 });
 
 describe('prompt recall', () => {
@@ -101,5 +122,20 @@ describe('prompt recall', () => {
     const admitted = await executePromptRecallWithFallback(projectDb, globalDb, { ...options, admit: refuseAuthor });
     expect(admitted.map((m) => m.id)).toEqual(['kept']);
     expect(executePromptRecall(projectDb, globalDb, { ...options, admit: refuseAuthor }).map((m) => m.id)).toEqual(['kept']);
+  });
+
+  test('recall names the path that produced its memories', async () => {
+    mockEmbedLocal.mockResolvedValue(unit(1));
+    expect((await recallForPrompt(projectDb, globalDb, options)).path).toBe('semantic');
+
+    mockEmbedLocal.mockRejectedValue(new Error('embedder down'));
+    const degraded = await recallForPrompt(projectDb, globalDb, options);
+    expect(degraded.path).toBe('keyword-fallback');
+    expect(degraded.memories.map((m) => m.id).sort()).toEqual(['kept', 'refused']);
+
+    expect(await recallForPrompt(projectDb, globalDb, { ...options, prompt: 'hi' })).toEqual({
+      path: 'not-run',
+      memories: [],
+    });
   });
 });

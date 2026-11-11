@@ -11,6 +11,8 @@
  * ALL line errors, so one validation pass reports the whole file.
  */
 
+import { isRecallPath, type RecallPath } from './types.js';
+
 // ============================================================================
 // DOMAIN TYPES
 // ============================================================================
@@ -66,6 +68,11 @@ export type Answer = Readonly<{
   promptTokens: number | null;
   /** The model that answered, as the provider reported it. */
   model: string | null;
+  /**
+   * How the memory this answer read was recalled. Null for an answer that
+   * does not say: one collected by hand, or written before this was recorded.
+   */
+  recall: RecallPath | null;
 }>;
 
 /** The five measures every answer is judged on, each 0..1, higher is better. */
@@ -213,6 +220,44 @@ export function parseJsonl<T>(
   return errors.length > 0 ? { kind: 'err', errors } : { kind: 'ok', value: items };
 }
 
+/** Parse a file that holds one JSON object (not a list, not a scalar). */
+export function parseJsonObject(text: string): ParseResult<Row> {
+  const notAnObject: ParseResult<Row> = {
+    kind: 'err',
+    errors: [{ line: 1, message: 'expected a JSON object' }],
+  };
+  try {
+    const raw: unknown = JSON.parse(text);
+    return typeof raw === 'object' && raw !== null && !Array.isArray(raw)
+      ? { kind: 'ok', value: raw as Row }
+      : notAnObject;
+  } catch {
+    return notAnObject;
+  }
+}
+
+/**
+ * A file appended to one line at a time, split at an interrupted write.
+ *
+ * A process killed mid-append leaves a final line that is neither terminated
+ * nor complete JSON. That line is `torn`: it was never a row, and the next
+ * append must not be glued onto it. A final line that is complete JSON but
+ * lacks its newline (a hand-edited file) is a row and stays in `complete`.
+ */
+export type AppendedLines = Readonly<{ complete: string; torn: string | null }>;
+
+export function splitTornTail(text: string): AppendedLines {
+  if (text === '' || text.endsWith('\n')) return { complete: text, torn: null };
+  const lastBreak = text.lastIndexOf('\n');
+  const tail = text.slice(lastBreak + 1);
+  try {
+    JSON.parse(tail);
+    return { complete: text, torn: null };
+  } catch {
+    return { complete: text.slice(0, lastBreak + 1), torn: tail };
+  }
+}
+
 /** Reject keys outside the schema: a typo such as `true_nwo` must not pass silently. */
 function unknownKeys(row: Row, allowed: readonly string[]): string | null {
   const extra = Object.keys(row).filter((key) => !allowed.includes(key));
@@ -258,7 +303,8 @@ export function parseAnswerRow(row: Row): Answer | string {
   const promptTokens = nonNegativeIntOrNull(row.prompt_tokens);
   if (promptTokens === undefined) return `${id}: prompt_tokens must be a non-negative integer`;
   const model = typeof row.answer_model === 'string' ? row.answer_model : null;
-  return { id, answer: row.answer, toolCalls, promptTokens, model };
+  const recall = isRecallPath(row.recall) ? row.recall : null;
+  return { id, answer: row.answer, toolCalls, promptTokens, model, recall };
 }
 
 const LABEL_KEYS = ['run', 'id', ...MEASURES] as const;
@@ -296,18 +342,11 @@ export function parseEvalSettings(text: string): ParseResult<EvalSettings> {
     kind: 'err',
     errors: [{ line: 1, message }],
   });
-  let raw: unknown;
-  try {
-    raw = JSON.parse(text);
-  } catch {
-    return fail('expected a JSON object');
-  }
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
-    return fail('expected a JSON object');
-  }
-  const extra = unknownKeys(raw as Row, ['authoring_sessions']);
+  const parsed = parseJsonObject(text);
+  if (parsed.kind === 'err') return parsed;
+  const extra = unknownKeys(parsed.value, ['authoring_sessions']);
   if (extra) return fail(extra);
-  const sessions = nonBlankStrings((raw as Row).authoring_sessions);
+  const sessions = nonBlankStrings(parsed.value.authoring_sessions);
   if (!sessions) {
     return fail('authoring_sessions must be a list of session ids (use [] when there are none)');
   }
@@ -315,21 +354,8 @@ export function parseEvalSettings(text: string): ParseResult<EvalSettings> {
 }
 
 // ============================================================================
-// SERIALIZATION
+// DESCRIPTION
 // ============================================================================
-
-/** The JSONL row for a case: the inverse of parseCaseRow. */
-export function caseToRow(evalCase: EvalCase): Record<string, unknown> {
-  return {
-    id: evalCase.id,
-    split: evalCase.split,
-    kind: evalCase.kind,
-    asked_on: evalCase.askedOn,
-    question: evalCase.question,
-    true_now: [...evalCase.trueNow],
-    stale: [...evalCase.stale],
-  };
-}
 
 /** The method's target size: a useful diagnostic, not a precise estimate. */
 export const TARGET_CASES = 20;

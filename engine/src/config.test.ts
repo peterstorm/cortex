@@ -6,7 +6,6 @@
 import { describe, it, expect } from 'vitest';
 import {
   getProjectDbPath,
-  getGlobalDbPath,
   getLegacyGlobalDbPaths,
   homeDir,
   locateGlobalDb,
@@ -32,22 +31,22 @@ describe('config - path resolution', () => {
     expect(result).toBe('/home/user/myproject/.memory/cortex.db');
   });
 
-  it('getGlobalDbPath is the same for every harness: the XDG data dir, under home by default', () => {
-    expect(getGlobalDbPath({}, '/home/u')).toBe('/home/u/.local/share/cortex/global.db');
-    expect(getGlobalDbPath({ PI_CODING_AGENT_DIR: '/home/u/.pi/agent' }, '/home/u')).toBe(
+  it('the global DB path is the same for every harness: the XDG data dir, under home by default', () => {
+    expect(locateGlobalDb({}, '/home/u').path).toBe('/home/u/.local/share/cortex/global.db');
+    expect(locateGlobalDb({ PI_CODING_AGENT_DIR: '/home/u/.pi/agent' }, '/home/u').path).toBe(
       '/home/u/.local/share/cortex/global.db',
     );
   });
 
-  it('getGlobalDbPath honours XDG_DATA_HOME, ignoring a relative one as the spec requires', () => {
-    expect(getGlobalDbPath({ XDG_DATA_HOME: '/data' }, '/home/u')).toBe('/data/cortex/global.db');
-    expect(getGlobalDbPath({ XDG_DATA_HOME: 'relative/data' }, '/home/u')).toBe(
+  it('the global DB path honours XDG_DATA_HOME, ignoring a relative one as the spec requires', () => {
+    expect(locateGlobalDb({ XDG_DATA_HOME: '/data' }, '/home/u').path).toBe('/data/cortex/global.db');
+    expect(locateGlobalDb({ XDG_DATA_HOME: 'relative/data' }, '/home/u').path).toBe(
       '/home/u/.local/share/cortex/global.db',
     );
   });
 
-  it('getGlobalDbPath lets CORTEX_GLOBAL_DB override everything', () => {
-    expect(getGlobalDbPath({ CORTEX_GLOBAL_DB: '/x/m.db', XDG_DATA_HOME: '/data' }, '/home/u')).toBe('/x/m.db');
+  it('the global DB path lets CORTEX_GLOBAL_DB override everything', () => {
+    expect(locateGlobalDb({ CORTEX_GLOBAL_DB: '/x/m.db', XDG_DATA_HOME: '/data' }, '/home/u').path).toBe('/x/m.db');
   });
 
   it('locateGlobalDb tells an explicit override from the default, which is the one merged into', () => {
@@ -58,7 +57,7 @@ describe('config - path resolution', () => {
   it('homeDir takes an absolute $HOME and ignores a relative one', () => {
     expect(homeDir({ HOME: '/tmp/isolated-home' })).toBe('/tmp/isolated-home');
     expect(homeDir({ HOME: 'relative' })).not.toBe('relative');
-    expect(getGlobalDbPath({ HOME: '/tmp/isolated-home' })).toBe('/tmp/isolated-home/.local/share/cortex/global.db');
+    expect(locateGlobalDb({ HOME: '/tmp/isolated-home' }).path).toBe('/tmp/isolated-home/.local/share/cortex/global.db');
   });
 
   it('getLegacyGlobalDbPaths lists the old per-harness files, Claude first', () => {

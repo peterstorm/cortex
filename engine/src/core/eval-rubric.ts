@@ -207,6 +207,35 @@ function parseJudgementRow(row: Row): Judgement | string {
 export const parseJudgements = (text: string): ParseResult<readonly Judgement[]> =>
   parseJsonl(text, parseJudgementRow, (j) => `${j.id}/${j.key}`);
 
+/** What scoring one case of a run needs: nothing, a stored judgement, or the judge. */
+export type CaseScoring = Readonly<
+  | { kind: 'unanswered' }
+  | { kind: 'cached'; scored: ScoredAnswer }
+  | { kind: 'to-judge'; answer: Answer; prompt: string; key: string }
+>;
+
+/**
+ * Plan the scoring of one case. A stored judgement is reused only when its
+ * key matches the key of the prompt the judge would be sent now, so a changed
+ * rubric, case, answer or judge model each force a fresh judgement.
+ *
+ * @param keyOf - the key of a rendered judge prompt; hashing it is the shell's
+ */
+export function planCase(
+  run: Readonly<{ answers: ReadonlyMap<CaseId, Answer>; judgements: readonly Judgement[] }>,
+  evalCase: EvalCase,
+  keyOf: (judgePrompt: string) => string,
+): CaseScoring {
+  const answer = run.answers.get(evalCase.id);
+  if (!answer) return { kind: 'unanswered' };
+  const prompt = buildJudgePrompt(evalCase, answer.answer);
+  const key = keyOf(prompt);
+  const cached = run.judgements.find((j) => j.id === evalCase.id && j.key === key);
+  return cached
+    ? { kind: 'cached', scored: { evalCase, answer, judgement: cached } }
+    : { kind: 'to-judge', answer, prompt, key };
+}
+
 // ============================================================================
 // AGGREGATION
 // ============================================================================
@@ -293,13 +322,13 @@ export function judgeAgreement(result: RunResult, labels: readonly Label[]): rea
 // ============================================================================
 
 const COL = 12;
-const num = (value: number | null | undefined, digits: number): string =>
-  (value === null || value === undefined ? '-' : value.toFixed(digits)).padStart(COL);
+const num = (value: number | null, digits: number): string =>
+  (value === null ? '-' : value.toFixed(digits)).padStart(COL);
 
-function deltaCell(values: readonly (number | null | undefined)[], digits: number): string {
+function deltaCell(values: readonly (number | null)[], digits: number): string {
   if (values.length !== 2) return '';
   const [a, b] = values;
-  if (a === null || a === undefined || b === null || b === undefined) return ''.padStart(10);
+  if (a === null || b === null) return ''.padStart(10);
   const d = b - a;
   return `${d >= 0 ? '+' : ''}${d.toFixed(digits)}`.padStart(10);
 }
@@ -317,16 +346,18 @@ function splitTable(
     `  ${'measure'.padEnd(18)}` +
     runs.map((r) => r.run.slice(0, COL - 1).padStart(COL)).join('') +
     (runs.length === 2 ? 'change'.padStart(10) : '');
-  const row = (label: string, values: readonly (number | null | undefined)[], digits: number) =>
-    `  ${label.padEnd(18)}${values.map((v) => num(v, digits)).join('')}${deltaCell(values, digits)}`;
+  const row = (label: string, pick: (summary: Summary) => number | null, digits: number) => {
+    const values = summaries.map((s) => (s === null ? null : pick(s)));
+    return `  ${label.padEnd(18)}${values.map((v) => num(v, digits)).join('')}${deltaCell(values, digits)}`;
+  };
 
   return [
     '',
     `${split} (${first.n} questions, of ${totalInSet} in the test set)`,
     header,
-    ...MEASURES.map((m) => row(m, summaries.map((s) => s?.means[m]), 2)),
-    row('prompt_tokens', summaries.map((s) => s?.promptTokens), 0),
-    row('tool_calls', summaries.map((s) => s?.toolCalls), 2),
+    ...MEASURES.map((m) => row(m, (s) => s.means[m], 2)),
+    row('prompt_tokens', (s) => s.promptTokens, 0),
+    row('tool_calls', (s) => s.toolCalls, 2),
   ];
 }
 
@@ -375,7 +406,23 @@ function memoryRead(runs: readonly RunResult[]): readonly string[] {
   return [
     ...runs.map((r) => `  ${r.run}: ${describeMemory(r.memory)}`),
     ...(differ.length > 0 ? [`  <- the runs read different ${differ.join(' and ')} databases`] : []),
+    ...runs.flatMap(keywordFallbackNote),
   ];
+}
+
+/**
+ * Recall falls back to keyword search when the embedder fails, and that ranks
+ * differently. Answers that read memory that way are not like for like with
+ * the rest, in this run or the other.
+ */
+function keywordFallbackNote(run: RunResult): readonly string[] {
+  const fellBack = run.scored.filter((s) => s.answer.recall === 'keyword-fallback').length;
+  return fellBack === 0
+    ? []
+    : [
+        `  <- ${run.run}: ${fellBack} of ${run.scored.length} scored answers read memory through ` +
+          'keyword-fallback recall (the embedder was unavailable)',
+      ];
 }
 
 function describeMemory(memory: MemorySource): string {

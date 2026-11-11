@@ -8,11 +8,14 @@ import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import type { MemoryAdmission } from '../core/admission.js';
+import type { SnapshotSources } from '../core/eval-run.js';
 import { createMemory, type MemoryType } from '../core/types.js';
 import { insertFact, insertMemory, openDatabase, upsertEntity } from '../infra/db.js';
 import {
   countRefused,
   excludeSessions,
+  noMemoryContext,
   openSnapshotContext,
   resolveEvalEndpoint,
   snapshotMemory,
@@ -72,6 +75,25 @@ function addFact(dbPath: string, entity: string, object: string, sourceMemoryId:
 const projectDb = () => path.join(project, '.memory', 'cortex.db');
 const admit = excludeSessions(new Set(['author-session']));
 
+const takeSnapshot = (): SnapshotSources => snapshotMemory({ projectRoot: project, globalDbPath, snapshotDir });
+
+/** What the run would inject for `question`, read from the snapshot and closed again. */
+async function injected(sources: SnapshotSources, question: string, admitting: MemoryAdmission = admit) {
+  const memory = openSnapshotContext({
+    snapshotDir,
+    sources,
+    projectName: 'project',
+    branch: 'main',
+    asOf: new Date('2026-11-09T00:00:00Z'),
+    admit: admitting,
+  });
+  try {
+    return await memory.context(question);
+  } finally {
+    memory.close();
+  }
+}
+
 beforeEach(() => {
   root = mkdtempSync(path.join(tmpdir(), 'cortex-eval-adapters-'));
   project = path.join(root, 'project');
@@ -92,48 +114,46 @@ afterEach(() => {
 
 describe('snapshotMemory', () => {
   test('freezes the memory a run reads: later writes do not reach it', async () => {
-    snapshotMemory({ projectRoot: project, globalDbPath, snapshotDir });
+    const sources = takeSnapshot();
     addMemory(projectDb(), 'later', 'Written after the snapshot about reclaw', 'work-session').close();
 
-    const memory = openSnapshotContext({
-      snapshotDir,
-      projectName: 'project',
-      branch: 'main',
-      asOf: new Date('2026-11-09T00:00:00Z'),
-      admit,
-    });
-    try {
-      expect(await memory.context('what does reclaw run on?')).not.toContain('Written after the snapshot');
-    } finally {
-      memory.close();
-    }
+    expect((await injected(sources, 'what does reclaw run on?')).text).not.toContain('Written after the snapshot');
   });
 
   test('returns the databases it copied; a missing global database is recorded as null', () => {
-    expect(snapshotMemory({ projectRoot: project, globalDbPath, snapshotDir })).toEqual({ project: projectDb(), global: null });
+    expect(takeSnapshot()).toEqual({ project: projectDb(), global: null });
   });
 
   test('records the global database when there is one, and its memories reach the context', async () => {
     addMemory(globalDbPath, 'g', 'A global memory about reclaw', 'work-session').close();
-    expect(snapshotMemory({ projectRoot: project, globalDbPath, snapshotDir })).toEqual({ project: projectDb(), global: globalDbPath });
+    const sources = takeSnapshot();
+    expect(sources).toEqual({ project: projectDb(), global: globalDbPath });
 
-    const memory = openSnapshotContext({
-      snapshotDir,
-      projectName: 'project',
-      branch: 'main',
-      asOf: new Date('2026-11-09T00:00:00Z'),
-      admit,
-    });
-    try {
-      expect(await memory.context('what about reclaw?')).toContain('A global memory about reclaw');
-    } finally {
-      memory.close();
-    }
+    expect((await injected(sources, 'what about reclaw?')).text).toContain('A global memory about reclaw');
+  });
+
+  test('refuses to read a run whose global snapshot has gone missing, rather than measure less memory', async () => {
+    addMemory(globalDbPath, 'g', 'A global memory about reclaw', 'work-session').close();
+    const sources = takeSnapshot();
+    rmSync(path.join(snapshotDir, 'global.db'));
+
+    await expect(injected(sources, 'what about reclaw?')).rejects.toThrow(/snapshot of .*global\.db is missing/);
+    expect(() => countRefused(snapshotDir, sources, admit)).toThrow(/start a new run/);
+    // The project snapshot was not left open by the refusal: it can be removed and retaken.
+    expect(() => takeSnapshot()).not.toThrow();
+  });
+
+  test('a run taken with no global database reads none, even if one appears in the snapshot directory later', async () => {
+    const sources = takeSnapshot();
+    addMemory(path.join(snapshotDir, 'global.db'), 'stray', 'A stray global memory about reclaw', 'work-session').close();
+
+    expect((await injected(sources, 'what about reclaw?')).text).not.toContain('A stray global memory');
+    expect(countRefused(snapshotDir, sources, () => false)).toBe(2);
   });
 
   test('can be retaken over a leftover snapshot from an aborted start', () => {
-    snapshotMemory({ projectRoot: project, globalDbPath, snapshotDir });
-    expect(() => snapshotMemory({ projectRoot: project, globalDbPath, snapshotDir })).not.toThrow();
+    takeSnapshot();
+    expect(() => takeSnapshot()).not.toThrow();
   });
 
   test('refuses a project without a cortex database', () => {
@@ -142,46 +162,42 @@ describe('snapshotMemory', () => {
 });
 
 describe('authoring-session exclusion', () => {
-  beforeEach(() => snapshotMemory({ projectRoot: project, globalDbPath, snapshotDir }));
+  let sources: SnapshotSources;
+  beforeEach(() => {
+    sources = takeSnapshot();
+  });
 
   test('counts the memories it refuses', () => {
-    expect(countRefused(snapshotDir, admit)).toBe(1);
-    expect(countRefused(snapshotDir, () => true)).toBe(0);
+    expect(countRefused(snapshotDir, sources, admit)).toBe(1);
+    expect(countRefused(snapshotDir, sources, () => true)).toBe(0);
   });
 
   test('the injected context carries real memories and facts, never the answer key', async () => {
-    const memory = openSnapshotContext({
-      snapshotDir,
-      projectName: 'project',
-      branch: 'main',
-      asOf: new Date('2026-11-09T00:00:00Z'),
-      admit,
-    });
-    try {
-      const context = await memory.context('EVAL ANSWER KEY warmind served');
-      expect(context).toContain('CORTEX_MEMORY_START');
-      expect(context).toContain('Reclaw runs pi on claude-sonnet-5.5');
-      expect(context).toContain('ds4-native');
-      expect(context).not.toContain('ANSWER KEY');
-      expect(context).not.toContain('warmind-1017-native');
-    } finally {
-      memory.close();
-    }
+    const { text } = await injected(sources, 'EVAL ANSWER KEY warmind served');
+    expect(text).toContain('CORTEX_MEMORY_START');
+    expect(text).toContain('Reclaw runs pi on claude-sonnet-5.5');
+    expect(text).toContain('ds4-native');
+    expect(text).not.toContain('ANSWER KEY');
+    expect(text).not.toContain('warmind-1017-native');
   });
 
   test('without exclusion the same read would have leaked it', async () => {
-    const memory = openSnapshotContext({
-      snapshotDir,
-      projectName: 'project',
-      branch: 'main',
-      asOf: new Date('2026-11-09T00:00:00Z'),
-      admit: () => true,
-    });
-    try {
-      expect(await memory.context('EVAL ANSWER KEY warmind served')).toContain('warmind-1017-native');
-    } finally {
-      memory.close();
-    }
+    expect((await injected(sources, 'EVAL ANSWER KEY warmind served', () => true)).text).toContain(
+      'warmind-1017-native',
+    );
+  });
+});
+
+describe('the recall path behind a context', () => {
+  test('a question recall ran for says which path answered it', async () => {
+    const { recall } = await injected(takeSnapshot(), 'what does reclaw run pi on today?');
+    // Which of the two depends on whether this machine can load the embedder.
+    expect(['semantic', 'keyword-fallback']).toContain(recall);
+  });
+
+  test('a question too short to recall for, and the no-memory baseline, say recall did not run', async () => {
+    expect((await injected(takeSnapshot(), 'hi')).recall).toBe('not-run');
+    expect(await noMemoryContext('what does reclaw run pi on today?')).toEqual({ text: '', recall: 'not-run' });
   });
 });
 

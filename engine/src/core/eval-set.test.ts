@@ -2,18 +2,30 @@ import { describe, expect, test } from 'vitest';
 import * as fc from 'fast-check';
 import {
   CASE_KINDS,
-  caseToRow,
   describeEvalSet,
   parseAnswers,
+  parseJsonObject,
   parseCaseRow,
   parseCases,
   parseEvalSettings,
   parseIsoDate,
   parseLabels,
   parseRunName,
+  splitTornTail,
   type EvalCase,
   type EvalSettings,
 } from './eval-set.js';
+
+/** The JSONL row for a case: the inverse of parseCaseRow. */
+const caseToRow = (evalCase: EvalCase): Record<string, unknown> => ({
+  id: evalCase.id,
+  split: evalCase.split,
+  kind: evalCase.kind,
+  asked_on: evalCase.askedOn,
+  question: evalCase.question,
+  true_now: [...evalCase.trueNow],
+  stale: [...evalCase.stale],
+});
 
 const row = (overrides: Record<string, unknown> = {}) => ({
   id: 'q01',
@@ -120,7 +132,88 @@ describe('parseCases', () => {
   });
 });
 
+describe('parseJsonObject', () => {
+  test('an object parses to its row', () => {
+    expect(parseJsonObject('{"a": 1}')).toEqual({ kind: 'ok', value: { a: 1 } });
+  });
+
+  test.each([['[1, 2]'], ['null'], ['"text"'], ['7'], ['{"a": '], ['']])(
+    'rejects %s: not one JSON object',
+    (text) => {
+      expect(parseJsonObject(text)).toEqual({
+        kind: 'err',
+        errors: [{ line: 1, message: 'expected a JSON object' }],
+      });
+    },
+  );
+
+  test('accepts exactly the JSON texts that are objects, and never throws (property)', () => {
+    fc.assert(
+      fc.property(fc.jsonValue(), (value) => {
+        const isObject = typeof value === 'object' && value !== null && !Array.isArray(value);
+        expect(parseJsonObject(JSON.stringify(value)).kind).toBe(isObject ? 'ok' : 'err');
+      }),
+    );
+    fc.assert(fc.property(fc.string(), (text) => ['ok', 'err'].includes(parseJsonObject(text).kind)));
+  });
+});
+
+describe('splitTornTail', () => {
+  const rowA = JSON.stringify({ id: 'q1', answer: 'a' });
+  const rowB = JSON.stringify({ id: 'q2', answer: 'b' });
+
+  test('a file of terminated lines, or an empty one, has no torn tail', () => {
+    expect(splitTornTail('')).toEqual({ complete: '', torn: null });
+    expect(splitTornTail(`${rowA}\n${rowB}\n`)).toEqual({ complete: `${rowA}\n${rowB}\n`, torn: null });
+  });
+
+  test('an interrupted last line is torn off; the rows before it stay', () => {
+    const half = rowB.slice(0, 12);
+    expect(splitTornTail(`${rowA}\n${half}`)).toEqual({ complete: `${rowA}\n`, torn: half });
+    expect(splitTornTail(half)).toEqual({ complete: '', torn: half });
+  });
+
+  test('a complete last row that only lacks its newline is a row, not a torn tail', () => {
+    expect(splitTornTail(`${rowA}\n${rowB}`)).toEqual({ complete: `${rowA}\n${rowB}`, torn: null });
+  });
+
+  test('cutting an appended file anywhere loses at most the row being written (property)', () => {
+    const rowsArb = fc.array(
+      fc.record({ id: fc.stringMatching(/^[a-z][a-z0-9]{0,6}$/), answer: fc.string() }),
+      { minLength: 1, maxLength: 6 },
+    );
+    fc.assert(
+      fc.property(rowsArb, fc.nat(), (rows, cut) => {
+        const lines = rows.map((r) => `${JSON.stringify(r)}\n`);
+        const text = lines.join('');
+        const interrupted = text.slice(0, cut % (text.length + 1));
+        const { complete, torn } = splitTornTail(interrupted);
+
+        // Nothing is invented: what is kept, then what is torn, is the file.
+        expect(`${complete}${torn ?? ''}`).toBe(interrupted);
+        // Every kept line is one of the rows written, in order, in full.
+        const kept = complete.split('\n').filter((line) => line !== '');
+        expect(kept).toEqual(lines.slice(0, kept.length).map((line) => line.trimEnd()));
+        // At most the row in flight is missing.
+        const written = interrupted.split('\n').length - 1;
+        expect(kept.length).toBeGreaterThanOrEqual(written);
+      }),
+    );
+  });
+});
+
 describe('parseAnswers', () => {
+  test('reads the recall path an answer recorded; an answer that records none has none', () => {
+    const result = parseAnswers(
+      jsonl(
+        { id: 'q1', answer: 'a', recall: 'keyword-fallback' },
+        { id: 'q2', answer: 'b' },
+        { id: 'q3', answer: 'c', recall: 'a note of my own' },
+      ),
+    );
+    expect(result.kind === 'ok' && result.value.map((a) => a.recall)).toEqual(['keyword-fallback', null, null]);
+  });
+
   test("accepts Team0's format and the harness's own fields, ignoring notes", () => {
     const result = parseAnswers(
       jsonl(
@@ -131,8 +224,8 @@ describe('parseAnswers', () => {
     expect(result).toEqual({
       kind: 'ok',
       value: [
-        { id: 'q01', answer: 'Nov 1', toolCalls: 6, promptTokens: null, model: null },
-        { id: 'q02', answer: 'x', toolCalls: null, promptTokens: 1200, model: 'glm' },
+        { id: 'q01', answer: 'Nov 1', toolCalls: 6, promptTokens: null, model: null, recall: null },
+        { id: 'q02', answer: 'x', toolCalls: null, promptTokens: 1200, model: 'glm', recall: null },
       ],
     });
   });

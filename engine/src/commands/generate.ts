@@ -9,7 +9,7 @@ import type { Database } from 'bun:sqlite';
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import type { Memory } from '../core/types.js';
+import { admitAll, type MemoryAdmission } from '../core/admission.js';
 import type { RankedMemory } from '../core/surface.js';
 import type { EntityProfile } from '../core/entities.js';
 import { SURFACE_STALE_HOURS, SURFACE_OVERHEAD_TOKENS } from '../config.js';
@@ -25,8 +25,12 @@ export interface GenerateOptions {
   readonly globalDb: Database;
   /** Where the session runs: the branch, the surface file and the cache key. */
   readonly cwd: string;
-  /** Where the project's `.memory/` lives: cache, locks and status. Defaults to `cwd`. */
-  readonly root?: string;
+  /**
+   * Where the project's `.memory/` lives: cache, locks and status. Required,
+   * so a caller cannot fall back to the session directory by omission and
+   * split the project's memory per directory again.
+   */
+  readonly root: string;
   readonly surfacePath?: string;
   readonly cachePath?: string;
   readonly lockDir?: string;
@@ -59,7 +63,7 @@ export function runGenerate(options: GenerateOptions): GenerateResult {
   const startTime = Date.now();
 
   // Default paths
-  const root = options.root ?? options.cwd;
+  const { root } = options;
   const surfacePath = options.surfacePath ?? path.join(options.cwd, '.claude', 'cortex-memory.local.md');
   const cachePath = options.cachePath ?? path.join(root, '.memory', 'surface-cache');
   const lockDir = options.lockDir ?? path.join(root, '.memory', 'locks');
@@ -100,11 +104,6 @@ export function runGenerate(options: GenerateOptions): GenerateResult {
   };
 }
 
-/** Which active memories a read may use. Entity facts follow their source memory. */
-export type MemoryAdmission = (memory: Memory) => boolean;
-
-const admitAll: MemoryAdmission = () => true;
-
 export interface ComposedSurface {
   /** Surface markdown, not yet wrapped in markers. */
   readonly content: string;
@@ -133,8 +132,10 @@ export function composeSurface(
   const admit = options.admit ?? admitAll;
   // I/O: Fetch active memories from both DBs
   const active = [...getActiveMemories(projectDb), ...getActiveMemories(globalDb)];
-  const allMemories = active.filter(admit);
+  // `admit` is asked once per memory; the admitted list is derived from the
+  // refused set, so the two cannot disagree.
   const refused = new Set(active.filter((mem) => !admit(mem)).map((mem) => mem.id));
+  const allMemories = active.filter((mem) => !refused.has(mem.id));
 
   // I/O: Fetch entities and current facts for surface entity section
   const entityProfiles = buildEntityProfiles(projectDb, globalDb, refused);

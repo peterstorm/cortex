@@ -235,11 +235,17 @@ export function sharedColumns(
 /**
  * The INSERT that copies one table from `legacy` into `main`.
  *
- * OR IGNORE keeps the row already present on a key clash: the same memory id
- * in both, or an entity with the same name and type. A fact whose entity
- * clashed is repointed to the entity that was kept, matched the way the
- * unique index matches (case-insensitive name, same type); with no clash
- * that lookup finds the fact's own entity.
+ * ON CONFLICT DO NOTHING keeps the row already present on a key clash: the
+ * same memory id in both, or an entity with the same name and type. It skips
+ * key clashes and nothing else. A row the target refuses for any other reason
+ * (a NULL where it needs a value, a failed CHECK) raises, which rolls the
+ * source's transaction back and leaves the source in place: OR IGNORE would
+ * have dropped that row, counted it as "already present", and let the source
+ * be moved aside as merged.
+ *
+ * A fact whose entity clashed is repointed to the entity that was kept,
+ * matched the way the unique index matches (case-insensitive name, same
+ * type); with no clash that lookup finds the fact's own entity.
  */
 export function copyStatement(table: MergedTable, columns: readonly string[]): string {
   const list = columns.join(', ');
@@ -252,7 +258,12 @@ export function copyStatement(table: MergedTable, columns: readonly string[]): s
         : `src.${column}`,
     )
     .join(', ');
-  return `INSERT OR IGNORE INTO main.${table} (${list}) SELECT ${values} FROM legacy.${table} AS src`;
+  // `WHERE true` is SQLite's required disambiguation between a join's ON and
+  // the upsert clause after INSERT ... SELECT.
+  return (
+    `INSERT INTO main.${table} (${list}) SELECT ${values} FROM legacy.${table} AS src ` +
+    'WHERE true ON CONFLICT DO NOTHING'
+  );
 }
 
 function countsOf(values: readonly number[]): TableCounts {

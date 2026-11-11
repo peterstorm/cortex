@@ -195,6 +195,7 @@ During extraction, candidates the LLM classifies as scope `"global"` are routed 
 - **The project's name is its repository's.** A worktree named `loom-security-audit` is project `loom`.
 - **A bare repository's worktrees each keep their own memory.** There is no main checkout to hold it.
 - **Outside git, the directory is the project**, as it was before.
+- **When git is there but cannot answer** (a timeout on a loaded machine, a repository it refuses as "dubious ownership"), the directory is used as the project so the session is not failed, and a `WARN` on stderr says so. Memory written then lands in that directory's own database, apart from the repository's, until a later command merges it back.
 
 **Keeping a directory to itself.** A directory holding `.memory/standalone` (an empty file) keeps its own memory, even inside a repository. Use it for a bot's workspace, whose conversations must not mix into the memory of the people developing the bot. The nearest marker between the session and its checkout's top wins, and the repository never merges a marked directory.
 
@@ -212,6 +213,7 @@ A subdirectory database in a directory no session starts from again is not found
 - **The old files are kept.** They are renamed to `*.merged-<timestamp>`, never deleted.
 - **An old file at its old path means "not merged yet".** Once a file is renamed it is never read again, so the merge runs once per file. Whether the shared database already exists does not matter: an empty one cannot hide unmerged memories.
 - **Each file is merged in one transaction.** It is renamed only after that commits, so an interrupted merge leaves it in place, and the retry skips the rows already copied.
+- **Only a clash on a key counts as "already present".** A row the shared database refuses for any other reason (a fact whose entity is gone, a missing required value) fails that file's merge, which rolls back and leaves the file at its old path. It is never counted as a duplicate and moved aside.
 - **A failed merge loses nothing.** Files are merged Claude Code first and the merge stops at the first failure, so a later file can never take an earlier one's clashes. Until the retry succeeds, a harness whose own file is still unmerged keeps using it.
 - **A harness still on an old version is caught up.** It writes to its old path, which recreates the file there, and the next command merges it. Writes it makes to a file that is open while that file is renamed stay in the renamed copy. That copy is kept and can be merged again by moving it back to the old path.
 - **`CORTEX_GLOBAL_DB` turns the merge off.** A database named there is used exactly as it is, and the old files are never read or moved. The test suite sets it, so no test can touch your real databases.
@@ -415,7 +417,7 @@ Every change to extraction, ranking or pruning feels like progress. `/eval` tell
 
 **What it measures.** The read path, exactly as the hooks inject it: for each question the answering model gets the push surface plus the prompt-recall block cortex would add for that prompt, and nothing else. It has no tools, so the score is what the memory delivers unprompted, not what an agent could dig up with `/recall`. The `none` condition gives the same prompt with no memory. That is the baseline that says whether memory helps at all.
 
-**The eval directory** (default `<project>/.memory/eval`, gitignored with `.memory/`):
+**The eval directory** (default `<cwd>/.memory/eval`, gitignored with `.memory/`). `<cwd>` is `--cwd`, or the directory the command runs in. The memory a run snapshots is the project's, which lives at the repository root, so from a subdirectory or a linked worktree the two differ: run from the root, or pass `--dir`.
 
 ```
 eval.json                 {"authoring_sessions": ["<session id>", ...]}
@@ -423,9 +425,11 @@ questions.jsonl           one confirmed case per line
 labels.jsonl              optional: your own scores, to check the judge
 runs/<run>/run.json       the run's identity (condition, answer model, prompt digest, snapshot and the DBs it was copied from)
 runs/<run>/memory/        frozen copy of the project + global DBs the run answers from
-runs/<run>/answers.jsonl  appended as each case is answered
+runs/<run>/answers.jsonl  appended as each case is answered, with the recall path its memory came through
 runs/<run>/scores.jsonl   appended as each answer is judged
 ```
+
+Both `.jsonl` files are written one line at a time. A write cut off mid-line (a crash, a full disk) leaves a torn last line; the next `answer` or `score` drops it, says so, and answers or judges that case again. Every complete line before it is kept.
 
 A case:
 
@@ -453,7 +457,9 @@ The report has one table per split over the cases both runs scored, with the cha
 
 **Comparability, enforced.**
 - A run answers from a `VACUUM INTO` snapshot taken at its start. Surface ranking also depends on the branch and on time (recency decay), so the run pins both.
-- An interrupted run resumes with the same command and fills only the missing answers. A resume under a different condition, answer model, answer prompt or authoring-session list is refused: that is a new experiment and needs a new run name.
+- An interrupted run resumes with the same command and fills only the missing answers. A resume under a different condition, project name, answer model, answer prompt or authoring-session list is refused: that is a new experiment and needs a new run name. So is a `run.json` whose condition contradicts the memory it records.
+- A run reads exactly the databases its `run.json` records. If it recorded a global database and that snapshot file has since gone missing, answering stops instead of quietly measuring the project's memory alone.
+- Each answer records how prompt recall reached its memory: `semantic`, `keyword-fallback` (the embedder was unavailable, and keyword search ranks differently) or `not-run`. The report flags how many of a run's scored answers came through the fallback, because those are not like for like with the rest.
 - A judgement is stored under the hash of its exact judge prompt (rubric, case and answer) plus the requested judge model. Re-scoring reuses it, while editing a truth or switching the judge re-judges.
 - Each answer records the model the provider reported, and the report flags a run that a routing server answered with several models.
 - Each snapshot records the project and global database it was copied from, and the report flags two snapshot runs that read different ones: a run taken under another harness or machine read other global memory, so it is not a before and after.

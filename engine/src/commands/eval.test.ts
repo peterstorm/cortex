@@ -13,12 +13,16 @@ import {
   loadEvalSet,
   openRun,
   parseEvalArgs,
+  renderAgreements,
   scoreRuns,
   scoringPlan,
+  summarizeAnswering,
+  type AnswerOutcome,
   type EvalPaths,
+  type RunPaths,
   type RunRequest,
 } from './eval.js';
-import type { EvalCase, RunName } from '../core/eval-set.js';
+import { parseLabels, type EvalCase, type RunName } from '../core/eval-set.js';
 import type { Llm, MemoryContext } from '../core/eval-run.js';
 
 let dir: string;
@@ -76,8 +80,21 @@ const SOURCES = { project: '/work/dotfiles/.memory/cortex.db', global: null };
 /** A fake snapshot that records nothing and refuses `excludedMemories` memories. */
 const taken = (excludedMemories = 0) => () => ({ sources: SOURCES, excludedMemories });
 
-const contextFor: MemoryContext = async (question) => `memory about ${question}`;
+const contextFor: MemoryContext = async (question) => ({ text: `memory about ${question}`, recall: 'semantic' });
 const quiet = () => {};
+
+const readRows = (file: string): Record<string, unknown>[] =>
+  readFileSync(file, 'utf8')
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line));
+
+/** Cut a file as a write interrupted partway through its last line would leave it. */
+function tearLastLine(file: string): void {
+  const text = readFileSync(file, 'utf8');
+  const lastLineStart = text.lastIndexOf('\n', text.length - 2) + 1;
+  writeFileSync(file, text.slice(0, lastLineStart + 9));
+}
 
 beforeEach(() => {
   dir = mkdtempSync(path.join(tmpdir(), 'cortex-eval-'));
@@ -141,47 +158,113 @@ describe('openRun', () => {
       openRun(paths.run('before' as RunName), request({ requestedModel: 'other-model' }), taken()),
     ).toThrow(/start a new run name[\s\S]*answer model: run has answer-model, now other-model/);
   });
+
+  test('refuses to resume once the project is known by another name', () => {
+    openRun(paths.run('before' as RunName), request(), taken(4));
+    expect(() => openRun(paths.run('before' as RunName), request({ project: 'renamed' }), taken())).toThrow(
+      /project: run has dotfiles, now renamed/,
+    );
+  });
+
+  test('refuses a run.json whose condition contradicts the memory it records', () => {
+    const runPaths = paths.run('before' as RunName);
+    openRun(runPaths, request(), taken(4));
+    const row = JSON.parse(readFileSync(runPaths.manifest, 'utf8'));
+    writeFileSync(runPaths.manifest, JSON.stringify({ ...row, condition: 'none' }));
+
+    expect(() => openRun(runPaths, request({ condition: 'none' }), taken())).toThrow(
+      /condition none contradicts memory kind snapshot/,
+    );
+  });
 });
 
 describe('answerCases', () => {
-  const cases = (): readonly EvalCase[] => {
+  let runPaths: RunPaths;
+  /** Answer the three cases of run `before`; `rest` swaps the memory context or the log. */
+  let answer: (
+    llm: Llm,
+    rest?: Partial<{ context: MemoryContext; log: (line: string) => void }>,
+  ) => Promise<AnswerOutcome>;
+
+  beforeEach(() => {
     writeSet([caseRow('q1'), caseRow('q2'), caseRow('q3')]);
-    return loadEvalSet(paths).cases;
-  };
+    const { cases } = loadEvalSet(paths);
+    runPaths = paths.run('before' as RunName);
+    const manifest = openRun(runPaths, request(), taken());
+    answer = (llm, rest = {}) =>
+      answerCases({ cases, manifest, paths: runPaths, llm, context: contextFor, log: quiet, ...rest });
+  });
 
   test('answers every case from its memory context and records the served model', async () => {
-    const all = cases();
-    const runPaths = paths.run('before' as RunName);
-    const manifest = openRun(runPaths, request(), taken());
     const { llm, prompts } = scriptedLlm(() => 'an answer');
 
-    const outcome = await answerCases({ cases: all, manifest, paths: runPaths, llm, context: contextFor, log: quiet });
+    const outcome = await answer(llm);
 
     expect(outcome).toEqual({ answered: 3, alreadyAnswered: 0, failed: [] });
     expect(prompts[0]).toContain('memory about question q1');
     expect(prompts[0]).toContain('Today is 2026-11-09');
-    const rows = readFileSync(runPaths.answers, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
-    expect(rows.map((r) => [r.id, r.answer_model])).toEqual([
+    expect(readRows(runPaths.answers).map((r) => [r.id, r.answer_model])).toEqual([
       ['q1', 'served-model'],
       ['q2', 'served-model'],
       ['q3', 'served-model'],
     ]);
   });
 
-  test('a failed case is reported, not stored, and answered on the next run', async () => {
-    const all = cases();
-    const runPaths = paths.run('before' as RunName);
-    const manifest = openRun(runPaths, request(), taken());
+  test('each answer records the recall path its memory came through', async () => {
+    const degraded: MemoryContext = async (question) => ({
+      text: 'm',
+      recall: question.endsWith('q2') ? 'keyword-fallback' : 'semantic',
+    });
 
+    await answer(scriptedLlm(() => 'a').llm, { context: degraded });
+
+    expect(readRows(runPaths.answers).map((r) => r.recall)).toEqual(['semantic', 'keyword-fallback', 'semantic']);
+  });
+
+  test('an answer torn by an interrupted write is dropped, said so, and answered again', async () => {
+    await answer(scriptedLlm(() => 'first').llm);
+    tearLastLine(runPaths.answers);
+
+    const logged: string[] = [];
+    const retry = scriptedLlm(() => 'second');
+    const outcome = await answer(retry.llm, { log: (line) => logged.push(line) });
+
+    expect(outcome).toEqual({ answered: 1, alreadyAnswered: 2, failed: [] });
+    expect(retry.prompts).toHaveLength(1);
+    expect(retry.prompts[0]).toContain('question q3');
+    expect(logged[0]).toContain('dropped an incomplete last line');
+    expect(readRows(runPaths.answers).map((r) => [r.id, r.answer])).toEqual([
+      ['q1', 'first'],
+      ['q2', 'first'],
+      ['q3', 'second'],
+    ]);
+  });
+
+  test('a complete last answer that only lacks its newline is kept, and the next one starts a new line', async () => {
+    writeFileSync(runPaths.answers, JSON.stringify({ id: 'q1', answer: 'written by hand' }));
+
+    const logged: string[] = [];
+    const outcome = await answer(scriptedLlm(() => 'a').llm, { log: (line) => logged.push(line) });
+
+    expect(outcome).toEqual({ answered: 2, alreadyAnswered: 1, failed: [] });
+    expect(logged.some((line) => line.includes('dropped'))).toBe(false);
+    expect(readRows(runPaths.answers).map((r) => [r.id, r.answer])).toEqual([
+      ['q1', 'written by hand'],
+      ['q2', 'a'],
+      ['q3', 'a'],
+    ]);
+  });
+
+  test('a failed case is reported, not stored, and answered on the next run', async () => {
     const flaky = scriptedLlm((prompt) => {
       if (prompt.includes('question q2')) throw new Error('LLM API 503');
       return 'ok';
     });
-    const first = await answerCases({ cases: all, manifest, paths: runPaths, llm: flaky.llm, context: contextFor, log: quiet });
+    const first = await answer(flaky.llm);
     expect(first.failed).toEqual([{ id: 'q2', error: 'LLM API 503' }]);
 
     const healthy = scriptedLlm(() => 'ok');
-    const second = await answerCases({ cases: all, manifest, paths: runPaths, llm: healthy.llm, context: contextFor, log: quiet });
+    const second = await answer(healthy.llm);
     expect(second).toEqual({ answered: 1, alreadyAnswered: 2, failed: [] });
     expect(healthy.prompts).toHaveLength(1);
     expect(healthy.prompts[0]).toContain('question q2');
@@ -249,6 +332,43 @@ describe('scoreRuns', () => {
     expect(stored).toHaveLength(1);
   });
 
+  test('a judgement torn by an interrupted write is dropped and judged again; the others are reused', async () => {
+    await answeredRun('before', 'answer');
+    const { cases } = loadEvalSet(paths);
+    const judge = scriptedLlm(() => verdict(1));
+    const score = () => scoreRuns({ cases, paths, runs: ['before' as RunName], judge: judge.llm, judgeRequested: 'judge', log: quiet });
+    await score();
+    const scores = paths.run('before' as RunName).scores;
+    tearLastLine(scores);
+
+    expect(scoringPlan(cases, paths, ['before' as RunName], 'judge')).toBe(
+      'before: 2 of 2 cases answered, 1 judgements reusable, 1 to judge with judge',
+    );
+    const [result] = await score();
+
+    expect(result.scored.map((s) => s.evalCase.id)).toEqual(['q1', 'q2']);
+    expect(judge.prompts).toHaveLength(3);
+    expect(readRows(scores).map((r) => r.id)).toEqual(['q1', 'q2']);
+  });
+
+  test('a run whose last answer was torn scores the answers that were written whole', async () => {
+    await answeredRun('before', 'answer');
+    tearLastLine(paths.run('before' as RunName).answers);
+    const { cases } = loadEvalSet(paths);
+
+    const [result] = await scoreRuns({
+      cases,
+      paths,
+      runs: ['before' as RunName],
+      judge: scriptedLlm(() => verdict(1)).llm,
+      judgeRequested: 'judge',
+      log: quiet,
+    });
+
+    expect(result.scored.map((s) => s.evalCase.id)).toEqual(['q1']);
+    expect(result.unanswered).toEqual(['q2']);
+  });
+
   test('each result carries the memory its run answered from, read back from the manifest', async () => {
     await answeredRun('before', 'answer');
     const { cases } = loadEvalSet(paths);
@@ -290,6 +410,60 @@ describe('scoreRuns', () => {
     expect(scoringPlan(cases, paths, ['before' as RunName], 'judge')).toBe(
       'before: 1 of 2 cases answered, 0 judgements reusable, 1 to judge with judge',
     );
+  });
+});
+
+describe('summarizeAnswering', () => {
+  const outcome = { answered: 2, alreadyAnswered: 1, failed: [] };
+
+  test('a cortex run says how many authoring-session memories it excluded', () => {
+    const manifest = openRun(paths.run('before' as RunName), request(), taken(4));
+    expect(summarizeAnswering(manifest, outcome)).toEqual({
+      output: 'run before (cortex): 2 answered now, 1 already answered; 4 authoring-session memories excluded',
+      failure: null,
+    });
+  });
+
+  test('the baseline run has no memory to exclude from', () => {
+    const manifest = openRun(paths.run('none' as RunName), request({ run: 'none' as RunName, condition: 'none' }), taken());
+    expect(summarizeAnswering(manifest, outcome).output).toBe('run none (none): 2 answered now, 1 already answered');
+  });
+
+  test('any failed case fails the pass and says how to retry', () => {
+    const manifest = openRun(paths.run('before' as RunName), request(), taken());
+    const failed = [{ id: 'q2' as EvalCase['id'], error: 'LLM API 503' }];
+    expect(summarizeAnswering(manifest, { ...outcome, failed }).failure).toBe(
+      '1 case(s) failed; run the same command again to retry them',
+    );
+  });
+});
+
+describe('renderAgreements', () => {
+  test('renders a table for each labelled run and none for a run nobody labelled', async () => {
+    writeSet([caseRow('q1')]);
+    const { cases } = loadEvalSet(paths);
+    for (const name of ['before', 'after']) {
+      const runPaths = paths.run(name as RunName);
+      const manifest = openRun(runPaths, request({ run: name as RunName }), taken());
+      await answerCases({ cases, manifest, paths: runPaths, llm: scriptedLlm(() => 'a').llm, context: contextFor, log: quiet });
+    }
+    const results = await scoreRuns({
+      cases,
+      paths,
+      runs: ['before' as RunName, 'after' as RunName],
+      judge: scriptedLlm(() => verdict(1)).llm,
+      judgeRequested: 'judge',
+      log: quiet,
+    });
+    const labels = parseLabels(JSON.stringify({ run: 'after', id: 'q1', relevant: 0.5 }));
+    if (labels.kind !== 'ok') throw new Error('labels fixture must parse');
+
+    const tables = renderAgreements(results, labels.value);
+
+    expect(tables).toHaveLength(1);
+    expect(tables[0]).toContain('judge vs your labels for after');
+    expect(tables[0]).toMatch(/relevant\s+0\.50\s+\(1\)\s+<- check the judge/);
+    expect(renderAgreements(results, [])).toEqual([]);
   });
 });
 

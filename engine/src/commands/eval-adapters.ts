@@ -9,6 +9,7 @@ import type { Database } from 'bun:sqlite';
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { getProjectDbPath } from '../config.js';
+import type { MemoryAdmission } from '../core/admission.js';
 import { wrapInMarkers } from '../core/surface.js';
 import type { Llm, MemoryContext, SnapshotSources } from '../core/eval-run.js';
 import { VERDICT_SCHEMA } from '../core/eval-rubric.js';
@@ -19,8 +20,10 @@ import {
   type ChatCompletionOptions,
   type LlmEndpoint,
 } from '../infra/llm-client.js';
-import { composeSurface, type MemoryAdmission } from './generate.js';
-import { executePromptRecallWithFallback, formatPromptRecall } from './prompt-recall.js';
+// The eval measures the reads the hooks really make, so it calls the same
+// two functions they do rather than a copy of them.
+import { composeSurface } from './generate.js';
+import { formatPromptRecall, recallForPrompt } from './prompt-recall.js';
 
 // ============================================================================
 // MEMORY SNAPSHOT
@@ -82,24 +85,42 @@ export function snapshotMemory({ projectRoot, globalDbPath, snapshotDir }: Snaps
 
 type SnapshotDbs = Readonly<{ projectDb: Database; globalDb: Database; close: () => void }>;
 
-/** A missing global snapshot reads as an empty global DB, as it does live. */
-function openSnapshot(snapshotDir: string): SnapshotDbs {
-  const projectDb = openDatabaseReadOnly(path.join(snapshotDir, PROJECT_SNAPSHOT));
+/**
+ * Open a run's snapshot as its manifest describes it. A run taken with no
+ * global database reads an empty one, as a live session would.
+ *
+ * @throws Error when the manifest records a global database but its snapshot
+ *   file is gone: answering from the project alone would quietly measure less
+ *   memory than the run started with.
+ */
+function openSnapshot(snapshotDir: string, sources: SnapshotSources): SnapshotDbs {
   const globalPath = path.join(snapshotDir, GLOBAL_SNAPSHOT);
-  const globalDb = existsSync(globalPath) ? openDatabaseReadOnly(globalPath) : openDatabase(':memory:');
-  return {
-    projectDb,
-    globalDb,
-    close: () => {
-      projectDb.close();
-      globalDb.close();
-    },
-  };
+  if (sources.global !== null && !existsSync(globalPath)) {
+    throw new Error(
+      `the run's snapshot of ${sources.global} is missing (${globalPath}); ` +
+        'its memory can no longer be read as it was, so start a new run',
+    );
+  }
+  const projectDb = openDatabaseReadOnly(path.join(snapshotDir, PROJECT_SNAPSHOT));
+  try {
+    const globalDb = sources.global === null ? openDatabase(':memory:') : openDatabaseReadOnly(globalPath);
+    return {
+      projectDb,
+      globalDb,
+      close: () => {
+        projectDb.close();
+        globalDb.close();
+      },
+    };
+  } catch (error) {
+    projectDb.close();
+    throw error;
+  }
 }
 
 /** How many active memories in the snapshot `admit` refuses. */
-export function countRefused(snapshotDir: string, admit: MemoryAdmission): number {
-  const dbs = openSnapshot(snapshotDir);
+export function countRefused(snapshotDir: string, sources: SnapshotSources, admit: MemoryAdmission): number {
+  const dbs = openSnapshot(snapshotDir, sources);
   try {
     return [...getActiveMemories(dbs.projectDb), ...getActiveMemories(dbs.globalDb)].filter(
       (memory) => !admit(memory),
@@ -115,38 +136,51 @@ export type SnapshotContext = Readonly<{ context: MemoryContext; close: () => vo
  * The context Claude Code's hooks inject on a prompt — the push surface
  * followed by the prompt-recall block — computed from the snapshot with the
  * run's pinned branch and time. The surface does not depend on the
- * question, so it is composed once.
+ * question, so it is composed once. Each context says which recall path
+ * produced its block: the keyword fallback ranks differently.
  */
 export function openSnapshotContext(options: {
   readonly snapshotDir: string;
+  /** The databases the snapshot was copied from, as the run's manifest records them. */
+  readonly sources: SnapshotSources;
   readonly projectName: string;
   readonly branch: string;
   readonly asOf: Date;
   readonly admit: MemoryAdmission;
 }): SnapshotContext {
-  const dbs = openSnapshot(options.snapshotDir);
-  const surface = wrapInMarkers(
-    composeSurface(dbs.projectDb, dbs.globalDb, options.branch, {
-      admit: options.admit,
-      now: options.asOf,
-    }).content,
-  );
+  const dbs = openSnapshot(options.snapshotDir, options.sources);
+  const surface = (() => {
+    try {
+      return wrapInMarkers(
+        composeSurface(dbs.projectDb, dbs.globalDb, options.branch, {
+          admit: options.admit,
+          now: options.asOf,
+        }).content,
+      );
+    } catch (error) {
+      dbs.close();
+      throw error;
+    }
+  })();
 
   const context: MemoryContext = async (question) => {
-    const recalled = await executePromptRecallWithFallback(dbs.projectDb, dbs.globalDb, {
+    const recalled = await recallForPrompt(dbs.projectDb, dbs.globalDb, {
       prompt: question,
       surfaceContent: surface,
       projectName: options.projectName,
       admit: options.admit,
     });
-    return [surface, formatPromptRecall(recalled)].filter((block) => block !== '').join('\n\n');
+    return {
+      text: [surface, formatPromptRecall(recalled.memories)].filter((block) => block !== '').join('\n\n'),
+      recall: recalled.path,
+    };
   };
 
   return { context, close: dbs.close };
 }
 
 /** The baseline condition: the agent is given no memory at all. */
-export const noMemoryContext: MemoryContext = async () => '';
+export const noMemoryContext: MemoryContext = async () => ({ text: '', recall: 'not-run' });
 
 // ============================================================================
 // LLM ENDPOINTS

@@ -4,14 +4,16 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import * as fc from 'fast-check';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { getProjectDbPath } from '../config.js';
+import { getLockDir, getProjectDbPath } from '../config.js';
 import { createMemory } from '../core/types.js';
 import { getMemory, insertMemory, openDatabase } from './db.js';
 import {
+  classifyProbeFailure,
   describeProjectMigration,
   hasProjectMemory,
   migrateProjectDb,
@@ -80,6 +82,72 @@ beforeEach(() => {
 });
 
 afterEach(() => rmSync(base, { recursive: true, force: true }));
+
+describe('classifyProbeFailure', () => {
+  it.each([
+    [{ code: 'ENOENT', message: 'spawnSync git ENOENT' }],
+    [{ status: 128, stderr: 'fatal: not a git repository (or any of the parent directories): .git\n' }],
+  ])('git missing, or no repository here, is no repository: %j', (error) => {
+    expect(classifyProbeFailure(error)).toEqual({ kind: 'no-repository' });
+  });
+
+  it.each([
+    [{ code: 'ETIMEDOUT' }, 'git did not answer within 5000 ms'],
+    [{ signal: 'SIGTERM', stderr: '' }, 'git did not answer within 5000 ms'],
+    [
+      { status: 128, stderr: "fatal: detected dubious ownership in repository at '/work/loom'\n" },
+      "fatal: detected dubious ownership in repository at '/work/loom'",
+    ],
+    [new Error('spawnSync git EACCES'), 'spawnSync git EACCES'],
+    ['boom', 'boom'],
+  ])('git that was there and could not answer is not the same thing: %j', (error, reason) => {
+    expect(classifyProbeFailure(error)).toEqual({ kind: 'unanswered', reason });
+  });
+
+  it('classifies anything thrown, and only the two expected failures as no repository (property)', () => {
+    fc.assert(
+      fc.property(fc.anything(), (error) => {
+        const failure = classifyProbeFailure(error);
+        const shape = (typeof error === 'object' && error !== null ? error : {}) as { code?: unknown; stderr?: unknown };
+        const expected =
+          shape.code === 'ENOENT' || (typeof shape.stderr === 'string' && /not a git repository/i.test(shape.stderr));
+        expect(failure.kind).toBe(expected ? 'no-repository' : 'unanswered');
+      }),
+    );
+  });
+});
+
+describe('probeRepository', () => {
+  const collect = () => {
+    const warnings: string[] = [];
+    return { warnings, warn: (message: string) => warnings.push(message) };
+  };
+
+  it('says nothing for a directory in no repository', () => {
+    const dir = join(base, 'scratch');
+    mkdirSync(dir);
+    const { warnings, warn } = collect();
+
+    expect(probeRepository(dir, warn)).toEqual({ kind: 'not-a-repository' });
+    expect(warnings).toEqual([]);
+  });
+
+  it('warns when git is there but cannot answer, and still treats the directory as the project', () => {
+    const broken = makeRepo('broken');
+    writeFileSync(join(broken, '.git', 'config'), 'this is not a git config\n');
+    const { warnings, warn } = collect();
+
+    expect(probeRepository(broken, warn)).toEqual({ kind: 'not-a-repository' });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain(`git could not say which repository ${broken} belongs to (`);
+    expect(warnings[0]).toContain('bad config');
+    expect(warnings[0]).toContain("kept apart from the repository's until a later command merges it");
+
+    const again = collect();
+    expect(resolveProjectLocation(broken, again.warn)).toMatchObject({ root: broken, scope: 'directory', strays: [] });
+    expect(again.warnings).toHaveLength(1);
+  });
+});
 
 describe('resolveProjectLocation', () => {
   it('outside a repository, the directory is the project', () => {
@@ -189,6 +257,52 @@ describe('migrateProjectDb', () => {
     if (migration.kind !== 'merged') throw new Error(JSON.stringify(migration));
     expect(migration.merged[0].duplicates.memories).toBe(1);
     expect(memoryIn(loom, 'same')?.content).toBe('content of same');
+  });
+
+  it('reports busy, and leaves the stray in place, while another process holds the merge lock', () => {
+    const loom = makeRepo('loom');
+    const audit = addWorktree(loom, 'loom-audit');
+    seedDb(audit, 'audit-memory');
+    const location = resolveProjectLocation(audit);
+    mkdirSync(getLockDir(loom), { recursive: true });
+    // This process's PID is alive, so the lock reads as held by another merge.
+    const lock = join(getLockDir(loom), 'merge.lock');
+    writeFileSync(lock, String(process.pid));
+
+    const migration = migrateProjectDb(location, NOW, 150);
+
+    expect(migration).toEqual({ kind: 'busy' });
+    expect(existsSync(getProjectDbPath(audit))).toBe(true);
+    expect(existsSync(getProjectDbPath(loom))).toBe(false);
+    expect(describeProjectMigration(migration as { kind: 'busy' }, location)).toContain(
+      'another process is still merging the stray memory databases into project "loom"',
+    );
+
+    rmSync(lock);
+    expect(migrateProjectDb(location, NOW, 150).kind).toBe('merged');
+    expect(memoryIn(loom, 'audit-memory')).not.toBeNull();
+  });
+
+  it('stops at a stray it cannot read: the earlier ones are merged, that one stays where it is', () => {
+    const loom = makeRepo('loom');
+    const audit = addWorktree(loom, 'loom-audit');
+    const engine = join(audit, 'engine');
+    mkdirSync(engine);
+    seedDb(engine, 'engine-memory');
+    mkdirSync(join(audit, '.memory'));
+    writeFileSync(getProjectDbPath(audit), 'this is not a sqlite database, whatever its name says');
+
+    const location = resolveProjectLocation(engine);
+    const migration = migrateProjectDb(location, NOW);
+    if (migration.kind !== 'failed') throw new Error(JSON.stringify(migration));
+
+    expect(migration.error).toContain(getProjectDbPath(audit));
+    expect(migration.merged.map((m) => m.source)).toEqual([engine]);
+    expect(memoryIn(loom, 'engine-memory')).not.toBeNull();
+    expect(existsSync(getProjectDbPath(engine))).toBe(false);
+    expect(existsSync(getProjectDbPath(audit))).toBe(true);
+    expect(readdirSync(join(audit, '.memory'))).toEqual(['cortex.db']);
+    expect(describeProjectMigration(migration, location)).toMatch(/failed: .*\nmerged before the failure:\n {2}.*engine: memories \+1/);
   });
 
   it('never merges a standalone directory into the repository', () => {

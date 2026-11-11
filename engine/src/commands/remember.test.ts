@@ -795,7 +795,7 @@ describe('remember surface cache invalidation (finding 1b)', () => {
         'session-1',
         projectDb,
         globalDb,
-        { cwd: tempDir }
+        { projectRoot: tempDir }
       );
 
       expect(result.success).toBe(true);
@@ -823,7 +823,7 @@ describe('remember surface cache invalidation (finding 1b)', () => {
         's',
         projectDb,
         globalDb,
-        { cwd: tempDir }
+        { projectRoot: tempDir }
       );
 
       expect(dup.success).toBe(false);

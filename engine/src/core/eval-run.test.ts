@@ -1,10 +1,13 @@
 import { describe, expect, test } from 'vitest';
 import * as fc from 'fast-check';
 import {
+  conditionOf,
   differingSources,
   manifestToRow,
   parseManifest,
+  planRun,
   resumeConflicts,
+  startManifest,
   type MemorySource,
   type RunIdentity,
   type RunManifest,
@@ -24,7 +27,6 @@ const snapshot = (overrides: Partial<Extract<MemorySource, { kind: 'snapshot' }>
 
 const manifest = (overrides: Partial<RunManifest> = {}): RunManifest => ({
   run: 'before' as RunName,
-  condition: 'cortex',
   project: '.dotfiles',
   requestedModel: 'deepseek-v4-flash',
   answerPromptDigest: 'a'.repeat(64),
@@ -57,11 +59,32 @@ describe('run manifest', () => {
       }),
     );
     fc.assert(
-      fc.property(memoryArb, fc.constantFrom('cortex' as const, 'none' as const), (memory, condition) => {
-        const m = manifest({ memory, condition });
+      fc.property(memoryArb, (memory) => {
+        const m = manifest({ memory });
         expect(roundTrip(m)).toEqual({ kind: 'ok', value: m });
       }),
     );
+  });
+
+  test('the condition is which memory the run reads, and the row says so', () => {
+    expect(conditionOf(snapshot())).toBe('cortex');
+    expect(conditionOf({ kind: 'none' })).toBe('none');
+    expect(manifestToRow(manifest({ memory: { kind: 'none' } })).condition).toBe('none');
+  });
+
+  test.each([
+    ['cortex', { kind: 'none' }],
+    ['none', manifestToRow(manifest()).memory],
+  ])('rejects a run.json whose condition %s contradicts its memory', (condition, memory) => {
+    const row = { ...manifestToRow(manifest()), condition, memory };
+    expect(parseManifest(JSON.stringify(row))).toEqual({
+      kind: 'err',
+      errors: [{ line: 1, message: expect.stringContaining(`condition ${condition} contradicts memory kind`) }],
+    });
+  });
+
+  test.each([['[]'], ['42'], ['{not json']])('rejects %s: a manifest is one JSON object', (text) => {
+    expect(parseManifest(text)).toEqual({ kind: 'err', errors: [{ line: 1, message: 'expected a JSON object' }] });
   });
 
   test.each(['branch', 'sources'])('rejects a snapshot that lost its %s', (key) => {
@@ -103,8 +126,45 @@ describe('resumeConflicts', () => {
   });
 
   test('a baseline run reads no memory, so its authoring sessions never conflict', () => {
-    const baseline = manifest({ condition: 'none', memory: { kind: 'none' } });
+    const baseline = manifest({ memory: { kind: 'none' } });
     expect(resumeConflicts(baseline, identity({ condition: 'none', excludedSessions: ['s9'] }))).toEqual([]);
+  });
+});
+
+describe('planRun', () => {
+  test('a run with no manifest starts', () => {
+    expect(planRun(null, identity())).toEqual({ kind: 'start' });
+  });
+
+  test('the same setup resumes the stored manifest unchanged', () => {
+    const stored = manifest();
+    expect(planRun(stored, identity())).toEqual({ kind: 'resume', manifest: stored });
+  });
+
+  test('a different setup is refused, naming each conflict', () => {
+    expect(planRun(manifest(), identity({ project: 'elsewhere' }))).toEqual({
+      kind: 'refuse',
+      conflicts: ['project: run has .dotfiles, now elsewhere'],
+    });
+  });
+
+  test('a started run resumes under the identity it was started with (property)', () => {
+    const identityArb = fc.record({
+      condition: fc.constantFrom('cortex' as const, 'none' as const),
+      project: fc.string(),
+      requestedModel: fc.string(),
+      answerPromptDigest: fc.string({ minLength: 12 }),
+      excludedSessions: fc.array(fc.string()),
+    });
+    fc.assert(
+      fc.property(identityArb, (wanted) => {
+        const memory: MemorySource =
+          wanted.condition === 'none' ? { kind: 'none' } : snapshot({ excludedSessions: wanted.excludedSessions });
+        const started = startManifest('before' as RunName, wanted, memory, new Date('2026-11-09T12:00:00Z'));
+        expect(planRun(started, wanted)).toEqual({ kind: 'resume', manifest: started });
+        expect(roundTrip(started)).toEqual({ kind: 'ok', value: started });
+      }),
+    );
   });
 });
 

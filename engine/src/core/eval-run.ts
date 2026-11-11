@@ -11,7 +11,8 @@
  */
 
 import { match } from 'ts-pattern';
-import { parseRunName, type ParseResult, type Row, type RunName } from './eval-set.js';
+import { parseJsonObject, parseRunName, type ParseResult, type Row, type RunName } from './eval-set.js';
+import type { RecallPath } from './types.js';
 
 /** What the answering agent is given: cortex's injected context, or nothing (the baseline). */
 export type Condition = 'cortex' | 'none';
@@ -50,6 +51,19 @@ export type MemorySource =
     }>
   | Readonly<{ kind: 'none' }>;
 
+/**
+ * The condition a run answers under is which memory it reads, so it is
+ * derived from the memory rather than stored beside it: a manifest cannot
+ * claim the cortex condition and no memory.
+ */
+export function conditionOf(memory: MemorySource): Condition {
+  return match(memory)
+    .returnType<Condition>()
+    .with({ kind: 'snapshot' }, () => 'cortex')
+    .with({ kind: 'none' }, () => 'none')
+    .exhaustive();
+}
+
 // ============================================================================
 // PORTS
 // ============================================================================
@@ -64,12 +78,18 @@ export type LlmReply = Readonly<{
 /** One prompt in, one completion out. Answering and judging are separate adapters. */
 export type Llm = (prompt: string) => Promise<LlmReply>;
 
+/**
+ * What an agent is given at the start of a turn, and how its recall block
+ * was produced. The path is part of the answer's record: a run that fell
+ * back to keyword recall for some questions read different memory for them.
+ */
+export type InjectedContext = Readonly<{ text: string; recall: RecallPath }>;
+
 /** The memory context an agent would be given at the start of a turn asking `question`. */
-export type MemoryContext = (question: string) => Promise<string>;
+export type MemoryContext = (question: string) => Promise<InjectedContext>;
 
 export type RunManifest = Readonly<{
   run: RunName;
-  condition: Condition;
   project: string;
   requestedModel: string;
   answerPromptDigest: string;
@@ -80,7 +100,7 @@ export type RunManifest = Readonly<{
 export function manifestToRow(manifest: RunManifest): Record<string, unknown> {
   return {
     run: manifest.run,
-    condition: manifest.condition,
+    condition: conditionOf(manifest.memory),
     project: manifest.project,
     requested_model: manifest.requestedModel,
     answer_prompt_sha256: manifest.answerPromptDigest,
@@ -136,14 +156,9 @@ export function parseManifest(text: string): ParseResult<RunManifest> {
     kind: 'err',
     errors: [{ line: 1, message }],
   });
-  let raw: unknown;
-  try {
-    raw = JSON.parse(text);
-  } catch {
-    return fail('expected a JSON object');
-  }
-  if (typeof raw !== 'object' || raw === null) return fail('expected a JSON object');
-  const row = raw as Row;
+  const parsed = parseJsonObject(text);
+  if (parsed.kind === 'err') return parsed;
+  const row = parsed.value;
 
   const run = parseRunName(row.run);
   const condition = parseCondition(row.condition);
@@ -151,6 +166,9 @@ export function parseManifest(text: string): ParseResult<RunManifest> {
   if (!run) return fail('run must be a run name');
   if (!condition) return fail('condition must be cortex or none');
   if (!memory) return fail('memory must describe a snapshot or none');
+  if (condition !== conditionOf(memory)) {
+    return fail(`condition ${condition} contradicts memory kind ${memory.kind}`);
+  }
   for (const key of ['project', 'requested_model', 'answer_prompt_sha256', 'created_at'] as const) {
     if (typeof row[key] !== 'string') return fail(`${key} must be a string`);
   }
@@ -158,7 +176,6 @@ export function parseManifest(text: string): ParseResult<RunManifest> {
     kind: 'ok',
     value: {
       run,
-      condition,
       project: row.project as string,
       requestedModel: row.requested_model as string,
       answerPromptDigest: row.answer_prompt_sha256 as string,
@@ -193,7 +210,7 @@ export function resumeConflicts(existing: RunManifest, wanted: RunIdentity): rea
   const differs = (label: string, a: string, b: string) => {
     if (a !== b) conflicts.push(`${label}: run has ${a}, now ${b}`);
   };
-  differs('condition', existing.condition, wanted.condition);
+  differs('condition', conditionOf(existing.memory), wanted.condition);
   differs('project', existing.project, wanted.project);
   differs('answer model', existing.requestedModel, wanted.requestedModel);
   differs('answer prompt', existing.answerPromptDigest.slice(0, 12), wanted.answerPromptDigest.slice(0, 12));
@@ -205,6 +222,37 @@ export function resumeConflicts(existing: RunManifest, wanted: RunIdentity): rea
     conflicts.push('authoring sessions changed since the run started');
   }
   return conflicts;
+}
+
+/** What opening a run comes to: pick up where it stopped, refuse, or start it. */
+export type RunOpening =
+  | Readonly<{ kind: 'resume'; manifest: RunManifest }>
+  /** Mixing two setups in one run would make it incomparable. */
+  | Readonly<{ kind: 'refuse'; conflicts: readonly string[] }>
+  | Readonly<{ kind: 'start' }>;
+
+/** Decide how to open a run from its stored manifest, if it has one. */
+export function planRun(existing: RunManifest | null, wanted: RunIdentity): RunOpening {
+  if (existing === null) return { kind: 'start' };
+  const conflicts = resumeConflicts(existing, wanted);
+  return conflicts.length > 0 ? { kind: 'refuse', conflicts } : { kind: 'resume', manifest: existing };
+}
+
+/** The manifest of a run started now, reading `memory`. */
+export function startManifest(
+  run: RunName,
+  identity: RunIdentity,
+  memory: MemorySource,
+  now: Date,
+): RunManifest {
+  return {
+    run,
+    project: identity.project,
+    requestedModel: identity.requestedModel,
+    answerPromptDigest: identity.answerPromptDigest,
+    memory,
+    createdAt: now.toISOString(),
+  };
 }
 
 /**

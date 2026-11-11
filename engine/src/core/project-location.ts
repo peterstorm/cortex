@@ -44,6 +44,10 @@ export type ProjectLocation = Readonly<{
    * Directories whose own `.memory/cortex.db` belongs to this project and is
    * merged into the root's: subdirectories between the session and the root
    * a session once started in, and the repository's other worktrees.
+   *
+   * In merge-precedence order. On a key clash the root's row is kept, then
+   * the earliest stray's: the session's own directories, nearest first, then
+   * the other worktrees in git's order.
    */
   strays: readonly string[];
 }>;
@@ -104,15 +108,28 @@ export function directoriesUpTo(dir: string, top: string): readonly string[] {
 }
 
 /**
+ * The session's place in its checkout: the checkout's top, and the
+ * directories from the session up to it, nearest first. The one derivation
+ * for both the markers the shell looks for and the markers locateProject
+ * honours — were they to differ, a marker would be silently ignored.
+ */
+function sessionInCheckout(
+  cwd: string,
+  worktrees: readonly Worktree[],
+): Readonly<{ checkout: string; upward: readonly string[] }> {
+  const checkout = checkoutOf(cwd, worktrees) ?? cwd;
+  return { checkout, upward: directoriesUpTo(cwd, checkout) };
+}
+
+/**
  * The directories whose standalone marker the shell must check: every
  * directory from the session up to its checkout's top, and every other
  * worktree's top.
  */
 export function markerCandidates(cwd: string, probe: RepositoryProbe): readonly string[] {
   if (probe.kind === 'not-a-repository') return [];
-  const checkout = checkoutOf(cwd, probe.worktrees) ?? cwd;
   const worktreeTops = probe.worktrees.filter((w) => !w.bare).map((w) => w.path);
-  return unique([...directoriesUpTo(cwd, checkout), ...worktreeTops]);
+  return unique([...sessionInCheckout(cwd, probe.worktrees).upward, ...worktreeTops]);
 }
 
 /**
@@ -135,8 +152,7 @@ export function locateProject(
   if (probe.kind === 'not-a-repository') return at(cwd, 'directory', []);
 
   const [main] = probe.worktrees;
-  const checkout = checkoutOf(cwd, probe.worktrees) ?? cwd;
-  const upward = directoriesUpTo(cwd, checkout);
+  const { checkout, upward } = sessionInCheckout(cwd, probe.worktrees);
 
   const marked = upward.findIndex((dir) => standalone.has(dir));
   if (marked !== -1) return at(upward[marked], 'standalone', upward.slice(0, marked));

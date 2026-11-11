@@ -92,8 +92,10 @@ import {
   loadLabels,
   openRun,
   parseEvalArgs,
+  renderAgreements,
   scoreRuns,
   scoringPlan,
+  summarizeAnswering,
   type EvalCommand,
   type EvalPaths,
 } from './commands/eval.js';
@@ -109,7 +111,7 @@ import {
   snapshotMemory,
 } from './commands/eval-adapters.js';
 import { describeEvalSet, type EvalCase, type EvalSettings } from './core/eval-set.js';
-import { judgeAgreement, renderAgreement, renderReport } from './core/eval-rubric.js';
+import { renderReport } from './core/eval-rubric.js';
 import { getCurrentBranch } from './infra/git-context.js';
 import { disposeLocalModel, embedLocal } from './infra/local-embed.js';
 import { ensureNativeLibraryPath } from './infra/native-library-path.js';
@@ -591,7 +593,7 @@ async function handleRemember(args: string[]): Promise<CommandResult> {
         // drop a genuinely new memory as a duplicate. See LOCAL_COSINE_CALIBRATED.
         embedFn: LOCAL_COSINE_CALIBRATED ? embedLocal : null,
         projectName: project.name,
-        cwd: project.root,
+        projectRoot: project.root,
         // Drain the embedding queue NOW instead of at the next session start
         // (FR-046): an explicit remember should be semantically searchable
         // immediately. backfill is idempotent and also clears any older queued
@@ -1582,7 +1584,7 @@ async function handleEvalAnswer(
       // per-harness ones first if that has not happened yet.
       mergeStrayProjectDbs(project);
       const sources = snapshotMemory({ projectRoot: project.root, globalDbPath: resolveGlobalDbPath(), snapshotDir });
-      return { sources, excludedMemories: countRefused(snapshotDir, admit) };
+      return { sources, excludedMemories: countRefused(snapshotDir, sources, admit) };
     },
   );
 
@@ -1590,6 +1592,7 @@ async function handleEvalAnswer(
     manifest.memory.kind === 'snapshot'
       ? openSnapshotContext({
           snapshotDir: runPaths.snapshot,
+          sources: manifest.memory.sources,
           projectName: manifest.project,
           branch: manifest.memory.branch,
           asOf: new Date(manifest.createdAt),
@@ -1607,20 +1610,8 @@ async function handleEvalAnswer(
       context: memory.context,
       log,
     });
-    const excluded =
-      manifest.memory.kind === 'snapshot'
-        ? `; ${manifest.memory.excludedMemories} authoring-session memories excluded`
-        : '';
-    const output =
-      `run ${command.run} (${manifest.condition}): ${outcome.answered} answered now, ` +
-      `${outcome.alreadyAnswered} already answered${excluded}`;
-    return outcome.failed.length === 0
-      ? { kind: 'succeeded', output }
-      : {
-          kind: 'failed',
-          output,
-          error: `${outcome.failed.length} case(s) failed; run the same command again to retry them`,
-        };
+    const { output, failure } = summarizeAnswering(manifest, outcome);
+    return failure === null ? { kind: 'succeeded', output } : { kind: 'failed', output, error: failure };
   } finally {
     memory.close();
   }
@@ -1650,10 +1641,7 @@ async function handleEvalScore(
     log,
   });
 
-  const labels = loadLabels(paths);
-  const agreements = results
-    .filter((r) => labels.some((l) => l.run === r.run))
-    .map((r) => renderAgreement(r.run, judgeAgreement(r, labels)));
+  const agreements = renderAgreements(results, loadLabels(paths));
   return { kind: 'succeeded', output: [renderReport(cases, results), ...agreements].join('\n') };
 }
 

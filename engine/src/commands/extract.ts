@@ -25,7 +25,7 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto';
-import { basename, join } from 'node:path';
+import { join } from 'node:path';
 import type { Database } from 'bun:sqlite';
 import type { GitContext, HookInput, Memory, MemoryCandidate } from '../core/types.js';
 import type { ProjectLocation } from '../core/project-location.js';
@@ -122,15 +122,17 @@ export type ExtractionResult =
  *
  * @param input - Hook input from stdin
  * @param projectDb - Project database instance
- * @param project - Where the project's memory lives and its name. The
+ * @param globalDb - Global database, or null to keep global-scoped memories in the project's
+ * @param project - Where the project's memory lives and its name: required, so
+ *   a caller cannot fall back to the session's directory by omission. The
  *   session's own directory (`input.cwd`) still supplies the git context.
  * @returns Extraction result
  */
 export async function executeExtract(
   input: HookInput,
   projectDb: Database,
-  globalDb: Database | null = null,
-  project: Pick<ProjectLocation, 'root' | 'name'> = { root: input.cwd, name: basename(input.cwd) },
+  globalDb: Database | null,
+  project: Pick<ProjectLocation, 'root' | 'name'>,
 ): Promise<ExtractionResult> {
   // Concurrency guard: extraction runs detached on SessionEnd with no other
   // coordination — two overlapping runs would snapshot active memories at

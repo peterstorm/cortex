@@ -285,7 +285,7 @@ export async function runAiPruneIfNeeded(
   projectDb: Database,
   globalDb: Database,
   telemetryPath: string,
-  cwd?: string,
+  projectRoot?: string,
   transport?: LlmPromptTransport
 ): Promise<AiPruneResult> {
   const projectMemories = getActiveMemories(projectDb);
@@ -307,7 +307,7 @@ export async function runAiPruneIfNeeded(
     };
   }
 
-  return runAiPrune(projectDb, globalDb, telemetryPath, cwd, transport);
+  return runAiPrune(projectDb, globalDb, telemetryPath, projectRoot, transport);
 }
 
 /**
@@ -346,7 +346,7 @@ export async function runAiPrune(
   projectDb: Database,
   globalDb: Database,
   telemetryPath: string,
-  cwd?: string,
+  projectRoot?: string,
   transport?: LlmPromptTransport
 ): Promise<AiPruneResult> {
   if (resolveOpenAiCompatEndpoint() === null && !isClaudeLlmAvailable()) {
@@ -363,7 +363,7 @@ export async function runAiPrune(
   // advanced on the success path below, an abort leaves the review still owed.
   const progress = { archived: 0, reviewed: 0 };
   try {
-    return await prune(projectDb, globalDb, telemetryPath, progress, cwd, transport);
+    return await prune(projectDb, globalDb, telemetryPath, progress, projectRoot, transport);
   } catch (err) {
     // Everything under here is I/O — SQLite, telemetry, the surface cache.
     // This is the sibling of executeSemanticEdges' top-level guard: without it
@@ -402,7 +402,7 @@ async function prune(
   globalDb: Database,
   telemetryPath: string,
   progress: { archived: number; reviewed: number },
-  cwd?: string,
+  projectRoot?: string,
   transport?: LlmPromptTransport
 ): Promise<AiPruneResult> {
   const projectMemories = getActiveMemories(projectDb);
@@ -541,8 +541,8 @@ async function prune(
 
   // Successful batches may already have archived memories even when a sibling
   // batch failed, so invalidate the surface before returning a partial error.
-  if (cwd !== undefined && progress.archived > 0) {
-    invalidateSurfaceCache(cwd);
+  if (projectRoot !== undefined && progress.archived > 0) {
+    invalidateSurfaceCache(projectRoot);
   }
 
   if (successfulBatches !== totalBatches) {

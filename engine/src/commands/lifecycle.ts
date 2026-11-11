@@ -92,7 +92,7 @@ export function runLifecycleIfNeeded(
   projectDb: Database,
   globalDb: Database,
   telemetryPath: string,
-  cwd?: string
+  projectRoot?: string
 ): LifecycleResult {
   const now = new Date();
   const lastLifecycleAt = readLastLifecycleAt(telemetryPath);
@@ -109,7 +109,7 @@ export function runLifecycleIfNeeded(
     return { decayed: 0, archived: 0, pruned: 0, skipped: true };
   }
 
-  const result = runFullLifecycle(projectDb, globalDb, cwd);
+  const result = runFullLifecycle(projectDb, globalDb, projectRoot);
 
   writeLastLifecycleAt(telemetryPath, now.toISOString());
 
@@ -125,16 +125,16 @@ export function runLifecycleIfNeeded(
  *
  * @param projectDb - Project database
  * @param globalDb - Global database
- * @param cwd - Project root; when provided, surface cache is invalidated on changes
+ * @param projectRoot - Project root; when provided, surface cache is invalidated on changes
  * @returns Combined lifecycle counts across both databases
  */
 export function runFullLifecycle(
   projectDb: Database,
   globalDb: Database,
-  cwd?: string
+  projectRoot?: string
 ): LifecycleResult {
-  const projectResult = runLifecycle(projectDb, cwd);
-  const globalResult = runLifecycle(globalDb, cwd);
+  const projectResult = runLifecycle(projectDb, projectRoot);
+  const globalResult = runLifecycle(globalDb, projectRoot);
 
   // Hard-delete pruned memories past retention period
   vacuumPrunedMemories(projectDb, VACUUM_RETENTION_DAYS);
@@ -161,7 +161,7 @@ export function runFullLifecycle(
  * The spec says "14 consecutive days" but tracking daily state is complex;
  * we use last_accessed_at as proxy.
  */
-export function runLifecycle(db: Database, cwd?: string): LifecycleResult {
+export function runLifecycle(db: Database, projectRoot?: string): LifecycleResult {
   const now = new Date();
 
   // I/O: Fetch all active memories
@@ -245,8 +245,8 @@ export function runLifecycle(db: Database, cwd?: string): LifecycleResult {
   }
 
   // Invalidate cached surfaces when the visible memory set changed
-  if (cwd !== undefined && (archivedCount > 0 || prunedCount > 0)) {
-    invalidateSurfaceCache(cwd);
+  if (projectRoot !== undefined && (archivedCount > 0 || prunedCount > 0)) {
+    invalidateSurfaceCache(projectRoot);
   }
 
   return {

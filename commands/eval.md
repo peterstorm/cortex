@@ -13,7 +13,7 @@ description: "Score what an agent answers from cortex's memory against a test se
 
 ## Description
 
-Applies Team0's "Measure before you build" to cortex's read path. Each case in `<project>/.memory/eval/questions.jsonl` is asked of a tool-less model. That model gets exactly what the hooks would inject (the push surface plus the prompt-recall block), or nothing in the `none` baseline. A judge then scores every answer 0-1 on `correct_current`, `relevant`, `missed`, `ordered` and `context_complete`, with one table for practice cases and one for held-out cases. Full details are in the README's "Evaluation" section.
+Applies Team0's "Measure before you build" to cortex's read path. Each case in `<cwd>/.memory/eval/questions.jsonl` is asked of a tool-less model. That model gets exactly what the hooks would inject (the push surface plus the prompt-recall block), or nothing in the `none` baseline. A judge then scores every answer 0-1 on `correct_current`, `relevant`, `missed`, `ordered` and `context_complete`, with one table for practice cases and one for held-out cases. Full details are in the README's "Evaluation" section.
 
 ## CLI Command
 
@@ -32,7 +32,7 @@ bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts eval score <run> [<run>] [--dry-run]
 **Optional:**
 - `--condition=none` - answer with no memory: the baseline
 - `--dry-run` - for `score`, show what would be judged without calling a model
-- `--dir=<path>` - eval directory (default `<cwd>/.memory/eval`)
+- `--dir=<path>` - eval directory (default `<cwd>/.memory/eval`). The default follows the directory you run from, while the memory that gets snapshotted is the project's, at the repository root. From a subdirectory or a linked worktree, pass `--dir` (or `--cwd=<repository root>`) so every run uses the same eval set.
 
 ## Usage Example
 
@@ -56,4 +56,5 @@ bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts eval score <run> [<run>] [--dry-run]
 - `relevant` falling as memory grows means junk is getting in.
 - A `<- mixed models` flag means a routing server swapped weights mid-run, so the run is not a clean comparison.
 - A `<- the runs read different ... databases` flag means the two snapshots came from different project or global databases (another harness, another machine), so the change measures the data, not cortex.
+- A `<- <run>: N of M scored answers read memory through keyword-fallback recall` flag means the embedder was unavailable for those answers. Keyword search ranks differently, so fix the embedder and answer a new run before comparing.
 - A `<- check the judge` flag on a measure means its scores can't be trusted until the judge is fixed or that measure is scored by hand.

@@ -8,19 +8,24 @@
  * aggregation are the pure core in core/eval-*.ts, and the adapters live in
  * eval-adapters.ts.
  *
- * Eval directory (default <project>/.memory/eval, gitignored with .memory/):
+ * Eval directory (default <cwd>/.memory/eval, where cwd is --cwd or the
+ * directory the command runs in; gitignored with .memory/). The memory it
+ * snapshots is the project's, at the repository root, so from a subdirectory
+ * the two differ: pass --dir, or run from the root.
  *   eval.json                 {"authoring_sessions": [...]}
  *   questions.jsonl           confirmed cases
  *   labels.jsonl              optional: your own scores, to check the judge
  *   runs/<run>/run.json       the run's identity (condition, model, snapshot)
  *   runs/<run>/memory/        the frozen DB snapshot the run answers from
- *   runs/<run>/answers.jsonl  one line per answer, appended as answered
+ *   runs/<run>/answers.jsonl  one line per answer (with the recall path its
+ *                             memory came through), appended as answered
  *   runs/<run>/scores.jsonl   one line per judgement, keyed by the judge prompt
  */
 
 import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { match } from 'ts-pattern';
 import {
   formatParseErrors,
   parseAnswers,
@@ -29,6 +34,7 @@ import {
   parseIsoDate,
   parseLabels,
   parseRunName,
+  splitTornTail,
   type Answer,
   type CaseId,
   type EvalCase,
@@ -40,20 +46,25 @@ import {
 } from '../core/eval-set.js';
 import {
   buildAnswerPrompt,
-  buildJudgePrompt,
+  judgeAgreement,
   judgementToRow,
   parseJudgements,
   parseVerdict,
+  planCase,
+  renderAgreement,
   ANSWER_PROMPT,
+  type CaseScoring,
   type Judgement,
   type RunResult,
   type ScoredAnswer,
 } from '../core/eval-rubric.js';
 import {
+  conditionOf,
   manifestToRow,
   parseCondition,
   parseManifest,
-  resumeConflicts,
+  planRun,
+  startManifest,
   type Condition,
   type Llm,
   type MemoryContext,
@@ -116,13 +127,39 @@ function readOptional<T>(file: string, parse: (text: string) => ParseResult<T>, 
   return existsSync(file) ? readParsed(file, parse) : absent;
 }
 
+/**
+ * Parse a file this command appends to. A write interrupted mid-line leaves
+ * a torn last line; it is not a row, so the rows before it still read.
+ */
+const completeRows =
+  <T>(parse: (text: string) => ParseResult<T>) =>
+  (text: string): ParseResult<T> =>
+    parse(splitTornTail(text).complete);
+
 const appendRow = (file: string, row: Record<string, unknown>): void =>
   appendFileSync(file, `${JSON.stringify(row)}\n`, 'utf8');
 
-function writeJsonAtomic(file: string, value: Record<string, unknown>): void {
+function writeAtomic(file: string, text: string): void {
   const tmp = `${file}.tmp-${process.pid}`;
-  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  writeFileSync(tmp, text, 'utf8');
   renameSync(tmp, file);
+}
+
+/**
+ * Make a file safe to append a row to: drop a torn last line (an earlier
+ * write that was interrupted), and end the last row with a newline. Without
+ * this the next row would be glued onto the torn one and both would be lost.
+ */
+function repairAppendedFile(file: string, log: (line: string) => void): void {
+  if (!existsSync(file)) return;
+  const text = readFileSync(file, 'utf8');
+  const { complete, torn } = splitTornTail(text);
+  if (torn !== null) {
+    writeAtomic(file, complete);
+    log(`${file}: dropped an incomplete last line left by an interrupted write`);
+  } else if (text !== '' && !text.endsWith('\n')) {
+    appendFileSync(file, '\n', 'utf8');
+  }
 }
 
 export const sha256 = (text: string): string => createHash('sha256').update(text).digest('hex');
@@ -175,40 +212,33 @@ export function openRun(paths: RunPaths, request: RunRequest, takeSnapshot: Take
     answerPromptDigest: sha256(ANSWER_PROMPT),
     excludedSessions: [...request.authoringSessions].sort(),
   };
+  const existing = existsSync(paths.manifest) ? readParsed(paths.manifest, parseManifest) : null;
 
-  if (existsSync(paths.manifest)) {
-    const existing = readParsed(paths.manifest, parseManifest);
-    const conflicts = resumeConflicts(existing, identity);
-    if (conflicts.length > 0) {
+  return match(planRun(existing, identity))
+    .with({ kind: 'resume' }, ({ manifest }) => manifest)
+    .with({ kind: 'refuse' }, ({ conflicts }) => {
       throw new Error(
         `run ${request.run} was started with a different setup; start a new run name to compare:\n` +
           conflicts.map((c) => `  - ${c}`).join('\n'),
       );
-    }
-    return existing;
-  }
-
-  mkdirSync(paths.dir, { recursive: true });
-  const memory: MemorySource =
-    identity.condition === 'none'
-      ? { kind: 'none' }
-      : {
+    })
+    .with({ kind: 'start' }, () => {
+      mkdirSync(paths.dir, { recursive: true });
+      const memory = match(identity.condition)
+        .returnType<MemorySource>()
+        .with('none', () => ({ kind: 'none' }))
+        .with('cortex', () => ({
           kind: 'snapshot',
           branch: request.branch,
           excludedSessions: identity.excludedSessions,
           ...takeSnapshot(paths.snapshot),
-        };
-  const manifest: RunManifest = {
-    run: request.run,
-    condition: identity.condition,
-    project: identity.project,
-    requestedModel: identity.requestedModel,
-    answerPromptDigest: identity.answerPromptDigest,
-    memory,
-    createdAt: request.now.toISOString(),
-  };
-  writeJsonAtomic(paths.manifest, manifestToRow(manifest));
-  return manifest;
+        }))
+        .exhaustive();
+      const manifest = startManifest(request.run, identity, memory, request.now);
+      writeAtomic(paths.manifest, `${JSON.stringify(manifestToRow(manifest), null, 2)}\n`);
+      return manifest;
+    })
+    .exhaustive();
 }
 
 export type AnswerOutcome = Readonly<{
@@ -238,6 +268,7 @@ export async function answerCases(deps: {
   readonly log: (line: string) => void;
 }): Promise<AnswerOutcome> {
   const { cases, manifest, paths, llm, context, log } = deps;
+  repairAppendedFile(paths.answers, log);
   const done = new Set(readOptional(paths.answers, parseAnswers, []).map((a) => a.id));
   const today = runDate(manifest);
   const failed: { id: CaseId; error: string }[] = [];
@@ -247,13 +278,14 @@ export async function answerCases(deps: {
     if (done.has(evalCase.id)) continue;
     try {
       const memory = await context(evalCase.question);
-      const reply = await llm(buildAnswerPrompt(evalCase.question, memory, manifest.project, today));
+      const reply = await llm(buildAnswerPrompt(evalCase.question, memory.text, manifest.project, today));
       appendRow(paths.answers, {
         id: evalCase.id,
         answer: reply.content,
         prompt_tokens: reply.promptTokens,
         answer_model: reply.model,
-        context_chars: memory.length,
+        context_chars: memory.text.length,
+        recall: memory.recall,
         answered_at: new Date().toISOString(),
       });
       answered++;
@@ -289,8 +321,8 @@ function loadRun(paths: EvalPaths, run: RunName): LoadedRun {
     run,
     paths: runPaths,
     memory: readParsed(runPaths.manifest, parseManifest).memory,
-    answers: new Map(readParsed(runPaths.answers, parseAnswers).map((a) => [a.id, a])),
-    judgements: readOptional(runPaths.scores, parseJudgements, []),
+    answers: new Map(readParsed(runPaths.answers, completeRows(parseAnswers)).map((a) => [a.id, a])),
+    judgements: readOptional(runPaths.scores, completeRows(parseJudgements), []),
   };
 }
 
@@ -298,25 +330,10 @@ function loadRun(paths: EvalPaths, run: RunName): LoadedRun {
  * A judgement is reused only for exactly what it scored: the rendered judge
  * prompt (rubric, case and answer) and the judge model requested.
  */
-export const judgeKey = (judgePrompt: string, judgeRequested: string): string =>
-  sha256(`${judgeRequested}\n${judgePrompt}`);
-
-type CaseScoring = Readonly<
-  | { kind: 'unanswered' }
-  | { kind: 'cached'; scored: ScoredAnswer }
-  | { kind: 'to-judge'; answer: Answer; prompt: string; key: string }
->;
-
-function planCase(loaded: LoadedRun, evalCase: EvalCase, judgeRequested: string): CaseScoring {
-  const answer = loaded.answers.get(evalCase.id);
-  if (!answer) return { kind: 'unanswered' };
-  const prompt = buildJudgePrompt(evalCase, answer.answer);
-  const key = judgeKey(prompt, judgeRequested);
-  const cached = loaded.judgements.find((j) => j.id === evalCase.id && j.key === key);
-  return cached
-    ? { kind: 'cached', scored: { evalCase, answer, judgement: cached } }
-    : { kind: 'to-judge', answer, prompt, key };
-}
+const judgeKey =
+  (judgeRequested: string) =>
+  (judgePrompt: string): string =>
+    sha256(`${judgeRequested}\n${judgePrompt}`);
 
 /** Dry run: what scoring would reuse and what it would send to the judge. No model is called. */
 export function scoringPlan(
@@ -328,7 +345,7 @@ export function scoringPlan(
   return runs
     .map((run) => {
       const loaded = loadRun(paths, run);
-      const plans = cases.map((c) => planCase(loaded, c, judgeRequested));
+      const plans = cases.map((c) => planCase(loaded, c, judgeKey(judgeRequested)));
       const count = (kind: CaseScoring['kind']) => plans.filter((p) => p.kind === kind).length;
       return (
         `${run}: ${cases.length - count('unanswered')} of ${cases.length} cases answered, ` +
@@ -379,12 +396,13 @@ export async function scoreRuns(deps: {
   const results: RunResult[] = [];
 
   for (const loaded of loadedRuns) {
+    repairAppendedFile(loaded.paths.scores, log);
     const scored: ScoredAnswer[] = [];
     const unanswered: CaseId[] = [];
     const unscored: CaseId[] = [];
 
     for (const evalCase of cases) {
-      const plan = planCase(loaded, evalCase, judgeRequested);
+      const plan = planCase(loaded, evalCase, judgeKey(judgeRequested));
       if (plan.kind === 'unanswered') {
         unanswered.push(evalCase.id);
         continue;
@@ -407,6 +425,37 @@ export async function scoreRuns(deps: {
     results.push({ run: loaded.run, memory: loaded.memory, scored, unanswered, unscored });
   }
   return results;
+}
+
+// ============================================================================
+// SUMMARIES
+// ============================================================================
+
+/** What a command reports: its output, and why it counts as failed, if it does. */
+export type EvalReport = Readonly<{ output: string; failure: string | null }>;
+
+/** One line for an answering pass; any failed case fails the pass, to be retried. */
+export function summarizeAnswering(manifest: RunManifest, outcome: AnswerOutcome): EvalReport {
+  const excluded = match(manifest.memory)
+    .with({ kind: 'snapshot' }, (m) => `; ${m.excludedMemories} authoring-session memories excluded`)
+    .with({ kind: 'none' }, () => '')
+    .exhaustive();
+  return {
+    output:
+      `run ${manifest.run} (${conditionOf(manifest.memory)}): ${outcome.answered} answered now, ` +
+      `${outcome.alreadyAnswered} already answered${excluded}`,
+    failure:
+      outcome.failed.length === 0
+        ? null
+        : `${outcome.failed.length} case(s) failed; run the same command again to retry them`,
+  };
+}
+
+/** The judge-agreement table of every run somebody labelled; unlabelled runs get none. */
+export function renderAgreements(results: readonly RunResult[], labels: readonly Label[]): readonly string[] {
+  return results
+    .filter((r) => labels.some((l) => l.run === r.run))
+    .map((r) => renderAgreement(r.run, judgeAgreement(r, labels)));
 }
 
 // ============================================================================

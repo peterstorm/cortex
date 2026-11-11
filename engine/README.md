@@ -396,10 +396,11 @@ SessionStart fast path. Checks cache and serves if fresh (<24h); on cache miss o
 |---|---|---|
 | Project DB | `<repository root>/.memory/cortex.db` (main worktree; the directory itself outside git; `.memory/standalone` opts a directory out) | Yes |
 | Global DB | `${XDG_DATA_HOME:-~/.local/share}/cortex/global.db` (shared by every harness; `CORTEX_GLOBAL_DB` overrides) | N/A |
-| Surface | `<project>/.claude/cortex-memory.local.md` | Yes |
-| Cache | `<project>/.memory/surface-cache/{hash}.json` | Yes |
-| Locks | `<project>/.memory/locks/` | Yes |
-| Telemetry | `<project>/.memory/cortex-status.json` | Yes |
+| Surface | `<session directory>/.claude/cortex-memory.local.md` (beside the session, which may be a worktree or a subdirectory of the repository) | Yes |
+| Cache | `<repository root>/.memory/surface-cache/{hash}.json` | Yes |
+| Locks | `<repository root>/.memory/locks/` (`surface.lock`, and `merge.lock` while stray databases are merged) | Yes |
+| Telemetry | `<repository root>/.memory/telemetry.json` | Yes |
+| Eval | `<cwd>/.memory/eval/` by default (the directory `eval` runs in, not the repository root; `--dir` overrides) | Yes |
 | Pipeline logs | `/tmp/cortex-{extract,backfill,generate,semantic-edges,lifecycle,ai-prune}.log` | N/A |
 
 `.gitignore` patterns auto-added by `ensureGitignored()`: `.memory/`, `.claude/cortex-memory.local.md`, `.pi/cortex-memory.local.md`.

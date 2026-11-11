@@ -71,11 +71,11 @@ function filterActive(memories: readonly Memory[]): readonly Memory[] {
  *
  * @param db - Database instance
  * @param id - Memory ID to archive
- * @param cwd - Project root; when provided, the surface cache is invalidated
+ * @param projectRoot - Project root; when provided, the surface cache is invalidated
  *              so the archived memory can't be served from a stale cache
  * @returns ForgetResult indicating success or not found
  */
-export function forgetById(db: Database, id: string, cwd?: string): ForgetResult {
+export function forgetById(db: Database, id: string, projectRoot?: string): ForgetResult {
   // Fetch memory (I/O)
   const memory = getMemory(db, id);
 
@@ -93,8 +93,8 @@ export function forgetById(db: Database, id: string, cwd?: string): ForgetResult
   supersedeFactsForMemory(db, id);
 
   // Invalidate cached surfaces: the visible memory set changed
-  if (cwd !== undefined) {
-    invalidateSurfaceCache(cwd);
+  if (projectRoot !== undefined) {
+    invalidateSurfaceCache(projectRoot);
   }
 
   return {
@@ -139,6 +139,6 @@ export function forgetByQuery(db: Database, query: string, limit: number = 10): 
  * @param ids - Array of memory IDs to archive
  * @returns Array of ForgetResult for each ID
  */
-export function forgetByIds(db: Database, ids: readonly string[], cwd?: string): readonly ForgetResult[] {
-  return ids.map(id => forgetById(db, id, cwd));
+export function forgetByIds(db: Database, ids: readonly string[], projectRoot?: string): readonly ForgetResult[] {
+  return ids.map(id => forgetById(db, id, projectRoot));
 }

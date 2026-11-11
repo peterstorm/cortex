@@ -80,11 +80,6 @@ export function locateGlobalDb(env: Env = currentEnv(), home: string = homeDir(e
   return { kind: 'default', path: join(dataHome, 'cortex', 'global.db') };
 }
 
-/** The global database's path, wherever it is configured to live. */
-export function getGlobalDbPath(env: Env = currentEnv(), home: string = homeDir(env)): string {
-  return locateGlobalDb(env, home).path;
-}
-
 /**
  * Where each harness kept its own global database before they were unified,
  * in merge-precedence order: on an id clash the first one's row is kept.

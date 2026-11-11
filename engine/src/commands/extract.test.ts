@@ -22,7 +22,23 @@ import {
 } from '../infra/db.js';
 import { truncateTranscript, buildExtractionPrompt, parseExtractionResponse } from '../core/extraction.js';
 import { tokenize, jaccardSimilarity, classifySimilarity } from '../core/similarity.js';
-import { deduplicateCandidates, applyDedupMerges, executeExtract, computeEdgeCandidates, computeSimilarityAndCreateEdges } from './extract.js';
+import {
+  deduplicateCandidates,
+  applyDedupMerges,
+  executeExtract as extractForProject,
+  computeEdgeCandidates,
+  computeSimilarityAndCreateEdges,
+} from './extract.js';
+import { locateProject } from '../core/project-location.js';
+
+/** Extract for a session whose directory is its own project: it is in no repository. */
+const executeExtract = (input: HookInput, projectDb: Database, globalDb: Database | null = null) =>
+  extractForProject(
+    input,
+    projectDb,
+    globalDb,
+    locateProject(input.cwd, { kind: 'not-a-repository' }, new Set()),
+  );
 
 // Mock the LLM boundary so executeExtract tests never shell out to `claude`,
 // and the local embedding model so no ONNX weights are loaded. The
