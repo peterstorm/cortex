@@ -35,6 +35,7 @@
 import { Database } from 'bun:sqlite';
 import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
+import { match } from 'ts-pattern';
 import type { HookInput } from './core/types.js';
 import {
   getProjectDbPath,
@@ -348,14 +349,17 @@ function initDatabases(cwd: string): [Database, Database] {
  */
 export function extractionToCommandResult(result: ExtractionResult): CommandResult {
   const output = JSON.stringify(result);
-  switch (result.kind) {
-    case 'succeeded':
-      return { kind: 'succeeded', output };
-    case 'deferred':
-      return { kind: 'deferred', output };
-    case 'failed':
-      return { kind: 'failed', retryable: result.retryable, output, error: result.error };
-  }
+  return match(result)
+    .returnType<CommandResult>()
+    .with({ kind: 'succeeded' }, () => ({ kind: 'succeeded', output }))
+    .with({ kind: 'deferred' }, () => ({ kind: 'deferred', output }))
+    .with({ kind: 'failed' }, (failed) => ({
+      kind: 'failed',
+      retryable: failed.retryable,
+      output,
+      error: failed.error,
+    }))
+    .exhaustive();
 }
 
 /** Execute extraction for already-parsed session metadata. */
@@ -1439,19 +1443,20 @@ export type IngestSessionCommandOperations = Readonly<{
  */
 export function commandToIngestionStep(result: CommandResult): IngestionStepResult {
   const withOutput = result.output === undefined ? {} : { output: result.output };
-  switch (result.kind) {
-    case 'succeeded':
-      return { kind: 'succeeded', ...withOutput };
-    case 'deferred':
-      return { kind: 'deferred', reason: result.output ?? 'command deferred' };
-    case 'failed':
-      return {
-        kind: 'failed',
-        retryable: result.retryable === true,
-        error: result.error,
-        ...withOutput,
-      };
-  }
+  return match(result)
+    .returnType<IngestionStepResult>()
+    .with({ kind: 'succeeded' }, () => ({ kind: 'succeeded', ...withOutput }))
+    .with({ kind: 'deferred' }, (deferred) => ({
+      kind: 'deferred',
+      reason: deferred.output ?? 'command deferred',
+    }))
+    .with({ kind: 'failed' }, (failed) => ({
+      kind: 'failed',
+      retryable: failed.retryable === true,
+      error: failed.error,
+      ...withOutput,
+    }))
+    .exhaustive();
 }
 
 /** Injectable shell boundary for the complete detached ingestion pipeline. */
@@ -1489,14 +1494,15 @@ async function handleEval(args: string[]): Promise<CommandResult> {
   const log = (line: string) => process.stderr.write(`[cortex:eval] ${line}\n`);
   try {
     const { cases, settings } = loadEvalSet(paths);
-    switch (command.kind) {
-      case 'validate':
-        return { kind: 'succeeded', output: describeEvalSet(cases, settings) };
-      case 'answer':
-        return await handleEvalAnswer(command, paths, cases, settings, log);
-      case 'score':
-        return await handleEvalScore(command, paths, cases, log);
-    }
+    return await match(command)
+      .returnType<Promise<CommandResult>>()
+      .with({ kind: 'validate' }, async () => ({
+        kind: 'succeeded',
+        output: describeEvalSet(cases, settings),
+      }))
+      .with({ kind: 'answer' }, (answer) => handleEvalAnswer(answer, paths, cases, settings, log))
+      .with({ kind: 'score' }, (score) => handleEvalScore(score, paths, cases, log))
+      .exhaustive();
   } catch (err) {
     return { kind: 'failed', error: `Eval failed: ${err instanceof Error ? err.message : String(err)}` };
   }
@@ -1616,6 +1622,36 @@ async function handleIngestSession(): Promise<CommandResult> {
 // MAIN DISPATCH
 // ============================================================================
 
+/**
+ * Every subcommand and its handler. The usage line is derived from the keys,
+ * so the list a user sees cannot drift from the commands that exist.
+ */
+const SUBCOMMANDS = {
+  extract: () => handleExtract(),
+  'ingest-session': () => handleIngestSession(),
+  generate: handleGenerate,
+  recall: handleRecall,
+  remember: handleRemember,
+  'index-code': handleIndexCode,
+  forget: handleForget,
+  consolidate: handleConsolidate,
+  lifecycle: handleLifecycle,
+  'ai-prune': handleAiPrune,
+  maintenance: handleMaintenance,
+  traverse: handleTraverse,
+  inspect: handleInspect,
+  backfill: handleBackfill,
+  'semantic-edges': handleSemanticEdges,
+  'load-surface': handleLoadSurface,
+  'prompt-recall': () => handlePromptRecall(),
+  'entity-query': handleEntityQuery,
+  eval: handleEval,
+} as const satisfies Readonly<Record<string, (args: string[]) => Promise<CommandResult>>>;
+
+type Subcommand = keyof typeof SUBCOMMANDS;
+
+const isSubcommand = (name: string): name is Subcommand => Object.hasOwn(SUBCOMMANDS, name);
+
 /** Process exit status for the CLI. */
 export type ExitCode = 0 | 1;
 
@@ -1648,84 +1684,20 @@ async function main(): Promise<ExitCode> {
   // else, including the hook scripts that already set the path themselves.
   ensureNativeLibraryPath();
 
-  const args = process.argv.slice(2);
+  const [subcommand, ...subcommandArgs] = process.argv.slice(2);
 
-  if (args.length === 0) {
+  if (subcommand === undefined) {
     logError('Usage: cli.ts <subcommand> [args...]');
-    logError('Subcommands: extract, ingest-session, generate, recall, remember, index-code, forget, consolidate, lifecycle, ai-prune, maintenance, traverse, inspect, backfill, semantic-edges, load-surface, prompt-recall, entity-query, eval');
+    logError(`Subcommands: ${Object.keys(SUBCOMMANDS).join(', ')}`);
     return 1;
   }
-
-  const subcommand = args[0];
-  const subcommandArgs = args.slice(1);
 
   let result: CommandResult;
 
   try {
-    switch (subcommand) {
-      case 'extract':
-        result = await handleExtract();
-        break;
-      case 'ingest-session':
-        result = await handleIngestSession();
-        break;
-      case 'generate':
-        result = await handleGenerate(subcommandArgs);
-        break;
-      case 'recall':
-        result = await handleRecall(subcommandArgs);
-        break;
-      case 'remember':
-        result = await handleRemember(subcommandArgs);
-        break;
-      case 'index-code':
-        result = await handleIndexCode(subcommandArgs);
-        break;
-      case 'forget':
-        result = await handleForget(subcommandArgs);
-        break;
-      case 'consolidate':
-        result = await handleConsolidate(subcommandArgs);
-        break;
-      case 'lifecycle':
-        result = await handleLifecycle(subcommandArgs);
-        break;
-      case 'ai-prune':
-        result = await handleAiPrune(subcommandArgs);
-        break;
-      case 'maintenance':
-        result = await handleMaintenance(subcommandArgs);
-        break;
-      case 'traverse':
-        result = await handleTraverse(subcommandArgs);
-        break;
-      case 'inspect':
-        result = await handleInspect(subcommandArgs);
-        break;
-      case 'backfill':
-        result = await handleBackfill(subcommandArgs);
-        break;
-      case 'semantic-edges':
-        result = await handleSemanticEdges(subcommandArgs);
-        break;
-      case 'load-surface':
-        result = await handleLoadSurface(subcommandArgs);
-        break;
-      case 'prompt-recall':
-        result = await handlePromptRecall();
-        break;
-      case 'entity-query':
-        result = await handleEntityQuery(subcommandArgs);
-        break;
-      case 'eval':
-        result = await handleEval(subcommandArgs);
-        break;
-      default:
-        result = {
-          kind: 'failed',
-          error: `Unknown subcommand: ${subcommand}`,
-        };
-    }
+    result = isSubcommand(subcommand)
+      ? await SUBCOMMANDS[subcommand](subcommandArgs)
+      : { kind: 'failed', error: `Unknown subcommand: ${subcommand}` };
   } catch (err) {
     result = {
       kind: 'failed',
