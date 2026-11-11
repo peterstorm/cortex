@@ -2,7 +2,7 @@
 
 Persistent memory system for Claude Code. Extracts knowledge from sessions, ranks it, and surfaces the most relevant subset as context for future sessions.
 
-Runtime: **Bun** (TypeScript). Storage: **SQLite** via `bun:sqlite` (WAL mode, built into Bun). LLM: headless coding-agent CLI — **`claude -p --model haiku`** by default, or **`pi -p`** under the pi agent (extraction, AI prune, edge classification). Embeddings: **Gemini Embedding 001** (semantic search), local fallback **BGE-small-en-v1.5** (384-dim Float32).
+Runtime: **Bun** (TypeScript). Storage: **SQLite** via `bun:sqlite` (WAL mode, built into Bun). LLM: headless coding-agent CLI — **`claude -p --model haiku`** by default, or **`pi -p`** under the pi agent (extraction, AI prune, edge classification). Embeddings: local only — **potion-retrieval-32M** (`minishlab/potion-retrieval-32M`, a model2vec static model, 512-dim Float32) run in-process on CPU through `@huggingface/transformers` and `onnxruntime-node`. There is no remote embedding provider and no API key.
 
 ## Architecture
 
@@ -24,8 +24,7 @@ engine/src/
 │   ├── filesystem.ts   PID locking, surface write, gitignore management
 │   ├── git-context.ts  Branch, commits, changed files via execSync
 │   ├── claude-llm.ts   Headless LLM CLI client (claude -p / pi -p): extraction + edge classification
-│   ├── gemini-embed.ts Embedding API (768-dim Float64, batch up to 100)
-│   └── local-embed.ts  HuggingFace transformers fallback (BGE-small-en-v1.5, 384-dim Float32)
+│   └── local-embed.ts  The only embedder: potion-retrieval-32M via transformers.js (512-dim Float32)
 │
 ├── commands/       ← Imperative shells. Orchestrate core + infra.
 │   ├── extract.ts      Session-end pipeline (transcript → memories → edges)
@@ -59,8 +58,9 @@ engine/src/
 | `summary` | TEXT | Short display text (≤200 chars for manual, LLM-generated for extraction) |
 | `memory_type` | TEXT | `architecture` \| `decision` \| `pattern` \| `gotcha` \| `context` \| `progress` \| `code_description` \| `code` |
 | `scope` | TEXT | `project` \| `global` |
-| `embedding` | BLOB | Float64Array (Gemini, 768-dim) — nullable, queued for backfill |
-| `local_embedding` | BLOB | Float32Array (BGE-small-en-v1.5, 384-dim) — nullable, fallback |
+| `embedding` | BLOB | Float64Array, nullable. Legacy: left from the removed remote embedding provider. Nothing computes it now, so new rows hold null; see [Embedding Strategy](#embedding-strategy) for what still reads it |
+| `local_embedding` | BLOB | Float32Array (potion-retrieval-32M, 512-dim), nullable until backfill embeds the row. The vector recall ranks on |
+| `local_embedding_model` | TEXT | Model id that produced `local_embedding`. A row tagged with another model (or untagged) is skipped by recall and re-embedded by backfill |
 | `confidence` | REAL | 0–1. Decays over time. Manual memories start at 1.0. |
 | `priority` | INTEGER | 1–10. Static (set by LLM or user). |
 | `pinned` | INTEGER | 0/1. Pinned = exempt from decay. |
@@ -128,7 +128,7 @@ SessionStart hook
 
 ### Session End (detached worker)
 
-The hook re-invokes itself as a detached worker (`setsid`, or `spawn({detached: true})` on macOS) so the pipeline survives Claude Code reaping the hook's process group. Steps run **sequentially** — SQLite allows one writer, and lifecycle + ai-prune both read-modify-write telemetry.json. Each step logs to `/tmp/cortex-<step>.log`. The hook sources `GEMINI_API_KEY` from `$CORTEX_GEMINI_ENV` (default: sops-nix path).
+The hook re-invokes itself as a detached worker (`setsid`, or `spawn({detached: true})` on macOS) so the pipeline survives Claude Code reaping the hook's process group. Steps run **sequentially** — SQLite allows one writer, and lifecycle + ai-prune both read-modify-write telemetry.json. Each step logs to `/tmp/cortex-<step>.log`. The hook needs no API key for embeddings; on NixOS it puts a 64-bit `libstdc++` on `LD_LIBRARY_PATH` for `onnxruntime-node` (`CORTEX_ONNX_LD_PATH` pins the directory, otherwise it probes the nix store).
 
 ```
 SessionEnd hook (JSON stdin: {session_id, transcript_path, cwd})
@@ -279,7 +279,7 @@ hybridSimilarityScored(tokens, tokens, localEmbA, localEmbB) → {score, method}
   method = jaccard otherwise (with <0.1 pre-filter → score 0)
 
 classifySimilarity(score, space) — bands calibrated PER SPACE:
-  jaccard / gemini-cosine:  ignore <0.1 | relate <0.4 | suggest ≤0.5 | consolidate >0.5
+  jaccard:                  ignore <0.1 | relate <0.4 | suggest ≤0.5 | consolidate >0.5
   local-cosine (runs hot):  ignore <0.6 | relate <0.75 | suggest <0.82 | consolidate ≥0.82
 
 relate/consolidate → active relates_to edge, suggest → suggested edge.
@@ -288,7 +288,7 @@ Cap: top MAX_EDGES_PER_MEMORY (3) strongest edges per new memory.
 
 ### Cosine Similarity (at search time)
 
-Used by `/recall` and prompt-recall when embeddings are available, and by `consolidate` via hybrid similarity for duplicate-pair detection with per-space thresholds (`consolidationThresholdFor`: 0.5 Jaccard/Gemini, 0.8 local cosine).
+Used by `/recall` and prompt-recall when embeddings are available, and by `consolidate` via hybrid similarity for duplicate-pair detection with per-space thresholds (`consolidationThresholdFor`: 0.5 Jaccard, 0.8 local cosine).
 
 ### Tokenizer
 
@@ -296,12 +296,19 @@ Lowercases, strips punctuation, splits on whitespace, returns `Set<string>`.
 
 ## Embedding Strategy
 
-**Dual embedding** with Gemini primary, local fallback:
+**One local model, no remote provider** (`infra/local-embed.ts`):
 
-| Model | API | Dimensions | Type | Column |
+| Model | Runs | Dimensions | Type | Column |
 |---|---|---|---|---|
-| gemini-embedding-001 | Google AI | 768 | Float64Array | `embedding` |
-| BGE-small-en-v1.5 (`Xenova/bge-small-en-v1.5`) | Local (HuggingFace) | 384 | Float32Array | `local_embedding` |
+| potion-retrieval-32M (`minishlab/potion-retrieval-32M`, model2vec static) | In-process on CPU, `@huggingface/transformers` on `onnxruntime-node` | 512 | Float32Array | `local_embedding` |
+
+The model id and width are constants in `config.ts` (`LOCAL_EMBED_MODEL`, `LOCAL_EMBEDDING_DIMENSIONS`). A static model was chosen because the prompt-recall hook starts a fresh `bun` process per prompt, so load time is paid every time.
+
+Each row records the model that embedded it in `local_embedding_model`. Recall only ranks rows tagged with the current model; backfill re-embeds the rest.
+
+The `local-cosine` bands and thresholds (edge classification, dedup, consolidation) were calibrated on a different model, `Xenova/bge-small-en-v1.5`. While `LOCAL_EMBED_MODEL` is not that model, `LOCAL_COSINE_CALIBRATED` is false: extraction embeds nothing (so its dedup and its edge classification run on Jaccard), and `remember`'s duplicate check and `consolidate` use Jaccard instead of cosine. Recall ranking still uses cosine: it needs relative order, not absolute cutoffs.
+
+**The `embedding` column** (Float64 BLOB) is what remains of the removed remote provider. No code computes a vector for it. It is still part of the `Memory` type, so it is stored when a caller passes one and read back with the row; `remember`'s duplicate check falls back to it when its length matches the candidate vector, and `inspect` counts a memory as queued only when both `embedding` and `local_embedding` are null.
 
 ### Embedding Text Format
 
@@ -318,16 +325,17 @@ Prefix alignment ensures type-aware and project-aware similarity.
 
 ### Backfill
 
-Memories are inserted with `embedding = null` to avoid blocking extraction. The `backfill` command processes the queue:
-1. Fetch all active memories with null embeddings
+`remember` inserts memories with `local_embedding = null`, and so does extraction while `LOCAL_COSINE_CALIBRATED` is false (when it is true, extraction stores the vector it computed for dedup). `index-code` embeds its description inline. The `backfill` command processes the queue:
+1. Fetch active, non-`code` memories recall cannot see: no `local_embedding`, or one from another model (`getActiveMemoriesNeedingEmbedding`)
 2. Build embedding texts with metadata prefix
-3. Batch up to 100 per API call (Gemini limit)
-4. Update DB with resulting vectors
-5. Falls back to local model if no API key
+3. Embed them one at a time with the local model (it does not batch)
+4. Write `local_embedding` and its model tag
+
+If the model cannot load, every queued memory is reported as failed, with the load error.
 
 ### Code Memory Rule
 
-Raw code is **never** sent to the embedding API. `code` type memories have `embedding = null, local_embedding = null` permanently. Search finds them via `source_of` edges from their paired `code_description` memory.
+Raw code is **never** embedded. `code` type memories have `embedding = null, local_embedding = null` permanently. Search finds them via `source_of` edges from their paired `code_description` memory.
 
 ## Command Reference
 
@@ -337,7 +345,7 @@ SessionEnd hook pipeline. Reads JSON from stdin: `{session_id, transcript_path, 
 
 ### generate
 
-Builds surface from ranked memories. Args: `<cwd>`. Opens both DBs, runs full pipeline, writes surface + cache + telemetry.
+Builds surface from ranked memories. Args: `<cwd>`. Opens both DBs, runs full pipeline, writes surface + cache + the generation status file (`.memory/cortex-status.json`).
 
 ### remember
 
@@ -355,7 +363,7 @@ Archive by ID or fuzzy keyword query. Tries ID lookup in project → global, the
 
 Two modes, project DB only.
 
-**List mode** — `consolidate <cwd> [--threshold=N]`: detects duplicate pairs via hybrid similarity (cosine when both sides share an embedding type, Jaccard otherwise) and prints each pair with IDs, similarity %, type, priority, summary, and content for human review. Default threshold is per similarity space — 0.5 for Jaccard and Gemini-768 cosine, 0.8 for raw local-BGE cosine (which scores same-domain non-duplicates 0.6-0.75); `--threshold=N` overrides uniformly.
+**List mode** — `consolidate <cwd> [--threshold=N]`: detects duplicate pairs via hybrid similarity (cosine when both sides share an embedding type, Jaccard otherwise) and prints each pair with IDs, similarity %, type, priority, summary, and content for human review. Default threshold is per similarity space — 0.5 for Jaccard, 0.8 for raw local-BGE cosine (which scores same-domain non-duplicates 0.6-0.75); `--threshold=N` overrides uniformly.
 
 **Merge mode** — `consolidate <cwd> --merge --a=<idA> --b=<idB> --summary=<text> --content=<text>`: merges one reviewed pair. The merged memory gets confidence 1.0 (human-approved), the higher priority of the two, combined tags, pinned if either was pinned, and null embeddings (backfill re-embeds the new content). Both originals are marked `superseded` with `supersedes` edges, and the new memory ID is printed. Run `backfill` + `generate` afterwards.
 
@@ -373,11 +381,11 @@ BFS graph traversal from a memory ID. Args: `traverse <cwd> <memoryId> [maxDepth
 
 ### inspect
 
-Telemetry display (JSON output). Queries both DBs for stats: active memory counts by type/scope, edge count, embedding queue size, cache staleness. Reads `.memory/telemetry.json` for the last extraction record.
+Telemetry display (JSON output). Queries both DBs for stats: active memory counts by type/scope, edge count, embedding queue size, cache staleness. Reads `.memory/telemetry.json` (the path `cli.ts` passes, from `getTelemetryPath`) for a `last_extraction` record; nothing in the engine writes that record, so the field is normally absent. It does not read `.memory/cortex-status.json`.
 
 ### backfill
 
-Batch embedding processing. Fetches un-embedded memories, embeds via Gemini (batch up to 100) or local fallback. Updates DB with vectors.
+Batch embedding processing. Fetches active memories with no usable vector (none, or one from another model), embeds each with the local model, and writes `local_embedding`.
 
 ### load-surface
 
@@ -399,7 +407,8 @@ SessionStart fast path. Checks cache and serves if fresh (<24h); on cache miss o
 | Surface | `<session directory>/.claude/cortex-memory.local.md` (beside the session, which may be a worktree or a subdirectory of the repository) | Yes |
 | Cache | `<repository root>/.memory/surface-cache/{hash}.json` | Yes |
 | Locks | `<repository root>/.memory/locks/` (`surface.lock`, and `merge.lock` while stray databases are merged) | Yes |
-| Telemetry | `<repository root>/.memory/telemetry.json` | Yes |
+| Generation status | `<repository root>/.memory/cortex-status.json` — written by `generate` after each surface build: `last_generation`, `branch`, `memory_count`, `selected_count`, `duration_ms` | Yes |
+| Telemetry | `<repository root>/.memory/telemetry.json` — maintenance cadence state, read and merged by `lifecycle` (`last_lifecycle_at`) and `ai-prune` (`last_ai_prune_at`); also the file `inspect` reads | Yes |
 | Eval | `<cwd>/.memory/eval/` by default (the directory `eval` runs in, not the repository root; `--dir` overrides) | Yes |
 | Pipeline logs | `/tmp/cortex-{extract,backfill,generate,semantic-edges,lifecycle,ai-prune}.log` | N/A |
 
@@ -409,19 +418,19 @@ SessionStart fast path. Checks cache and serves if fresh (<24h); on cache miss o
 
 | Variable | Purpose | Required |
 |---|---|---|
-| `GEMINI_API_KEY` | Embedding API only (semantic search) — extraction does NOT use it | No (backfill falls back to local model) |
-| `CORTEX_GEMINI_ENV` | Path to file hooks source for `GEMINI_API_KEY` (default: sops-nix path) | No |
+| `CORTEX_ONNX_LD_PATH` | Directory holding a 64-bit `libstdc++.so.6` for `onnxruntime-node` (local embeddings). Hooks probe the nix store when unset | No (needed on NixOS only) |
 | `CORTEX_LLM_BINARY` | Force headless LLM binary (`claude` or `pi`) | No (auto-detected) |
 | `CORTEX_LLM_MODEL` | Override model for the LLM binary | No (`haiku` for claude; none for pi) |
 | `CLAUDE_PLUGIN_ROOT` | Plugin directory | Auto-set by Claude Code |
 
-Extraction, AI prune, and edge classification shell out to a headless coding-agent CLI: `claude -p --model haiku` by default, or `pi -p` when running under the pi agent (no `--model` flag — pi's configured provider default is used). Without `GEMINI_API_KEY`: recall falls back to local-embedding/keyword search, backfill uses the local model. Extraction still works.
+Extraction, AI prune, and edge classification shell out to a headless coding-agent CLI: `claude -p --model haiku` by default, or `pi -p` when running under the pi agent (no `--model` flag — pi's configured provider default is used). Embeddings need no key or network service: they are computed in-process. If the embedder cannot load or embed, `recall` falls back to keyword search and backfill reports the memories as failed; extraction still works.
 
 ## Testing
 
 ```bash
 cd engine && bun run test         # bun test --isolate (the vitest API, run by Bun)
 cd engine && bun run test:watch   # same, in watch mode
+cd engine && bun run typecheck    # tsc --noEmit -p . (also a CI step)
 ```
 
 Use the scripts, not a bare `bun test`: `vi.mock` is process-wide under Bun, so
@@ -448,9 +457,7 @@ Dependencies: `vitest`, `fast-check` (property-based). All core/ functions testa
 | `AI_PRUNE_MEMORY_THRESHOLD` | 50 | `config.ts` |
 | `DEFAULT_SEARCH_LIMIT` | 10 | `config.ts` |
 | `DEFAULT_TRAVERSAL_DEPTH` | 2 | `config.ts` |
-| `EMBEDDING_DIMENSIONS` (Gemini) | 768 | `gemini-embed.ts` |
-| `MAX_BATCH_SIZE` (Gemini) | 100 | `gemini-embed.ts` |
-| Local embedding dimensions | 384 | `local-embed.ts` |
+| `LOCAL_EMBEDDING_DIMENSIONS` | 512 | `config.ts` |
 | LLM CLI (extraction/prune/edges) | `claude -p --model haiku` (or `pi -p`) | `claude-llm.ts` |
-| Gemini model (embedding) | `gemini-embedding-001` | `gemini-embed.ts` |
-| Local model | `Xenova/bge-small-en-v1.5` | `local-embed.ts` |
+| `LOCAL_EMBED_MODEL` | `minishlab/potion-retrieval-32M` | `config.ts` |
+| `LOCAL_COSINE_CALIBRATED_MODEL` | `Xenova/bge-small-en-v1.5` | `config.ts` |

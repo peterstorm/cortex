@@ -165,7 +165,7 @@ Cortex follows a **Functional Core / Imperative Shell** design:
 │  filesystem.ts   PID locking, surface write           │
 │  git-context.ts  Branch, commits, changed files       │
 │  claude-llm.ts   Headless LLM CLI client (claude/pi)  │
-│  local-embed.ts  HuggingFace transformers fallback    │
+│  local-embed.ts  Local embedder (transformers.js)     │
 └───────────────────────────────────────────────────────┘
                           ↕
 ┌───────────────────────────────────────────────────────┐
@@ -514,8 +514,8 @@ Extraction, AI pruning, and edge classification prefer a **direct OpenAI-compati
     cortex.db                   # Project SQLite database
     surface-cache/              # Cached surfaces (branch-keyed)
     locks/                      # PID lock files
-    cortex-status.json          # Generated health telemetry (extraction stats, timing)
-    telemetry.json              # Maintenance and AI-prune cadence state
+    cortex-status.json          # Last surface generation (time, branch, counts, duration)
+    telemetry.json              # Lifecycle and AI-prune cadence state
     eval/                       # Eval set and runs (see Evaluation)
   .claude/
     cortex-memory.local.md      # Surface file Claude reads
@@ -553,11 +553,13 @@ cd engine
 bun install
 bun run test         # bun test --isolate (the vitest API, run by Bun)
 bun run test:watch   # same, in watch mode
+bun run typecheck    # tsc --noEmit -p .
 ```
 
 Run the suite through these scripts, not a bare `bun test`: tests mock modules
 with `vi.mock`, which Bun applies process-wide, so only `--isolate` keeps one
-file's mocks out of the others. CI runs the same script on Ubuntu and macOS.
+file's mocks out of the others. CI runs the typecheck and the test script on
+Ubuntu and macOS.
 
 ### CLI Usage
 
@@ -598,7 +600,7 @@ bun engine/src/cli.ts eval score <run> [<run>] [--dry-run] [--cwd=<project>]
 | Package | Purpose |
 |---|---|
 | `bun:sqlite` | SQLite (WAL mode, FTS5) — built into Bun, no install needed |
-| `@huggingface/transformers` | Local embedding model fallback |
+| `@huggingface/transformers` | Local embedding model (the only embedder) |
 | `ts-pattern` | Exhaustive pattern matching |
 | `vitest` | Test framework |
 | `fast-check` | Property-based testing |
