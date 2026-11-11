@@ -724,7 +724,7 @@ describe('cli - summarizeBackfillResults', () => {
 
   it('fails when everything failed (failed > 0, processed === 0)', () => {
     const summary = summarizeBackfillResults(
-      { ok: true, processed: 0, failed: 3, errors: ['e1', 'e2', 'e3'], method: 'gemini' },
+      { ok: true, processed: 0, failed: 3, errors: ['e1', 'e2', 'e3'], method: 'local' },
       okEmpty
     );
 
@@ -735,7 +735,7 @@ describe('cli - summarizeBackfillResults', () => {
 
   it('partial failure succeeds but surfaces counts and warnings', () => {
     const summary = summarizeBackfillResults(
-      { ok: true, processed: 3, failed: 2, errors: ['embed timeout', 'embed 500'], method: 'gemini' },
+      { ok: true, processed: 3, failed: 2, errors: ['embed timeout', 'embed 500'], method: 'local' },
       { ok: true, processed: 1, failed: 0, errors: [], method: 'local' }
     );
 
@@ -747,7 +747,7 @@ describe('cli - summarizeBackfillResults', () => {
 
   it('full success reports processed count with no warnings', () => {
     const summary = summarizeBackfillResults(
-      { ok: true, processed: 5, failed: 0, errors: [], method: 'gemini' },
+      { ok: true, processed: 5, failed: 0, errors: [], method: 'local' },
       { ok: true, processed: 2, failed: 0, errors: [], method: 'local' }
     );
 

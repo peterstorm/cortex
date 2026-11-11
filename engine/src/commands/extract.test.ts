@@ -54,7 +54,7 @@ vi.mock('../infra/claude-llm.js', () => ({
 vi.mock('../infra/llm-client.js', () => ({
   resolveOpenAiCompatEndpoint: () => mockResolveEndpoint(),
 }));
-vi.mock('../infra/local-embed.ts', () => ({
+vi.mock('../infra/local-embed.js', () => ({
   ensureModelLoaded: () => mockEnsureModelLoaded(),
   embedLocal: async () => {
     throw new Error('local embedding model disabled in tests');

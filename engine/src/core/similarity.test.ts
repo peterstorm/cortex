@@ -351,11 +351,11 @@ describe('classifySimilarity', () => {
   });
 
   describe('space-aware bands (local-cosine calibration)', () => {
-    it('gemini-cosine uses the same bands as jaccard', () => {
-      expect(classifySimilarity(0.05, 'gemini-cosine').action).toBe('ignore');
-      expect(classifySimilarity(0.25, 'gemini-cosine').action).toBe('relate');
-      expect(classifySimilarity(0.45, 'gemini-cosine').action).toBe('suggest');
-      expect(classifySimilarity(0.55, 'gemini-cosine').action).toBe('consolidate');
+    it('an explicit jaccard space uses the FR-059 bands, not the local-cosine ones', () => {
+      expect(classifySimilarity(0.05, 'jaccard').action).toBe('ignore');
+      expect(classifySimilarity(0.25, 'jaccard').action).toBe('relate');
+      expect(classifySimilarity(0.45, 'jaccard').action).toBe('suggest');
+      expect(classifySimilarity(0.55, 'jaccard').action).toBe('consolidate');
     });
 
     it('local-cosine ignores same-domain background similarity (< 0.6)', () => {

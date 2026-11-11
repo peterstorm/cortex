@@ -473,7 +473,7 @@ describe('collectTelemetry', () => {
     expect(result.memory_counts.total).toBe(0);
     expect(result.edge_count).toBe(0);
     expect(result.embedding_queue_size).toBe(0);
-    expect(result.cache_staleness.exists).toBe(false);
+    expect(result.cache_staleness?.exists).toBe(false);
     expect(result.last_extraction).toBeUndefined();
   });
 

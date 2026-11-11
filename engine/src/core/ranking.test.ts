@@ -58,7 +58,8 @@ const searchResultArb = (sourceType: 'project' | 'global') =>
   fc.record({
     memory: memoryArb,
     score: fc.double({ min: 0, max: 1, noNaN: true }),
-    source: fc.constant(sourceType)
+    source: fc.constant(sourceType),
+    related: fc.constant<readonly Memory[]>([]),
   });
 
 // Example-based tests

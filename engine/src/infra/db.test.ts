@@ -23,7 +23,10 @@ import {
   routeToDatabase,
   getActiveCodeMemoriesByFilePath,
   getActiveProseMemoriesByFilePath,
+  markEdgeClassified,
+  markEdgeFailed,
 } from './db.js';
+import { selectClassificationCandidates, pairContentHash } from '../commands/semantic-edges.js';
 import { rankBySimilarity } from '../core/similarity.js';
 import { createMemory, createEdge } from '../core/types.js';
 import { LOCAL_EMBED_MODEL } from '../config.js';
@@ -993,6 +996,7 @@ describe('Database Layer', () => {
       saveExtractionCheckpoint(db, {
         session_id: 'session-ckpt-1',
         cursor_position: 12345,
+        extracted_at: new Date().toISOString(),
       });
 
       const checkpoint = getExtractionCheckpoint(db, 'session-ckpt-1');
@@ -1012,11 +1016,13 @@ describe('Database Layer', () => {
       saveExtractionCheckpoint(db, {
         session_id: 'session-ckpt-2',
         cursor_position: 100,
+        extracted_at: new Date().toISOString(),
       });
 
       saveExtractionCheckpoint(db, {
         session_id: 'session-ckpt-2',
         cursor_position: 200,
+        extracted_at: new Date().toISOString(),
       });
 
       const checkpoint = getExtractionCheckpoint(db, 'session-ckpt-2');
@@ -1041,10 +1047,13 @@ describe('Database Layer', () => {
     it('generates extracted_at when not provided', () => {
       const beforeSave = new Date();
 
+      // Deliberately ill-typed: the parameter type requires extracted_at, but
+      // the function keeps a runtime fallback for callers that omit it, and
+      // that fallback is what this test exercises.
       saveExtractionCheckpoint(db, {
         session_id: 'session-ckpt-4',
         cursor_position: 600,
-      });
+      } as unknown as Parameters<typeof saveExtractionCheckpoint>[1]);
 
       const checkpoint = getExtractionCheckpoint(db, 'session-ckpt-4');
       expect(checkpoint).toBeDefined();
@@ -1323,8 +1332,6 @@ describe('Database Layer', () => {
     });
 
     it('classifiable edges respect attempt tracking and content changes', () => {
-      const { getRelatesToEdgesWithMemories, markEdgeClassified } = require('./db.js');
-      const { selectClassificationCandidates, pairContentHash } = require('../commands/semantic-edges.js');
       const db = openDatabase(':memory:');
 
       function seedMemory(id: string): void {
@@ -1382,8 +1389,6 @@ describe('Database Layer', () => {
     });
 
     it('failure backoff gates re-classification until expiry or content change', () => {
-      const { getRelatesToEdgesWithMemories, markEdgeClassified, markEdgeFailed } = require('./db.js');
-      const { selectClassificationCandidates, pairContentHash } = require('../commands/semantic-edges.js');
       const db = openDatabase(':memory:');
 
       function seedMemory(id: string): void {

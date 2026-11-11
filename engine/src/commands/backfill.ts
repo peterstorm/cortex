@@ -13,7 +13,7 @@ import { Database } from 'bun:sqlite';
 import type { Memory } from '../core/types.js';
 import { buildEmbeddingText } from '../core/extraction.js';
 import { getActiveMemoriesNeedingEmbedding, updateMemory } from '../infra/db.js';
-import { embedLocal, ensureModelLoaded } from '../infra/local-embed.ts';
+import { embedLocal, ensureModelLoaded } from '../infra/local-embed.js';
 
 
 /**
@@ -25,21 +25,12 @@ export type BackfillResult =
 
 /**
  * Functional Core: build embedding texts with metadata prefix
- * Only passes fields actually used by buildEmbeddingText (memory_type, summary)
  */
 function buildEmbeddingTexts(
   memories: readonly Memory[],
   projectName: string
 ): readonly string[] {
-  return memories.map((m) =>
-    buildEmbeddingText(
-      {
-        memory_type: m.memory_type,
-        summary: m.summary,
-      } as Pick<Memory, 'memory_type' | 'summary'>,
-      projectName
-    )
-  );
+  return memories.map((m) => buildEmbeddingText(m, projectName));
 }
 
 /**

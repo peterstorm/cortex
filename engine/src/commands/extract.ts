@@ -47,7 +47,7 @@ import {
   hybridSimilarityScored,
   classifySimilarity,
 } from '../core/similarity.js';
-import { embedLocal, ensureModelLoaded } from '../infra/local-embed.ts';
+import { embedLocal, ensureModelLoaded } from '../infra/local-embed.js';
 import {
   insertMemory,
   updateMemory,

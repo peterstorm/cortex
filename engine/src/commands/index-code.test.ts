@@ -15,6 +15,7 @@ import {
   formatErrorResult,
   executeIndexCode,
   type IndexCodeArgs,
+  type ParseResult,
 } from './index-code.js';
 import { openDatabase, getMemory, getEdgesForMemory } from '../infra/db.js';
 import { writeFileSync, unlinkSync, mkdtempSync } from 'fs';
@@ -26,6 +27,18 @@ import type { Database } from 'bun:sqlite';
 // PURE FUNCTION TESTS
 // ============================================================================
 
+/** The parsed args, or a failed test naming the parse error it got instead. */
+function parsedArgs(result: ParseResult): IndexCodeArgs {
+  if (!result.success) throw new Error(`expected a successful parse, got error: ${result.error}`);
+  return result.args;
+}
+
+/** The parse error, or a failed test when the parse succeeded. */
+function parseError(result: ParseResult): string {
+  if (result.success) throw new Error('expected a parse error, got a successful parse');
+  return result.error;
+}
+
 describe('parseIndexCodeArgs', () => {
   test('parses minimal args (file path + summary)', () => {
     const result = parseIndexCodeArgs(
@@ -34,7 +47,7 @@ describe('parseIndexCodeArgs', () => {
     );
 
     expect(result.success).toBe(true);
-    expect(result.args).toEqual({
+    expect(parsedArgs(result)).toEqual({
       filePath: '/path/to/file.ts',
       summary: 'This is a summary',
       startLine: undefined,
@@ -52,8 +65,8 @@ describe('parseIndexCodeArgs', () => {
     );
 
     expect(result.success).toBe(true);
-    expect(result.args?.startLine).toBe(10);
-    expect(result.args?.endLine).toBe(20);
+    expect(parsedArgs(result).startLine).toBe(10);
+    expect(parsedArgs(result).endLine).toBe(20);
   });
 
   test('parses with global scope', () => {
@@ -63,7 +76,7 @@ describe('parseIndexCodeArgs', () => {
     );
 
     expect(result.success).toBe(true);
-    expect(result.args?.scope).toBe('global');
+    expect(parsedArgs(result).scope).toBe('global');
   });
 
   test('parses with tags', () => {
@@ -73,7 +86,7 @@ describe('parseIndexCodeArgs', () => {
     );
 
     expect(result.success).toBe(true);
-    expect(result.args?.tags).toEqual(['typescript', 'async', 'api']);
+    expect(parsedArgs(result).tags).toEqual(['typescript', 'async', 'api']);
   });
 
   test('parses all options together', () => {
@@ -90,7 +103,7 @@ describe('parseIndexCodeArgs', () => {
     );
 
     expect(result.success).toBe(true);
-    expect(result.args).toEqual({
+    expect(parsedArgs(result)).toEqual({
       filePath: '/src/utils.ts',
       summary: 'Utility functions for data transformation',
       startLine: 42,
@@ -105,28 +118,28 @@ describe('parseIndexCodeArgs', () => {
     const result = parseIndexCodeArgs([], 'session-123');
 
     expect(result.success).toBe(false);
-    expect(result.error).toContain('file path and summary are required');
+    expect(parseError(result)).toContain('file path and summary are required');
   });
 
   test('rejects missing summary', () => {
     const result = parseIndexCodeArgs(['/file.ts'], 'session-123');
 
     expect(result.success).toBe(false);
-    expect(result.error).toContain('file path and summary are required');
+    expect(parseError(result)).toContain('file path and summary are required');
   });
 
   test('rejects empty file path', () => {
     const result = parseIndexCodeArgs(['', 'Summary'], 'session-123');
 
     expect(result.success).toBe(false);
-    expect(result.error).toContain('file path must not be empty');
+    expect(parseError(result)).toContain('file path must not be empty');
   });
 
   test('rejects empty summary', () => {
     const result = parseIndexCodeArgs(['/file.ts', ''], 'session-123');
 
     expect(result.success).toBe(false);
-    expect(result.error).toContain('summary must not be empty');
+    expect(parseError(result)).toContain('summary must not be empty');
   });
 
   test('rejects invalid start line', () => {
@@ -136,7 +149,7 @@ describe('parseIndexCodeArgs', () => {
     );
 
     expect(result.success).toBe(false);
-    expect(result.error).toContain('start line must be >= 1');
+    expect(parseError(result)).toContain('start line must be >= 1');
   });
 
   test('rejects invalid end line', () => {
@@ -146,7 +159,7 @@ describe('parseIndexCodeArgs', () => {
     );
 
     expect(result.success).toBe(false);
-    expect(result.error).toContain('end line must be >= 1');
+    expect(parseError(result)).toContain('end line must be >= 1');
   });
 
   test('rejects start > end', () => {
@@ -156,8 +169,8 @@ describe('parseIndexCodeArgs', () => {
     );
 
     expect(result.success).toBe(false);
-    expect(result.error).toContain('start line');
-    expect(result.error).toContain('must be <=');
+    expect(parseError(result)).toContain('start line');
+    expect(parseError(result)).toContain('must be <=');
   });
 
   test('rejects invalid scope', () => {
@@ -167,7 +180,7 @@ describe('parseIndexCodeArgs', () => {
     );
 
     expect(result.success).toBe(false);
-    expect(result.error).toContain('scope must be');
+    expect(parseError(result)).toContain('scope must be');
   });
 
   test('rejects unknown option', () => {
@@ -177,7 +190,7 @@ describe('parseIndexCodeArgs', () => {
     );
 
     expect(result.success).toBe(false);
-    expect(result.error).toContain('unknown option');
+    expect(parseError(result)).toContain('unknown option');
   });
 });
 
@@ -474,7 +487,6 @@ export function multiply(a: number, b: number): number {
       'session-lookup-failure',
       unavailableDb,
       globalDb,
-      undefined,
       'test-project'
     );
 
@@ -490,7 +502,6 @@ export function multiply(a: number, b: number): number {
       'session-123',
       projectDb,
       globalDb,
-      undefined, // no Voyage API key
       'test-project'
     );
 
@@ -510,7 +521,6 @@ export function multiply(a: number, b: number): number {
       'session-123',
       projectDb,
       globalDb,
-      undefined,
       'test-project'
     );
 
@@ -541,7 +551,6 @@ export function multiply(a: number, b: number): number {
       'session-123',
       projectDb,
       globalDb,
-      undefined,
       'test-project'
     );
 
@@ -564,7 +573,6 @@ export function multiply(a: number, b: number): number {
       'session-123',
       projectDb,
       globalDb,
-      undefined,
       'test-project'
     );
 
@@ -589,7 +597,6 @@ export function multiply(a: number, b: number): number {
       'session-cli-contract',
       projectDb,
       globalDb,
-      undefined,
       'test-project'
     );
 
@@ -627,7 +634,6 @@ export function multiply(a: number, b: number): number {
       'session-123',
       projectDb,
       globalDb,
-      undefined,
       'test-project'
     );
 
@@ -651,7 +657,6 @@ export function multiply(a: number, b: number): number {
       'session-1',
       projectDb,
       globalDb,
-      undefined,
       'test-project'
     );
 
@@ -664,7 +669,6 @@ export function multiply(a: number, b: number): number {
       'session-2',
       projectDb,
       globalDb,
-      undefined,
       'test-project'
     );
 
@@ -689,7 +693,6 @@ export function multiply(a: number, b: number): number {
       'session-1',
       projectDb,
       globalDb,
-      undefined,
       'test-project'
     );
 
@@ -702,7 +705,6 @@ export function multiply(a: number, b: number): number {
       'session-2',
       projectDb,
       globalDb,
-      undefined,
       'test-project'
     );
 
@@ -724,7 +726,6 @@ export function multiply(a: number, b: number): number {
       'session-123',
       projectDb,
       globalDb,
-      undefined,
       'test-project'
     );
 
@@ -744,7 +745,6 @@ export function multiply(a: number, b: number): number {
       'session-123',
       projectDb,
       globalDb,
-      undefined,
       'test-project'
     );
 
@@ -760,7 +760,6 @@ export function multiply(a: number, b: number): number {
       'session-123',
       projectDb,
       globalDb,
-      undefined,
       'test-project'
     );
 

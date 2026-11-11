@@ -22,7 +22,7 @@ import type { Memory } from '../core/types.js';
 import { createMemory, serializeSourceContext } from '../core/types.js';
 import { buildEmbeddingText } from '../core/extraction.js';
 import { insertMemory, insertEdge, updateMemory, deleteEdgesForMemory, routeToDatabase, getActiveCodeMemoriesByFilePath, getActiveProseMemoriesByFilePath } from '../infra/db.js';
-import { embedLocal } from '../infra/local-embed.ts';
+import { embedLocal } from '../infra/local-embed.js';
 import { readFileSync } from 'fs';
 
 // ============================================================================
@@ -387,15 +387,7 @@ export async function executeIndexCode(
     try {
       // Build embedding text with metadata prefix
       const embeddingText = buildEmbeddingText(
-        {
-          content: args.summary,
-          summary: args.summary,
-          memory_type: 'code_description',
-          scope: args.scope,
-          confidence: 1.0,
-          priority: 7,
-          tags: args.tags,
-        },
+        { memory_type: 'code_description', summary: args.summary },
         projectName
       );
 

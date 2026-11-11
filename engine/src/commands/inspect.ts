@@ -116,8 +116,6 @@ export function calculateStalenessHours(timestamp: string): number | null {
 export function parseTelemetryFile(
   data: Record<string, unknown>
 ): Partial<Pick<TelemetryData, 'last_extraction'>> {
-  const result: Partial<Pick<TelemetryData, 'last_extraction'>> = {};
-
   // Validate last_extraction if present
   if (data.last_extraction && typeof data.last_extraction === 'object') {
     const extraction = data.last_extraction as Record<string, unknown>;
@@ -129,16 +127,18 @@ export function parseTelemetryFile(
     ) {
       // Validate timestamp field
       if (typeof extraction.timestamp === 'string') {
-        result.last_extraction = {
-          status: extraction.status,
-          timestamp: extraction.timestamp,
-          error: typeof extraction.error === 'string' ? extraction.error : undefined,
+        return {
+          last_extraction: {
+            status: extraction.status,
+            timestamp: extraction.timestamp,
+            error: typeof extraction.error === 'string' ? extraction.error : undefined,
+          },
         };
       }
     }
   }
 
-  return result;
+  return {};
 }
 
 /**

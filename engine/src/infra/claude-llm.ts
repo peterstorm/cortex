@@ -192,13 +192,13 @@ export async function runLlmPrompt(prompt: string, timeoutMs: number): Promise<s
   }
 
   const proc = Bun.spawn(
-    args,
+    [...args],
     {
       stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'pipe',
       env: (() => {
-        const env = { ...process.env, CORTEX_EXTRACTING: '1' };
+        const env: NodeJS.ProcessEnv = { ...process.env, CORTEX_EXTRACTING: '1' };
         delete env.CLAUDECODE;
         return env;
       })(),
@@ -217,7 +217,7 @@ export async function runLlmPrompt(prompt: string, timeoutMs: number): Promise<s
 
   // Race between process completion and timeout.
   // Timer must be cleared after resolution to prevent keeping the event loop alive.
-  let timer: ReturnType<typeof setTimeout>;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       proc.kill('SIGKILL');
@@ -229,7 +229,7 @@ export async function runLlmPrompt(prompt: string, timeoutMs: number): Promise<s
   try {
     result = await Promise.race([proc.exited, timeout]);
   } finally {
-    clearTimeout(timer!);
+    clearTimeout(timer);
   }
 
   if (result !== 0) {
