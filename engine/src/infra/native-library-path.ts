@@ -79,14 +79,28 @@ function isElf64(path: string): boolean {
   }
 }
 
-function librarySearchDirectories(environment: NodeJS.ProcessEnv): readonly string[] {
+function librarySearchDirectories(
+  environment: NodeJS.ProcessEnv,
+  defaultDirectories: readonly string[],
+): readonly string[] {
   const configured = (environment.LD_LIBRARY_PATH ?? '').split(':').filter((entry) => entry.length > 0);
-  return [...configured, ...DEFAULT_LIBRARY_DIRECTORIES];
+  return [...configured, ...defaultDirectories];
 }
 
-/** Can the loader already find a usable libstdc++ without our help? */
-export function resolvesNatively(environment: NodeJS.ProcessEnv = process.env): boolean {
-  return librarySearchDirectories(environment).some((directory) => isElf64(join(directory, SONAME)));
+/**
+ * Can the loader already find a usable libstdc++ without our help?
+ *
+ * @param defaultDirectories - Where the loader looks after `LD_LIBRARY_PATH`.
+ *   A parameter so a test can decide what the system already provides: on a
+ *   stock distribution `/usr/lib/x86_64-linux-gnu` holds libstdc++, and a test
+ *   reading the real directories would only ever see `true` there.
+ */
+export function resolvesNatively(
+  environment: NodeJS.ProcessEnv = process.env,
+  defaultDirectories: readonly string[] = DEFAULT_LIBRARY_DIRECTORIES,
+): boolean {
+  return librarySearchDirectories(environment, defaultDirectories)
+    .some((directory) => isElf64(join(directory, SONAME)));
 }
 
 /**
@@ -148,7 +162,7 @@ export type NativeLibraryProbes = Readonly<{
 }>;
 
 const FILESYSTEM_PROBES: NativeLibraryProbes = Object.freeze({
-  resolves: resolvesNatively,
+  resolves: (environment: NodeJS.ProcessEnv) => resolvesNatively(environment),
   probeStore: () => probeStoreLibraryDirectory(),
   isDirectory: existsSync,
 });

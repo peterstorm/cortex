@@ -25,6 +25,7 @@ import { embedLocal } from '../infra/local-embed.ts';
 import { rankBySimilarity, STOP_WORDS, extractUnigrams } from '../core/similarity.js';
 import { buildQueryEmbeddingText } from './recall.js';
 import { sanitizeSurfaceText } from '../core/surface.js';
+import type { MemoryAdmission } from './generate.js';
 import {
   RECALL_MAX_BLOCK_BYTES,
   SUMMARY_MAX_CHARS,
@@ -201,6 +202,8 @@ export type PromptRecallOptions = {
   readonly limit?: number;
   /** Project name for the [query] [project:name] embedding prefix (FR-039) */
   readonly projectName?: string;
+  /** Which memories recall may return; the hook admits all of them. */
+  readonly admit?: MemoryAdmission;
 };
 
 /**
@@ -262,10 +265,12 @@ export function executePromptRecall(
   const seenIds = new Set<string>();
   const merged: Memory[] = [];
 
+  const admit = options.admit ?? (() => true);
   for (const mem of [...strict, ...projectOr, ...globalOr]) {
     if (seenIds.has(mem.id)) continue;
     seenIds.add(mem.id);
 
+    if (!admit(mem)) continue;
     if (isTagOnlyMatch(mem, unigrams)) continue;
     if (isInSurface(mem, options.surfaceContent)) continue;
 
@@ -303,6 +308,7 @@ export async function executePromptRecallWithFallback(
   }
 
   const limit = options.limit ?? PROMPT_RECALL_LIMIT;
+  const admit = options.admit ?? (() => true);
 
   let semantic: readonly Memory[];
   try {
@@ -315,7 +321,7 @@ export async function executePromptRecallWithFallback(
     const candidates = [
       ...(projectDb ? getMemoriesWithEmbedding(projectDb) : []),
       ...(globalDb ? getMemoriesWithEmbedding(globalDb) : []),
-    ].filter(({ memory }) => !isInSurface(memory, options.surfaceContent));
+    ].filter(({ memory }) => admit(memory) && !isInSurface(memory, options.surfaceContent));
 
     semantic = selectSemanticHits(
       rankBySimilarity(candidates, queryEmbedding, SEMANTIC_LIMIT, SEMANTIC_COSINE_FLOOR),
@@ -327,7 +333,8 @@ export async function executePromptRecallWithFallback(
   }
 
   const strict = searchStrictKeyword(projectDb, globalDb, unigrams, limit).filter(
-    (mem) => !isTagOnlyMatch(mem, unigrams) && !isInSurface(mem, options.surfaceContent),
+    (mem) =>
+      admit(mem) && !isTagOnlyMatch(mem, unigrams) && !isInSurface(mem, options.surfaceContent),
   );
 
   return mergePromptRecall(semantic, strict, limit);

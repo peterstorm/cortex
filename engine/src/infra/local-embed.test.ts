@@ -4,7 +4,7 @@
  * Handles cases where model may/may not be available in test environment.
  */
 
-import { describe, it, expect, beforeEach, afterAll } from 'vitest';
+import { describe, it, expect, beforeEach, afterAll, vi } from 'vitest';
 import { LOCAL_EMBEDDING_DIMENSIONS } from '../config.js';
 import {
   embedLocal,
@@ -200,22 +200,24 @@ describe('local-embed', () => {
 
   describe('caching behavior', () => {
     it('reuses loaded model for multiple embeddings', async () => {
-      const available = await ensureModelLoaded();
-      if (!available) {
-        return;
+      // Count model loads directly. A wall-clock comparison of two embeddings
+      // proved nothing (the model was already loaded before either timing) and
+      // flaked on millisecond granularity.
+      const { PreTrainedModel } = await import('@huggingface/transformers');
+      const loads = vi.spyOn(PreTrainedModel, 'from_pretrained');
+      try {
+        const available = await ensureModelLoaded();
+        if (!available) {
+          return;
+        }
+
+        await embedLocal('first text');
+        await embedLocal('second text');
+
+        expect(loads).toHaveBeenCalledTimes(1);
+      } finally {
+        loads.mockRestore();
       }
-
-      const start = Date.now();
-      await embedLocal('first text');
-      const firstDuration = Date.now() - start;
-
-      const start2 = Date.now();
-      await embedLocal('second text');
-      const secondDuration = Date.now() - start2;
-
-      // Second call should be faster (no model loading)
-      // This is a rough heuristic - model loading is typically much slower
-      expect(secondDuration).toBeLessThan(firstDuration * 0.8);
     });
   });
 });

@@ -52,6 +52,7 @@ beforeEach(() => {
 describe('extract command - core logic', () => {
   let db: Database;
   let input: HookInput;
+  const projectDirs: string[] = [];
 
   beforeEach(() => {
     // Setup in-memory database
@@ -60,12 +61,22 @@ describe('extract command - core logic', () => {
     mockIsClaudeLlmAvailable.mockReset().mockReturnValue(true);
     mockResolveEndpoint.mockReset().mockReturnValue(null);
 
-    // Setup test input
+    // A real, writable project directory: executeExtract takes its per-project
+    // lock under `<cwd>/.memory/locks` before the LLM gate, so a cwd that
+    // cannot be created (e.g. /home/user/project) defers on `lock io-error`
+    // and never reaches the branch under test. The transcript is deliberately
+    // absent, so a run that passes the gate fails on reading it.
+    const cwd = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'cortex-extract-gate-'));
+    projectDirs.push(cwd);
     input = {
       session_id: 'test-session-123',
-      transcript_path: '/tmp/transcript.jsonl',
-      cwd: '/home/user/project',
+      transcript_path: nodePath.join(cwd, 'missing-transcript.jsonl'),
+      cwd,
     };
+  });
+
+  afterAll(() => {
+    for (const dir of projectDirs) fs.rmSync(dir, { recursive: true, force: true });
   });
 
   describe('LLM availability gate', () => {

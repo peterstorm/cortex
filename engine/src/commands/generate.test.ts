@@ -286,7 +286,10 @@ describe('generate command', () => {
 
     expect(cacheData).toHaveProperty('surface');
     expect(cacheData).toHaveProperty('branch', 'main');
-    expect(cacheData).toHaveProperty('cwd', tempDir);
+    // The cache records the symlink-free cwd (finding 9), so on macOS, where
+    // the temp dir lives under the /var -> /private/var link, compare against
+    // the real path.
+    expect(cacheData).toHaveProperty('cwd', fs.realpathSync(tempDir));
     expect(cacheData).toHaveProperty('generated_at');
     expect(cacheData.surface).toContain('Test');
   });

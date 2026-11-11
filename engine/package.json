@@ -3,17 +3,21 @@
   "version": "0.2.0",
   "type": "module",
   "scripts": {
-    "test": "bun test",
-    "test:watch": "bun test --watch"
+    "test": "bun test --isolate",
+    "test:watch": "bun test --isolate --watch"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.0.0",
     "ts-pattern": "^5.9.0"
   },
   "devDependencies": {
+    "@types/bun": "1.4.4",
     "@types/node": "^22.10.2",
     "fast-check": "^4.6.0",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"
+  },
+  "overrides": {
+    "onnxruntime-node": "1.24.3"
   }
 }

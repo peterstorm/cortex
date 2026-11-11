@@ -29,11 +29,13 @@
  * - semantic-edges: Typed-edge classification
  * - load-surface: Surface load cache
  * - entity-query: Entity/fact graph queries
+ * - eval: Score agent answers from memory against an eval set
  */
 
 import { Database } from 'bun:sqlite';
 import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
+import { match } from 'ts-pattern';
 import type { HookInput } from './core/types.js';
 import {
   getProjectDbPath,
@@ -77,6 +79,32 @@ import {
   type IngestionStepResult,
   type SessionIngestionRetryPolicy,
 } from './commands/ingest-session.js';
+import {
+  answerCases,
+  evalPaths,
+  loadEvalSet,
+  loadLabels,
+  openRun,
+  parseEvalArgs,
+  scoreRuns,
+  scoringPlan,
+  type EvalCommand,
+  type EvalPaths,
+} from './commands/eval.js';
+import {
+  ANSWER_COMPLETION,
+  JUDGE_COMPLETION,
+  countRefused,
+  endpointLlm,
+  excludeSessions,
+  noMemoryContext,
+  openSnapshotContext,
+  resolveEvalEndpoint,
+  snapshotMemory,
+} from './commands/eval-adapters.js';
+import { describeEvalSet, type EvalCase, type EvalSettings } from './core/eval-set.js';
+import { judgeAgreement, renderAgreement, renderReport } from './core/eval-rubric.js';
+import { getCurrentBranch } from './infra/git-context.js';
 import { disposeLocalModel, embedLocal } from './infra/local-embed.js';
 import { ensureNativeLibraryPath } from './infra/native-library-path.js';
 
@@ -321,14 +349,17 @@ function initDatabases(cwd: string): [Database, Database] {
  */
 export function extractionToCommandResult(result: ExtractionResult): CommandResult {
   const output = JSON.stringify(result);
-  switch (result.kind) {
-    case 'succeeded':
-      return { kind: 'succeeded', output };
-    case 'deferred':
-      return { kind: 'deferred', output };
-    case 'failed':
-      return { kind: 'failed', retryable: result.retryable, output, error: result.error };
-  }
+  return match(result)
+    .returnType<CommandResult>()
+    .with({ kind: 'succeeded' }, () => ({ kind: 'succeeded', output }))
+    .with({ kind: 'deferred' }, () => ({ kind: 'deferred', output }))
+    .with({ kind: 'failed' }, (failed) => ({
+      kind: 'failed',
+      retryable: failed.retryable,
+      output,
+      error: failed.error,
+    }))
+    .exhaustive();
 }
 
 /** Execute extraction for already-parsed session metadata. */
@@ -1414,19 +1445,20 @@ export type IngestSessionCommandOperations = Readonly<{
  */
 export function commandToIngestionStep(result: CommandResult): IngestionStepResult {
   const withOutput = result.output === undefined ? {} : { output: result.output };
-  switch (result.kind) {
-    case 'succeeded':
-      return { kind: 'succeeded', ...withOutput };
-    case 'deferred':
-      return { kind: 'deferred', reason: result.output ?? 'command deferred' };
-    case 'failed':
-      return {
-        kind: 'failed',
-        retryable: result.retryable === true,
-        error: result.error,
-        ...withOutput,
-      };
-  }
+  return match(result)
+    .returnType<IngestionStepResult>()
+    .with({ kind: 'succeeded' }, () => ({ kind: 'succeeded', ...withOutput }))
+    .with({ kind: 'deferred' }, (deferred) => ({
+      kind: 'deferred',
+      reason: deferred.output ?? 'command deferred',
+    }))
+    .with({ kind: 'failed' }, (failed) => ({
+      kind: 'failed',
+      retryable: failed.retryable === true,
+      error: failed.error,
+      ...withOutput,
+    }))
+    .exhaustive();
 }
 
 /** Injectable shell boundary for the complete detached ingestion pipeline. */
@@ -1451,6 +1483,133 @@ export async function runIngestSessionInput(
     : { kind: 'failed', output, error: 'Session ingestion completed with failed step(s)' };
 }
 
+/**
+ * Handle 'eval' subcommand: score what an agent answers from cortex's memory
+ * against the project's eval set. See commands/eval.ts for the method and
+ * the eval directory layout.
+ */
+async function handleEval(args: string[]): Promise<CommandResult> {
+  const command = parseEvalArgs(args, process.cwd());
+  if (typeof command === 'string') return { kind: 'failed', error: command };
+
+  const paths = evalPaths(command.dir);
+  const log = (line: string) => process.stderr.write(`[cortex:eval] ${line}\n`);
+  try {
+    const { cases, settings } = loadEvalSet(paths);
+    return await match(command)
+      .returnType<Promise<CommandResult>>()
+      .with({ kind: 'validate' }, async () => ({
+        kind: 'succeeded',
+        output: describeEvalSet(cases, settings),
+      }))
+      .with({ kind: 'answer' }, (answer) => handleEvalAnswer(answer, paths, cases, settings, log))
+      .with({ kind: 'score' }, (score) => handleEvalScore(score, paths, cases, log))
+      .exhaustive();
+  } catch (err) {
+    return { kind: 'failed', error: `Eval failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
+async function handleEvalAnswer(
+  command: Extract<EvalCommand, { kind: 'answer' }>,
+  paths: EvalPaths,
+  cases: readonly EvalCase[],
+  settings: EvalSettings,
+  log: (line: string) => void,
+): Promise<CommandResult> {
+  const resolved = resolveEvalEndpoint('answer', process.env);
+  if (resolved.kind === 'err') return { kind: 'failed', error: resolved.message };
+
+  const admit = excludeSessions(settings.authoringSessions);
+  const runPaths = paths.run(command.run);
+  const manifest = openRun(
+    runPaths,
+    {
+      run: command.run,
+      condition: command.condition,
+      project: getProjectName(command.cwd),
+      requestedModel: resolved.endpoint.model,
+      branch: getCurrentBranch(command.cwd),
+      authoringSessions: settings.authoringSessions,
+      now: new Date(),
+    },
+    (snapshotDir) => {
+      const sources = snapshotMemory({ cwd: command.cwd, globalDbPath: getGlobalDbPath(), snapshotDir });
+      return { sources, excludedMemories: countRefused(snapshotDir, admit) };
+    },
+  );
+
+  const memory =
+    manifest.memory.kind === 'snapshot'
+      ? openSnapshotContext({
+          snapshotDir: runPaths.snapshot,
+          projectName: manifest.project,
+          branch: manifest.memory.branch,
+          asOf: new Date(manifest.createdAt),
+          admit,
+        })
+      : { context: noMemoryContext, close: () => {} };
+
+  log(`answering with ${resolved.endpoint.model} at ${resolved.endpoint.baseUrl}`);
+  try {
+    const outcome = await answerCases({
+      cases,
+      manifest,
+      paths: runPaths,
+      llm: endpointLlm(resolved.endpoint, ANSWER_COMPLETION),
+      context: memory.context,
+      log,
+    });
+    const excluded =
+      manifest.memory.kind === 'snapshot'
+        ? `; ${manifest.memory.excludedMemories} authoring-session memories excluded`
+        : '';
+    const output =
+      `run ${command.run} (${manifest.condition}): ${outcome.answered} answered now, ` +
+      `${outcome.alreadyAnswered} already answered${excluded}`;
+    return outcome.failed.length === 0
+      ? { kind: 'succeeded', output }
+      : {
+          kind: 'failed',
+          output,
+          error: `${outcome.failed.length} case(s) failed; run the same command again to retry them`,
+        };
+  } finally {
+    memory.close();
+  }
+}
+
+async function handleEvalScore(
+  command: Extract<EvalCommand, { kind: 'score' }>,
+  paths: EvalPaths,
+  cases: readonly EvalCase[],
+  log: (line: string) => void,
+): Promise<CommandResult> {
+  const resolved = resolveEvalEndpoint('judge', process.env);
+  if (resolved.kind === 'err') return { kind: 'failed', error: resolved.message };
+  const { endpoint } = resolved;
+
+  if (command.dryRun) {
+    return { kind: 'succeeded', output: scoringPlan(cases, paths, command.runs, endpoint.model) };
+  }
+
+  log(`judging with ${endpoint.model} at ${endpoint.baseUrl}: questions, expected truth and answers are sent there`);
+  const results = await scoreRuns({
+    cases,
+    paths,
+    runs: command.runs,
+    judge: endpointLlm(endpoint, JUDGE_COMPLETION),
+    judgeRequested: endpoint.model,
+    log,
+  });
+
+  const labels = loadLabels(paths);
+  const agreements = results
+    .filter((r) => labels.some((l) => l.run === r.run))
+    .map((r) => renderAgreement(r.run, judgeAgreement(r, labels)));
+  return { kind: 'succeeded', output: [renderReport(cases, results), ...agreements].join('\n') };
+}
+
 async function handleIngestSession(): Promise<CommandResult> {
   const input = await readStdinJson();
   return input
@@ -1466,91 +1625,81 @@ async function handleIngestSession(): Promise<CommandResult> {
 // ============================================================================
 
 /**
- * Main CLI entry point
- * Parses subcommand and dispatches to appropriate handler
+ * Every subcommand and its handler. The usage line is derived from the keys,
+ * so the list a user sees cannot drift from the commands that exist.
  */
-async function main() {
+const SUBCOMMANDS = {
+  extract: () => handleExtract(),
+  'ingest-session': () => handleIngestSession(),
+  generate: handleGenerate,
+  recall: handleRecall,
+  remember: handleRemember,
+  'index-code': handleIndexCode,
+  forget: handleForget,
+  consolidate: handleConsolidate,
+  lifecycle: handleLifecycle,
+  'ai-prune': handleAiPrune,
+  maintenance: handleMaintenance,
+  traverse: handleTraverse,
+  inspect: handleInspect,
+  backfill: handleBackfill,
+  'semantic-edges': handleSemanticEdges,
+  'load-surface': handleLoadSurface,
+  'prompt-recall': () => handlePromptRecall(),
+  'entity-query': handleEntityQuery,
+  eval: handleEval,
+} as const satisfies Readonly<Record<string, (args: string[]) => Promise<CommandResult>>>;
+
+type Subcommand = keyof typeof SUBCOMMANDS;
+
+const isSubcommand = (name: string): name is Subcommand => Object.hasOwn(SUBCOMMANDS, name);
+
+/** Process exit status for the CLI. */
+export type ExitCode = 0 | 1;
+
+/**
+ * The exit status a command's result maps to.
+ *
+ * A deferral is not a failure: the command did no work yet and the caller is
+ * expected to run it again, so it exits 0 like a success.
+ */
+export function exitCodeFor(result: CommandResult): ExitCode {
+  return result.kind === 'failed' ? 1 : 0;
+}
+
+/**
+ * Main CLI entry point
+ * Parses subcommand and dispatches to appropriate handler.
+ *
+ * Returns the exit status instead of calling `process.exit`, so the entry
+ * point can set `process.exitCode` and let the event loop drain: buffered
+ * stdout reaches a pipe in full, and native teardown runs on a normal exit.
+ * onnxruntime-node before 1.24 made Bun panic under `process.exit()` ("A C++
+ * exception occurred", status 134) even after `disposeLocalModel()`; the
+ * engine pins 1.24.3 through package.json `overrides`, and the regression
+ * test in cli-exit.test.ts covers both.
+ */
+async function main(): Promise<ExitCode> {
   // Before any subcommand runs, because the loader reads LD_LIBRARY_PATH once
   // at process start: where onnxruntime's libstdc++ is off the default path,
   // this re-runs the process with it and never returns. A no-op everywhere
   // else, including the hook scripts that already set the path themselves.
   ensureNativeLibraryPath();
 
-  const args = process.argv.slice(2);
+  const [subcommand, ...subcommandArgs] = process.argv.slice(2);
 
-  if (args.length === 0) {
+  if (subcommand === undefined) {
     logError('Usage: cli.ts <subcommand> [args...]');
-    logError('Subcommands: extract, ingest-session, generate, recall, remember, index-code, forget, consolidate, lifecycle, ai-prune, maintenance, traverse, inspect, backfill, semantic-edges, load-surface, prompt-recall, entity-query');
-    process.exit(1);
+    logError(`Subcommands: ${Object.keys(SUBCOMMANDS).join(', ')}`);
+    return 1;
   }
-
-  const subcommand = args[0];
-  const subcommandArgs = args.slice(1);
 
   let result: CommandResult;
 
   try {
-    switch (subcommand) {
-      case 'extract':
-        result = await handleExtract();
-        break;
-      case 'ingest-session':
-        result = await handleIngestSession();
-        break;
-      case 'generate':
-        result = await handleGenerate(subcommandArgs);
-        break;
-      case 'recall':
-        result = await handleRecall(subcommandArgs);
-        break;
-      case 'remember':
-        result = await handleRemember(subcommandArgs);
-        break;
-      case 'index-code':
-        result = await handleIndexCode(subcommandArgs);
-        break;
-      case 'forget':
-        result = await handleForget(subcommandArgs);
-        break;
-      case 'consolidate':
-        result = await handleConsolidate(subcommandArgs);
-        break;
-      case 'lifecycle':
-        result = await handleLifecycle(subcommandArgs);
-        break;
-      case 'ai-prune':
-        result = await handleAiPrune(subcommandArgs);
-        break;
-      case 'maintenance':
-        result = await handleMaintenance(subcommandArgs);
-        break;
-      case 'traverse':
-        result = await handleTraverse(subcommandArgs);
-        break;
-      case 'inspect':
-        result = await handleInspect(subcommandArgs);
-        break;
-      case 'backfill':
-        result = await handleBackfill(subcommandArgs);
-        break;
-      case 'semantic-edges':
-        result = await handleSemanticEdges(subcommandArgs);
-        break;
-      case 'load-surface':
-        result = await handleLoadSurface(subcommandArgs);
-        break;
-      case 'prompt-recall':
-        result = await handlePromptRecall();
-        break;
-      case 'entity-query':
-        result = await handleEntityQuery(subcommandArgs);
-        break;
-      default:
-        result = {
-          kind: 'failed',
-          error: `Unknown subcommand: ${subcommand}`,
-        };
-    }
+    result = isSubcommand(subcommand)
+      ? await SUBCOMMANDS[subcommand](subcommandArgs)
+      : { kind: 'failed', error: `Unknown subcommand: ${subcommand}` };
   } catch (err) {
     result = {
       kind: 'failed',
@@ -1566,14 +1715,11 @@ async function main() {
   // Dispose ONNX model resources before exit
   await disposeLocalModel();
 
-  // A deferral is not a failure: the command did no work yet and the caller is
-  // expected to run it again, so it exits 0 like a success.
   if (result.kind === 'failed') {
     logError(result.error);
-    process.exit(1);
   }
 
-  process.exit(0);
+  return exitCodeFor(result);
 }
 
 // ============================================================================
@@ -1587,10 +1733,17 @@ function logError(message: string): void {
   console.error(`[cortex] ${message}`);
 }
 
-// Run main only when executed directly (not imported by tests)
+// Run main only when executed directly (not imported by tests).
+// Never `process.exit()` here: see main() for why the exit status is set and
+// the event loop left to drain instead.
 if (import.meta.main) {
-  main().catch((err) => {
-    logError(`Fatal error: ${err}`);
-    process.exit(1);
-  });
+  main().then(
+    (code) => {
+      process.exitCode = code;
+    },
+    (err) => {
+      logError(`Fatal error: ${err}`);
+      process.exitCode = 1;
+    },
+  );
 }
