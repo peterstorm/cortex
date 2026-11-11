@@ -6,7 +6,7 @@
 
 import { Database } from 'bun:sqlite';
 import * as fs from 'node:fs';
-import { getActiveMemories, getAllEdges } from '../infra/db.js';
+import { countActiveMemoryRows, getActiveMemories, getAllEdges } from '../infra/db.js';
 import type { Memory, MemoryType, MemoryScope } from '../core/types.js';
 
 // ============================================================================
@@ -21,6 +21,12 @@ export interface TelemetryData {
   };
   readonly memory_counts: {
     readonly total: number;
+    /**
+     * Rows stored as active that do not hold a valid Memory. Every read skips
+     * them (see rowToMemory), so they are in none of the counts beside this
+     * one — recall, lifecycle and the surface never see them either.
+     */
+    readonly unreadable: number;
     readonly by_type: Record<MemoryType, number>;
     readonly by_scope: Record<MemoryScope, number>;
   };
@@ -227,6 +233,12 @@ export function collectTelemetry(
   const globalMemories = getActiveMemories(globalDb);
   const allMemories = [...projectMemories, ...globalMemories];
 
+  // Stored-as-active rows the mapper dropped. Clamped because the count and
+  // the read are two statements: a concurrent writer can archive a row in
+  // between, and a negative count of rows means nothing.
+  const storedActive = countActiveMemoryRows(projectDb) + countActiveMemoryRows(globalDb);
+  const unreadable = Math.max(0, storedActive - allMemories.length);
+
   // Query both DBs for edges (I/O)
   const projectEdges = getAllEdges(projectDb);
   const globalEdges = getAllEdges(globalDb);
@@ -248,6 +260,7 @@ export function collectTelemetry(
     last_extraction: parsedTelemetry.last_extraction,
     memory_counts: {
       total: allMemories.length,
+      unreadable,
       by_type: byType,
       by_scope: byScope,
     },

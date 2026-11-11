@@ -382,25 +382,27 @@ function deserializeFloat32Array(buffer: Buffer): Float32Array {
 }
 
 /**
- * Raw memories-table row shape. Enum-valued columns are typed with the domain
- * unions; SQLite enforces NOT NULL/UNIQUE/FK only, so enum and range
- * invariants are enforced at the application boundary — createMemory on
- * insert, validateMemoryFields on update (see updateMemory).
+ * Raw memories-table row shape. SQLite enforces NOT NULL/UNIQUE/FK only, so
+ * the enum-valued columns (`memory_type`, `scope`, `source_type`, `status`)
+ * are `string` here, like EdgeRow.relation_type: they are unvalidated cells,
+ * and typing them as the domain unions asserted a guarantee SQLite does not
+ * provide. Cortex's own writes go through createMemory (insert) and
+ * validateMemoryFields (update), but other tools write to these files too —
+ * rowToMemory is where a row is parsed into a Memory or dropped.
  */
 type MemoryRow = {
   id: string;
   content: string;
   summary: string;
-  memory_type: MemoryType;
-  scope: MemoryScope;
+  memory_type: string;
+  scope: string;
   embedding: Buffer | null;
   local_embedding: Buffer | null;
   confidence: number;
   priority: number;
   pinned: number;
-  // Deliberately `string`, like EdgeRow.relation_type: this is the unvalidated
-  // cell, narrowed by parseSourceType in rowToMemory. Typing it as the union
-  // asserted a guarantee SQLite does not provide.
+  // Narrowed by parseSourceType rather than a guard: an unknown origin is
+  // provenance metadata, mapped to 'manual' instead of costing the row.
   source_type: string;
   source_session: string;
   source_context: string;
@@ -409,7 +411,7 @@ type MemoryRow = {
   last_accessed_at: string;
   created_at: string;
   updated_at: string;
-  status: MemoryStatus;
+  status: string;
   archived_at: string | null;
 };
 
@@ -488,34 +490,60 @@ function parseSourceType(raw: string, memoryId: string): SourceType {
 }
 
 /**
- * Convert a raw database row to a Memory domain object.
- * Pure helper — centralizes the row-to-Memory mapping used by all query functions.
+ * Map one memories-table row to a Memory, or null (with a stderr diagnostic)
+ * when the row does not hold a valid Memory. Every memory read path routes
+ * through this single mapper.
+ *
+ * A row can be unreadable without being Cortex's doing: the file is plain
+ * SQLite, and another tool writing to it is not bound by createMemory. One
+ * such row — an archived memory with priority 0 — made createMemory throw out
+ * of getArchivedMemories and with it out of every lifecycle run for that
+ * project, so nothing there was archived, pruned or vacuumed for months. The
+ * row is the unit of failure, exactly as it is for edges, entities and facts:
+ * it is skipped and named, and the row itself is left as it was found.
  */
-function rowToMemory(row: MemoryRow): Memory {
-  const tags = parseJsonStringArray(row.tags, `Memory ${row.id}`, 'tags');
-
-  return createMemory({
-    id: row.id,
-    content: row.content,
-    summary: row.summary,
-    memory_type: row.memory_type,
-    scope: row.scope,
-    embedding: row.embedding ? deserializeFloat64Array(row.embedding) : null,
-    local_embedding: row.local_embedding ? deserializeFloat32Array(row.local_embedding) : null,
-    confidence: row.confidence,
-    priority: row.priority,
-    pinned: row.pinned === 1,
-    source_type: parseSourceType(row.source_type, row.id),
-    source_session: row.source_session,
-    source_context: row.source_context,
-    tags,
-    access_count: row.access_count,
-    last_accessed_at: row.last_accessed_at,
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-    status: row.status,
-    archived_at: row.archived_at ?? null,
-  });
+function rowToMemory(row: MemoryRow): Memory | null {
+  // Narrowed into consts for the same reason rowToEdge does it: a property
+  // narrowing does not survive into the readRow closure.
+  const memoryType = row.memory_type;
+  const scope = row.scope;
+  const status = row.status;
+  if (!isMemoryType(memoryType)) {
+    console.warn(`[cortex:db] Skipping memory ${row.id}: invalid memory_type '${memoryType}'`);
+    return null;
+  }
+  if (!isMemoryScope(scope)) {
+    console.warn(`[cortex:db] Skipping memory ${row.id}: invalid scope '${scope}'`);
+    return null;
+  }
+  if (!isMemoryStatus(status)) {
+    console.warn(`[cortex:db] Skipping memory ${row.id}: invalid status '${status}'`);
+    return null;
+  }
+  return readRow(`memory ${row.id}`, () =>
+    createMemory({
+      id: row.id,
+      content: row.content,
+      summary: row.summary,
+      memory_type: memoryType,
+      scope,
+      embedding: row.embedding ? deserializeFloat64Array(row.embedding) : null,
+      local_embedding: row.local_embedding ? deserializeFloat32Array(row.local_embedding) : null,
+      confidence: row.confidence,
+      priority: row.priority,
+      pinned: row.pinned === 1,
+      source_type: parseSourceType(row.source_type, row.id),
+      source_session: row.source_session,
+      source_context: row.source_context,
+      tags: parseJsonStringArray(row.tags, `Memory ${row.id}`, 'tags'),
+      access_count: row.access_count,
+      last_accessed_at: row.last_accessed_at,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      status,
+      archived_at: row.archived_at ?? null,
+    })
+  );
 }
 
 /**
@@ -721,7 +749,7 @@ export function updateMemory(db: Database, id: string, fields: Partial<Memory>):
  *
  * @param db - Database instance
  * @param id - Memory ID
- * @returns Memory or null if not found
+ * @returns Memory, or null if not found or the row is unreadable
  */
 export function getMemory(db: Database, id: string): Memory | null {
   const stmt = db.prepare(`
@@ -775,7 +803,7 @@ export function getMemoriesByIds(
   const params = statuses === 'any' ? [...ids] : [...ids, ...statuses];
   const rows = stmt.all(...params) as MemoryRow[];
 
-  return rows.map(rowToMemory);
+  return readRows(rows, rowToMemory);
 }
 
 /**
@@ -792,7 +820,7 @@ export function getActiveMemories(db: Database): readonly Memory[] {
 
   const rows = stmt.all() as MemoryRow[];
 
-  return rows.map(rowToMemory);
+  return readRows(rows, rowToMemory);
 }
 
 /**
@@ -823,7 +851,7 @@ function getActiveMemoriesByFilePath(
   `);
   const rows = stmt.all(memoryType, filePath) as MemoryRow[];
 
-  return rows.map(rowToMemory);
+  return readRows(rows, rowToMemory);
 }
 
 /**
@@ -863,7 +891,7 @@ export function getArchivedMemories(db: Database): readonly Memory[] {
 
   const rows = stmt.all() as MemoryRow[];
 
-  return rows.map(rowToMemory);
+  return readRows(rows, rowToMemory);
 }
 
 /**
@@ -917,7 +945,7 @@ export function getActiveMemoriesNeedingEmbedding(
     )
     .all(...pred.params) as MemoryRow[];
 
-  return rows.map(rowToMemory);
+  return readRows(rows, rowToMemory);
 }
 
 /**
@@ -953,6 +981,7 @@ function collectMemoriesWithEmbeddings(
 
   for (const row of rows) {
     const memory = rowToMemory(row);
+    if (memory === null) continue;
 
     const memoryEmbedding = memory.local_embedding;
     if (!memoryEmbedding) {
@@ -1046,7 +1075,7 @@ function searchByKeywordWithJoiner(
 
   const rows = stmt.all(safeQuery, limit) as MemoryRow[];
 
-  return rows.map(rowToMemory);
+  return readRows(rows, rowToMemory);
 }
 
 /**
@@ -1083,6 +1112,17 @@ export function getMemoriesWithEmbeddingByIds(
   const rows = stmt.all(...ids, ...pred.params) as MemoryRow[];
 
   return collectMemoriesWithEmbeddings(rows);
+}
+
+/**
+ * Count rows stored as active, whether or not they can be read as a Memory.
+ * `inspect` compares this with what getActiveMemories returns to report how
+ * many rows the row mapper is skipping.
+ * I/O: Reads from database
+ */
+export function countActiveMemoryRows(db: Database): number {
+  const row = db.prepare(`SELECT COUNT(*) AS n FROM memories WHERE status = 'active'`).get() as { n: number };
+  return row.n;
 }
 
 /**
@@ -1601,7 +1641,7 @@ export function vacuumPrunedMemories(db: Database, retentionDays: number): numbe
 
 /**
  * Raw extraction_checkpoints row shape. Declared for the same reason as
- * MemoryRow and EdgeRow: an `as any` here lets a column rename drift past the
+ * MemoryRow and EdgeRow: an untyped row here lets a column rename drift past the
  * compiler and reach createExtractionCheckpoint as undefined, which is exactly
  * the silent-column-drift class the typed rows exist to prevent.
  */

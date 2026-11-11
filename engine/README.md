@@ -373,7 +373,7 @@ BFS graph traversal from a memory ID. Args: `traverse <cwd> <memoryId> [maxDepth
 
 ### inspect
 
-Telemetry display (JSON output). Queries both DBs for stats: active memory counts by type/scope, edge count, embedding queue size, cache staleness. Reads `.memory/telemetry.json` for the last extraction record.
+Telemetry display (JSON output). Queries both DBs for stats: active memory counts by type/scope, edge count, embedding queue size, cache staleness. `memory_counts.unreadable` counts rows stored as active that do not hold a valid memory (for example a priority outside 1–10 written by another tool): every read skips such a row with a `[cortex:db] Skipping memory <id>: <reason>` line on stderr and leaves it in the file, so one bad row costs only itself. Reads `.memory/telemetry.json` for the last extraction record.
 
 ### backfill
 
