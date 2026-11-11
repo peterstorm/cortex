@@ -13,8 +13,11 @@
  */
 
 import type { Database } from 'bun:sqlite';
-import { existsSync, renameSync, rmSync } from 'node:fs';
-import { openDatabaseReadOnly } from './db.js';
+import { existsSync, mkdirSync, renameSync, rmSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { match } from 'ts-pattern';
+import { openDatabase, openDatabaseReadOnly } from './db.js';
+import { acquireLockWithin, releaseLock } from './lock.js';
 
 // ============================================================================
 // TYPES
@@ -45,6 +48,109 @@ export type SourceCounts = Readonly<{
   /** Rows not copied because the target already held the same key. */
   duplicates: TableCounts;
 }>;
+
+/** One source merged into the target. `S` is however the caller names a source. */
+export type FileMerge<S = string> = SourceCounts &
+  Readonly<{
+    source: S;
+    /** Where the source was moved after its rows were committed. */
+    keptAs: string;
+  }>;
+
+export type FileMigration<S = string> =
+  /** None of the sources exists: nothing to do. */
+  | Readonly<{ kind: 'current' }>
+  | Readonly<{ kind: 'merged'; merged: readonly FileMerge<S>[] }>
+  /** Another process held the merge lock past the wait. */
+  | Readonly<{ kind: 'busy' }>
+  /** A source could not be merged; the merge stopped there, after `merged`. */
+  | Readonly<{ kind: 'failed'; error: string; merged: readonly FileMerge<S>[] }>;
+
+export type MigrateFilesOptions<S> = Readonly<{
+  target: string;
+  /** Candidate sources, in precedence order: on a key clash the earlier row is kept. */
+  sources: readonly S[];
+  pathOf: (source: S) => string;
+  lockFile: string;
+  now: Date;
+  waitMs: number;
+}>;
+
+// ============================================================================
+// MIGRATION
+// ============================================================================
+
+/**
+ * Merge every source that exists into `target`, creating it if needed, then
+ * move each aside. A source at its path is unmerged; once moved aside it is
+ * never read again — that is the whole idempotency rule.
+ *
+ * Runs under `lockFile`, waiting up to `waitMs` for another process's merge.
+ * Each source is one transaction, moved aside only after it commits, so a
+ * crash leaves it in place and the retry skips what was already copied.
+ * Sources merge in order and the merge stops at the first failure, so a
+ * later source never takes clashes that belong to an earlier one.
+ */
+export function migrateFiles<S>(options: MigrateFilesOptions<S>): FileMigration<S> {
+  const { target, lockFile, pathOf } = options;
+  const pending = () => options.sources.filter((source) => existsSync(pathOf(source)));
+  if (pending().length === 0) return { kind: 'current' };
+
+  try {
+    mkdirSync(dirname(target), { recursive: true });
+  } catch (error) {
+    return { kind: 'failed', error: `cannot create ${dirname(target)}: ${message(error)}`, merged: [] };
+  }
+
+  const lock = acquireLockWithin(lockFile, options.waitMs);
+  if (!lock.acquired) {
+    return lock.reason === 'held'
+      ? { kind: 'busy' }
+      : { kind: 'failed', error: `cannot take the merge lock ${lockFile}`, merged: [] };
+  }
+
+  try {
+    // Re-read under the lock: the process we waited for may have merged them.
+    const sources = pending();
+    return sources.length === 0 ? { kind: 'current' } : mergeEach(target, sources, pathOf, options.now);
+  } finally {
+    releaseLock(lockFile);
+  }
+}
+
+function mergeEach<S>(
+  target: string,
+  sources: readonly S[],
+  pathOf: (source: S) => string,
+  now: Date,
+): FileMigration<S> {
+  const merged: FileMerge<S>[] = [];
+  let db;
+  try {
+    db = openDatabase(target);
+  } catch (error) {
+    return { kind: 'failed', error: `cannot open ${target}: ${message(error)}`, merged };
+  }
+
+  try {
+    for (const [index, source] of sources.entries()) {
+      try {
+        const path = pathOf(source);
+        const counts = mergeDatabaseInto(db, path, `${target}.source-${process.pid}-${index}`);
+        merged.push({ source, ...counts, keptAs: keepAside(path, mergedSuffix(now)) });
+      } catch (error) {
+        return { kind: 'failed', error: `${pathOf(source)}: ${message(error)}`, merged };
+      }
+    }
+    return { kind: 'merged', merged };
+  } finally {
+    db.close();
+  }
+}
+
+function message(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
 // ============================================================================
 // MERGE
@@ -160,6 +266,38 @@ export function describeCounts({ copied, duplicates }: SourceCounts): string {
       .map((t) => `${t} +${copied[t]}${duplicates[t] ? ` (${duplicates[t]} already present)` : ''}`)
       .join(', ') || 'empty'
   );
+}
+
+/** The outcomes worth a log line: something was merged, or could not be. */
+export type ReportableMigration<S> = Exclude<FileMigration<S>, { kind: 'current' }>;
+
+/**
+ * One log entry for a migration: a headline, then one line per source.
+ *
+ * @param noun - what was merged, e.g. `global memory`
+ * @param target - where it was merged into, as the reader should see it
+ * @param label - how to name one source
+ */
+export function describeFileMigration<S>(
+  migration: ReportableMigration<S>,
+  noun: string,
+  target: string,
+  label: (source: S) => string,
+): string {
+  const lines = (merged: readonly FileMerge<S>[]) =>
+    merged.map((m) => `  ${label(m.source)}: ${describeCounts(m)}; original kept at ${m.keptAs}`);
+  return match(migration)
+    .with({ kind: 'busy' }, () => `another process is still merging the ${noun} databases into ${target}`)
+    .with({ kind: 'failed' }, ({ error, merged }) =>
+      [
+        `merging the ${noun} databases into ${target} failed: ${error}`,
+        ...(merged.length > 0 ? ['merged before the failure:', ...lines(merged)] : []),
+      ].join('\n'),
+    )
+    .with({ kind: 'merged' }, ({ merged }) =>
+      [`merged ${merged.length} ${noun} database(s) into ${target}:`, ...lines(merged)].join('\n'),
+    )
+    .exhaustive();
 }
 
 /** The suffix a merged source is kept under: `merged-2026-11-10T12-00-00-000Z`. */

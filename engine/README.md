@@ -394,7 +394,7 @@ SessionStart fast path. Checks cache and serves if fresh (<24h); on cache miss o
 
 | File | Location | Gitignored |
 |---|---|---|
-| Project DB | `<project>/.memory/cortex.db` | Yes |
+| Project DB | `<repository root>/.memory/cortex.db` (main worktree; the directory itself outside git; `.memory/standalone` opts a directory out) | Yes |
 | Global DB | `${XDG_DATA_HOME:-~/.local/share}/cortex/global.db` (shared by every harness; `CORTEX_GLOBAL_DB` overrides) | N/A |
 | Surface | `<project>/.claude/cortex-memory.local.md` | Yes |
 | Cache | `<project>/.memory/surface-cache/{hash}.json` | Yes |

@@ -28,12 +28,12 @@ Run this to get every active memory (project + global):
 bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts inspect <cwd>
 ```
 
-Then query the databases directly for full detail:
+Then query the databases directly for full detail. The project root is the `memory at` path `inspect` prints on its first line: the repository's main worktree, not necessarily `<cwd>`.
 
 ```bash
 bun -e "
 import Database from 'bun:sqlite';
-const db = new Database('<cwd>/.memory/cortex.db', { readonly: true });
+const db = new Database('<project root>/.memory/cortex.db', { readonly: true });
 const rows = db.query(\"SELECT id, memory_type, summary, confidence, access_count, pinned, created_at FROM memories WHERE status = 'active' ORDER BY memory_type, created_at\").all();
 for (const r of rows) {
   console.log(r.memory_type + ' | ' + r.id.slice(0,8) + ' | conf=' + r.confidence + ' acc=' + r.access_count + (r.pinned ? ' PIN' : '') + ' | ' + r.summary.slice(0,140));
@@ -80,7 +80,7 @@ After user confirms, archive efficiently via direct DB update:
 ```bash
 bun -e "
 import Database from 'bun:sqlite';
-const db = new Database('<cwd>/.memory/cortex.db');
+const db = new Database('<project root>/.memory/cortex.db');
 const ids = [/* list of full UUIDs */];
 const placeholders = ids.map(() => '?').join(',');
 db.prepare('UPDATE memories SET status = ?, updated_at = ? WHERE id IN (' + placeholders + ')').run('archived', new Date().toISOString(), ...ids);

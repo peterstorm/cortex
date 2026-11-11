@@ -4,7 +4,7 @@
  * No side effects - callers handle file I/O
  */
 
-import { join, basename, isAbsolute } from 'node:path';
+import { join, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import type { SimilaritySpace } from './core/types.js';
 
@@ -145,17 +145,6 @@ export function getLockDir(projectRoot: string): string {
  */
 export function getTelemetryPath(projectRoot: string): string {
   return join(projectRoot, '.memory', 'telemetry.json');
-}
-
-/**
- * Resolve project name from project root path
- * Pure function - extracts last path segment as project name
- *
- * @param projectRoot - Absolute path to project root
- * @returns Project name (last directory name)
- */
-export function getProjectName(projectRoot: string): string {
-  return basename(projectRoot) || 'unknown';
 }
 
 // ============================================================================

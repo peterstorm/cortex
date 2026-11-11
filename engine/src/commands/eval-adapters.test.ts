@@ -92,7 +92,7 @@ afterEach(() => {
 
 describe('snapshotMemory', () => {
   test('freezes the memory a run reads: later writes do not reach it', async () => {
-    snapshotMemory({ cwd: project, globalDbPath, snapshotDir });
+    snapshotMemory({ projectRoot: project, globalDbPath, snapshotDir });
     addMemory(projectDb(), 'later', 'Written after the snapshot about reclaw', 'work-session').close();
 
     const memory = openSnapshotContext({
@@ -110,12 +110,12 @@ describe('snapshotMemory', () => {
   });
 
   test('returns the databases it copied; a missing global database is recorded as null', () => {
-    expect(snapshotMemory({ cwd: project, globalDbPath, snapshotDir })).toEqual({ project: projectDb(), global: null });
+    expect(snapshotMemory({ projectRoot: project, globalDbPath, snapshotDir })).toEqual({ project: projectDb(), global: null });
   });
 
   test('records the global database when there is one, and its memories reach the context', async () => {
     addMemory(globalDbPath, 'g', 'A global memory about reclaw', 'work-session').close();
-    expect(snapshotMemory({ cwd: project, globalDbPath, snapshotDir })).toEqual({ project: projectDb(), global: globalDbPath });
+    expect(snapshotMemory({ projectRoot: project, globalDbPath, snapshotDir })).toEqual({ project: projectDb(), global: globalDbPath });
 
     const memory = openSnapshotContext({
       snapshotDir,
@@ -132,17 +132,17 @@ describe('snapshotMemory', () => {
   });
 
   test('can be retaken over a leftover snapshot from an aborted start', () => {
-    snapshotMemory({ cwd: project, globalDbPath, snapshotDir });
-    expect(() => snapshotMemory({ cwd: project, globalDbPath, snapshotDir })).not.toThrow();
+    snapshotMemory({ projectRoot: project, globalDbPath, snapshotDir });
+    expect(() => snapshotMemory({ projectRoot: project, globalDbPath, snapshotDir })).not.toThrow();
   });
 
   test('refuses a project without a cortex database', () => {
-    expect(() => snapshotMemory({ cwd: path.join(root, 'elsewhere'), globalDbPath, snapshotDir })).toThrow(/no cortex database/);
+    expect(() => snapshotMemory({ projectRoot: path.join(root, 'elsewhere'), globalDbPath, snapshotDir })).toThrow(/no cortex database/);
   });
 });
 
 describe('authoring-session exclusion', () => {
-  beforeEach(() => snapshotMemory({ cwd: project, globalDbPath, snapshotDir }));
+  beforeEach(() => snapshotMemory({ projectRoot: project, globalDbPath, snapshotDir }));
 
   test('counts the memories it refuses', () => {
     expect(countRefused(snapshotDir, admit)).toBe(1);

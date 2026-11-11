@@ -23,7 +23,10 @@ import { getCurrentBranch } from '../infra/git-context.js';
 export interface GenerateOptions {
   readonly projectDb: Database;
   readonly globalDb: Database;
+  /** Where the session runs: the branch, the surface file and the cache key. */
   readonly cwd: string;
+  /** Where the project's `.memory/` lives: cache, locks and status. Defaults to `cwd`. */
+  readonly root?: string;
   readonly surfacePath?: string;
   readonly cachePath?: string;
   readonly lockDir?: string;
@@ -56,9 +59,10 @@ export function runGenerate(options: GenerateOptions): GenerateResult {
   const startTime = Date.now();
 
   // Default paths
+  const root = options.root ?? options.cwd;
   const surfacePath = options.surfacePath ?? path.join(options.cwd, '.claude', 'cortex-memory.local.md');
-  const cachePath = options.cachePath ?? path.join(options.cwd, '.memory', 'surface-cache');
-  const lockDir = options.lockDir ?? path.join(options.cwd, '.memory', 'locks');
+  const cachePath = options.cachePath ?? path.join(root, '.memory', 'surface-cache');
+  const lockDir = options.lockDir ?? path.join(root, '.memory', 'locks');
 
   // I/O: Get current branch
   const branch = getCurrentBranch(options.cwd);
@@ -78,7 +82,7 @@ export function runGenerate(options: GenerateOptions): GenerateResult {
 
   // I/O: Write telemetry
   const durationMs = Date.now() - startTime;
-  const telemetryPath = path.join(options.cwd, '.memory', 'cortex-status.json');
+  const telemetryPath = path.join(root, '.memory', 'cortex-status.json');
   writeTelemetry(telemetryPath, {
     last_generation: new Date().toISOString(),
     branch,
@@ -340,9 +344,13 @@ function buildEntityProfiles(
 /**
  * Invalidate all cached surfaces (FR-022).
  * Called after extraction inserts new memories, since any branch surface may be stale.
+ * The cache lives with the project's memory, so this clears every worktree's
+ * and every subdirectory's cached surface of the project at once.
+ *
+ * @param projectRoot - where the project's `.memory/` lives
  */
-export function invalidateSurfaceCache(cwd: string, cachePath?: string): void {
-  const cacheDir = cachePath ?? path.join(cwd, '.memory', 'surface-cache');
+export function invalidateSurfaceCache(projectRoot: string, cachePath?: string): void {
+  const cacheDir = cachePath ?? path.join(projectRoot, '.memory', 'surface-cache');
   try {
     const files = fs.readdirSync(cacheDir);
     for (const file of files) {

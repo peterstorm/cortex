@@ -84,6 +84,24 @@ export function acquireLock(lockFile: string): LockAcquisition {
   return { acquired: false, reason: 'held' };
 }
 
+/**
+ * Acquire the lock, polling while another live process holds it, for up to
+ * `waitMs`. For short critical sections a caller must not skip, unlike the
+ * detached workers, which skip a held lock and run next time.
+ */
+export function acquireLockWithin(
+  lockFile: string,
+  waitMs: number,
+  pollMs = 100,
+): LockAcquisition {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const lock = acquireLock(lockFile);
+    if (lock.acquired || lock.reason === 'io-error' || Date.now() >= deadline) return lock;
+    Bun.sleepSync(pollMs);
+  }
+}
+
 /** Release a lock owned by the current process. */
 export function releaseLock(lockFile: string): void {
   try {

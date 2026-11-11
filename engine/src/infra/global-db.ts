@@ -16,8 +16,7 @@
  * Imperative shell — every function here does I/O.
  */
 
-import { existsSync, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync } from 'node:fs';
 import { match } from 'ts-pattern';
 import {
   currentEnv,
@@ -28,38 +27,22 @@ import {
   type Env,
   type LegacyGlobalDb,
 } from '../config.js';
-import { openDatabase } from './db.js';
 import {
-  describeCounts,
-  keepAside,
-  mergeDatabaseInto,
-  mergedSuffix,
-  type SourceCounts,
+  describeFileMigration,
+  migrateFiles,
+  type FileMerge,
+  type FileMigration,
+  type ReportableMigration,
 } from './db-merge.js';
-import { acquireLock, releaseLock } from './lock.js';
 
 // ============================================================================
 // TYPES
 // ============================================================================
 
-export type LegacyMerge = Readonly<{
-  source: LegacyGlobalDb;
-  /** Where the legacy file was moved after its rows were committed. */
-  keptAs: string;
-}> &
-  SourceCounts;
+export type LegacyMerge = FileMerge<LegacyGlobalDb>;
 
-export type GlobalDbMigration =
-  /** No legacy database is left at its old path: nothing to do. */
-  | Readonly<{ kind: 'current' }>
-  | Readonly<{ kind: 'merged'; sources: readonly LegacyMerge[] }>
-  /** Another process held the merge lock past the wait. */
-  | Readonly<{ kind: 'busy' }>
-  /**
-   * A source could not be merged. Sources are merged in precedence order and
-   * the merge stops at the first failure, so `merged` are the ones before it.
-   */
-  | Readonly<{ kind: 'failed'; error: string; merged: readonly LegacyMerge[] }>;
+/** `current` means no legacy database is left at its old path. */
+export type GlobalDbMigration = FileMigration<LegacyGlobalDb>;
 
 export type MigrateOptions = Readonly<{
   target: string;
@@ -71,7 +54,6 @@ export type MigrateOptions = Readonly<{
 
 /** A merge of a few thousand rows takes milliseconds; this only covers a stuck one. */
 const DEFAULT_WAIT_MS = 10_000;
-const POLL_MS = 100;
 
 // ============================================================================
 // MERGE
@@ -79,105 +61,26 @@ const POLL_MS = 100;
 
 /**
  * Merge every legacy database still at its old path into `target`, creating
- * `target` if needed. Each source is copied in its own transaction and moved
- * aside only after it commits, so a crash leaves it in place for the retry,
- * which skips the rows already copied.
+ * `target` if needed, Claude Code's first. See migrateFiles for the rules.
  */
 export function migrateGlobalDb(options: MigrateOptions): GlobalDbMigration {
-  const { target } = options;
-  const pending = () => options.legacy.filter((source) => existsSync(source.path));
-  if (pending().length === 0) return { kind: 'current' };
-
-  try {
-    mkdirSync(dirname(target), { recursive: true });
-  } catch (error) {
-    return { kind: 'failed', error: `cannot create ${dirname(target)}: ${message(error)}`, merged: [] };
-  }
-
-  const lockFile = `${target}.lock`;
-  const lock = acquireWithin(lockFile, options.waitMs ?? DEFAULT_WAIT_MS);
-  if (lock !== 'acquired') {
-    return lock === 'held'
-      ? { kind: 'busy' }
-      : { kind: 'failed', error: `cannot take the merge lock ${lockFile}`, merged: [] };
-  }
-
-  try {
-    // Re-read under the lock: the process we waited for may have merged them.
-    const sources = pending();
-    return sources.length === 0 ? { kind: 'current' } : mergeInto(target, sources, options.now);
-  } finally {
-    releaseLock(lockFile);
-  }
-}
-
-function acquireWithin(lockFile: string, waitMs: number): 'acquired' | 'held' | 'io-error' {
-  const deadline = Date.now() + waitMs;
-  for (;;) {
-    const lock = acquireLock(lockFile);
-    if (lock.acquired) return 'acquired';
-    if (lock.reason === 'io-error') return 'io-error';
-    if (Date.now() >= deadline) return 'held';
-    Bun.sleepSync(POLL_MS);
-  }
-}
-
-function mergeInto(target: string, sources: readonly LegacyGlobalDb[], now: Date): GlobalDbMigration {
-  const merged: LegacyMerge[] = [];
-  let db;
-  try {
-    db = openDatabase(target);
-  } catch (error) {
-    return { kind: 'failed', error: `cannot open ${target}: ${message(error)}`, merged };
-  }
-
-  try {
-    for (const [index, source] of sources.entries()) {
-      try {
-        const counts = mergeDatabaseInto(db, source.path, `${target}.source-${process.pid}-${index}`);
-        merged.push({ source, ...counts, keptAs: keepAside(source.path, mergedSuffix(now)) });
-      } catch (error) {
-        // Stop here: a later source merged now would win clashes that belong
-        // to this one when it is retried.
-        return { kind: 'failed', error: `${source.path}: ${message(error)}`, merged };
-      }
-    }
-    return { kind: 'merged', sources: merged };
-  } finally {
-    db.close();
-  }
-}
-
-function message(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return migrateFiles({
+    target: options.target,
+    sources: options.legacy,
+    pathOf: (source) => source.path,
+    lockFile: `${options.target}.lock`,
+    now: options.now,
+    waitMs: options.waitMs ?? DEFAULT_WAIT_MS,
+  });
 }
 
 // ============================================================================
 // REPORTING
 // ============================================================================
 
-/** The outcomes worth a log line: something was merged, or could not be. */
-export type ReportableMigration = Exclude<GlobalDbMigration, { kind: 'current' }>;
-
-const describeSources = (sources: readonly LegacyMerge[]): readonly string[] =>
-  sources.map(
-    (merge) => `  ${merge.source.harness}: ${describeCounts(merge)}; original kept at ${merge.keptAs}`,
-  );
-
 /** One line per source, for the log. */
-export function describeMigration(migration: ReportableMigration, target: string): string {
-  return match(migration)
-    .with({ kind: 'busy' }, () => `another process is still merging the global memory databases into ${target}`)
-    .with({ kind: 'failed' }, ({ error, merged }) =>
-      [
-        `merging the global memory databases into ${target} failed: ${error}`,
-        ...(merged.length > 0 ? ['merged before the failure:', ...describeSources(merged)] : []),
-      ].join('\n'),
-    )
-    .with({ kind: 'merged' }, ({ sources }) =>
-      [`merged ${sources.length} global memory database(s) into ${target}:`, ...describeSources(sources)].join('\n'),
-    )
-    .exhaustive();
+export function describeMigration(migration: ReportableMigration<LegacyGlobalDb>, target: string): string {
+  return describeFileMigration(migration, 'global memory', target, (source) => source.harness);
 }
 
 // ============================================================================

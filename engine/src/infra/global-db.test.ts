@@ -122,7 +122,7 @@ describe('migrateGlobalDb', () => {
 
     // Only the database and its own WAL files: no snapshot or lock left behind.
     expect(readdirSync(dirname(target)).filter((f) => !/^global\.db(-wal|-shm)?$/.test(f))).toEqual([]);
-    expect(result.sources.map((s) => [s.source.harness, s.copied.memories, s.duplicates.memories])).toEqual([
+    expect(result.merged.map((s) => [s.source.harness, s.copied.memories, s.duplicates.memories])).toEqual([
       ['claude', 2, 0],
       ['pi', 1, 0],
     ]);
@@ -138,7 +138,7 @@ describe('migrateGlobalDb', () => {
       expect(existsSync(original)).toBe(false);
       expect(keptCopies(original)).toHaveLength(1);
     }
-    expect(result.sources[0].keptAs).toBe(`${claude}.merged-2026-11-10T12-00-00-000Z`);
+    expect(result.merged[0].keptAs).toBe(`${claude}.merged-2026-11-10T12-00-00-000Z`);
   });
 
   it('merges into a shared database that already exists: an empty one cannot hide unmerged memories', () => {
@@ -146,7 +146,7 @@ describe('migrateGlobalDb', () => {
     withTarget((db) => insertMemory(db, makeMemory('already-shared')));
     const claude = seedLegacy('claude', (db) => insertMemory(db, makeMemory('c1')));
 
-    expect(merged(migrate()).sources[0].copied.memories).toBe(1);
+    expect(merged(migrate()).merged[0].copied.memories).toBe(1);
     withTarget((db) => {
       expect(getMemory(db, 'already-shared')).not.toBeNull();
       expect(getMemory(db, 'c1')).not.toBeNull();
@@ -167,16 +167,16 @@ describe('migrateGlobalDb', () => {
     merged(migrate());
     seedLegacy('claude', (db) => insertMemory(db, makeMemory('c2-written-later')));
 
-    expect(merged(migrate({ now: LATER })).sources[0].copied.memories).toBe(1);
+    expect(merged(migrate({ now: LATER })).merged[0].copied.memories).toBe(1);
     withTarget((db) => expect(getMemory(db, 'c2-written-later')).not.toBeNull());
     expect(keptCopies(claude)).toHaveLength(2);
   });
 
   it('never overwrites a kept copy when the same file is merged twice at the same instant', () => {
     const claude = seedLegacy('claude', (db) => insertMemory(db, makeMemory('c1')));
-    const first = merged(migrate()).sources[0].keptAs;
+    const first = merged(migrate()).merged[0].keptAs;
     seedLegacy('claude', (db) => insertMemory(db, makeMemory('c2')));
-    const second = merged(migrate()).sources[0].keptAs;
+    const second = merged(migrate()).merged[0].keptAs;
 
     expect(second).not.toBe(first);
     expect(keptCopies(claude)).toHaveLength(2);
@@ -186,7 +186,7 @@ describe('migrateGlobalDb', () => {
     seedLegacy('pi', (db) => insertMemory(db, makeMemory('p1')));
 
     const result = merged(migrate());
-    expect(result.sources.map((s) => s.source.harness)).toEqual(['pi']);
+    expect(result.merged.map((s) => s.source.harness)).toEqual(['pi']);
     expect(withTarget((db) => getMemory(db, 'p1'))).not.toBeNull();
   });
 
@@ -195,8 +195,8 @@ describe('migrateGlobalDb', () => {
     seedLegacy('pi', (db) => insertMemory(db, makeMemory('same', { content: 'from pi' })));
 
     const result = merged(migrate());
-    expect(result.sources[1].copied.memories).toBe(0);
-    expect(result.sources[1].duplicates.memories).toBe(1);
+    expect(result.merged[1].copied.memories).toBe(0);
+    expect(result.merged[1].duplicates.memories).toBe(1);
     expect(withTarget((db) => getMemory(db, 'same')?.content)).toBe('from claude');
   });
 
@@ -221,8 +221,8 @@ describe('migrateGlobalDb', () => {
     });
 
     const result = merged(migrate());
-    expect(result.sources[1].duplicates.entities).toBe(1);
-    expect(result.sources[1].copied.facts).toBe(1);
+    expect(result.merged[1].duplicates.entities).toBe(1);
+    expect(result.merged[1].copied.facts).toBe(1);
     withTarget((db) => {
       const entity = getEntityByName(db, 'bun')!;
       expect(getCurrentFacts(db, entity.id).map((f) => f.object).sort()).toEqual(['a runtime', 'fast']);
@@ -246,8 +246,8 @@ describe('migrateGlobalDb', () => {
     });
 
     const result = merged(migrate());
-    expect(result.sources[0].copied.edges).toBe(1);
-    expect(result.sources[0].copied.extraction_checkpoints).toBe(1);
+    expect(result.merged[0].copied.edges).toBe(1);
+    expect(result.merged[0].copied.extraction_checkpoints).toBe(1);
   });
 
   it('includes rows still in the legacy WAL, written by a connection that is still open', () => {
@@ -291,8 +291,8 @@ describe('migrateGlobalDb', () => {
     old.close();
 
     const result = merged(migrate());
-    expect(result.sources[0].copied.memories).toBe(1);
-    expect(result.sources[0].copied.entities).toBe(0);
+    expect(result.merged[0].copied.memories).toBe(1);
+    expect(result.merged[0].copied.entities).toBe(0);
     expect(withTarget((db) => getMemory(db, 'old'))).toMatchObject({ content: 'from an old schema', archived_at: null });
   });
 

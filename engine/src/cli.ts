@@ -43,7 +43,6 @@ import {
   getSurfaceOutputPath,
   getLockDir,
   getTelemetryPath,
-  getProjectName,
   DEFAULT_SEARCH_LIMIT,
   GITIGNORE_PATTERNS,
   LOCAL_COSINE_CALIBRATED,
@@ -52,12 +51,19 @@ import { openDatabase, openDatabaseReadOnly, getActiveMemories, getMemoriesByIds
 import { ensureGitignored, writeSurface } from './infra/filesystem.js';
 import { resolveGlobalDbPath } from './infra/global-db.js';
 import { acquireLock, releaseLock } from './infra/lock.js';
+import {
+  describeProjectMigration,
+  hasProjectMemory,
+  migrateProjectDb,
+  resolveProjectLocation,
+} from './infra/project-db.js';
+import type { ProjectLocation } from './core/project-location.js';
 
 // Command imports
 import { executeExtract, type ExtractionResult } from './commands/extract.js';
 import { runGenerate, loadCachedSurface, computeDbFingerprint } from './commands/generate.js';
 import { wrapInMarkers } from './core/surface.js';
-import { executeRecall, formatRecallResult, formatRecallError } from './commands/recall.js';
+import { executeRecall, formatRecallResult } from './commands/recall.js';
 import type { RecallOptions } from './commands/recall.js';
 import { executeRemember } from './commands/remember.js';
 import { executeIndexCode } from './commands/index-code.js';
@@ -280,6 +286,37 @@ function ensureDbDir(dbPath: string): void {
 }
 
 /**
+ * Find the project `cwd` belongs to (see core/project-location.ts).
+ *
+ * Validates cwd first (single choke point) — exits 1 with a usage error on
+ * an invalid cwd so no phantom directories are ever created.
+ */
+function locate(cwd: string): ProjectLocation {
+  const cwdError = validateCwd(cwd);
+  if (cwdError !== null) {
+    logError(cwdError);
+    process.exit(1);
+  }
+  return resolveProjectLocation(cwd);
+}
+
+/**
+ * Merge the project's stray databases (its worktrees', and the session's
+ * subdirectories') into its own, and say what moved. One that cannot be
+ * merged now stays where it is and is retried next time.
+ */
+function mergeStrayProjectDbs(project: ProjectLocation): void {
+  const migration = migrateProjectDb(project, new Date());
+  match(migration)
+    .with({ kind: 'current' }, () => {})
+    .with({ kind: 'merged' }, (merged) => logError(`INFO: ${describeProjectMigration(merged, project)}`))
+    .with({ kind: 'busy' }, { kind: 'failed' }, (unmerged) =>
+      logError(`WARN: ${describeProjectMigration(unmerged, project)}; retrying next time`),
+    )
+    .exhaustive();
+}
+
+/**
  * Make a project's `.memory/` usable: directory present, patterns gitignored.
  *
  * Shared by the two entry points that need it — initDatabases, which also
@@ -288,43 +325,35 @@ function ensureDbDir(dbPath: string): void {
  * root is prepared (a permission mode, another gitignore pattern) now lands in
  * one place instead of one obvious place and one buried in a command handler.
  *
- * Callers validate cwd first; the two disagree about what to do when it is
- * invalid (exit vs. return a failure), so that decision stays with them.
+ * Both the root and the session's own directory are gitignored: the memory
+ * lives at the root, the surface file in the session's directory.
  *
- * @param cwd - Project root directory, already validated.
  * @returns The project database path.
  */
-function prepareProjectDbDir(cwd: string): string {
-  const projectDbPath = getProjectDbPath(cwd);
+function prepareProjectDbDir(project: ProjectLocation): string {
+  mergeStrayProjectDbs(project);
+  const projectDbPath = getProjectDbPath(project.root);
   ensureDbDir(projectDbPath);
 
-  try {
-    ensureGitignored(cwd, GITIGNORE_PATTERNS);
-  } catch (err) {
-    logError(`Failed to update .gitignore: ${err}`);
+  for (const dir of new Set([project.root, project.cwd])) {
+    try {
+      ensureGitignored(dir, GITIGNORE_PATTERNS);
+    } catch (err) {
+      logError(`Failed to update .gitignore: ${err}`);
+    }
   }
 
   return projectDbPath;
 }
 
 /**
- * Open or create project and global databases
- * Ensures .memory/ directory exists and is gitignored
+ * Open or create the project's and the global database, merging stray
+ * project databases and the per-harness global ones into them first.
  *
- * Validates cwd first (single choke point) — exits 1 with a usage error
- * on invalid cwd so no phantom directories are ever created.
- *
- * @param cwd - Project root directory
  * @returns Tuple of [projectDb, globalDb]
  */
-function initDatabases(cwd: string): [Database, Database] {
-  const cwdError = validateCwd(cwd);
-  if (cwdError !== null) {
-    logError(cwdError);
-    process.exit(1);
-  }
-
-  const projectDbPath = prepareProjectDbDir(cwd);
+function initDatabases(project: ProjectLocation): [Database, Database] {
+  const projectDbPath = prepareProjectDbDir(project);
   const globalDbPath = resolveGlobalDbPath();
   ensureDbDir(globalDbPath);
 
@@ -373,10 +402,11 @@ async function handleExtractInput(input: HookInput): Promise<CommandResult> {
   // Both DBs: extraction classifies candidate scope (FR-008), and
   // global-scoped candidates must land in the global DB to be visible
   // from other projects.
-  const [projectDb, globalDb] = initDatabases(input.cwd);
+  const project = locate(input.cwd);
+  const [projectDb, globalDb] = initDatabases(project);
 
   try {
-    const result = await executeExtract(input, projectDb, globalDb);
+    const result = await executeExtract(input, projectDb, globalDb, project);
     return extractionToCommandResult(result);
   } catch (err) {
     return {
@@ -417,17 +447,18 @@ async function handleGenerate(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = args[0];
-  const [projectDb, globalDb] = initDatabases(cwd);
+  const project = locate(args[0]);
+  const [projectDb, globalDb] = initDatabases(project);
 
   try {
     const result = runGenerate({
       projectDb,
       globalDb,
-      cwd,
-      surfacePath: getSurfaceOutputPath(cwd),
-      cachePath: getSurfaceCacheDir(cwd),
-      lockDir: getLockDir(cwd),
+      cwd: project.cwd,
+      root: project.root,
+      surfacePath: getSurfaceOutputPath(project.cwd),
+      cachePath: getSurfaceCacheDir(project.root),
+      lockDir: getLockDir(project.root),
     });
 
     return {
@@ -484,10 +515,10 @@ export function parseRecallArgs(
     }
   }
 
-  // Construct immutable RecallOptions
+  // Construct immutable RecallOptions. The project name is added by the
+  // handler once the project is located: it is the repository's, not cwd's.
   const options: RecallOptions = {
     query,
-    projectName: getProjectName(cwd),
     limit: limit ?? DEFAULT_SEARCH_LIMIT,
     ...(branch !== undefined && { branch }),
     ...(keyword !== undefined && { keyword }),
@@ -509,11 +540,11 @@ async function handleRecall(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const { cwd, options } = parsed;
-  const [projectDb, globalDb] = initDatabases(cwd);
+  const project = locate(parsed.cwd);
+  const [projectDb, globalDb] = initDatabases(project);
 
   try {
-    const result = await executeRecall(projectDb, globalDb, options);
+    const result = await executeRecall(projectDb, globalDb, { ...parsed.options, projectName: project.name });
     return {
       kind: 'succeeded',
       output: formatRecallResult(result),
@@ -542,8 +573,8 @@ async function handleRemember(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = args[0];
-  const [projectDb, globalDb] = initDatabases(cwd);
+  const project = locate(args[0]);
+  const [projectDb, globalDb] = initDatabases(project);
 
   // Pass args without cwd to runRemember (it expects content first)
   const rememberArgs = args.slice(1);
@@ -559,14 +590,14 @@ async function handleRemember(args: string[]): Promise<CommandResult> {
         // thresholds were calibrated against; otherwise a threshold hit would
         // drop a genuinely new memory as a duplicate. See LOCAL_COSINE_CALIBRATED.
         embedFn: LOCAL_COSINE_CALIBRATED ? embedLocal : null,
-        projectName: getProjectName(cwd),
-        cwd,
+        projectName: project.name,
+        cwd: project.root,
         // Drain the embedding queue NOW instead of at the next session start
         // (FR-046): an explicit remember should be semantically searchable
         // immediately. backfill is idempotent and also clears any older queued
         // vectors. Incomplete flushes are non-fatal — the queue catches up.
         flushEmbedding: (db, _memory) =>
-          backfill(db, getProjectName(cwd)).then((r) => {
+          backfill(db, project.name).then((r) => {
             if (!r.ok) {
               throw new Error(r.error);
             }
@@ -606,8 +637,8 @@ async function handleIndexCode(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = args[0];
-  const [projectDb, globalDb] = initDatabases(cwd);
+  const project = locate(args[0]);
+  const [projectDb, globalDb] = initDatabases(project);
 
   try {
     // Forward everything after cwd: filePath, summary, and all flags
@@ -616,7 +647,7 @@ async function handleIndexCode(args: string[]): Promise<CommandResult> {
       'manual-index',
       projectDb,
       globalDb,
-      getProjectName(cwd)
+      project.name
     );
 
     if (!result.success) {
@@ -649,15 +680,15 @@ async function handleForget(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = args[0];
+  const project = locate(args[0]);
   const idOrQuery = args[1];
-  const [projectDb, globalDb] = initDatabases(cwd);
+  const [projectDb, globalDb] = initDatabases(project);
 
   try {
     // Try as ID first (both DBs)
-    let result = forgetById(projectDb, idOrQuery, cwd);
+    let result = forgetById(projectDb, idOrQuery, project.root);
     if (result.status === 'not_found') {
-      result = forgetById(globalDb, idOrQuery, cwd);
+      result = forgetById(globalDb, idOrQuery, project.root);
     }
 
     // If still not found, try as keyword query
@@ -679,7 +710,7 @@ async function handleForget(args: string[]): Promise<CommandResult> {
       const archiveResult = forgetById(
         candidate.scope === 'global' ? globalDb : projectDb,
         candidate.id,
-        cwd,
+        project.root,
       );
       if (archiveResult.status === 'archived') {
         return {
@@ -733,7 +764,8 @@ async function handleConsolidate(args: string[]): Promise<CommandResult> {
     return { kind: 'failed', error: cwdError };
   }
   // Only open project DB - consolidate operates on project scope only
-  const projectDbPath = prepareProjectDbDir(cwd);
+  const project = resolveProjectLocation(cwd);
+  const projectDbPath = prepareProjectDbDir(project);
 
   const projectDb = openDatabase(projectDbPath);
 
@@ -770,7 +802,7 @@ async function handleConsolidate(args: string[]): Promise<CommandResult> {
         summary,
         content,
         'consolidate-session',
-        cwd
+        project.root
       );
       if (mergeResult.kind === 'skipped') {
         return {
@@ -827,13 +859,13 @@ async function handleLifecycle(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = args[0];
+  const project = locate(args[0]);
   const ifNeeded = args.includes('--if-needed');
-  const [projectDb, globalDb] = initDatabases(cwd);
+  const [projectDb, globalDb] = initDatabases(project);
 
   try {
     if (ifNeeded) {
-      const result = runLifecycleIfNeeded(projectDb, globalDb, getTelemetryPath(cwd), cwd);
+      const result = runLifecycleIfNeeded(projectDb, globalDb, getTelemetryPath(project.root), project.root);
       if (result.skipped) {
         return { kind: 'succeeded', output: 'Lifecycle skipped (no changes needed)' };
       }
@@ -846,7 +878,7 @@ async function handleLifecycle(args: string[]): Promise<CommandResult> {
     // Same lifecycle+vacuum sequence as the --if-needed path (minus the
     // skip heuristics) — a manual run must also hard-delete expired
     // pruned rows.
-    const result = runFullLifecycle(projectDb, globalDb, cwd);
+    const result = runFullLifecycle(projectDb, globalDb, project.root);
 
     return {
       kind: 'succeeded',
@@ -875,9 +907,9 @@ async function handleAiPrune(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = args[0];
+  const project = locate(args[0]);
   const ifNeeded = args.includes('--if-needed');
-  const lockFile = join(getLockDir(cwd), 'ai-prune.lock');
+  const lockFile = join(getLockDir(project.root), 'ai-prune.lock');
   const lock = acquireLock(lockFile);
   if (!lock.acquired) {
     return lock.reason === 'held'
@@ -886,11 +918,11 @@ async function handleAiPrune(args: string[]): Promise<CommandResult> {
   }
 
   try {
-    const [projectDb, globalDb] = initDatabases(cwd);
+    const [projectDb, globalDb] = initDatabases(project);
     try {
       const result = ifNeeded
-        ? await runAiPruneIfNeeded(projectDb, globalDb, getTelemetryPath(cwd), cwd)
-        : await runAiPrune(projectDb, globalDb, getTelemetryPath(cwd), cwd);
+        ? await runAiPruneIfNeeded(projectDb, globalDb, getTelemetryPath(project.root), project.root)
+        : await runAiPrune(projectDb, globalDb, getTelemetryPath(project.root), project.root);
 
       if (result.kind === 'skipped') {
         return { kind: 'succeeded', output: `AI prune skipped: ${result.reason}` };
@@ -932,10 +964,9 @@ async function handleTraverse(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = positional[0];
   const memoryId = positional[1];
   const maxDepth = positional.length > 2 ? parseInt(positional[2], 10) : 2;
-  const [projectDb, globalDb] = initDatabases(cwd);
+  const [projectDb, globalDb] = initDatabases(locate(positional[0]));
 
   try {
     // Try project DB first
@@ -980,15 +1011,18 @@ async function handleInspect(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = args[0];
-  const [projectDb, globalDb] = initDatabases(cwd);
+  const project = locate(args[0]);
+  const [projectDb, globalDb] = initDatabases(project);
 
   try {
+    process.stdout.write(
+      `Project: ${project.name} (${project.scope}) — memory at ${getProjectDbPath(project.root)}\n`,
+    );
     runInspect(
       projectDb,
       globalDb,
-      getTelemetryPath(cwd),
-      getSurfaceCacheDir(cwd)
+      getTelemetryPath(project.root),
+      getSurfaceCacheDir(project.root)
     );
 
     return {
@@ -1075,10 +1109,10 @@ async function handleBackfill(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = args[0];
-  const [projectDb, globalDb] = initDatabases(cwd);
+  const project = locate(args[0]);
+  const [projectDb, globalDb] = initDatabases(project);
   try {
-    const projectResult = await backfill(projectDb, getProjectName(cwd));
+    const projectResult = await backfill(projectDb, project.name);
     const globalResult = await backfill(globalDb, 'global');
 
     const { result, warnings } = summarizeBackfillResults(projectResult, globalResult);
@@ -1110,8 +1144,8 @@ async function handleSemanticEdges(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = args[0];
-  const [projectDb, globalDb] = initDatabases(cwd);
+  const project = locate(args[0]);
+  const [projectDb, globalDb] = initDatabases(project);
 
   const limit = (() => {
     const limitArg = args.find(a => a.startsWith('--limit='));
@@ -1127,7 +1161,7 @@ async function handleSemanticEdges(args: string[]): Promise<CommandResult> {
   }
 
   try {
-    const result = await executeSemanticEdges(projectDb, { limit: limit.value, lockDir: getLockDir(cwd) });
+    const result = await executeSemanticEdges(projectDb, { limit: limit.value, lockDir: getLockDir(project.root) });
 
     if (!result.ok) {
       return { kind: 'failed', error: result.error };
@@ -1161,29 +1195,34 @@ async function handleLoadSurface(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = args[0];
+  const project = locate(args[0]);
 
   try {
     // Only act for projects that already use cortex. This hook runs at
     // SessionStart in EVERY project; creating .memory/DBs in untouched
     // projects is not ok — and without a project DB the cache fingerprint
-    // can't be validated anyway.
-    if (!existsSync(getProjectDbPath(cwd))) {
+    // can't be validated anyway. A stray database (a worktree's, a
+    // subdirectory's) counts: opening merges it into the project's.
+    if (!hasProjectMemory(project)) {
       return { kind: 'succeeded', output: 'No cached surface available' };
     }
 
-    const [projectDb, globalDb] = initDatabases(cwd);
+    const [projectDb, globalDb] = initDatabases(project);
     try {
       // Fingerprint the current DBs so a cache written against a different
       // memory set (archives, merges, inserts) is a miss, not a hit.
       const fingerprint = computeDbFingerprint(projectDb, globalDb);
-      const result = loadCachedSurface(cwd, getSurfaceCacheDir(cwd), fingerprint);
+      const result = loadCachedSurface(project.cwd, getSurfaceCacheDir(project.root), fingerprint);
 
       if (result !== null && !result.staleness.stale) {
         // Write cached surface through the same locked, atomic,
         // marker-splicing path as generation — a bare writeFileSync here
         // bypassed the surface lock and clobbered user content.
-        writeSurface(getSurfaceOutputPath(cwd), wrapInMarkers(result.surface), getLockDir(cwd));
+        writeSurface(
+          getSurfaceOutputPath(project.cwd),
+          wrapInMarkers(result.surface),
+          getLockDir(project.root),
+        );
         return { kind: 'succeeded', output: 'Loaded cached surface' };
       }
 
@@ -1191,10 +1230,11 @@ async function handleLoadSurface(args: string[]): Promise<CommandResult> {
       runGenerate({
         projectDb,
         globalDb,
-        cwd,
-        surfacePath: getSurfaceOutputPath(cwd),
-        cachePath: getSurfaceCacheDir(cwd),
-        lockDir: getLockDir(cwd),
+        cwd: project.cwd,
+        root: project.root,
+        surfacePath: getSurfaceOutputPath(project.cwd),
+        cachePath: getSurfaceCacheDir(project.root),
+        lockDir: getLockDir(project.root),
       });
       return {
         kind: 'succeeded',
@@ -1226,13 +1266,12 @@ async function handleEntityQuery(args: string[]): Promise<CommandResult> {
     };
   }
 
-  const cwd = args[0];
   const query = args[1];
   const includeHistory = args.includes('--history');
   const limitArg = args.find(a => a.startsWith('--limit='));
   const limit = limitArg ? parseInt(limitArg.split('=')[1], 10) : 5;
 
-  const [projectDb, globalDb] = initDatabases(cwd);
+  const [projectDb, globalDb] = initDatabases(locate(args[0]));
 
   try {
     const result = executeEntityQuery(projectDb, globalDb, {
@@ -1315,8 +1354,12 @@ async function handlePromptRecall(): Promise<CommandResult> {
 
     // Check DBs exist — don't create empty ones for a read-only hook. Resolving
     // may merge the legacy per-harness global DBs (once, ever); that moves
-    // existing memories rather than creating a database.
-    const projectDbPath = getProjectDbPath(cwd);
+    // existing memories rather than creating a database. Stray project
+    // databases are left for the next writing command: this hook runs on every
+    // prompt and must stay fast.
+    if (validateCwd(cwd) !== null) return { kind: 'succeeded' };
+    const project = resolveProjectLocation(cwd);
+    const projectDbPath = getProjectDbPath(project.root);
     const globalDbPath = resolveGlobalDbPath();
     const hasProjectDb = existsSync(projectDbPath);
     const hasGlobalDb = existsSync(globalDbPath);
@@ -1352,7 +1395,7 @@ async function handlePromptRecall(): Promise<CommandResult> {
       const memories = await executePromptRecallWithFallback(projectDb, globalDb, {
         prompt,
         surfaceContent,
-        projectName: getProjectName(cwd),
+        projectName: project.name,
       });
       const output = formatPromptRecall(memories);
 
@@ -1386,7 +1429,7 @@ async function handleMaintenance(args: string[]): Promise<CommandResult> {
   }
 
   const cwd = args[0];
-  const lockFile = join(getLockDir(cwd), 'maintenance.lock');
+  const lockFile = join(getLockDir(locate(cwd).root), 'maintenance.lock');
   const lock = acquireLock(lockFile);
   if (!lock.acquired) {
     return lock.reason === 'held'
@@ -1522,12 +1565,13 @@ async function handleEvalAnswer(
 
   const admit = excludeSessions(settings.authoringSessions);
   const runPaths = paths.run(command.run);
+  const project = locate(command.cwd);
   const manifest = openRun(
     runPaths,
     {
       run: command.run,
       condition: command.condition,
-      project: getProjectName(command.cwd),
+      project: project.name,
       requestedModel: resolved.endpoint.model,
       branch: getCurrentBranch(command.cwd),
       authoringSessions: settings.authoringSessions,
@@ -1536,7 +1580,8 @@ async function handleEvalAnswer(
     (snapshotDir) => {
       // The same global DB every other command opens, merged from the
       // per-harness ones first if that has not happened yet.
-      const sources = snapshotMemory({ cwd: command.cwd, globalDbPath: resolveGlobalDbPath(), snapshotDir });
+      mergeStrayProjectDbs(project);
+      const sources = snapshotMemory({ projectRoot: project.root, globalDbPath: resolveGlobalDbPath(), snapshotDir });
       return { sources, excludedMemories: countRefused(snapshotDir, admit) };
     },
   );

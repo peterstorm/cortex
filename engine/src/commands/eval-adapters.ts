@@ -36,8 +36,8 @@ export const excludeSessions =
     !sessions.has(memory.source_session);
 
 export type SnapshotRequest = Readonly<{
-  /** The project whose memory DB is copied. */
-  cwd: string;
+  /** Where the project's memory lives (its repository root), not the directory the eval ran in. */
+  projectRoot: string;
   /** The global DB the CLI would open; the caller resolves it, so a test never reads the real one. */
   globalDbPath: string;
   snapshotDir: string;
@@ -51,8 +51,8 @@ export type SnapshotRequest = Readonly<{
  * @returns the databases it copied, for the run manifest
  * @throws Error when the project has no cortex DB — there is nothing to evaluate
  */
-export function snapshotMemory({ cwd, globalDbPath, snapshotDir }: SnapshotRequest): SnapshotSources {
-  const projectDbPath = getProjectDbPath(cwd);
+export function snapshotMemory({ projectRoot, globalDbPath, snapshotDir }: SnapshotRequest): SnapshotSources {
+  const projectDbPath = getProjectDbPath(projectRoot);
   if (!existsSync(projectDbPath)) {
     throw new Error(`no cortex database at ${projectDbPath}; nothing to evaluate`);
   }

@@ -19,10 +19,10 @@ Cortex maintains **two** SQLite databases:
 
 | Database | Location | Scope |
 |---|---|---|
-| **Project** | `<project>/.memory/cortex.db` | Project-specific memories (default) |
+| **Project** | `<repository root>/.memory/cortex.db`: the main worktree of the git repository the session is in, or the directory itself outside git | Project-specific memories (default) |
 | **Global** | `${XDG_DATA_HOME:-~/.local/share}/cortex/global.db` (override: `CORTEX_GLOBAL_DB`) | Cross-project knowledge |
 
-During extraction, candidates the LLM classifies as scope "global" (e.g., "TypeScript generics work like this" vs "our API uses X pattern") are routed to the **global** database; everything else lands in the project database. Every harness reads and writes the same two databases. The per-harness global databases of earlier versions are merged into the shared one by any command that finds them still at their old paths, then renamed aside (see the README's "Two Databases").
+During extraction, candidates the LLM classifies as scope "global" (e.g., "TypeScript generics work like this" vs "our API uses X pattern") are routed to the **global** database; everything else lands in the project database. Every harness reads and writes the same two databases, and every worktree and subdirectory of a repository the same project database (see the README's "Two Databases"). The per-harness global databases of earlier versions are merged into the shared one by any command that finds them still at their old paths, then renamed aside (see the README's "Two Databases").
 
 ---
 
@@ -34,7 +34,7 @@ When you start Claude Code:
 
 1. Check for a **cached surface** file (keyed by `sha256(branch:cwd)`)
 2. If cache exists and is < 24h old → serve from cache
-3. If stale or missing → regenerate from DB (explained in "Surface Generation" below) — but only if the project already has a `.memory/cortex.db`; the hook never creates databases in untouched projects
+3. If stale or missing → regenerate from DB (explained in "Surface Generation" below) — but only if the project already has a database, or a stray one waiting to be merged; the hook never creates databases in untouched projects
 4. Write result to `.claude/cortex-memory.local.md`
 
 Claude Code loads this file as context. The surface targets ~1500 tokens (hard max 2000) — enough for relevant memories without bloating the context window.

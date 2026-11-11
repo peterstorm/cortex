@@ -14,7 +14,6 @@ import {
   getSurfaceOutputPath,
   getLockDir,
   getTelemetryPath,
-  getProjectName,
   MAX_TRANSCRIPT_BYTES,
   SURFACE_MAX_TOKENS,
   DEFAULT_SEARCH_LIMIT,
@@ -86,28 +85,6 @@ describe('config - path resolution', () => {
   it('getTelemetryPath returns correct path', () => {
     const result = getTelemetryPath('/project');
     expect(result).toBe('/project/.memory/telemetry.json');
-  });
-});
-
-describe('config - project name extraction', () => {
-  it('getProjectName extracts last directory', () => {
-    expect(getProjectName('/home/user/myproject')).toBe('myproject');
-  });
-
-  it('getProjectName handles trailing slash', () => {
-    expect(getProjectName('/home/user/myproject/')).toBe('myproject');
-  });
-
-  it('getProjectName handles root path', () => {
-    expect(getProjectName('/')).toBe('unknown');
-  });
-
-  it('getProjectName handles empty path', () => {
-    expect(getProjectName('')).toBe('unknown');
-  });
-
-  it('getProjectName handles nested path', () => {
-    expect(getProjectName('/a/b/c/d')).toBe('d');
   });
 });
 
