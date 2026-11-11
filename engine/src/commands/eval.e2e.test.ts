@@ -79,6 +79,11 @@ async function cli(...args: string[]): Promise<{ code: number; stdout: string; s
   return { code, stdout, stderr };
 }
 
+/** A failed step shows the CLI's own error output, not just its exit code. */
+function expectOk(result: { code: number; stderr: string }): void {
+  expect({ code: result.code, stderr: result.stderr }).toEqual({ code: 0, stderr: expect.any(String) });
+}
+
 beforeAll(() => {
   root = mkdtempSync(path.join(tmpdir(), 'cortex-eval-e2e-'));
   project = path.join(root, 'project');
@@ -127,8 +132,8 @@ afterAll(() => {
 
 describe('cortex eval, end to end', () => {
   test('validate summarizes the set and warns about its size', async () => {
-    const { code, stdout } = await cli('validate');
-    expect(code).toBe(0);
+    const { code, stdout, stderr } = await cli('validate');
+    expectOk({ code, stderr });
     expect(stdout).toContain('2 cases: 1 practice, 1 held_out');
     expect(stdout).toContain('authoring sessions excluded from memory reads: 1');
     expect(stdout).toContain('the method calls for about 20');
@@ -137,17 +142,17 @@ describe('cortex eval, end to end', () => {
   test('answer, score and compare: memory beats no memory, and the answer key never leaks', async () => {
     const withMemory = await cli('answer', 'cortex-1');
     expect(withMemory.stderr).not.toContain('FAILED');
-    expect(withMemory.code).toBe(0);
+    expectOk(withMemory);
     expect(withMemory.stdout).toContain('run cortex-1 (cortex): 2 answered now, 0 already answered; 1 authoring-session memories excluded');
 
     const baseline = await cli('answer', 'none-1', '--condition=none');
-    expect(baseline.code).toBe(0);
+    expectOk(baseline);
 
     const again = await cli('answer', 'cortex-1');
     expect(again.stdout).toContain('0 answered now, 2 already answered');
 
     const scored = await cli('score', 'none-1', 'cortex-1');
-    expect(scored.code).toBe(0);
+    expectOk(scored);
     expect(scored.stdout).toContain('none-1: stub-answer-served (2)');
     expect(scored.stdout).toMatch(/practice \(1 questions[\s\S]*correct_current\s+0\.00\s+1\.00\s+\+1\.00/);
     expect(scored.stdout).toMatch(/held_out \(1 questions[\s\S]*correct_current\s+0\.00\s+1\.00\s+\+1\.00/);
