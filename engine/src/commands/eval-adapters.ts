@@ -8,9 +8,9 @@
 import type { Database } from 'bun:sqlite';
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
-import { getGlobalDbPath, getProjectDbPath } from '../config.js';
+import { getProjectDbPath } from '../config.js';
 import { wrapInMarkers } from '../core/surface.js';
-import type { Llm, MemoryContext } from '../core/eval-run.js';
+import type { Llm, MemoryContext, SnapshotSources } from '../core/eval-run.js';
 import { VERDICT_SCHEMA } from '../core/eval-rubric.js';
 import { getActiveMemories, openDatabase, openDatabaseReadOnly } from '../infra/db.js';
 import {
@@ -35,22 +35,35 @@ export const excludeSessions =
   (memory) =>
     !sessions.has(memory.source_session);
 
+export type SnapshotRequest = Readonly<{
+  /** The project whose memory DB is copied. */
+  cwd: string;
+  /** The global DB the CLI would open; the caller resolves it, so a test never reads the real one. */
+  globalDbPath: string;
+  snapshotDir: string;
+}>;
+
 /**
  * Copy the project's (and the global) memory DB into `snapshotDir` with
  * VACUUM INTO: a consistent point-in-time copy taken from a read-only
  * connection, so a live session writing to the DB is never blocked.
  *
+ * @returns the databases it copied, for the run manifest
  * @throws Error when the project has no cortex DB — there is nothing to evaluate
  */
-export function snapshotMemory(cwd: string, snapshotDir: string): void {
+export function snapshotMemory({ cwd, globalDbPath, snapshotDir }: SnapshotRequest): SnapshotSources {
   const projectDbPath = getProjectDbPath(cwd);
   if (!existsSync(projectDbPath)) {
     throw new Error(`no cortex database at ${projectDbPath}; nothing to evaluate`);
   }
+  const sources: SnapshotSources = {
+    project: projectDbPath,
+    global: existsSync(globalDbPath) ? globalDbPath : null,
+  };
   mkdirSync(snapshotDir, { recursive: true });
   const copies: readonly (readonly [string, string])[] = [
-    [projectDbPath, PROJECT_SNAPSHOT],
-    ...(existsSync(getGlobalDbPath()) ? [[getGlobalDbPath(), GLOBAL_SNAPSHOT] as const] : []),
+    [sources.project, PROJECT_SNAPSHOT],
+    ...(sources.global === null ? [] : [[sources.global, GLOBAL_SNAPSHOT] as const]),
   ];
   for (const [source, name] of copies) {
     const target = path.join(snapshotDir, name);
@@ -64,6 +77,7 @@ export function snapshotMemory(cwd: string, snapshotDir: string): void {
       db.close();
     }
   }
+  return sources;
 }
 
 type SnapshotDbs = Readonly<{ projectDb: Database; globalDb: Database; close: () => void }>;

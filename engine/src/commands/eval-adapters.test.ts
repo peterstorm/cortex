@@ -21,7 +21,7 @@ import {
 let root: string;
 let project: string;
 let snapshotDir: string;
-const originalHome = process.env.HOME;
+let globalDbPath: string;
 
 function addMemory(dbPath: string, id: string, summary: string, session: string, type: MemoryType = 'decision') {
   const db = openDatabase(dbPath);
@@ -77,8 +77,8 @@ beforeEach(() => {
   project = path.join(root, 'project');
   snapshotDir = path.join(root, 'snapshot');
   mkdirSync(path.join(project, '.memory'), { recursive: true });
-  // The global DB lives under HOME; point it at the temp dir.
-  process.env.HOME = path.join(root, 'home');
+  // The caller resolves the global DB; tests keep it in the temp dir, never the real one.
+  globalDbPath = path.join(root, 'global.db');
 
   addMemory(projectDb(), 'real', 'Reclaw runs pi on claude-sonnet-5.5', 'work-session').close();
   addMemory(projectDb(), 'leak', 'EVAL ANSWER KEY: warmind-1017-native is served', 'author-session').close();
@@ -87,13 +87,12 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  process.env.HOME = originalHome;
   rmSync(root, { recursive: true, force: true });
 });
 
 describe('snapshotMemory', () => {
   test('freezes the memory a run reads: later writes do not reach it', async () => {
-    snapshotMemory(project, snapshotDir);
+    snapshotMemory({ cwd: project, globalDbPath, snapshotDir });
     addMemory(projectDb(), 'later', 'Written after the snapshot about reclaw', 'work-session').close();
 
     const memory = openSnapshotContext({
@@ -110,18 +109,40 @@ describe('snapshotMemory', () => {
     }
   });
 
+  test('returns the databases it copied; a missing global database is recorded as null', () => {
+    expect(snapshotMemory({ cwd: project, globalDbPath, snapshotDir })).toEqual({ project: projectDb(), global: null });
+  });
+
+  test('records the global database when there is one, and its memories reach the context', async () => {
+    addMemory(globalDbPath, 'g', 'A global memory about reclaw', 'work-session').close();
+    expect(snapshotMemory({ cwd: project, globalDbPath, snapshotDir })).toEqual({ project: projectDb(), global: globalDbPath });
+
+    const memory = openSnapshotContext({
+      snapshotDir,
+      projectName: 'project',
+      branch: 'main',
+      asOf: new Date('2026-11-09T00:00:00Z'),
+      admit,
+    });
+    try {
+      expect(await memory.context('what about reclaw?')).toContain('A global memory about reclaw');
+    } finally {
+      memory.close();
+    }
+  });
+
   test('can be retaken over a leftover snapshot from an aborted start', () => {
-    snapshotMemory(project, snapshotDir);
-    expect(() => snapshotMemory(project, snapshotDir)).not.toThrow();
+    snapshotMemory({ cwd: project, globalDbPath, snapshotDir });
+    expect(() => snapshotMemory({ cwd: project, globalDbPath, snapshotDir })).not.toThrow();
   });
 
   test('refuses a project without a cortex database', () => {
-    expect(() => snapshotMemory(path.join(root, 'elsewhere'), snapshotDir)).toThrow(/no cortex database/);
+    expect(() => snapshotMemory({ cwd: path.join(root, 'elsewhere'), globalDbPath, snapshotDir })).toThrow(/no cortex database/);
   });
 });
 
 describe('authoring-session exclusion', () => {
-  beforeEach(() => snapshotMemory(project, snapshotDir));
+  beforeEach(() => snapshotMemory({ cwd: project, globalDbPath, snapshotDir }));
 
   test('counts the memories it refuses', () => {
     expect(countRefused(snapshotDir, admit)).toBe(1);

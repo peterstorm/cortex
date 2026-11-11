@@ -16,6 +16,7 @@ import {
   type RunResult,
   type ScoredAnswer,
 } from './eval-rubric.js';
+import type { MemorySource, SnapshotSources } from './eval-run.js';
 import {
   MEASURES,
   parseCaseRow,
@@ -49,8 +50,19 @@ const scored = (c: EvalCase, value: number, model: string | null = 'm', promptTo
   judgement: { id: c.id, key: 'k', judgeModel: 'j', scores: scores(value), reason: '', scoredAt: 't' },
 });
 
+const SOURCES = { project: '/work/p/.memory/cortex.db', global: '/home/u/.local/share/cortex/global.db' };
+
+const snapshot = (sources: SnapshotSources = SOURCES): MemorySource => ({
+  kind: 'snapshot',
+  branch: 'main',
+  sources,
+  excludedMemories: 2,
+  excludedSessions: ['author'],
+});
+
 const run = (name: string, items: readonly ScoredAnswer[], rest: Partial<RunResult> = {}): RunResult => ({
   run: name as RunName,
+  memory: snapshot(),
   scored: items,
   unanswered: [],
   unscored: [],
@@ -213,6 +225,21 @@ describe('renderReport', () => {
     expect(text).toContain('before: glm (1), deepseek (1)  <- mixed models');
     expect(text).toContain('before: no answer for q3');
     expect(text).toContain('before: judge could not score q4');
+  });
+
+  test('names the memory each run read', () => {
+    const text = renderReport([q1], [run('none', [scored(q1, 0)], { memory: { kind: 'none' } }), run('after', [scored(q1, 1)])]);
+    expect(text).toContain('memory read:\n  none: none (baseline)\n');
+    expect(text).toContain(
+      `  after: snapshot of ${SOURCES.project} + ${SOURCES.global}, branch main, 2 authoring-session memories refused`,
+    );
+    expect(text).not.toContain('<- the runs read different');
+  });
+
+  test('flags two snapshot runs that read different global databases', () => {
+    const otherHarness = snapshot({ ...SOURCES, global: '/home/u/.pi/agent/memory/cortex-global.db' });
+    const text = renderReport([q1], [run('before', [scored(q1, 0)]), run('after', [scored(q1, 1)], { memory: otherHarness })]);
+    expect(text).toContain('<- the runs read different global databases');
   });
 
   test('says so when no case was scored in every run', () => {

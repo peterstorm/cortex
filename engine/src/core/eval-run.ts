@@ -24,6 +24,17 @@ export function parseCondition(raw: unknown): Condition | null {
 }
 
 /**
+ * The databases a snapshot was copied from. Two snapshot runs compare memory
+ * like for like only when these match: a run taken under another global
+ * database (another harness, another machine) read different memory.
+ */
+export type SnapshotSources = Readonly<{
+  project: string;
+  /** Null when there was no global database to copy. */
+  global: string | null;
+}>;
+
+/**
  * The memory a run reads: a frozen snapshot, or none at all. Surface ranking
  * also depends on the branch and on time (recency decay), so a snapshot run
  * pins both: the branch here, the time as the manifest's createdAt.
@@ -32,6 +43,7 @@ export type MemorySource =
   | Readonly<{
       kind: 'snapshot';
       branch: string;
+      sources: SnapshotSources;
       /** Memories refused because an authoring session produced them. */
       excludedMemories: number;
       excludedSessions: readonly string[];
@@ -76,6 +88,7 @@ export function manifestToRow(manifest: RunManifest): Record<string, unknown> {
       .with({ kind: 'snapshot' }, (m) => ({
         kind: m.kind,
         branch: m.branch,
+        sources: { project: m.sources.project, global: m.sources.global },
         excluded_memories: m.excludedMemories,
         excluded_sessions: [...m.excludedSessions],
       }))
@@ -85,14 +98,24 @@ export function manifestToRow(manifest: RunManifest): Record<string, unknown> {
   };
 }
 
+function parseSnapshotSources(raw: unknown): SnapshotSources | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const row = raw as Row;
+  if (typeof row.project !== 'string') return null;
+  if (row.global !== null && typeof row.global !== 'string') return null;
+  return { project: row.project, global: row.global };
+}
+
 function parseMemorySource(raw: unknown): MemorySource | null {
   if (typeof raw !== 'object' || raw === null) return null;
   const row = raw as Row;
   if (row.kind === 'none') return { kind: 'none' };
   if (row.kind !== 'snapshot') return null;
   const sessions = row.excluded_sessions;
+  const sources = parseSnapshotSources(row.sources);
   if (
     typeof row.branch !== 'string' ||
+    sources === null ||
     typeof row.excluded_memories !== 'number' ||
     !Array.isArray(sessions) ||
     !sessions.every((s) => typeof s === 'string')
@@ -102,6 +125,7 @@ function parseMemorySource(raw: unknown): MemorySource | null {
   return {
     kind: 'snapshot',
     branch: row.branch,
+    sources,
     excludedMemories: row.excluded_memories,
     excludedSessions: sessions as readonly string[],
   };
@@ -150,11 +174,21 @@ const sameSessions = (a: readonly string[], b: readonly string[]): boolean => {
 };
 
 /**
- * Why `wanted` cannot resume `existing`, or [] when it can. The snapshot,
- * its branch and its as-of time are reused on resume, so memory cannot
- * drift; what can drift is everything the caller chooses afresh.
+ * What a caller chooses afresh each time it opens a run. The snapshot (with
+ * its sources), branch and as-of time are not here: a resume reuses the
+ * run's own, so they cannot drift.
  */
-export function resumeConflicts(existing: RunManifest, wanted: RunManifest): readonly string[] {
+export type RunIdentity = Readonly<{
+  condition: Condition;
+  project: string;
+  requestedModel: string;
+  answerPromptDigest: string;
+  /** Sessions whose memories the run refuses. */
+  excludedSessions: readonly string[];
+}>;
+
+/** Why `wanted` cannot resume `existing`, or [] when it can. */
+export function resumeConflicts(existing: RunManifest, wanted: RunIdentity): readonly string[] {
   const conflicts: string[] = [];
   const differs = (label: string, a: string, b: string) => {
     if (a !== b) conflicts.push(`${label}: run has ${a}, now ${b}`);
@@ -165,10 +199,20 @@ export function resumeConflicts(existing: RunManifest, wanted: RunManifest): rea
   differs('answer prompt', existing.answerPromptDigest.slice(0, 12), wanted.answerPromptDigest.slice(0, 12));
   if (
     existing.memory.kind === 'snapshot' &&
-    wanted.memory.kind === 'snapshot' &&
-    !sameSessions(existing.memory.excludedSessions, wanted.memory.excludedSessions)
+    wanted.condition === 'cortex' &&
+    !sameSessions(existing.memory.excludedSessions, wanted.excludedSessions)
   ) {
     conflicts.push('authoring sessions changed since the run started');
   }
   return conflicts;
+}
+
+/**
+ * Which sources differ between the snapshot runs being compared, in a fixed
+ * order. A baseline run reads no memory and differs from nothing.
+ */
+export function differingSources(memories: readonly MemorySource[]): readonly (keyof SnapshotSources)[] {
+  const snapshots = memories.flatMap((m) => (m.kind === 'snapshot' ? [m.sources] : []));
+  const varies = (key: keyof SnapshotSources) => new Set(snapshots.map((s) => s[key])).size > 1;
+  return (['project', 'global'] as const).filter(varies);
 }

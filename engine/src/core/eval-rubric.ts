@@ -10,6 +10,8 @@
  * shell; this module only renders the exact text that gets hashed.
  */
 
+import { match } from 'ts-pattern';
+import { differingSources, type MemorySource } from './eval-run.js';
 import { parseJsonFromLlmText } from './json-utils.js';
 import {
   CASE_KINDS,
@@ -214,6 +216,8 @@ export type ScoredAnswer = Readonly<{ evalCase: EvalCase; answer: Answer; judgem
 /** One run joined against the current eval set. */
 export type RunResult = Readonly<{
   run: RunName;
+  /** The memory the run answered from, as its manifest records it. */
+  memory: MemorySource;
   scored: readonly ScoredAnswer[];
   /** Cases the run has no answer for. */
   unanswered: readonly CaseId[];
@@ -361,6 +365,31 @@ function answerModels(runs: readonly RunResult[]): readonly string[] {
   });
 }
 
+/**
+ * Which memory each run answered from. A difference here is a difference in
+ * the experiment, not in cortex: two snapshots of different global databases
+ * (another harness, another machine) are not a before and after.
+ */
+function memoryRead(runs: readonly RunResult[]): readonly string[] {
+  const differ = differingSources(runs.map((r) => r.memory));
+  return [
+    ...runs.map((r) => `  ${r.run}: ${describeMemory(r.memory)}`),
+    ...(differ.length > 0 ? [`  <- the runs read different ${differ.join(' and ')} databases`] : []),
+  ];
+}
+
+function describeMemory(memory: MemorySource): string {
+  return match(memory)
+    .with({ kind: 'none' }, () => 'none (baseline)')
+    .with(
+      { kind: 'snapshot' },
+      (m) =>
+        `snapshot of ${m.sources.project} + ${m.sources.global ?? 'no global database'}, ` +
+        `branch ${m.branch}, ${m.excludedMemories} authoring-session memories refused`,
+    )
+    .exhaustive();
+}
+
 function notes(runs: readonly RunResult[]): readonly string[] {
   return runs.flatMap((r) => [
     ...(r.unanswered.length > 0 ? [`${r.run}: no answer for ${r.unanswered.join(', ')}`] : []),
@@ -381,6 +410,8 @@ export function renderReport(cases: readonly EvalCase[], runs: readonly RunResul
   return [
     'answered by:',
     ...answerModels(shared),
+    'memory read:',
+    ...memoryRead(runs),
     ...(tables.length > 0 ? tables : ['', 'No case was scored in every run.']),
     ...kindTable(shared),
     ...(left.length > 0 ? ['', 'left out of the comparison:', ...left.map((n) => `  ${n}`)] : []),

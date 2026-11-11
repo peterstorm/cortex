@@ -1526,8 +1526,8 @@ async function handleEvalAnswer(
       now: new Date(),
     },
     (snapshotDir) => {
-      snapshotMemory(command.cwd, snapshotDir);
-      return countRefused(snapshotDir, admit);
+      const sources = snapshotMemory({ cwd: command.cwd, globalDbPath: getGlobalDbPath(), snapshotDir });
+      return { sources, excludedMemories: countRefused(snapshotDir, admit) };
     },
   );
 

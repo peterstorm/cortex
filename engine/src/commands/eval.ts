@@ -58,7 +58,9 @@ import {
   type Llm,
   type MemoryContext,
   type MemorySource,
+  type RunIdentity,
   type RunManifest,
+  type SnapshotSources,
 } from '../core/eval-run.js';
 
 // ============================================================================
@@ -152,19 +154,11 @@ export type RunRequest = Readonly<{
   now: Date;
 }>;
 
-/** Take the memory snapshot into a directory; returns how many memories the eval refuses. */
-export type TakeSnapshot = (snapshotDir: string) => number;
+/** What taking a snapshot produced: where it was copied from, and how many memories the eval refuses. */
+export type SnapshotTaken = Readonly<{ sources: SnapshotSources; excludedMemories: number }>;
 
-function requestedMemory(request: RunRequest, excludedMemories: number): MemorySource {
-  return request.condition === 'none'
-    ? { kind: 'none' }
-    : {
-        kind: 'snapshot',
-        branch: request.branch,
-        excludedMemories,
-        excludedSessions: [...request.authoringSessions].sort(),
-      };
-}
+/** Take the memory snapshot into a directory. */
+export type TakeSnapshot = (snapshotDir: string) => SnapshotTaken;
 
 /**
  * Resume the run when its identity matches, or start it: snapshot memory
@@ -174,20 +168,17 @@ function requestedMemory(request: RunRequest, excludedMemories: number): MemoryS
  * @throws Error listing every identity conflict
  */
 export function openRun(paths: RunPaths, request: RunRequest, takeSnapshot: TakeSnapshot): RunManifest {
-  const wanted = (excludedMemories: number, createdAt: string): RunManifest => ({
-    run: request.run,
+  const identity: RunIdentity = {
     condition: request.condition,
     project: request.project,
     requestedModel: request.requestedModel,
     answerPromptDigest: sha256(ANSWER_PROMPT),
-    memory: requestedMemory(request, excludedMemories),
-    createdAt,
-  });
+    excludedSessions: [...request.authoringSessions].sort(),
+  };
 
   if (existsSync(paths.manifest)) {
     const existing = readParsed(paths.manifest, parseManifest);
-    const excluded = existing.memory.kind === 'snapshot' ? existing.memory.excludedMemories : 0;
-    const conflicts = resumeConflicts(existing, wanted(excluded, existing.createdAt));
+    const conflicts = resumeConflicts(existing, identity);
     if (conflicts.length > 0) {
       throw new Error(
         `run ${request.run} was started with a different setup; start a new run name to compare:\n` +
@@ -198,8 +189,24 @@ export function openRun(paths: RunPaths, request: RunRequest, takeSnapshot: Take
   }
 
   mkdirSync(paths.dir, { recursive: true });
-  const excluded = request.condition === 'cortex' ? takeSnapshot(paths.snapshot) : 0;
-  const manifest = wanted(excluded, request.now.toISOString());
+  const memory: MemorySource =
+    identity.condition === 'none'
+      ? { kind: 'none' }
+      : {
+          kind: 'snapshot',
+          branch: request.branch,
+          excludedSessions: identity.excludedSessions,
+          ...takeSnapshot(paths.snapshot),
+        };
+  const manifest: RunManifest = {
+    run: request.run,
+    condition: identity.condition,
+    project: identity.project,
+    requestedModel: identity.requestedModel,
+    answerPromptDigest: identity.answerPromptDigest,
+    memory,
+    createdAt: request.now.toISOString(),
+  };
   writeJsonAtomic(paths.manifest, manifestToRow(manifest));
   return manifest;
 }
@@ -268,6 +275,7 @@ export async function answerCases(deps: {
 type LoadedRun = Readonly<{
   run: RunName;
   paths: RunPaths;
+  memory: MemorySource;
   answers: ReadonlyMap<CaseId, Answer>;
   judgements: readonly Judgement[];
 }>;
@@ -280,6 +288,7 @@ function loadRun(paths: EvalPaths, run: RunName): LoadedRun {
   return {
     run,
     paths: runPaths,
+    memory: readParsed(runPaths.manifest, parseManifest).memory,
     answers: new Map(readParsed(runPaths.answers, parseAnswers).map((a) => [a.id, a])),
     judgements: readOptional(runPaths.scores, parseJudgements, []),
   };
@@ -395,7 +404,7 @@ export async function scoreRuns(deps: {
       log(`${loaded.run}/${evalCase.id}: judged`);
     }
 
-    results.push({ run: loaded.run, scored, unanswered, unscored });
+    results.push({ run: loaded.run, memory: loaded.memory, scored, unanswered, unscored });
   }
   return results;
 }

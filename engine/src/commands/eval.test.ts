@@ -71,6 +71,11 @@ function scriptedLlm(reply: (prompt: string, call: number) => string, model = 's
   return { llm, prompts };
 }
 
+const SOURCES = { project: '/work/dotfiles/.memory/cortex.db', global: null };
+
+/** A fake snapshot that records nothing and refuses `excludedMemories` memories. */
+const taken = (excludedMemories = 0) => () => ({ sources: SOURCES, excludedMemories });
+
 const contextFor: MemoryContext = async (question) => `memory about ${question}`;
 const quiet = () => {};
 
@@ -94,16 +99,17 @@ describe('loadEvalSet', () => {
 });
 
 describe('openRun', () => {
-  test('a new cortex run takes one snapshot and records what it excluded', () => {
+  test('a new cortex run takes one snapshot and records where it came from and what it excluded', () => {
     let snapshots = 0;
     const manifest = openRun(paths.run('before' as RunName), request(), () => {
       snapshots++;
-      return 4;
+      return { sources: SOURCES, excludedMemories: 4 };
     });
     expect(snapshots).toBe(1);
     expect(manifest.memory).toEqual({
       kind: 'snapshot',
       branch: 'main',
+      sources: SOURCES,
       excludedMemories: 4,
       excludedSessions: ['author-1'],
     });
@@ -118,7 +124,7 @@ describe('openRun', () => {
   });
 
   test('resuming keeps the original identity, snapshot and start time', () => {
-    const first = openRun(paths.run('before' as RunName), request(), () => 4);
+    const first = openRun(paths.run('before' as RunName), request(), taken(4));
     const resumed = openRun(
       paths.run('before' as RunName),
       request({ now: new Date('2026-12-01T00:00:00Z'), branch: 'feature' }),
@@ -130,9 +136,9 @@ describe('openRun', () => {
   });
 
   test('refuses to resume under a different setup', () => {
-    openRun(paths.run('before' as RunName), request(), () => 4);
+    openRun(paths.run('before' as RunName), request(), taken(4));
     expect(() =>
-      openRun(paths.run('before' as RunName), request({ requestedModel: 'other-model' }), () => 0),
+      openRun(paths.run('before' as RunName), request({ requestedModel: 'other-model' }), taken()),
     ).toThrow(/start a new run name[\s\S]*answer model: run has answer-model, now other-model/);
   });
 });
@@ -146,7 +152,7 @@ describe('answerCases', () => {
   test('answers every case from its memory context and records the served model', async () => {
     const all = cases();
     const runPaths = paths.run('before' as RunName);
-    const manifest = openRun(runPaths, request(), () => 0);
+    const manifest = openRun(runPaths, request(), taken());
     const { llm, prompts } = scriptedLlm(() => 'an answer');
 
     const outcome = await answerCases({ cases: all, manifest, paths: runPaths, llm, context: contextFor, log: quiet });
@@ -165,7 +171,7 @@ describe('answerCases', () => {
   test('a failed case is reported, not stored, and answered on the next run', async () => {
     const all = cases();
     const runPaths = paths.run('before' as RunName);
-    const manifest = openRun(runPaths, request(), () => 0);
+    const manifest = openRun(runPaths, request(), taken());
 
     const flaky = scriptedLlm((prompt) => {
       if (prompt.includes('question q2')) throw new Error('LLM API 503');
@@ -185,7 +191,7 @@ describe('answerCases', () => {
 describe('scoreRuns', () => {
   async function answeredRun(name: string, answer: string, ids: readonly string[] = ['q1', 'q2']) {
     const runPaths = paths.run(name as RunName);
-    const manifest = openRun(runPaths, request({ run: name as RunName }), () => 0);
+    const manifest = openRun(runPaths, request({ run: name as RunName }), taken());
     const { cases } = loadEvalSet(paths);
     await answerCases({
       cases: cases.filter((c) => ids.includes(c.id)),
@@ -241,6 +247,20 @@ describe('scoreRuns', () => {
     expect(result.scored.map((s) => s.evalCase.id)).toEqual(['q2']);
     const stored = readFileSync(paths.run('before' as RunName).scores, 'utf8').trim().split('\n');
     expect(stored).toHaveLength(1);
+  });
+
+  test('each result carries the memory its run answered from, read back from the manifest', async () => {
+    await answeredRun('before', 'answer');
+    const { cases } = loadEvalSet(paths);
+    const [result] = await scoreRuns({
+      cases,
+      paths,
+      runs: ['before' as RunName],
+      judge: scriptedLlm(() => verdict(1)).llm,
+      judgeRequested: 'judge',
+      log: quiet,
+    });
+    expect(result.memory).toMatchObject({ kind: 'snapshot', sources: SOURCES });
   });
 
   test('a case one run never answered is reported as unanswered', async () => {
