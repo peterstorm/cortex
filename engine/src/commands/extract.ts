@@ -10,18 +10,17 @@
  * - FR-012: Support resumable extraction if transcript >100KB
  *
  * Imperative shell - orchestrates I/O and pure functions:
- * 1. Read transcript file
- * 2. Get extraction checkpoint
- * 3. Truncate if needed (pure)
- * 4. Get git context
- * 5. Build extraction prompt (pure)
- * 6. Call the LLM (direct endpoint first, CLI subprocess as fallback)
- * 7. Parse response (pure)
- * 8. For each candidate:
- *    - Insert memory
- *    - Compute similarity + create edges
- * 9. Save checkpoint
- * 10. Run lifecycle
+ * 1. Get the extraction checkpoint (reset on a projection-version change)
+ * 2. Read a bounded window of projected transcript chunks from the cursor
+ *    (reset and re-read if the transcript shrank)
+ * 3. Get git context and the known entities
+ * 4. For each chunk:
+ *    - Build extraction prompt (pure)
+ *    - Call the LLM (direct endpoint first, CLI subprocess as fallback)
+ *    - Parse response (pure)
+ *    - Dedup (pure), insert, create similarity edges, record entity facts
+ *    - Save the checkpoint at the chunk's end
+ * 5. At the transcript's end: run lifecycle, invalidate the surface cache
  */
 
 import { createHash, randomUUID } from 'node:crypto';

@@ -95,6 +95,8 @@ Tracks cursor position for resumable extraction when transcripts exceed 100KB.
 | `session_id` | TEXT | Session being extracted |
 | `cursor_position` | INTEGER | Byte offset into transcript |
 | `extracted_at` | TEXT | ISO8601 |
+| `transcript_length` | INTEGER | Transcript size in bytes when saved; a smaller file later means it was rewritten, and the cursor resets to 0. Null only on legacy rows |
+| `projection_version` | INTEGER | Projection the cursor was produced under; any other value (null on legacy rows) resets the cursor to 0 |
 
 ### FTS5 Index
 
@@ -128,39 +130,51 @@ SessionStart hook
 
 ### Session End (detached worker)
 
-The hook re-invokes itself as a detached worker (`setsid`, or `spawn({detached: true})` on macOS) so the pipeline survives Claude Code reaping the hook's process group. Steps run **sequentially** — SQLite allows one writer, and lifecycle + ai-prune both read-modify-write telemetry.json. Each step logs to `/tmp/cortex-<step>.<pid>.log`; the worker deletes such logs once they are a week old. The hook needs no API key for embeddings; on NixOS it puts a 64-bit `libstdc++` on `LD_LIBRARY_PATH` for `onnxruntime-node` (`CORTEX_ONNX_LD_PATH` pins the directory, otherwise it probes the nix store).
+The hook re-invokes itself as a detached worker (`setsid`, or `spawn({detached: true})` on macOS) so the pipeline survives Claude Code reaping the hook's process group. It runs three commands **sequentially**: `extract`, then `backfill` (only when extract succeeded), then `maintenance`, which runs its own four steps one after another behind a per-project lock — SQLite allows one writer, and lifecycle + ai-prune both read-modify-write telemetry.json. Each command logs to `/tmp/cortex-{extract,backfill,maintenance}.<pid>.log`; the worker deletes such logs once they are a week old. The hook needs no API key for embeddings; on NixOS it puts a 64-bit `libstdc++` on `LD_LIBRARY_PATH` for `onnxruntime-node` (`CORTEX_ONNX_LD_PATH` pins the directory, otherwise it probes the nix store).
 
 ```
 SessionEnd hook (JSON stdin: {session_id, transcript_path, cwd})
   → extract-and-generate.sh (detaches worker, exits 0)
-    → Step 1: bun cli.ts extract < stdin_json
-        1. readFileSync(transcript_path)
-        2. getExtractionCheckpoint(session_id) → resume cursor
-        3. truncateTranscript(content, 100KB, cursor) [pure]
-        4. getGitContext(cwd) → {branch, commits, files}
-        5. buildExtractionPrompt(transcript, git, project) [pure]
-        6. Headless LLM CLI (claude -p --model haiku, or pi -p) → raw response
-        7. parseExtractionResponse(response) → MemoryCandidate[] [pure]
-        8. Route candidates by scope: global-scoped → global DB,
-           everything else → project DB. For each candidate:
-           a. candidateToMemory() [pure] → Memory
-           b. insertMemory(db, memory)
-           c. computeSimilarityAndCreateEdges():
+    → Step 1: bun cli.ts extract < stdin_json     (per-project extract.lock)
+        1. getExtractionCheckpoint(session_id) → resume cursor; reset to 0
+           when its projection_version is not the current one
+        2. readProjectedChunks(transcript_path, cursor) → up to 5 chunks of
+           ≤100KB of what the model saw, streamed from the cursor; reset to 0
+           and re-read if the transcript shrank below the checkpoint
+        3. getGitContext(cwd) → {branch, commits, files}; known entities
+        4. For each chunk:
+           a. buildExtractionPrompt(chunk, git, project, entities) [pure]
+           b. LLM: direct OpenAI-compatible endpoint, else headless CLI
+              (claude -p --model haiku, or pi -p) → raw response
+           c. parseExtractionResponse(response) → memories + entity facts [pure]
+           d. Route candidates by scope: global-scoped → global DB,
+              everything else → project DB
+           e. deduplicateCandidates() [pure] → skip / merge into an existing
+              memory / keep; insert the kept ones
+           f. computeSimilarityAndCreateEdges():
               - hybrid similarity (local cosine if both embedded, else Jaccard)
               - classify with per-space bands (Jaccard: 0.1/0.4/0.5,
                 local cosine: 0.6/0.75/0.82) → active/suggested edges
               - keep top 3 strongest edges per new memory
-        9. saveExtractionCheckpoint(cursor)
-       10. runLifecycle(projectDb) — decay/archive/prune
-       11. invalidateSurfaceCache(cwd) — delete all .json in surface-cache/
+           g. upsert entities and facts (superseding a changed fact)
+           h. saveExtractionCheckpoint(chunk end) — a chunk with any failed
+              write keeps the old cursor, so it is retried
+        5. Only once the transcript's end is reached:
+           runLifecycle(projectDb) — decay/archive/prune
+           invalidateSurfaceCache(root) if anything was inserted
 
-    → Step 2: bun cli.ts backfill <cwd>       (embed new memories)
-    → Step 3: bun cli.ts semantic-edges <cwd> (typed edge classification)
-    → Step 4: bun cli.ts lifecycle <cwd> --if-needed
-    → Step 5: bun cli.ts ai-prune <cwd> --if-needed
-    → Step 6: bun cli.ts generate <cwd>       (LAST, after archival — see
+    → Step 2: bun cli.ts backfill <cwd>       (embed new memories; skipped
+                                               when extract failed)
+    → Step 3: bun cli.ts maintenance <cwd>    (per-project maintenance.lock;
+                                               a second run skips)
+        1. semantic-edges <cwd>               (typed edge classification)
+        2. lifecycle <cwd> --if-needed
+        3. ai-prune <cwd> --if-needed
+        4. generate <cwd>                     (LAST, after archival — see
                                                Surface Generation Pipeline)
 ```
+
+Pi runs the same three commands in one detached `ingest-session` worker, which retries a deferred or transiently failed extract until the transcript is drained before it backfills.
 
 All hooks exit 0 unconditionally — never block session. Errors surface only in `/tmp/cortex-*.log` (`load-surface` keeps its log only when it fails).
 
