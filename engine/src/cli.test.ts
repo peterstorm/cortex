@@ -5,11 +5,9 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Database } from 'bun:sqlite';
-import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { spawnSync } from 'node:child_process';
+import { join } from 'node:path';
 import {
   extractionToCommandResult,
   openPromptRecallDatabase,
@@ -22,8 +20,7 @@ import {
 import type { CommandResult } from './cli.js';
 import { openDatabase, insertMemory } from './infra/db.js';
 import { createMemory } from './core/types.js';
-
-const CLI_PATH = join(dirname(fileURLToPath(import.meta.url)), 'cli.ts');
+import { runCli } from './test-support.js';
 
 describe('cli - parseHookInput', () => {
   it('should parse valid hook input JSON', () => {
@@ -575,37 +572,19 @@ describe('cli - prompt-recall best-effort diagnostics', () => {
   });
 
   it('warns when valid JSON is missing the prompt-recall contract fields', () => {
-    const home = mkdtempSync(join(tmpdir(), 'cortex-prompt-recall-home-'));
-    try {
-      const result = spawnSync('bun', [CLI_PATH, 'prompt-recall'], {
-        input: JSON.stringify({ prompt: 42 }),
-        encoding: 'utf8',
-        env: { ...process.env, HOME: home },
-      });
+    const result = runCli(['prompt-recall'], { input: JSON.stringify({ prompt: 42 }) });
 
-      expect(result.status).toBe(0);
-      expect(result.stderr).toContain('prompt-recall ignored malformed input');
-      expect(result.stderr).toContain('string prompt and cwd');
-    } finally {
-      rmSync(home, { recursive: true, force: true });
-    }
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain('prompt-recall ignored malformed input');
+    expect(result.stderr).toContain('string prompt and cwd');
   });
 
   it('warns on malformed hook input while preserving a successful exit', () => {
-    const home = mkdtempSync(join(tmpdir(), 'cortex-prompt-recall-home-'));
-    try {
-      const result = spawnSync('bun', [CLI_PATH, 'prompt-recall'], {
-        input: '{not valid json',
-        encoding: 'utf8',
-        env: { ...process.env, HOME: home },
-      });
+    const result = runCli(['prompt-recall'], { input: '{not valid json' });
 
-      expect(result.status).toBe(0);
-      expect(result.stderr).toContain('prompt-recall failed (best-effort, continuing)');
-      expect(result.stderr).toContain('JSON');
-    } finally {
-      rmSync(home, { recursive: true, force: true });
-    }
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain('prompt-recall failed (best-effort, continuing)');
+    expect(result.stderr).toContain('JSON');
   });
 });
 

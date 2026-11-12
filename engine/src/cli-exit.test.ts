@@ -10,14 +10,11 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import { exitCodeFor } from './cli.js';
-
-const CLI_PATH = join(dirname(fileURLToPath(import.meta.url)), 'cli.ts');
+import { runCli } from './test-support.js';
 
 describe('cli - exitCodeFor', () => {
   it('maps a success to 0', () => {
@@ -34,18 +31,12 @@ describe('cli - exitCodeFor', () => {
   });
 });
 
-/** Run the real CLI in an isolated HOME and project directory. */
-function runCli(args: (cwd: string) => readonly string[]) {
-  const home = mkdtempSync(join(tmpdir(), 'cortex-exit-home-'));
+/** Run the real CLI in an isolated HOME (runCli's) and project directory. */
+function runCliInFreshProject(args: (cwd: string) => readonly string[]) {
   const cwd = mkdtempSync(join(tmpdir(), 'cortex-exit-cwd-'));
   try {
-    return spawnSync('bun', [CLI_PATH, ...args(cwd)], {
-      encoding: 'utf8',
-      env: { ...process.env, HOME: home },
-      timeout: 180_000,
-    });
+    return runCli(args(cwd), { timeout: 180_000 });
   } finally {
-    rmSync(home, { recursive: true, force: true });
     rmSync(cwd, { recursive: true, force: true });
   }
 }
@@ -56,7 +47,7 @@ describe('cli - process exit status', () => {
     () => {
       // remember embeds for dedup and flushes the embedding queue, so the
       // ONNX runtime is loaded and disposed before the process ends.
-      const result = runCli((cwd) => [
+      const result = runCliInFreshProject((cwd) => [
         'remember',
         cwd,
         'exit-status regression memory',
@@ -71,14 +62,14 @@ describe('cli - process exit status', () => {
   );
 
   it('exits 1 for a failed command', () => {
-    const result = runCli(() => ['no-such-subcommand']);
+    const result = runCliInFreshProject(() => ['no-such-subcommand']);
 
     expect(result.stderr).toContain('Unknown subcommand: no-such-subcommand');
     expect(result.status).toBe(1);
   });
 
   it('exits 1 with usage when no subcommand is given', () => {
-    const result = runCli(() => []);
+    const result = runCliInFreshProject(() => []);
 
     expect(result.stderr).toContain('Usage: cli.ts <subcommand>');
     expect(result.status).toBe(1);

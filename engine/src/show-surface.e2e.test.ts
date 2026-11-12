@@ -5,23 +5,22 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createMemory } from './core/types.js';
 import { insertMemory, openDatabase } from './infra/db.js';
+import { git as gitIn, initRepo, runCli } from './test-support.js';
 
-const CLI = fileURLToPath(new URL('./cli.ts', import.meta.url));
 const SHIM = fileURLToPath(new URL('../../hooks/scripts/show-surface.sh', import.meta.url));
 
 let root: string;
 let repo: string;
 let env: NodeJS.ProcessEnv;
 
-const git = (...args: string[]) =>
-  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd: repo, stdio: 'ignore' });
+const git = (...args: string[]) => gitIn(repo, ...args);
 
 /** What the hook prints for a prompt submitted in `cwd`. */
 function shown(cwd: string): string {
@@ -37,8 +36,7 @@ beforeAll(() => {
   repo = path.join(root, 'repo');
   env = { ...process.env, HOME: path.join(root, 'home') };
   mkdirSync(path.join(repo, '.memory'), { recursive: true });
-  git('init', '-q', '-b', 'main');
-  git('commit', '-q', '--allow-empty', '-m', 'init');
+  initRepo(repo);
 
   const db = openDatabase(path.join(repo, '.memory', 'cortex.db'));
   insertMemory(
@@ -58,7 +56,7 @@ beforeAll(() => {
   );
   db.close();
 
-  const generated = spawnSync('bun', [CLI, 'generate', repo], { env, encoding: 'utf8' });
+  const generated = runCli(['generate', repo], { env });
   expect({ status: generated.status, stderr: generated.stderr }).toEqual({ status: 0, stderr: expect.any(String) });
 }, 120_000);
 

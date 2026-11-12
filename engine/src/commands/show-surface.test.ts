@@ -5,19 +5,18 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getSurfaceOutputPath } from '../config.js';
 import { createMemory } from '../core/types.js';
 import { generateSurface, wrapInMarkers } from '../core/surface.js';
+import { git as gitIn, initRepo } from '../test-support.js';
 import { showSurface } from './show-surface.js';
 
 let repo: string;
 
-const git = (...args: string[]) =>
-  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd: repo, stdio: 'ignore' });
+const git = (...args: string[]) => gitIn(repo, ...args);
 
 const surfaceFor = (branch: string, note = 'The surface follows the checked-out branch'): string =>
   wrapInMarkers(
@@ -63,8 +62,7 @@ function recordingReload(rewriteTo?: () => string) {
 
 beforeEach(() => {
   repo = mkdtempSync(join(tmpdir(), 'cortex-show-surface-'));
-  git('init', '-q', '-b', 'main');
-  git('commit', '-q', '--allow-empty', '-m', 'init');
+  initRepo(repo);
 });
 
 afterEach(() => rmSync(repo, { recursive: true, force: true }));

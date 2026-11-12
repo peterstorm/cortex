@@ -9,11 +9,10 @@ import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { createMemory } from '../core/types.js';
 import { insertMemory, openDatabase } from '../infra/db.js';
+import { CLI_PATH } from '../test-support.js';
 
-const CLI = fileURLToPath(new URL('../cli.ts', import.meta.url));
 const TRUTH = 'claude-sonnet-5.5';
 
 let root: string;
@@ -60,7 +59,7 @@ const cli = (...args: string[]) => cliIn(project, ...args);
 
 async function cliIn(cwd: string, ...args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
   const url = `http://127.0.0.1:${server.port}/v1`;
-  const proc = Bun.spawn(['bun', CLI, 'eval', ...args, `--cwd=${cwd}`], {
+  const proc = Bun.spawn(['bun', CLI_PATH, 'eval', ...args, `--cwd=${cwd}`], {
     env: {
       ...process.env,
       HOME: path.join(root, 'home'),
