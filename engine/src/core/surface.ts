@@ -61,7 +61,7 @@ export function generateSurface(
   // Header
   sections.push(`# Cortex Memory Surface`);
   sections.push('');
-  sections.push(`**Branch:** ${sanitizeSurfaceText(branch, 200)}`);
+  sections.push(renderBranchHeader(branch));
 
   if (staleness && staleness.stale) {
     sections.push(`**Warning:** Surface is ${Math.round(staleness.age_hours)}h old. May be stale.`);
@@ -113,6 +113,43 @@ export function generateSurface(
   }
 
   return content;
+}
+
+const BRANCH_HEADER_PREFIX = '**Branch:** ';
+
+/**
+ * The header line naming the branch a surface was generated for. Pure.
+ *
+ * A branch name is text this system does not control (a cloned repository
+ * chooses it, and git allows '<' in one), so it goes through
+ * sanitizeSurfaceText like any other untrusted text. That makes the header a
+ * RENDERING of the branch, not the branch itself: see surfaceIsForBranch.
+ */
+export function renderBranchHeader(branch: string): string {
+  return `${BRANCH_HEADER_PREFIX}${sanitizeSurfaceText(branch, 200)}`;
+}
+
+/**
+ * Whether a surface file was generated for `branch`. Pure function.
+ *
+ * Compares the header the surface carries with the header the renderer would
+ * write for `branch`, never with the raw name: sanitizing changes some names
+ * ('<' is escaped, a leading '#' is dropped, CORTEX markers are stripped, long
+ * names are cut), and a raw comparison saw such a branch as switched on every
+ * prompt.
+ *
+ * The header is read inside the cortex block when the file has one, so a line
+ * the user wrote above it cannot answer for it. A surface with no header names
+ * no branch, so there is nothing to disagree with: true.
+ *
+ * Two names that render alike (one 200-character prefix, or `a<b` and
+ * `a&lt;b`) are indistinguishable here; the rendering is all the file keeps.
+ */
+export function surfaceIsForBranch(surface: string, branch: string): boolean {
+  const blockStart = surface.indexOf(SURFACE_START_MARKER);
+  const block = blockStart === -1 ? surface : surface.slice(blockStart);
+  const header = block.split('\n').find((line) => line.startsWith(BRANCH_HEADER_PREFIX));
+  return header === undefined || header === renderBranchHeader(branch);
 }
 
 /**

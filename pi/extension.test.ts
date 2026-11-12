@@ -1,8 +1,11 @@
+import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { generateSurface, wrapInMarkers } from '../engine/src/core/surface.js';
+import { createMemory } from '../engine/src/core/types.js';
 import registerCortex from './extension.js';
 import type { CliDetachedOptions, CliRunOptions, CliRunResult, CliRunner } from './cli-runner.js';
 
@@ -16,7 +19,7 @@ import type { CliDetachedOptions, CliRunOptions, CliRunResult, CliRunner } from 
 // caller-supplied notify callback — no module is intercepted.)
 type RecordedCall = { args: readonly string[]; options?: CliRunOptions | CliDetachedOptions };
 
-function fakeCli() {
+function fakeCli(onRun: (args: readonly string[]) => void = () => undefined) {
   const runs: RecordedCall[] = [];
   const detached: RecordedCall[] = [];
   let nextResult: CliRunResult = { ok: true, output: '' };
@@ -24,6 +27,7 @@ function fakeCli() {
   const runner: CliRunner = {
     run(args, options) {
       runs.push({ args, options });
+      onRun(args);
       return nextResult;
     },
     runDetached(args, options) {
@@ -357,6 +361,80 @@ describe('Cortex Pi extension diagnostics and surface contract', () => {
     expect(result.message?.customType).toBe('cortex-memory');
     expect(result.message?.content).toBe('Recall: use the functional core pattern');
     expect(result.message?.display).toBe(false);
+  });
+
+  describe('after a branch switch', () => {
+    /** A git repository on `branch` with the surface the generator wrote for `surfaceBranch`. */
+    function repoWithSurface(branch: string, surfaceBranch: string): string {
+      const cwd = tempProject();
+      const git = (...args: string[]) =>
+        execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, stdio: 'ignore' });
+      git('init', '-q', '-b', branch);
+      git('commit', '-q', '--allow-empty', '-m', 'init');
+      writeSurface(cwd, surfaceBranch);
+      return cwd;
+    }
+
+    function writeSurface(cwd: string, branch: string): void {
+      mkdirSync(join(cwd, '.claude'), { recursive: true });
+      writeFileSync(join(cwd, '.claude', 'cortex-memory.local.md'), surfaceFor(branch));
+    }
+
+    const surfaceFor = (branch: string): string =>
+      wrapInMarkers(
+        generateSurface(
+          [{
+            ...createMemory({
+              id: 'm1',
+              content: `learned on ${branch}`,
+              summary: `learned on ${branch}`,
+              memory_type: 'decision',
+              scope: 'project',
+              confidence: 0.9,
+              priority: 8,
+              source_type: 'manual',
+              source_session: 's',
+              source_context: '{}',
+            }),
+            rank: 0.9,
+          }],
+          branch,
+          null,
+        ),
+      );
+
+    const agentStart = async (handlers: ReturnType<typeof registerHandlers>, cwd: string) =>
+      (await handlers.get('before_agent_start')?.({ systemPrompt: 'base', prompt: '' }, { cwd })) as {
+        message?: { content: string };
+      };
+
+    it('reloads a surface written for another branch before injecting it', async () => {
+      const cwd = repoWithSurface('main', 'old-branch');
+      // What load-surface does: write the checked-out branch's surface.
+      const cli = fakeCli((args) => {
+        if (args[0] === 'load-surface') writeSurface(cwd, 'main');
+      });
+
+      const result = await agentStart(registerHandlers(cli.runner), cwd);
+
+      expect(cli.runs.map((run) => run.args)).toEqual([['load-surface', cwd]]);
+      expect(cli.runs[0].options).toMatchObject({ cwd });
+      expect(result.message?.content).toBe(surfaceFor('main').trim());
+      expect(result.message?.content).not.toContain('old-branch');
+    });
+
+    it.each(['main', 'fix/<angle>', '#123-fix'])(
+      'injects the surface without a reload when it names the checked-out branch (%s)',
+      async (branch) => {
+        const cwd = repoWithSurface(branch, branch);
+        const cli = fakeCli();
+
+        const result = await agentStart(registerHandlers(cli.runner), cwd);
+
+        expect(cli.runs).toEqual([]);
+        expect(result.message?.content).toBe(surfaceFor(branch).trim());
+      },
+    );
   });
 
   it('returns only the system prompt when no surface exists and the prompt is empty', async () => {

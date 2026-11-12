@@ -41,9 +41,11 @@ engine/src/
 │   ├── index-code.ts   Prose-code memory pairing
 │   ├── traverse.ts     BFS graph walk from memory ID
 │   ├── inspect.ts      Telemetry collection + formatting
+│   ├── show-surface.ts The surface a prompt is shown, reloaded on a branch switch
 │   └── backfill.ts     Batch embedding queue processing
 │
 ├── cli.ts          ← Entry point. Thin dispatcher: subcommand → handler.
+├── show-surface-hook.ts ← Per-prompt entry for show-surface.sh (kept off cli.ts's import graph)
 └── config.ts       ← Pure path resolution + constants. No I/O.
 ```
 
@@ -405,6 +407,10 @@ Telemetry display (JSON output). Queries both DBs for stats: active memory count
 ### backfill
 
 Batch embedding processing. Fetches active memories with no usable vector (none, or one from another model), embeds each with the local model, and writes `local_embedding`.
+
+### show-surface (hook entry, not a subcommand)
+
+`bun show-surface-hook.ts <cwd>`, run by the `UserPromptSubmit` hook on every prompt: prints the surface beside `<cwd>`. When the surface's `**Branch:**` header is not the header the renderer would write for the checked-out branch (`surfaceIsForBranch`), it first runs `cli.ts load-surface <cwd>`. The comparison is between renderings because the renderer escapes and trims branch names (`<`, a leading `#`, CORTEX markers, more than 200 characters); comparing against the raw name reloaded such a branch on every prompt. The pi extension calls the same `showSurface` before each agent start, with its own CLI runner as the reload. It is a separate entry rather than a `cli.ts` subcommand so that the per-prompt process does not load the whole engine (about 40 ms per start against 105 ms).
 
 ### load-surface
 

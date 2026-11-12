@@ -41,7 +41,7 @@ Claude Code loads this file as context. The surface targets ~1500 tokens (hard m
 
 ### 2. During Session
 
-**Every prompt** triggers two `UserPromptSubmit` hooks: one pipes the surface file into context, and one (`prompt-recall.sh`) runs recall against your prompt. It is semantic-first: the prompt is embedded, memories from both databases that are not already in the surface are ranked by cosine, and only hits at or above 0.50 and within 0.15 of the best are kept (max 3). Strict keyword AND matches (every prompt keyword present) supplement them. Broad keyword OR search is not used on the healthy path — it matched any single generic word and injected unrelated memories every turn — and survives only as the degraded path when the embedder fails.
+**Every prompt** triggers two `UserPromptSubmit` hooks: one pipes the surface file into context (reloading it first when a `git switch` since it was written left it naming another branch; Pi does the same before each agent start), and one (`prompt-recall.sh`) runs recall against your prompt. It is semantic-first: the prompt is embedded, memories from both databases that are not already in the surface are ranked by cosine, and only hits at or above 0.50 and within 0.15 of the best are kept (max 3). Strict keyword AND matches (every prompt keyword present) supplement them. Broad keyword OR search is not used on the healthy path — it matched any single generic word and injected unrelated memories every turn — and survives only as the degraded path when the embedder fails.
 
 You can also interact with cortex manually:
 
@@ -250,6 +250,7 @@ Memories are inserted without embeddings (to avoid blocking extraction). A backg
         scripts/
           extract-and-generate.sh  # SessionEnd hook
           load-surface.sh          # SessionStart hook
+          show-surface.sh          # UserPromptSubmit hook (prints the surface, for the current branch)
           prompt-recall.sh         # UserPromptSubmit hook (semantic-first recall)
       engine/src/          # TypeScript source
       commands/            # Skill markdown files

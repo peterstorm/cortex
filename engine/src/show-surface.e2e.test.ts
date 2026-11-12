@@ -92,6 +92,20 @@ describe('show-surface hook', () => {
     expect(output).toContain('**Branch:** main');
   }, 120_000);
 
+  test('does not reload, prompt after prompt, the surface of a branch whose name the renderer escapes', () => {
+    git('switch', '-q', '-c', 'fix/<angle>');
+    const first = shown(repo);
+    expect(first).toContain('**Branch:** fix/&lt;angle>');
+
+    // A line inside the cortex block: any reload rewrites the block and drops it.
+    const marked = first.replace('<!-- CORTEX_MEMORY_START -->\n', '<!-- CORTEX_MEMORY_START -->\nnot reloaded\n');
+    expect(marked).not.toBe(first);
+    writeFileSync(surfaceFile(), marked);
+
+    expect(shown(repo)).toBe(marked);
+    expect(shown(repo)).toBe(marked);
+  }, 120_000);
+
   test('prints nothing, and creates nothing, where there is no surface', () => {
     const bare = path.join(root, 'bare');
     mkdirSync(bare);
