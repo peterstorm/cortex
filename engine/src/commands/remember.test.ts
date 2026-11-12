@@ -7,11 +7,24 @@ import {
   executeRemember,
   findDuplicate,
   type RememberArgs,
+  type ParseResult,
 } from './remember.js';
 import { openDatabase, getMemory, insertMemory } from '../infra/db.js';
 import { createMemory } from '../core/types.js';
 import type { Database } from 'bun:sqlite';
 import type { Memory } from '../core/types.js';
+
+/** The parsed args, or a failed test naming the parse error it got instead. */
+function parsedArgs(result: ParseResult): RememberArgs {
+  if (!result.success) throw new Error(`expected a successful parse, got error: ${result.error}`);
+  return result.args;
+}
+
+/** The parse error, or a failed test when the parse succeeded. */
+function parseError(result: ParseResult): string {
+  if (result.success) throw new Error('expected a parse error, got a successful parse');
+  return result.error;
+}
 
 describe('Remember Command', () => {
   // ============================================================================
@@ -25,7 +38,7 @@ describe('Remember Command', () => {
       const result = parseRememberArgs(['test content'], sessionId);
 
       expect(result.success).toBe(true);
-      expect(result.args).toEqual({
+      expect(parsedArgs(result)).toEqual({
         content: 'test content',
         type: 'context',
         priority: 5,
@@ -50,7 +63,7 @@ describe('Remember Command', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(result.args).toEqual({
+      expect(parsedArgs(result)).toEqual({
         content: 'important decision about architecture',
         type: 'decision',
         priority: 9,
@@ -68,7 +81,7 @@ describe('Remember Command', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(result.args?.tags).toEqual(['tag1', 'tag2', 'tag3']);
+      expect(parsedArgs(result).tags).toEqual(['tag1', 'tag2', 'tag3']);
     });
 
     it('filters empty tags', async () => {
@@ -78,28 +91,28 @@ describe('Remember Command', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(result.args?.tags).toEqual(['tag1', 'tag2', 'tag3']);
+      expect(parsedArgs(result).tags).toEqual(['tag1', 'tag2', 'tag3']);
     });
 
     it('rejects empty content', async () => {
       const result = parseRememberArgs([''], sessionId);
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe('content must not be empty');
+      expect(parseError(result)).toBe('content must not be empty');
     });
 
     it('rejects whitespace-only content', async () => {
       const result = parseRememberArgs(['   '], sessionId);
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe('content must not be empty');
+      expect(parseError(result)).toBe('content must not be empty');
     });
 
     it('rejects missing content', async () => {
       const result = parseRememberArgs([], sessionId);
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe('content is required');
+      expect(parseError(result)).toBe('content is required');
     });
 
     it('rejects invalid memory type', async () => {
@@ -109,8 +122,8 @@ describe('Remember Command', () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.error).toContain('invalid memory type');
-      expect(result.error).toContain('invalid');
+      expect(parseError(result)).toContain('invalid memory type');
+      expect(parseError(result)).toContain('invalid');
     });
 
     it('rejects priority below 1', async () => {
@@ -120,7 +133,7 @@ describe('Remember Command', () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.error).toContain('priority must be between 1-10');
+      expect(parseError(result)).toContain('priority must be between 1-10');
     });
 
     it('rejects priority above 10', async () => {
@@ -130,7 +143,7 @@ describe('Remember Command', () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.error).toContain('priority must be between 1-10');
+      expect(parseError(result)).toContain('priority must be between 1-10');
     });
 
     it('rejects non-numeric priority', async () => {
@@ -140,7 +153,7 @@ describe('Remember Command', () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.error).toContain('priority must be between 1-10');
+      expect(parseError(result)).toContain('priority must be between 1-10');
     });
 
     it('rejects invalid scope', async () => {
@@ -150,7 +163,7 @@ describe('Remember Command', () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.error).toContain("scope must be 'project' or 'global'");
+      expect(parseError(result)).toContain("scope must be 'project' or 'global'");
     });
 
     it('rejects unknown option', async () => {
@@ -160,7 +173,7 @@ describe('Remember Command', () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.error).toContain('unknown option: --unknown=value');
+      expect(parseError(result)).toContain('unknown option: --unknown=value');
     });
 
     it('accepts all valid memory types', async () => {
@@ -182,7 +195,7 @@ describe('Remember Command', () => {
         );
 
         expect(result.success).toBe(true);
-        expect(result.args?.type).toBe(type);
+        expect(parsedArgs(result).type).toBe(type);
       }
     });
   });

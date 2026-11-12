@@ -2,15 +2,15 @@
  * Tests for backfill command
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { openDatabase, insertMemory, getMemory } from '../infra/db.ts';
-import { backfill } from './backfill.ts';
-import { createMemory } from '../core/types.ts';
-import * as localEmbed from '../infra/local-embed.ts';
+import { describe, it, expect, beforeEach, afterEach, vi, type MockInstance } from 'vitest';
+import { openDatabase, insertMemory } from '../infra/db.js';
+import { backfill } from './backfill.js';
+import { createMemory } from '../core/types.js';
+import * as localEmbed from '../infra/local-embed.js';
 
 describe('backfill', () => {
-  let ensureModelLoadedSpy: ReturnType<typeof vi.spyOn>;
-  let embedLocalSpy: ReturnType<typeof vi.spyOn>;
+  let ensureModelLoadedSpy: MockInstance<typeof localEmbed.ensureModelLoaded>;
+  let embedLocalSpy: MockInstance<typeof localEmbed.embedLocal>;
 
   beforeEach(() => {
     // Setup spies with default implementations

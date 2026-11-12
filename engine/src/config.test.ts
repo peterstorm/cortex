@@ -116,9 +116,8 @@ describe('config - constants', () => {
 });
 
 describe('config - consolidationThresholdFor', () => {
-  it('uses the well-separated default for jaccard and gemini-cosine', () => {
+  it('uses the well-separated default for jaccard', () => {
     expect(consolidationThresholdFor('jaccard')).toBe(CONSOLIDATION_SIMILARITY_THRESHOLD);
-    expect(consolidationThresholdFor('gemini-cosine')).toBe(CONSOLIDATION_SIMILARITY_THRESHOLD);
   });
 
   it('uses the calibrated hot-space threshold for local-cosine', () => {

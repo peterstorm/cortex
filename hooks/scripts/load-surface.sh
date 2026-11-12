@@ -53,8 +53,12 @@ main() {
 
   log_info "Loading cached surface for cwd: $cwd"
 
-  # Load cached surface (writes to .claude/cortex-memory.local.md if available)
-  if ! bun "$CLI_PATH" load-surface "$cwd" 2>&1 | tee "$LOAD_SURFACE_LOG"; then
+  # Load cached surface (writes to .claude/cortex-memory.local.md if available).
+  # The log is evidence for a failure; a success has nothing to keep, and one
+  # file per session start otherwise piles up in /tmp by the thousand.
+  if bun "$CLI_PATH" load-surface "$cwd" 2>&1 | tee "$LOAD_SURFACE_LOG"; then
+    rm -f "$LOAD_SURFACE_LOG"
+  else
     log_error "Load-surface failed (see $LOAD_SURFACE_LOG)"
   fi
 

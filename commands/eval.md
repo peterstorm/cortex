@@ -13,7 +13,7 @@ description: "Score what an agent answers from cortex's memory against a test se
 
 ## Description
 
-Applies Team0's "Measure before you build" to cortex's read path. Each case in `<cwd>/.memory/eval/questions.jsonl` is asked of a tool-less model. That model gets exactly what the hooks would inject (the push surface plus the prompt-recall block), or nothing in the `none` baseline. A judge then scores every answer 0-1 on `correct_current`, `relevant`, `missed`, `ordered` and `context_complete`, with one table for practice cases and one for held-out cases. Full details are in the README's "Evaluation" section.
+Applies Team0's "Measure before you build" to cortex's read path. Each case in `<repository root>/.memory/eval/questions.jsonl` is asked of a tool-less model. That model gets exactly what the hooks would inject (the push surface plus the prompt-recall block), or nothing in the `none` baseline. A judge then scores every answer 0-1 on `correct_current`, `relevant`, `missed`, `ordered` and `context_complete`, with one table for practice cases and one for held-out cases. Full details are in the README's "Evaluation" section.
 
 ## CLI Command
 
@@ -32,7 +32,7 @@ bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts eval score <run> [<run>] [--dry-run]
 **Optional:**
 - `--condition=none` - answer with no memory: the baseline
 - `--dry-run` - for `score`, show what would be judged without calling a model
-- `--dir=<path>` - eval directory (default `<cwd>/.memory/eval`). The default follows the directory you run from, while the memory that gets snapshotted is the project's, at the repository root. From a subdirectory or a linked worktree, pass `--dir` (or `--cwd=<repository root>`) so every run uses the same eval set.
+- `--dir=<path>` - eval directory (default `<repository root>/.memory/eval`, beside the memory that gets snapshotted). A subdirectory or a linked worktree of the repository resolves to the same directory as the root, so every run uses the same eval set.
 
 ## Usage Example
 

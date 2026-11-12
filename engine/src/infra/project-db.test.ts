@@ -5,7 +5,6 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as fc from 'fast-check';
-import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -21,19 +20,16 @@ import {
   resolveProjectLocation,
   STANDALONE_MARKER,
 } from './project-db.js';
+import { git, initRepo } from '../test-support.js';
 
 let base: string;
 const NOW = new Date('2026-11-11T09:00:00.000Z');
-
-const git = (cwd: string, ...args: string[]) =>
-  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, stdio: 'ignore' });
 
 /** A repository with one commit, so worktrees can be added. */
 function makeRepo(name: string): string {
   const dir = join(base, name);
   mkdirSync(dir, { recursive: true });
-  git(dir, 'init', '-q', '-b', 'main');
-  git(dir, 'commit', '-q', '--allow-empty', '-m', 'init');
+  initRepo(dir);
   return dir;
 }
 

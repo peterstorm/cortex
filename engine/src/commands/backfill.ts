@@ -13,7 +13,7 @@ import { Database } from 'bun:sqlite';
 import type { Memory } from '../core/types.js';
 import { buildEmbeddingText } from '../core/extraction.js';
 import { getActiveMemoriesNeedingEmbedding, updateMemory } from '../infra/db.js';
-import { embedLocal, ensureModelLoaded } from '../infra/local-embed.ts';
+import { embedLocal, ensureModelLoaded } from '../infra/local-embed.js';
 
 
 /**
@@ -24,31 +24,12 @@ export type BackfillResult =
   | { ok: false; error: string };
 
 /**
- * Functional Core: build embedding texts with metadata prefix
- * Only passes fields actually used by buildEmbeddingText (memory_type, summary)
- */
-function buildEmbeddingTexts(
-  memories: readonly Memory[],
-  projectName: string
-): readonly string[] {
-  return memories.map((m) =>
-    buildEmbeddingText(
-      {
-        memory_type: m.memory_type,
-        summary: m.summary,
-      } as Pick<Memory, 'memory_type' | 'summary'>,
-      projectName
-    )
-  );
-}
-
-/**
  * Imperative Shell: Backfill missing embeddings via local model
  */
 async function backfillLocal(
   db: Database,
   memories: readonly Memory[],
-  texts: readonly string[]
+  projectName: string
 ): Promise<{ processed: number; failed: number; errors: readonly string[] }> {
   let processed = 0;
   let failed = 0;
@@ -72,12 +53,9 @@ async function backfillLocal(
   }
 
   // Process individually (local model doesn't batch)
-  for (let i = 0; i < memories.length; i++) {
-    const memory = memories[i];
-    const text = texts[i];
-
+  for (const memory of memories) {
     try {
-      const embedding = await embedLocal(text);
+      const embedding = await embedLocal(buildEmbeddingText(memory, projectName));
       updateMemory(db, memory.id, { local_embedding: embedding });
       processed++;
     } catch (err) {
@@ -109,26 +87,18 @@ export async function backfill(
   projectName: string
 ): Promise<BackfillResult> {
   try {
-    // Imperative Shell: fetch data (I/O)
-
-    let totalProcessed = 0;
-    let totalFailed = 0;
-    const allErrors: string[] = [];
     // Embed every memory recall cannot see. These are consumed by recall and
     // prompt-recall, which is the whole point of storing them; dedup and
     // consolidation deliberately do NOT use cosine (see LOCAL_COSINE_CALIBRATED),
     // but that no longer makes the vectors unread.
     const localUnembedded = getActiveMemoriesNeedingEmbedding(db);
-    if (localUnembedded.length > 0) {
-      const texts = buildEmbeddingTexts(localUnembedded, projectName);
-      process.stderr.write(`[cortex:backfill] INFO: Backfilling local embeddings for ${localUnembedded.length} memories\n`);
-      const { processed, failed, errors } = await backfillLocal(db, localUnembedded, texts);
-      totalProcessed += processed;
-      totalFailed += failed;
-      allErrors.push(...errors);
+    if (localUnembedded.length === 0) {
+      return { ok: true, processed: 0, failed: 0, errors: [], method: 'local' };
     }
 
-    return { ok: true, processed: totalProcessed, failed: totalFailed, errors: allErrors, method: 'local' };
+    process.stderr.write(`[cortex:backfill] INFO: Backfilling local embeddings for ${localUnembedded.length} memories\n`);
+    const { processed, failed, errors } = await backfillLocal(db, localUnembedded, projectName);
+    return { ok: true, processed, failed, errors, method: 'local' };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { ok: false, error: `Backfill failed: ${message}` };

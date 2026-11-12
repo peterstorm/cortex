@@ -7,12 +7,12 @@
 import { Database } from 'bun:sqlite';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { openDatabase, insertMemory, insertEdge } from '../infra/db.js';
-import { createMemory, createEdge, type MemoryType } from '../core/types.js';
+import { openDatabase, insertMemory, insertEdge, getActiveMemoriesNeedingEmbedding } from '../infra/db.js';
+import { createMemory } from '../core/types.js';
+import { LOCAL_EMBEDDING_DIMENSIONS } from '../config.js';
 import {
   countByType,
   countByScope,
-  countPendingEmbeddings,
   calculateStalenessHours,
   formatTelemetry,
   collectTelemetry,
@@ -180,99 +180,6 @@ describe('countByScope', () => {
   });
 });
 
-describe('countPendingEmbeddings', () => {
-  test('empty array returns 0', () => {
-    const result = countPendingEmbeddings([]);
-    expect(result).toBe(0);
-  });
-
-  test('counts memories with null embeddings', () => {
-    const memories = [
-      createMemory({
-        id: 'm1',
-        content: 'test',
-        summary: 'test',
-        memory_type: 'decision',
-        scope: 'project',
-        confidence: 0.9,
-        priority: 5,
-        source_type: 'extraction',
-        source_session: 's1',
-        source_context: '{}',
-        embedding: null,
-        local_embedding: null,
-      }),
-      createMemory({
-        id: 'm2',
-        content: 'test',
-        summary: 'test',
-        memory_type: 'architecture',
-        scope: 'project',
-        confidence: 0.8,
-        priority: 7,
-        source_type: 'extraction',
-        source_session: 's1',
-        source_context: '{}',
-        embedding: new Float64Array(3),
-        local_embedding: null,
-      }),
-      createMemory({
-        id: 'm3',
-        content: 'test',
-        summary: 'test',
-        memory_type: 'pattern',
-        scope: 'project',
-        confidence: 0.7,
-        priority: 6,
-        source_type: 'extraction',
-        source_session: 's1',
-        source_context: '{}',
-        embedding: null,
-        local_embedding: null,
-      }),
-    ];
-
-    const result = countPendingEmbeddings(memories);
-    expect(result).toBe(2);
-  });
-
-  test('ignores memories with at least one embedding', () => {
-    const memories = [
-      createMemory({
-        id: 'm1',
-        content: 'test',
-        summary: 'test',
-        memory_type: 'decision',
-        scope: 'project',
-        confidence: 0.9,
-        priority: 5,
-        source_type: 'extraction',
-        source_session: 's1',
-        source_context: '{}',
-        embedding: new Float64Array(3),
-        local_embedding: null,
-      }),
-      createMemory({
-        id: 'm2',
-        content: 'test',
-        summary: 'test',
-        memory_type: 'architecture',
-        scope: 'project',
-        confidence: 0.8,
-        priority: 7,
-        source_type: 'extraction',
-        source_session: 's1',
-        source_context: '{}',
-        embedding: null,
-        local_embedding: new Float32Array(3),
-      }),
-    ];
-
-    const result = countPendingEmbeddings(memories);
-    expect(result).toBe(0);
-  });
-});
-
 describe('calculateStalenessHours', () => {
   test('calculates staleness for recent timestamp', () => {
     const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
@@ -299,80 +206,42 @@ describe('calculateStalenessHours', () => {
 });
 
 describe('parseTelemetryFile', () => {
-  test('parses valid last_extraction', () => {
-    const data = {
-      last_extraction: {
-        status: 'success',
-        timestamp: '2026-02-09T10:00:00Z',
-      },
-    };
-
-    const result = parseTelemetryFile(data);
-    expect(result.last_extraction?.status).toBe('success');
-    expect(result.last_extraction?.timestamp).toBe('2026-02-09T10:00:00Z');
+  test('reads both maintenance marks', () => {
+    expect(
+      parseTelemetryFile({
+        last_lifecycle_at: '2026-11-11T19:30:12.494Z',
+        last_ai_prune_at: '2026-09-14T12:12:26.730Z',
+        sessions_since_ai_prune: 6,
+      }),
+    ).toEqual({
+      last_lifecycle_at: '2026-11-11T19:30:12.494Z',
+      last_ai_prune_at: '2026-09-14T12:12:26.730Z',
+    });
   });
 
-  test('parses last_extraction with error', () => {
-    const data = {
-      last_extraction: {
-        status: 'failure',
-        timestamp: '2026-02-09T10:00:00Z',
-        error: 'test error',
-      },
-    };
-
-    const result = parseTelemetryFile(data);
-    expect(result.last_extraction?.status).toBe('failure');
-    expect(result.last_extraction?.error).toBe('test error');
+  test('a step that never succeeded reads as null, and so does a missing file', () => {
+    expect(parseTelemetryFile({ last_ai_prune_at: '2026-09-14T12:12:26.730Z' })).toEqual({
+      last_lifecycle_at: null,
+      last_ai_prune_at: '2026-09-14T12:12:26.730Z',
+    });
+    expect(parseTelemetryFile(null)).toEqual({ last_lifecycle_at: null, last_ai_prune_at: null });
   });
 
-  test('returns empty object when last_extraction missing', () => {
-    const data = {};
-
-    const result = parseTelemetryFile(data);
-    expect(result.last_extraction).toBeUndefined();
-  });
-
-  test('ignores invalid status', () => {
-    const data = {
-      last_extraction: {
-        status: 'invalid',
-        timestamp: '2026-02-09T10:00:00Z',
-      },
-    };
-
-    const result = parseTelemetryFile(data);
-    expect(result.last_extraction).toBeUndefined();
-  });
-
-  test('ignores missing timestamp', () => {
-    const data = {
-      last_extraction: {
-        status: 'success',
-      },
-    };
-
-    const result = parseTelemetryFile(data);
-    expect(result.last_extraction).toBeUndefined();
-  });
-
-  test('ignores non-object last_extraction', () => {
-    const data = {
-      last_extraction: 'invalid',
-    };
-
-    const result = parseTelemetryFile(data);
-    expect(result.last_extraction).toBeUndefined();
-  });
+  test.each([['not-a-timestamp'], [''], [1762889412494], [null], [{ at: '2026-11-11' }]])(
+    'a mark of %j is not a timestamp, so it reads as never',
+    (value) => {
+      expect(parseTelemetryFile({ last_lifecycle_at: value, last_ai_prune_at: value })).toEqual({
+        last_lifecycle_at: null,
+        last_ai_prune_at: null,
+      });
+    },
+  );
 });
 
 describe('formatTelemetry', () => {
   test('formats telemetry as JSON', () => {
     const data: TelemetryData = {
-      last_extraction: {
-        status: 'success',
-        timestamp: '2026-02-09T10:00:00Z',
-      },
+      maintenance: { last_lifecycle_at: '2026-02-09T10:00:00Z', last_ai_prune_at: null },
       memory_counts: {
         total: 5,
         unreadable: 0,
@@ -399,40 +268,13 @@ describe('formatTelemetry', () => {
     const result = formatTelemetry(data);
     const parsed = JSON.parse(result);
 
-    expect(parsed.last_extraction.status).toBe('success');
+    expect(parsed.maintenance).toEqual({ last_lifecycle_at: '2026-02-09T10:00:00Z', last_ai_prune_at: null });
     expect(parsed.memory_counts.total).toBe(5);
     expect(parsed.edge_count).toBe(3);
     expect(parsed.embedding_queue_size).toBe(1);
     expect(parsed.cache_staleness.exists).toBe(true);
   });
 
-  test('handles missing last_extraction', () => {
-    const data: TelemetryData = {
-      memory_counts: {
-        total: 0,
-        unreadable: 0,
-        by_type: {
-          architecture: 0,
-          decision: 0,
-          pattern: 0,
-          gotcha: 0,
-          context: 0,
-          progress: 0,
-          code_description: 0,
-          code: 0,
-        },
-        by_scope: { project: 0, global: 0 },
-      },
-      edge_count: 0,
-      embedding_queue_size: 0,
-    };
-
-    const result = formatTelemetry(data);
-    const parsed = JSON.parse(result);
-
-    expect(parsed.last_extraction).toBeUndefined();
-    expect(parsed.memory_counts.total).toBe(0);
-  });
 });
 
 // ============================================================================
@@ -453,7 +295,7 @@ describe('collectTelemetry', () => {
 
     // Create temp directory
     tempDir = fs.mkdtempSync('/tmp/cortex-inspect-test-');
-    telemetryPath = path.join(tempDir, 'cortex-status.json');
+    telemetryPath = path.join(tempDir, 'telemetry.json');
     cachePath = path.join(tempDir, 'surface-cache');
   });
 
@@ -475,8 +317,8 @@ describe('collectTelemetry', () => {
     expect(result.memory_counts.total).toBe(0);
     expect(result.edge_count).toBe(0);
     expect(result.embedding_queue_size).toBe(0);
-    expect(result.cache_staleness.exists).toBe(false);
-    expect(result.last_extraction).toBeUndefined();
+    expect(result.cache_staleness?.exists).toBe(false);
+    expect(result.maintenance).toEqual({ last_lifecycle_at: null, last_ai_prune_at: null });
   });
 
   test('collects telemetry from project DB', () => {
@@ -534,7 +376,61 @@ describe('collectTelemetry', () => {
     expect(result.memory_counts.by_type.architecture).toBe(1);
     expect(result.memory_counts.by_scope.project).toBe(2);
     expect(result.edge_count).toBe(1);
-    expect(result.embedding_queue_size).toBe(1);
+    // Both are queued: m2's vector is in the legacy `embedding` column, which
+    // recall never reads, so backfill still has to give it a local one.
+    expect(result.embedding_queue_size).toBe(2);
+  });
+
+  describe('embedding_queue_size is the queue backfill processes', () => {
+    const queued = (id: string, fields: Partial<Parameters<typeof createMemory>[0]> = {}) =>
+      createMemory({
+        id,
+        content: `content ${id}`,
+        summary: `summary ${id}`,
+        memory_type: 'decision',
+        scope: 'project',
+        confidence: 0.9,
+        priority: 5,
+        source_type: 'extraction',
+        source_session: 's1',
+        source_context: '{}',
+        ...fields,
+      });
+    const currentVector = () => new Float32Array(LOCAL_EMBEDDING_DIMENSIONS).fill(0.1);
+
+    const backfillQueueSize = () =>
+      getActiveMemoriesNeedingEmbedding(projectDb).length + getActiveMemoriesNeedingEmbedding(globalDb).length;
+
+    test('counts what backfill would embed, in both databases, and nothing else', () => {
+      insertMemory(projectDb, queued('no-vector'));
+      insertMemory(projectDb, queued('legacy-vector-only', { embedding: new Float64Array(3) }));
+      insertMemory(projectDb, queued('current-vector', { local_embedding: currentVector() }));
+      insertMemory(projectDb, queued('other-model', { local_embedding: currentVector() }));
+      projectDb.prepare(`UPDATE memories SET local_embedding_model = 'some/older-model' WHERE id = ?`).run('other-model');
+      insertMemory(projectDb, queued('untagged', { local_embedding: currentVector() }));
+      projectDb.prepare(`UPDATE memories SET local_embedding_model = NULL WHERE id = ?`).run('untagged');
+      insertMemory(projectDb, queued('raw-code', { memory_type: 'code' }));
+      insertMemory(projectDb, queued('archived', { status: 'archived', archived_at: new Date().toISOString() }));
+      insertMemory(globalDb, queued('global-no-vector', { scope: 'global' }));
+
+      const result = collectTelemetry(projectDb, globalDb, telemetryPath, cachePath);
+
+      // no-vector, legacy-vector-only, other-model, untagged, global-no-vector.
+      // Not current-vector (recall can see it), raw-code (never embedded,
+      // FR-053) or archived (backfill only reads active memories).
+      expect(result.embedding_queue_size).toBe(5);
+      expect(result.embedding_queue_size).toBe(backfillQueueSize());
+    });
+
+    test('reads 0 once every memory backfill would touch carries a current vector', () => {
+      insertMemory(projectDb, queued('embedded', { local_embedding: currentVector() }));
+      insertMemory(projectDb, queued('raw-code', { memory_type: 'code' }));
+
+      const result = collectTelemetry(projectDb, globalDb, telemetryPath, cachePath);
+
+      expect(result.embedding_queue_size).toBe(0);
+      expect(backfillQueueSize()).toBe(0);
+    });
   });
 
   test('collects telemetry from both DBs', () => {
@@ -671,27 +567,27 @@ describe('collectTelemetry', () => {
     expect(result.memory_counts.unreadable).toBe(0);
   });
 
-  test('reads telemetry file', () => {
-    // Write telemetry file
-    const telemetryData = {
-      last_extraction: {
-        status: 'success',
-        timestamp: '2026-02-09T10:00:00Z',
-      },
-    };
-
-    fs.writeFileSync(telemetryPath, JSON.stringify(telemetryData), 'utf8');
+  test('reports the maintenance marks lifecycle and ai-prune wrote', () => {
+    fs.writeFileSync(
+      telemetryPath,
+      JSON.stringify({ last_lifecycle_at: '2026-05-09T22:02:43.589Z', last_ai_prune_at: '2026-11-09T19:37:26.980Z' }),
+      'utf8',
+    );
 
     const result = collectTelemetry(projectDb, globalDb, telemetryPath, cachePath);
 
-    expect(result.last_extraction?.status).toBe('success');
-    expect(result.last_extraction?.timestamp).toBe('2026-02-09T10:00:00Z');
+    expect(result.maintenance).toEqual({
+      last_lifecycle_at: '2026-05-09T22:02:43.589Z',
+      last_ai_prune_at: '2026-11-09T19:37:26.980Z',
+    });
   });
 
-  test('handles missing telemetry file', () => {
+  test('a telemetry file that is not JSON reads as no marks', () => {
+    fs.writeFileSync(telemetryPath, '{ torn', 'utf8');
+
     const result = collectTelemetry(projectDb, globalDb, telemetryPath, cachePath);
 
-    expect(result.last_extraction).toBeUndefined();
+    expect(result.maintenance).toEqual({ last_lifecycle_at: null, last_ai_prune_at: null });
   });
 
   test('detects cache staleness', () => {

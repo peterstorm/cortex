@@ -13,7 +13,7 @@ import { composeSurface } from './generate.js';
 import { executePromptRecall, executePromptRecallWithFallback, recallForPrompt } from './prompt-recall.js';
 
 const mockEmbedLocal = vi.fn();
-vi.mock('../infra/local-embed.ts', () => ({
+vi.mock('../infra/local-embed.js', () => ({
   embedLocal: (text: string) => mockEmbedLocal(text),
 }));
 

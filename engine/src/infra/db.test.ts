@@ -23,10 +23,14 @@ import {
   routeToDatabase,
   getActiveCodeMemoriesByFilePath,
   getActiveProseMemoriesByFilePath,
+  markEdgeClassified,
+  markEdgeFailed,
 } from './db.js';
+import { selectClassificationCandidates, pairContentHash } from '../commands/semantic-edges.js';
 import { rankBySimilarity } from '../core/similarity.js';
 import { createMemory, createEdge } from '../core/types.js';
 import { LOCAL_EMBED_MODEL } from '../config.js';
+import { PROJECTION_VERSION } from '../core/transcript-projection.js';
 import type { Memory, Edge, MemoryScope, MemoryType, MemoryStatus } from '../core/types.js';
 
 /**
@@ -989,17 +993,21 @@ describe('Database Layer', () => {
       db.close();
     });
 
-    it('saves and retrieves checkpoint', () => {
-      saveExtractionCheckpoint(db, {
-        session_id: 'session-ckpt-1',
-        cursor_position: 12345,
-      });
+    /** A checkpoint as extraction writes one: every field stated. */
+    const checkpointAt = (session_id: string, cursor_position: number, extracted_at = new Date().toISOString()) => ({
+      session_id,
+      cursor_position,
+      extracted_at,
+      transcript_length: cursor_position + 100,
+      projection_version: PROJECTION_VERSION,
+    });
+
+    it('saves and retrieves checkpoint, every field round-tripping', () => {
+      const saved = checkpointAt('session-ckpt-1', 12345);
+      saveExtractionCheckpoint(db, saved);
 
       const checkpoint = getExtractionCheckpoint(db, 'session-ckpt-1');
-      expect(checkpoint).toBeDefined();
-      expect(checkpoint?.session_id).toBe('session-ckpt-1');
-      expect(checkpoint?.cursor_position).toBe(12345);
-
+      expect(checkpoint).toEqual({ id: expect.any(String), ...saved });
     });
 
     it('returns null for non-existent checkpoint', () => {
@@ -1009,52 +1017,21 @@ describe('Database Layer', () => {
     });
 
     it('updates checkpoint on duplicate session_id', () => {
-      saveExtractionCheckpoint(db, {
-        session_id: 'session-ckpt-2',
-        cursor_position: 100,
-      });
-
-      saveExtractionCheckpoint(db, {
-        session_id: 'session-ckpt-2',
-        cursor_position: 200,
-      });
+      saveExtractionCheckpoint(db, checkpointAt('session-ckpt-2', 100));
+      saveExtractionCheckpoint(db, checkpointAt('session-ckpt-2', 200));
 
       const checkpoint = getExtractionCheckpoint(db, 'session-ckpt-2');
       expect(checkpoint?.cursor_position).toBe(200);
-
+      expect(checkpoint?.transcript_length).toBe(300);
     });
 
-    it('respects caller-provided extracted_at timestamp', () => {
+    it('stores the extracted_at the caller gives, not the time of the write', () => {
       const customTimestamp = '2024-01-15T10:30:00.000Z';
 
-      saveExtractionCheckpoint(db, {
-        session_id: 'session-ckpt-3',
-        cursor_position: 500,
-        extracted_at: customTimestamp,
-      });
+      saveExtractionCheckpoint(db, checkpointAt('session-ckpt-3', 500, customTimestamp));
 
       const checkpoint = getExtractionCheckpoint(db, 'session-ckpt-3');
       expect(checkpoint?.extracted_at).toBe(customTimestamp);
-
-    });
-
-    it('generates extracted_at when not provided', () => {
-      const beforeSave = new Date();
-
-      saveExtractionCheckpoint(db, {
-        session_id: 'session-ckpt-4',
-        cursor_position: 600,
-      });
-
-      const checkpoint = getExtractionCheckpoint(db, 'session-ckpt-4');
-      expect(checkpoint).toBeDefined();
-
-      const afterSave = new Date();
-      const extractedAt = new Date(checkpoint!.extracted_at);
-
-      expect(extractedAt.getTime()).toBeGreaterThanOrEqual(beforeSave.getTime());
-      expect(extractedAt.getTime()).toBeLessThanOrEqual(afterSave.getTime());
-
     });
   });
 
@@ -1323,8 +1300,6 @@ describe('Database Layer', () => {
     });
 
     it('classifiable edges respect attempt tracking and content changes', () => {
-      const { getRelatesToEdgesWithMemories, markEdgeClassified } = require('./db.js');
-      const { selectClassificationCandidates, pairContentHash } = require('../commands/semantic-edges.js');
       const db = openDatabase(':memory:');
 
       function seedMemory(id: string): void {
@@ -1382,8 +1357,6 @@ describe('Database Layer', () => {
     });
 
     it('failure backoff gates re-classification until expiry or content change', () => {
-      const { getRelatesToEdgesWithMemories, markEdgeClassified, markEdgeFailed } = require('./db.js');
-      const { selectClassificationCandidates, pairContentHash } = require('../commands/semantic-edges.js');
       const db = openDatabase(':memory:');
 
       function seedMemory(id: string): void {

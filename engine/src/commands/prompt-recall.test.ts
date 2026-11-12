@@ -26,7 +26,7 @@ import { RECALL_MAX_BLOCK_BYTES } from '../config.js';
 // Mock the local embedder at module level so the fallback path never loads a
 // real model. Each test sets the desired behavior via mockEmbedLocal.
 const mockEmbedLocal = vi.fn();
-vi.mock('../infra/local-embed.ts', () => ({
+vi.mock('../infra/local-embed.js', () => ({
   embedLocal: (text: string) => mockEmbedLocal(text),
 }));
 

@@ -218,6 +218,7 @@ describe('lifecycle command', () => {
         target_id: 'hub',
         relation_type: 'relates_to',
         strength: 0.8,
+        bidirectional: false,
         status: 'active',
       });
     }

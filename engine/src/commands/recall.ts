@@ -5,7 +5,7 @@
 
 import type { Database } from 'bun:sqlite';
 import type { SearchResult, Memory, Edge } from '../core/types.js';
-import { embedLocal } from '../infra/local-embed.ts';
+import { embedLocal } from '../infra/local-embed.js';
 import {
   getMemoriesWithEmbedding,
   getMemoriesWithEmbeddingByIds,
@@ -472,5 +472,10 @@ export function formatRecallError(error: RecallError): string {
       return `Embedding failed: ${error.message}`;
     case 'search_failed':
       return `Search failed: ${error.message}`;
+    default: {
+      // Totality proof: a new RecallError variant fails to compile here.
+      const unreachable: never = error;
+      return unreachable;
+    }
   }
 }

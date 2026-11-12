@@ -16,7 +16,6 @@ import type {
   MemoryType,
   MemoryStatus,
   SourceType,
-  EdgeRelation,
 } from '../core/types.js';
 import { createMemory, createEdge, createExtractionCheckpoint, isEdgeRelation, isEdgeStatus, isMemoryType, isMemoryStatus, isMemoryScope, isSourceType, resolveArchiveAnchor } from '../core/types.js';
 import type { Entity, Fact, EntityType } from '../core/entities.js';
@@ -171,6 +170,9 @@ CREATE INDEX IF NOT EXISTS idx_facts_valid ON facts(valid_to);
  */
 export const CURRENT_SCHEMA_VERSION = 1;
 
+/** How long a connection waits for a lock before failing with SQLITE_BUSY. */
+const BUSY_TIMEOUT_MS = 5000;
+
 /**
  * Initialize database schema and enable optimizations
  * I/O: Creates/modifies database file
@@ -190,7 +192,7 @@ function initializeSchema(db: Database): void {
   // MUST be set BEFORE the WAL pragma: journal_mode=WAL itself takes a write
   // lock, so a concurrent writer would otherwise cause an unprotected
   // SQLITE_BUSY on open.
-  db.run('PRAGMA busy_timeout = 5000');
+  db.run(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
 
   // Enable WAL mode for concurrent access (FR-100)
   db.run('PRAGMA journal_mode = WAL');
@@ -349,11 +351,20 @@ export function openDatabase(path: string): Database {
  * wasted work and takes the writer lock. Throws if the file doesn't exist —
  * callers must check first and fall back to openDatabase when creating.
  *
+ * A reader waits for a lock like a writer does. Reading a WAL database is not
+ * lock-free at its edges: the first connection after the last one closed
+ * recovers the WAL under an exclusive lock, and VACUUM INTO (the eval
+ * snapshot) holds a read transaction across a checkpoint. Without a busy
+ * timeout either one fails at once with "database is locked" when another
+ * process is opening or closing the same file at that moment.
+ *
  * @param path - Existing database file path
  * @returns Read-only database instance (writes throw)
  */
 export function openDatabaseReadOnly(path: string): Database {
-  return new Database(path, { readonly: true });
+  const db = new Database(path, { readonly: true });
+  db.run(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
+  return db;
 }
 
 // ============================================================================
@@ -926,6 +937,9 @@ function embeddingPredicate(): {
  * instead strands stale-model rows forever: they hold a vector so backfill
  * skips them, and recall filters them out. `code` memories are unembedded by
  * design (FR-053) and excluded.
+ *
+ * The one definition of the embedding queue: `backfill` embeds what this
+ * returns, and `inspect` reports its length as `embedding_queue_size`.
  *
  * The predicate is wrapped in COALESCE(..., 0): for an untagged row
  * `local_embedding_model = ?` is NULL (not false), and `NOT NULL` is NULL —
@@ -1686,30 +1700,32 @@ export function getExtractionCheckpoint(
 }
 
 /**
+ * A checkpoint as a writer states it: every field a resume reads, none null.
+ *
+ * The stored row allows null transcript_length and projection_version, but
+ * only for legacy rows written before those columns existed. A row written
+ * now with a null projection_version would read back as legacy and have its
+ * cursor reset to 0 on the next load, discarding the progress it records; a
+ * null transcript_length would disable the shrunk-transcript check. So the
+ * write type leaves no way to produce either, and the caller states
+ * extracted_at rather than the write reading the clock.
+ */
+export type ExtractionCheckpointWrite = Readonly<
+  Omit<ExtractionCheckpoint, 'id' | 'transcript_length' | 'projection_version'> & {
+    transcript_length: number;
+    projection_version: number;
+  }
+>;
+
+/**
  * Save or update extraction checkpoint
  * I/O: Writes to database
  *
  * @param db - Database instance
- * @param checkpoint - Checkpoint to save (without id)
+ * @param checkpoint - Checkpoint to save (the row id is assigned here)
  */
-export function saveExtractionCheckpoint(
-  db: Database,
-  checkpoint: Omit<ExtractionCheckpoint, 'id' | 'transcript_length' | 'projection_version'> & {
-    readonly transcript_length?: number | null;
-    readonly projection_version?: number | null;
-  }
-): void {
-  // Respect caller's extracted_at if provided, otherwise use current timestamp
-  const extracted_at = checkpoint.extracted_at ?? new Date().toISOString();
-
-  const validated = createExtractionCheckpoint({
-    id: randomUUID(),
-    session_id: checkpoint.session_id,
-    cursor_position: checkpoint.cursor_position,
-    extracted_at,
-    transcript_length: checkpoint.transcript_length ?? null,
-    projection_version: checkpoint.projection_version ?? null,
-  });
+export function saveExtractionCheckpoint(db: Database, checkpoint: ExtractionCheckpointWrite): void {
+  const validated = createExtractionCheckpoint({ id: randomUUID(), ...checkpoint });
 
   // Atomic UPSERT — a check-then-insert would let two concurrent workers
   // both observe "no checkpoint" and insert duplicate rows.

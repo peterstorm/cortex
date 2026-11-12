@@ -31,6 +31,9 @@ const edgeArb: fc.Arbitrary<Edge> = fc.record({
   bidirectional: fc.boolean(),
   status: fc.constantFrom('active', 'suggested') as fc.Arbitrary<'active' | 'suggested'>,
   created_at: fc.constant(new Date().toISOString()),
+  classified_at: fc.constant(null),
+  classify_hash: fc.constant(null),
+  last_failed_at: fc.constant(null),
 });
 
 // Helper to create edges with all canonical Edge fields
@@ -49,6 +52,9 @@ function edge(
     bidirectional: false,
     status: 'active',
     created_at: new Date().toISOString(),
+    classified_at: null,
+    classify_hash: null,
+    last_failed_at: null,
   };
 }
 

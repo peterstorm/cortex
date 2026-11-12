@@ -30,7 +30,7 @@ Claude Code reads `.claude/cortex-memory.local.md` as context, giving it "memory
 
 ### Session Start
 
-A `SessionStart` hook loads a cached "surface" — a compact markdown summary of the most relevant memories. The cache is keyed by `sha256(branch:cwd)` and valid for 24 hours. If stale or missing, it regenerates from the database — but only for projects that already have a project database, or a stray one waiting to be merged (the hook never creates databases in untouched projects). In Pi, this cache refresh is detached so startup and `/new` do not wait on the engine CLI; an existing surface remains readable until the atomic refresh completes. Additionally, a `UserPromptSubmit` hook pipes the surface file contents on every prompt, and a second `UserPromptSubmit` hook (`prompt-recall.sh`) runs recall against your prompt — semantic-first (cosine floor 0.50, within a 0.15 band of the best hit, memories already in the surface excluded before ranking), supplemented by strict keyword AND matches. Broad keyword OR search only runs as the degraded path when the embedder is unavailable.
+A `SessionStart` hook loads a cached "surface" — a compact markdown summary of the most relevant memories. The cache is keyed by `sha256(branch:cwd)` and valid for 24 hours. If stale or missing, it regenerates from the database — but only for projects that already have a project database, or a stray one waiting to be merged (the hook never creates databases in untouched projects). In Pi, this cache refresh is detached so startup and `/new` do not wait on the engine CLI; an existing surface remains readable until the atomic refresh completes. Additionally, a `UserPromptSubmit` hook (`show-surface.sh`) prints the surface file on every prompt, first reloading it for the checked-out branch if a `git switch` since it was written left it naming another one (Pi's extension does the same before each agent start, through the same engine function, `commands/show-surface.ts`), and a second `UserPromptSubmit` hook (`prompt-recall.sh`) runs recall against your prompt — semantic-first (cosine floor 0.50, within a 0.15 band of the best hit, memories already in the surface excluded before ranking), supplemented by strict keyword AND matches. Broad keyword OR search only runs as the degraded path when the embedder is unavailable.
 
 ### During a Session
 
@@ -40,7 +40,7 @@ Seven slash commands let you interact with memory directly: `/remember`, `/recal
 
 A `SessionEnd` hook detaches a background worker (so nothing blocks the session) that runs the pipeline sequentially:
 
-1. **Extract** — Stream the session transcript (JSONL), project it to what the model actually saw (dropping subagent `details`, tool-result siblings and snapshots — ~96% of bytes on subagent-heavy sessions) and read it in resumable 100KB chunks of that projection, add git context (branch, commits, changed files), and use the configured direct OpenAI-compatible endpoint with thinking disabled (under both known chat-template conventions — `thinking` and `enable_thinking` — since the served model family is not known in advance), falling back to a headless coding-agent CLI when no direct endpoint is available; each invocation is bounded to five chunks, and the detached ingestion worker retries deferred or transiently failed extraction until the cursor reaches EOF before backfill; global-scoped candidates are routed to the global DB, while entity-only/global-only responses receive a project-local provenance memory so extracted facts are retained
+1. **Extract** — Stream the session transcript (JSONL), project it to what the model actually saw (dropping subagent `details`, tool-result siblings and snapshots — ~96% of bytes on subagent-heavy sessions) and read it in resumable 100KB chunks of that projection, add git context (branch, commits, changed files), and use the configured direct OpenAI-compatible endpoint with thinking disabled (under both known chat-template conventions — `thinking` and `enable_thinking` — since the served model family is not known in advance), falling back to a headless coding-agent CLI when no direct endpoint is available; each invocation is bounded to five chunks, and in Claude Code the rest waits for the next run on the same session (Pi's detached ingestion worker instead retries deferred or transiently failed extraction until the cursor reaches EOF before backfill); global-scoped candidates are routed to the global DB, while entity-only/global-only responses receive a project-local provenance memory so extracted facts are retained; once the transcript's end is reached, extract also runs a lifecycle pass
 2. **Backfill** — Compute embeddings for newly extracted memories (local static model, no API)
 3. **Semantic Edges** — Classify similarity-created `relates_to` edges into typed relationships
 4. **Lifecycle** — Decay confidence, archive stale memories, prune old ones
@@ -165,7 +165,7 @@ Cortex follows a **Functional Core / Imperative Shell** design:
 │  filesystem.ts   PID locking, surface write           │
 │  git-context.ts  Branch, commits, changed files       │
 │  claude-llm.ts   Headless LLM CLI client (claude/pi)  │
-│  local-embed.ts  HuggingFace transformers fallback    │
+│  local-embed.ts  Local embedder (transformers.js)     │
 └───────────────────────────────────────────────────────┘
                           ↕
 ┌───────────────────────────────────────────────────────┐
@@ -417,7 +417,7 @@ Every change to extraction, ranking or pruning feels like progress. `/eval` tell
 
 **What it measures.** The read path, exactly as the hooks inject it: for each question the answering model gets the push surface plus the prompt-recall block cortex would add for that prompt, and nothing else. It has no tools, so the score is what the memory delivers unprompted, not what an agent could dig up with `/recall`. The `none` condition gives the same prompt with no memory. That is the baseline that says whether memory helps at all.
 
-**The eval directory** (default `<cwd>/.memory/eval`, gitignored with `.memory/`). `<cwd>` is `--cwd`, or the directory the command runs in. The memory a run snapshots is the project's, which lives at the repository root, so from a subdirectory or a linked worktree the two differ: run from the root, or pass `--dir`.
+**The eval directory** (default `<repository root>/.memory/eval`, gitignored with `.memory/`; `--dir` overrides). It sits beside the memory a run snapshots, so a subdirectory or a linked worktree of the repository uses the same eval set as the root.
 
 ```
 eval.json                 {"authoring_sessions": ["<session id>", ...]}
@@ -514,8 +514,8 @@ Extraction, AI pruning, and edge classification prefer a **direct OpenAI-compati
     cortex.db                   # Project SQLite database
     surface-cache/              # Cached surfaces (branch-keyed)
     locks/                      # PID lock files
-    cortex-status.json          # Generated health telemetry (extraction stats, timing)
-    telemetry.json              # Maintenance and AI-prune cadence state
+    cortex-status.json          # Last surface generation (time, branch, counts, duration)
+    telemetry.json              # Lifecycle and AI-prune cadence state
     eval/                       # Eval set and runs (see Evaluation)
   .claude/
     cortex-memory.local.md      # Surface file Claude reads
@@ -533,6 +533,7 @@ Extraction, AI pruning, and edge classification prefer a **direct OpenAI-compati
         scripts/
           extract-and-generate.sh   # SessionEnd hook
           load-surface.sh           # SessionStart hook
+          show-surface.sh           # UserPromptSubmit hook (prints the surface, for the current branch)
           prompt-recall.sh          # UserPromptSubmit hook (semantic-first recall)
       engine/src/               # TypeScript source
       commands/                 # Skill markdown files
@@ -553,11 +554,13 @@ cd engine
 bun install
 bun run test         # bun test --isolate (the vitest API, run by Bun)
 bun run test:watch   # same, in watch mode
+bun run typecheck    # tsc --noEmit -p .
 ```
 
 Run the suite through these scripts, not a bare `bun test`: tests mock modules
 with `vi.mock`, which Bun applies process-wide, so only `--isolate` keeps one
-file's mocks out of the others. CI runs the same script on Ubuntu and macOS.
+file's mocks out of the others. CI runs the typecheck and the test script on
+Ubuntu and macOS.
 
 ### CLI Usage
 
@@ -582,7 +585,7 @@ bun engine/src/cli.ts inspect <cwd>
 bun engine/src/cli.ts index-code <cwd> <proseId> <codePath>
 bun engine/src/cli.ts traverse <cwd> <memoryId> [maxDepth]
 
-# Evaluation (defaults: --cwd=., --dir=<cwd>/.memory/eval)
+# Evaluation (defaults: --cwd=., --dir=<repository root>/.memory/eval)
 bun engine/src/cli.ts eval validate [--cwd=<project>]
 bun engine/src/cli.ts eval answer <run> [--condition=cortex|none] [--cwd=<project>]
 bun engine/src/cli.ts eval score <run> [<run>] [--dry-run] [--cwd=<project>]
@@ -598,7 +601,7 @@ bun engine/src/cli.ts eval score <run> [<run>] [--dry-run] [--cwd=<project>]
 | Package | Purpose |
 |---|---|
 | `bun:sqlite` | SQLite (WAL mode, FTS5) — built into Bun, no install needed |
-| `@huggingface/transformers` | Local embedding model fallback |
+| `@huggingface/transformers` | Local embedding model (the only embedder) |
 | `ts-pattern` | Exhaustive pattern matching |
 | `vitest` | Test framework |
 | `fast-check` | Property-based testing |

@@ -17,7 +17,7 @@ import type { Database } from 'bun:sqlite';
 import * as fs from 'node:fs';
 import type { Memory } from '../core/types.js';
 import { getActiveMemories, countActiveMemoriesCreatedAfter, updateMemory, archiveEdgesForMemory, supersedeFactsForMemory } from '../infra/db.js';
-import { isClaudeLlmAvailable, runLlmPromptDirect } from '../infra/claude-llm.js';
+import { isClaudeLlmAvailable, runLlmPromptDirect, LlmEndpointSaturatedError } from '../infra/claude-llm.js';
 import type { LlmPromptTransport } from '../infra/claude-llm.js';
 import { resolveOpenAiCompatEndpoint } from '../infra/llm-client.js';
 import { writeTelemetry } from '../infra/filesystem.js';
@@ -470,7 +470,14 @@ async function prune(
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logError(`Batch ${i + 1} LLM call failed: ${message}`);
-      continue; // skip failed batch, try next
+      if (err instanceof LlmEndpointSaturatedError) {
+        // Not one bad batch: every further call in this process fails the
+        // same way. Stop asking. The batches left unasked count as failed
+        // below, so the watermark stays put and the next run owes the review.
+        logError(`LLM endpoint is saturated; leaving ${totalBatches - i - 1} remaining batch(es) for the next run`);
+        break;
+      }
+      continue; // one failed batch says nothing about the next
     }
 
     const parsed = parsePruneResponse(response);

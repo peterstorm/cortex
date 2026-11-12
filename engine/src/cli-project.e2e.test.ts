@@ -5,25 +5,17 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import { getLockDir, getProjectDbPath, getSurfaceCacheDir, getSurfaceOutputPath } from './config.js';
 import { createMemory } from './core/types.js';
 import { getActiveMemories, getMemory, insertMemory, openDatabase } from './infra/db.js';
-
-const CLI_PATH = join(dirname(fileURLToPath(import.meta.url)), 'cli.ts');
+import { git, initRepo, runCli } from './test-support.js';
 
 let base: string;
 
-const git = (cwd: string, ...args: string[]) =>
-  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, stdio: 'ignore' });
-
-function cli(...args: string[]) {
-  return spawnSync('bun', [CLI_PATH, ...args], { encoding: 'utf8', env: process.env, timeout: 120_000 });
-}
+const cli = (...args: string[]) => runCli(args);
 
 function seed(dir: string, id: string, summary: string): void {
   mkdirSync(join(dir, '.memory'), { recursive: true });
@@ -59,8 +51,7 @@ describe('cli - one memory per repository', () => {
   it('generate from a worktree subdirectory merges the worktree DB into the main one and surfaces it there', () => {
     const main = join(base, 'loom');
     mkdirSync(main);
-    git(main, 'init', '-q', '-b', 'main');
-    git(main, 'commit', '-q', '--allow-empty', '-m', 'init');
+    initRepo(main);
     const worktree = join(base, 'loom-audit');
     git(main, 'worktree', 'add', '-q', '-b', 'audit', worktree);
     const session = join(worktree, 'engine');
@@ -96,8 +87,7 @@ describe('cli - one memory per repository', () => {
   it('remember and load-surface from a worktree subdirectory keep every project file at the main worktree', () => {
     const main = join(base, 'loom');
     mkdirSync(main);
-    git(main, 'init', '-q', '-b', 'main');
-    git(main, 'commit', '-q', '--allow-empty', '-m', 'init');
+    initRepo(main);
     const worktree = join(base, 'loom-audit');
     git(main, 'worktree', 'add', '-q', '-b', 'audit', worktree);
     const session = join(worktree, 'engine');

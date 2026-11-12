@@ -30,6 +30,7 @@ import {
   computeSimilarityAndCreateEdges,
 } from './extract.js';
 import { locateProject } from '../core/project-location.js';
+import { PROJECTION_VERSION } from '../core/transcript-projection.js';
 
 /** Extract for a session whose directory is its own project: it is in no repository. */
 const executeExtract = (input: HookInput, projectDb: Database, globalDb: Database | null = null) =>
@@ -54,7 +55,7 @@ vi.mock('../infra/claude-llm.js', () => ({
 vi.mock('../infra/llm-client.js', () => ({
   resolveOpenAiCompatEndpoint: () => mockResolveEndpoint(),
 }));
-vi.mock('../infra/local-embed.ts', () => ({
+vi.mock('../infra/local-embed.js', () => ({
   ensureModelLoaded: () => mockEnsureModelLoaded(),
   embedLocal: async () => {
     throw new Error('local embedding model disabled in tests');
@@ -312,12 +313,12 @@ describe('extract command - core logic', () => {
 
   describe('database operations', () => {
     it('saves and retrieves extraction checkpoint', () => {
-      const { saveExtractionCheckpoint, getExtractionCheckpoint } = require('../infra/db.js');
-
       saveExtractionCheckpoint(db, {
         session_id: 'test-session',
         cursor_position: 1234,
         extracted_at: new Date().toISOString(),
+        transcript_length: 5000,
+        projection_version: PROJECTION_VERSION,
       });
 
       const checkpoint = getExtractionCheckpoint(db, 'test-session');
@@ -328,13 +329,13 @@ describe('extract command - core logic', () => {
     });
 
     it('updates existing checkpoint', () => {
-      const { saveExtractionCheckpoint, getExtractionCheckpoint } = require('../infra/db.js');
-
       // First save
       saveExtractionCheckpoint(db, {
         session_id: 'test-session',
         cursor_position: 100,
         extracted_at: new Date().toISOString(),
+        transcript_length: 5000,
+        projection_version: PROJECTION_VERSION,
       });
 
       // Update
@@ -342,6 +343,8 @@ describe('extract command - core logic', () => {
         session_id: 'test-session',
         cursor_position: 200,
         extracted_at: new Date().toISOString(),
+        transcript_length: 5000,
+        projection_version: PROJECTION_VERSION,
       });
 
       const checkpoint = getExtractionCheckpoint(db, 'test-session');
@@ -957,12 +960,15 @@ describe('executeExtract (mocked LLM)', () => {
     const { cwd, transcriptPath } = makeTestProject(transcript);
     const db = openDatabase(':memory:');
 
-    // Stale checkpoint from before the transcript was rewritten shorter
+    // Stale checkpoint from before the transcript was rewritten shorter. It
+    // carries the current projection version, so the shrink check is the only
+    // thing that can reset it.
     saveExtractionCheckpoint(db, {
       session_id: 's-shrink',
       cursor_position: 5000,
       extracted_at: new Date().toISOString(),
       transcript_length: 5000,
+      projection_version: PROJECTION_VERSION,
     });
 
     mockExtractMemories.mockResolvedValue(memoriesResponse('alpha decision about sqlite storage'));
@@ -992,6 +998,7 @@ describe('executeExtract (mocked LLM)', () => {
       cursor_position: 10,
       extracted_at: new Date().toISOString(),
       transcript_length: 9999,
+      projection_version: PROJECTION_VERSION,
     });
 
     mockExtractMemories.mockResolvedValue('{"memories": [], "entities": []}');
@@ -1004,6 +1011,34 @@ describe('executeExtract (mocked LLM)', () => {
     // Re-extracted from 0: prompt contains the very start of the transcript
     expect(mockExtractMemories.mock.calls[0][0]).toContain('compacted transcript');
     expect(getExtractionCheckpoint(db, 's-shrink2')!.cursor_position).toBe(transcript.length);
+    db.close();
+  });
+
+  it('restarts from 0 on a legacy checkpoint, which has no projection version', async () => {
+    // Only the code from before projection existed wrote these rows (no writer
+    // can now: saveExtractionCheckpoint requires a version), so the row is
+    // planted directly. Its cursor is a character offset into the raw file and
+    // must not be resumed from, even though it lies within the transcript.
+    const transcript = '{"role":"user","content":"legacy cursor transcript"}\n';
+    const { cwd, transcriptPath } = makeTestProject(transcript);
+    const db = openDatabase(':memory:');
+    db.run(
+      `INSERT INTO extraction_checkpoints (id, session_id, cursor_position, extracted_at, transcript_length, projection_version)
+       VALUES ('legacy', 's-legacy', 10, ?, NULL, NULL)`,
+      [new Date().toISOString()],
+    );
+    mockExtractMemories.mockResolvedValue('{"memories": [], "entities": []}');
+
+    const result = await executeExtract(
+      { session_id: 's-legacy', transcript_path: transcriptPath, cwd }, db
+    );
+
+    expect(result.kind).toBe('succeeded');
+    expect(mockExtractMemories.mock.calls[0][0]).toContain('legacy cursor transcript');
+    expect(getExtractionCheckpoint(db, 's-legacy')).toMatchObject({
+      cursor_position: transcript.length,
+      projection_version: PROJECTION_VERSION,
+    });
     db.close();
   });
 

@@ -21,7 +21,7 @@
 import type { Database } from 'bun:sqlite';
 import type { Memory, RecallPath } from '../core/types.js';
 import { searchByKeywordOr, searchByKeywordAnd, getMemoriesWithEmbedding } from '../infra/db.js';
-import { embedLocal } from '../infra/local-embed.ts';
+import { embedLocal } from '../infra/local-embed.js';
 import { rankBySimilarity, STOP_WORDS, extractUnigrams } from '../core/similarity.js';
 import { buildQueryEmbeddingText } from './recall.js';
 import { sanitizeSurfaceText } from '../core/surface.js';

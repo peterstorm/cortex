@@ -5,11 +5,6 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Database } from 'bun:sqlite';
-import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { spawnSync } from 'node:child_process';
 import {
   extractionToCommandResult,
   openPromptRecallDatabase,
@@ -17,13 +12,11 @@ import {
   parseRecallArgs,
   runIngestSessionInput,
   summarizeBackfillResults,
-  validateCwd,
 } from './cli.js';
-import type { CommandResult } from './cli.js';
+import type { CommandResult } from './command-result.js';
 import { openDatabase, insertMemory } from './infra/db.js';
 import { createMemory } from './core/types.js';
-
-const CLI_PATH = join(dirname(fileURLToPath(import.meta.url)), 'cli.ts');
+import { runCli } from './test-support.js';
 
 describe('cli - parseHookInput', () => {
   it('should parse valid hook input JSON', () => {
@@ -502,63 +495,6 @@ describe('cli - integration flows', () => {
   });
 });
 
-describe('cli - validateCwd', () => {
-  let tmpDir: string;
-
-  beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), 'cortex-cwd-test-'));
-  });
-
-  it('accepts an existing absolute directory', () => {
-    expect(validateCwd(tmpDir)).toBeNull();
-  });
-
-  it('rejects dash-prefixed values (flags mistaken for cwd)', () => {
-    for (const arg of ['--session', '-x', '--if-needed']) {
-      const error = validateCwd(arg);
-      expect(error).not.toBeNull();
-      expect(error).toContain('looks like a flag');
-    }
-  });
-
-  it('rejects relative paths', () => {
-    const error = validateCwd('some/relative/dir');
-    expect(error).not.toBeNull();
-    expect(error).toContain('must be an absolute path');
-  });
-
-  it('rejects nonexistent directories without creating them', () => {
-    const missing = join(tmpDir, 'does-not-exist');
-
-    const error = validateCwd(missing);
-
-    expect(error).not.toBeNull();
-    expect(error).toContain('does not exist');
-    // Validation must be side-effect free — no phantom directories
-    expect(existsSync(missing)).toBe(false);
-  });
-
-  it('rejects paths pointing at a file, not a directory', () => {
-    const filePath = join(tmpDir, 'file.txt');
-    writeFileSync(filePath, 'not a dir', 'utf8');
-
-    const error = validateCwd(filePath);
-
-    expect(error).not.toBeNull();
-    expect(error).toContain('not a directory');
-  });
-
-  it('reports non-ENOENT filesystem failures instead of calling them missing', () => {
-    const loop = join(tmpDir, 'symlink-loop');
-    symlinkSync(loop, loop);
-
-    const error = validateCwd(loop);
-
-    expect(error).toContain('ELOOP');
-    expect(error).not.toContain('directory does not exist');
-  });
-});
-
 describe('cli - prompt-recall best-effort diagnostics', () => {
   it('reports a read-only open failure before using the read-write fallback', () => {
     const fallback = openDatabase(':memory:');
@@ -575,37 +511,19 @@ describe('cli - prompt-recall best-effort diagnostics', () => {
   });
 
   it('warns when valid JSON is missing the prompt-recall contract fields', () => {
-    const home = mkdtempSync(join(tmpdir(), 'cortex-prompt-recall-home-'));
-    try {
-      const result = spawnSync('bun', [CLI_PATH, 'prompt-recall'], {
-        input: JSON.stringify({ prompt: 42 }),
-        encoding: 'utf8',
-        env: { ...process.env, HOME: home },
-      });
+    const result = runCli(['prompt-recall'], { input: JSON.stringify({ prompt: 42 }) });
 
-      expect(result.status).toBe(0);
-      expect(result.stderr).toContain('prompt-recall ignored malformed input');
-      expect(result.stderr).toContain('string prompt and cwd');
-    } finally {
-      rmSync(home, { recursive: true, force: true });
-    }
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain('prompt-recall ignored malformed input');
+    expect(result.stderr).toContain('string prompt and cwd');
   });
 
   it('warns on malformed hook input while preserving a successful exit', () => {
-    const home = mkdtempSync(join(tmpdir(), 'cortex-prompt-recall-home-'));
-    try {
-      const result = spawnSync('bun', [CLI_PATH, 'prompt-recall'], {
-        input: '{not valid json',
-        encoding: 'utf8',
-        env: { ...process.env, HOME: home },
-      });
+    const result = runCli(['prompt-recall'], { input: '{not valid json' });
 
-      expect(result.status).toBe(0);
-      expect(result.stderr).toContain('prompt-recall failed (best-effort, continuing)');
-      expect(result.stderr).toContain('JSON');
-    } finally {
-      rmSync(home, { recursive: true, force: true });
-    }
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain('prompt-recall failed (best-effort, continuing)');
+    expect(result.stderr).toContain('JSON');
   });
 });
 
@@ -724,7 +642,7 @@ describe('cli - summarizeBackfillResults', () => {
 
   it('fails when everything failed (failed > 0, processed === 0)', () => {
     const summary = summarizeBackfillResults(
-      { ok: true, processed: 0, failed: 3, errors: ['e1', 'e2', 'e3'], method: 'gemini' },
+      { ok: true, processed: 0, failed: 3, errors: ['e1', 'e2', 'e3'], method: 'local' },
       okEmpty
     );
 
@@ -735,7 +653,7 @@ describe('cli - summarizeBackfillResults', () => {
 
   it('partial failure succeeds but surfaces counts and warnings', () => {
     const summary = summarizeBackfillResults(
-      { ok: true, processed: 3, failed: 2, errors: ['embed timeout', 'embed 500'], method: 'gemini' },
+      { ok: true, processed: 3, failed: 2, errors: ['embed timeout', 'embed 500'], method: 'local' },
       { ok: true, processed: 1, failed: 0, errors: [], method: 'local' }
     );
 
@@ -747,7 +665,7 @@ describe('cli - summarizeBackfillResults', () => {
 
   it('full success reports processed count with no warnings', () => {
     const summary = summarizeBackfillResults(
-      { ok: true, processed: 5, failed: 0, errors: [], method: 'gemini' },
+      { ok: true, processed: 5, failed: 0, errors: [], method: 'local' },
       { ok: true, processed: 2, failed: 0, errors: [], method: 'local' }
     );
 

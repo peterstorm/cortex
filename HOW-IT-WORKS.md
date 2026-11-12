@@ -41,7 +41,7 @@ Claude Code loads this file as context. The surface targets ~1500 tokens (hard m
 
 ### 2. During Session
 
-**Every prompt** triggers two `UserPromptSubmit` hooks: one pipes the surface file into context, and one (`prompt-recall.sh`) runs recall against your prompt. It is semantic-first: the prompt is embedded, memories from both databases that are not already in the surface are ranked by cosine, and only hits at or above 0.50 and within 0.15 of the best are kept (max 3). Strict keyword AND matches (every prompt keyword present) supplement them. Broad keyword OR search is not used on the healthy path — it matched any single generic word and injected unrelated memories every turn — and survives only as the degraded path when the embedder fails.
+**Every prompt** triggers two `UserPromptSubmit` hooks: one pipes the surface file into context (reloading it first when a `git switch` since it was written left it naming another branch; Pi does the same before each agent start), and one (`prompt-recall.sh`) runs recall against your prompt. It is semantic-first: the prompt is embedded, memories from both databases that are not already in the surface are ranked by cosine, and only hits at or above 0.50 and within 0.15 of the best are kept (max 3). Strict keyword AND matches (every prompt keyword present) supplement them. Broad keyword OR search is not used on the healthy path — it matched any single generic word and injected unrelated memories every turn — and survives only as the degraded path when the embedder fails.
 
 You can also interact with cortex manually:
 
@@ -62,13 +62,14 @@ There's also an `entity-query` CLI command for entity-first temporal retrieval (
 When your session ends, the hook detaches a background worker (so nothing blocks the session) that runs the pipeline sequentially:
 
 1. **Read transcript** — the JSONL file Claude Code writes during the session
-2. **Resume from checkpoint** — the transcript is first projected to what the model actually saw (message role/content plus compaction summaries; subagent `details`, tool-result siblings and file-history snapshots are dropped, ~96% of bytes on subagent-heavy sessions). Extraction then advances in 100KB chunks OF THAT PROJECTION, streaming from a stored raw byte offset so cost is proportional to new bytes, and picks up where it left off; an invocation processes at most five chunks, then the detached ingestion worker retries deferred or transiently failed extraction until it reaches EOF
+2. **Resume from checkpoint** — the transcript is first projected to what the model actually saw (message role/content plus compaction summaries; subagent `details`, tool-result siblings and file-history snapshots are dropped, ~96% of bytes on subagent-heavy sessions). Extraction then advances in 100KB chunks OF THAT PROJECTION, streaming from a stored raw byte offset so cost is proportional to new bytes, and picks up where it left off; an invocation processes at most five chunks, and the rest waits for the next run on the same session (Pi's ingestion worker, below, retries until it reaches EOF)
 3. **Send to the LLM** — prefer the configured direct OpenAI-compatible endpoint with thinking disabled; fall back to `claude -p --model haiku`, or `pi -p --thinking off` under the pi agent
 4. **Parse response** — validate each memory/entity candidate (type, confidence, priority); an all-invalid non-empty candidate array is a retryable parse failure, while global-scoped memories go to the global DB
 5. **Store in DB** — insert memories, retain the chunk checkpoint on any memory/fact write failure, and compute similarity edges; entity-only or global-only responses get a deterministic project-local provenance memory so facts always have a valid source
-6. **Backfill embeddings** — embed newly stored memories with the local static model
-7. **Maintenance (sequential)** — semantic edge classification, then lifecycle (decay/archive/prune), then AI prune. These used to be concurrent detached spawns, but SQLite allows one writer and lifecycle + AI prune both read-modify-write telemetry — so they now run one after another.
-8. **Regenerate surface LAST** — after all archival, so the surface never contains memories archived earlier in the same pipeline; the next session starts fresh
+   Once the transcript's end is reached, extraction also runs a lifecycle pass (decay/archive/prune)
+6. **Backfill embeddings** — embed newly stored memories with the local static model (skipped when extraction failed)
+7. **Maintenance (sequential)** — one `maintenance` command, behind a per-project lock so overlapping session ends cannot run it twice: semantic edge classification, then lifecycle (decay/archive/prune), then AI prune. These used to be concurrent detached spawns, but SQLite allows one writer and lifecycle + AI prune both read-modify-write telemetry — so they now run one after another.
+8. **Regenerate surface LAST** (the last step of `maintenance`) — after all archival, so the surface never contains memories archived earlier in the same pipeline; the next session starts fresh
 
 In Pi, `session_shutdown` only starts a detached `ingest-session` worker and then returns. The worker owns all eight ordered steps, so `/new` and `/q` never await transcript extraction, embedding, or maintenance. Ephemeral sessions (subagent spawns run `pi -p --no-session`) have no transcript, so their shutdown spawns nothing at all — no extraction and no maintenance — because nothing new entered the store; the spawning session's ingestion pipeline does the maintaining, and the next session's start refreshes the surface.
 
@@ -249,6 +250,7 @@ Memories are inserted without embeddings (to avoid blocking extraction). A backg
         scripts/
           extract-and-generate.sh  # SessionEnd hook
           load-surface.sh          # SessionStart hook
+          show-surface.sh          # UserPromptSubmit hook (prints the surface, for the current branch)
           prompt-recall.sh         # UserPromptSubmit hook (semantic-first recall)
       engine/src/          # TypeScript source
       commands/            # Skill markdown files

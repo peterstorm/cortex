@@ -23,8 +23,7 @@ describe('traverse command', () => {
 
       expect(result.success).toBe(false);
       if (!result.success) {
-        expect(result.error.type).toBe('memory_not_found');
-        expect(result.error.id).toBe('non-existent');
+        expect(result.error).toEqual({ type: 'memory_not_found', id: 'non-existent' });
       }
     });
 
@@ -33,8 +32,7 @@ describe('traverse command', () => {
 
       expect(result.success).toBe(false);
       if (!result.success) {
-        expect(result.error.type).toBe('invalid_depth');
-        expect(result.error.value).toBe(-1);
+        expect(result.error).toEqual({ type: 'invalid_depth', value: -1 });
       }
     });
 
@@ -52,8 +50,7 @@ describe('traverse command', () => {
 
       expect(result.success).toBe(false);
       if (!result.success) {
-        expect(result.error.type).toBe('invalid_direction');
-        expect(result.error.value).toBe('sideways');
+        expect(result.error).toEqual({ type: 'invalid_direction', value: 'sideways' });
       }
     });
 
@@ -62,8 +59,7 @@ describe('traverse command', () => {
 
       expect(result.success).toBe(false);
       if (!result.success) {
-        expect(result.error.type).toBe('invalid_min_strength');
-        expect(result.error.value).toBe(1.5);
+        expect(result.error).toEqual({ type: 'invalid_min_strength', value: 1.5 });
       }
     });
 

@@ -6,19 +6,31 @@
 
 import { Database } from 'bun:sqlite';
 import * as fs from 'node:fs';
-import { countActiveMemoryRows, getActiveMemories, getAllEdges } from '../infra/db.js';
+import {
+  countActiveMemoryRows,
+  getActiveMemories,
+  getActiveMemoriesNeedingEmbedding,
+  getAllEdges,
+} from '../infra/db.js';
 import type { Memory, MemoryType, MemoryScope } from '../core/types.js';
 
 // ============================================================================
 // TELEMETRY DATA TYPES
 // ============================================================================
 
+/**
+ * When each maintenance step last SUCCEEDED, from `.memory/telemetry.json`;
+ * null when it never has, or the file's value is not a timestamp. Both steps
+ * advance their mark only on success, so an old date here is how a step that
+ * fails on every run shows itself.
+ */
+export type MaintenanceMarks = Readonly<{
+  last_lifecycle_at: string | null;
+  last_ai_prune_at: string | null;
+}>;
+
 export interface TelemetryData {
-  readonly last_extraction?: {
-    readonly status: 'success' | 'failure';
-    readonly timestamp: string;
-    readonly error?: string;
-  };
+  readonly maintenance: MaintenanceMarks;
   readonly memory_counts: {
     readonly total: number;
     /**
@@ -31,6 +43,10 @@ export interface TelemetryData {
     readonly by_scope: Record<MemoryScope, number>;
   };
   readonly edge_count: number;
+  /**
+   * Memories the next `backfill` would embed, across both databases: exactly
+   * getActiveMemoriesNeedingEmbedding, the query backfill itself runs.
+   */
   readonly embedding_queue_size: number;
   readonly cache_staleness?: {
     readonly exists: boolean;
@@ -85,16 +101,6 @@ export function countByScope(memories: readonly Memory[]): Record<MemoryScope, n
 }
 
 /**
- * Count memories with null embeddings (pending embedding queue).
- * Pure function.
- */
-export function countPendingEmbeddings(memories: readonly Memory[]): number {
-  return memories.filter(
-    (m) => m.embedding === null && m.local_embedding === null
-  ).length;
-}
-
-/**
  * Calculate cache staleness in hours from timestamp.
  * Returns null if timestamp is invalid.
  * Pure function.
@@ -114,37 +120,21 @@ export function calculateStalenessHours(timestamp: string): number | null {
   }
 }
 
+/** A value that is a parseable timestamp, or null. */
+const timestampOrNull = (value: unknown): string | null =>
+  typeof value === 'string' && !Number.isNaN(Date.parse(value)) ? value : null;
+
 /**
- * Parse telemetry file data safely (pure).
- * Validates each field and returns only validated fields.
- * Parse, don't validate: returns typed data, not booleans.
+ * Parse the maintenance marks out of telemetry.json's content (pure).
+ * Total: an absent file (null), a missing key and a value that is not a
+ * timestamp all read as "never", which is also how lifecycle and ai-prune
+ * treat them when deciding whether to run.
  */
-export function parseTelemetryFile(
-  data: Record<string, unknown>
-): Partial<Pick<TelemetryData, 'last_extraction'>> {
-  const result: Partial<Pick<TelemetryData, 'last_extraction'>> = {};
-
-  // Validate last_extraction if present
-  if (data.last_extraction && typeof data.last_extraction === 'object') {
-    const extraction = data.last_extraction as Record<string, unknown>;
-
-    // Validate status field
-    if (
-      extraction.status === 'success' ||
-      extraction.status === 'failure'
-    ) {
-      // Validate timestamp field
-      if (typeof extraction.timestamp === 'string') {
-        result.last_extraction = {
-          status: extraction.status,
-          timestamp: extraction.timestamp,
-          error: typeof extraction.error === 'string' ? extraction.error : undefined,
-        };
-      }
-    }
-  }
-
-  return result;
+export function parseTelemetryFile(data: Record<string, unknown> | null): MaintenanceMarks {
+  return {
+    last_lifecycle_at: timestampOrNull(data?.last_lifecycle_at),
+    last_ai_prune_at: timestampOrNull(data?.last_ai_prune_at),
+  };
 }
 
 /**
@@ -244,20 +234,21 @@ export function collectTelemetry(
   const globalEdges = getAllEdges(globalDb);
   const totalEdges = projectEdges.length + globalEdges.length;
 
+  // The backfill queue, read through backfill's own query so the two cannot
+  // disagree about what is waiting (I/O)
+  const pendingEmbeddings =
+    getActiveMemoriesNeedingEmbedding(projectDb).length + getActiveMemoriesNeedingEmbedding(globalDb).length;
+
   // Pure transformations
   const byType = countByType(allMemories);
   const byScope = countByScope(allMemories);
-  const pendingEmbeddings = countPendingEmbeddings(allMemories);
 
   // Get cache staleness (I/O)
   const cacheStaleness = getCacheStaleness(cachePath);
 
-  // Parse telemetry file safely (pure)
-  const parsedTelemetry = telemetryFile ? parseTelemetryFile(telemetryFile) : {};
-
   // Assemble telemetry data
   return {
-    last_extraction: parsedTelemetry.last_extraction,
+    maintenance: parseTelemetryFile(telemetryFile),
     memory_counts: {
       total: allMemories.length,
       unreadable,

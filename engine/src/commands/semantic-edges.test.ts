@@ -17,7 +17,7 @@ import * as nodePath from 'node:path';
 import { createMemory } from '../core/types.js';
 import { openDatabase, insertMemory, insertEdge, getAllEdges, updateMemory } from '../infra/db.js';
 import { acquireLock } from '../infra/lock.js';
-import type { LlmPromptTransport } from '../infra/claude-llm.js';
+import { LlmEndpointSaturatedError, type LlmPromptTransport } from '../infra/claude-llm.js';
 import { withBunWhichUnavailable } from '../infra/llm-test-helpers.js';
 import {
   executeSemanticEdges,
@@ -151,6 +151,29 @@ describe('executeSemanticEdges', () => {
     expect(kept.classified_at).toBeNull();
     expect(kept.last_failed_at).not.toBeNull();
     expect(kept.classify_hash).not.toBeNull();
+  });
+
+  it('stops asking once the LLM endpoint is saturated and leaves the unasked edges unstamped', async () => {
+    // 60 edges = 6 batches of 10, two in flight at a time.
+    const edgeIds: string[] = [];
+    for (let index = 0; index < 60; index++) {
+      seedMemory(`s${index}`);
+      seedMemory(`t${index}`);
+      edgeIds.push(insertEdge(db, { source_id: `s${index}`, target_id: `t${index}`, relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active' }));
+    }
+    transportCall.mockRejectedValue(new LlmEndpointSaturatedError(3));
+
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
+
+    // Both in-flight batches hit saturation; the other four were never sent.
+    expect(transportCall).toHaveBeenCalledTimes(2);
+    expect(result).toEqual({ ok: true, classified: 0, failed: 60 });
+    const edges = getAllEdges(db).filter((e) => edgeIds.includes(e.id));
+    // Asked and failed: backed off. Never asked: nothing to back off from,
+    // so they are candidates again on the next run.
+    expect(edges.filter((e) => e.last_failed_at !== null)).toHaveLength(20);
+    expect(edges.filter((e) => e.last_failed_at === null)).toHaveLength(40);
+    expect(edges.every((e) => e.classified_at === null)).toBe(true);
   });
 
   it('leaves edges unclassified but records the failure for backoff on an unparseable response instead of retiring them', async () => {

@@ -142,6 +142,18 @@ export function getTelemetryPath(projectRoot: string): string {
   return join(projectRoot, '.memory', 'telemetry.json');
 }
 
+/**
+ * Resolve the generation status path: what the last surface generation did
+ * (when, which branch, how many memories). Separate from telemetry.json,
+ * which holds the maintenance watermarks.
+ *
+ * @param projectRoot - Absolute path to project root
+ * @returns Absolute path to the status file
+ */
+export function getStatusPath(projectRoot: string): string {
+  return join(projectRoot, '.memory', 'cortex-status.json');
+}
+
 // ============================================================================
 // CONSTANTS
 // ============================================================================
@@ -429,8 +441,9 @@ export const INTRA_BATCH_DEDUP_THRESHOLD = 0.75;
 export const CONSOLIDATION_SIMILARITY_THRESHOLD = 0.5;
 
 /**
- * Consolidation threshold for raw cosine on 384-dim LOCAL embeddings
- * (BGE-small-en-v1.5). Local cosine runs "hot": same-domain memories about
+ * Consolidation threshold for raw cosine between LOCAL embeddings, calibrated
+ * on LOCAL_COSINE_CALIBRATED_MODEL and applied only while
+ * LOCAL_COSINE_CALIBRATED holds. Its cosine runs "hot": same-domain memories about
  * DIFFERENT aspects routinely score 0.6-0.75 (see DEDUP_SIMILARITY_THRESHOLD
  * calibration note). At 0.5 nearly every same-project pair was flagged as a
  * "duplicate" — O(n²) false positives. 0.8 sits above the same-domain band

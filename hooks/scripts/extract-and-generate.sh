@@ -82,6 +82,10 @@ main() {
     return 0  # Never block session
   fi
 
+  # Each worker writes its own PID-suffixed logs and nothing ever removed
+  # them. Keep a week, which is longer than any failure stays interesting.
+  find /tmp -maxdepth 1 -name 'cortex-*.log' -type f -mtime +7 -delete 2>/dev/null || true
+
   log_info "Received Stop hook input, starting extraction..."
 
   # Parse cwd from stdin JSON for generate command

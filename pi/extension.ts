@@ -8,14 +8,17 @@
 
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { shouldRunShutdownPipeline, isCortexShutdownReason } from "./shutdown-policy.js";
-import { getSurfaceOutputPath } from "../engine/src/config.js";
-import { describeError, nodeCliRunner, type CliRunner } from "./cli-runner.js";
+import { showSurface } from "../engine/src/commands/show-surface.js";
+import { nodeCliRunner, type CliRunner } from "./cli-runner.js";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const CLI_PATH = join(PACKAGE_ROOT, "engine", "src", "cli.ts");
+
+/** A surface reload blocks the agent's start, so it gets a short leash. */
+const SURFACE_RELOAD_TIMEOUT_MS = 10_000;
 
 const defaultCliRunner = nodeCliRunner(CLI_PATH, { CORTEX_PLUGIN_ROOT: PACKAGE_ROOT });
 
@@ -34,24 +37,6 @@ function getCortexLlmEnvironment(model: PiModelSelection | undefined): NodeJS.Pr
     : {};
 }
 
-/** Source Gemini API key if available */
-function loadGeminiEnv(): void {
-  const envFile = join(process.env.HOME ?? "", ".config/sops-nix/secrets/rendered/gemini-env");
-  if (existsSync(envFile)) {
-    try {
-      const content = readFileSync(envFile, "utf-8");
-      for (const line of content.split("\n")) {
-        const match = line.match(/^export\s+(\w+)=["']?(.+?)["']?\s*$/);
-        if (match) process.env[match[1]] = match[2];
-      }
-    } catch (error) {
-      process.stderr.write(
-        `[cortex] Failed to read Gemini environment file ${envFile}: ${describeError(error)}\n`
-      );
-    }
-  }
-}
-
 /**
  * @param pi - The Pi extension API
  * @param cli - The engine boundary. Defaults to the real subprocess adapter;
@@ -59,8 +44,6 @@ function loadGeminiEnv(): void {
  *   framework and cannot be broken by one.
  */
 export default function (pi: ExtensionAPI, cli: CliRunner = defaultCliRunner) {
-  loadGeminiEnv();
-
   /** Best-effort stdout adapter for lifecycle hooks that intentionally degrade. */
   const runCli = (args: readonly string[], options?: Parameters<CliRunner["run"]>[1]): string => {
     const result = cli.run(args, options);
@@ -81,18 +64,18 @@ export default function (pi: ExtensionAPI, cli: CliRunner = defaultCliRunner) {
     const systemPrompt = event.systemPrompt
       + `\n\n# Cortex Memory CLI\nWhen cortex commands reference \`\${CLAUDE_PLUGIN_ROOT}\`, use this resolved path instead:\n\`${PACKAGE_ROOT}\`\nFor example: \`bun ${CLI_PATH} recall ${cwd} "query"\`\n`;
 
-    // 2. Load cached surface file
+    // 2. The memory surface, reloaded first if a `git switch` since it was
+    // written left it naming another branch: the same check and reload as
+    // Claude Code's UserPromptSubmit hook, from the same engine function.
     const parts: string[] = [];
-    const surfacePath = getSurfaceOutputPath(cwd);
-    if (existsSync(surfacePath)) {
-      try {
-        const surface = readFileSync(surfacePath, "utf-8").trim();
-        if (surface) parts.push(surface);
-      } catch (error) {
-        process.stderr.write(
-          `[cortex] Failed to read memory surface ${surfacePath}: ${describeError(error)}\n`
-        );
-      }
+    const shown = showSurface(cwd, (dir) => {
+      cli.run(["load-surface", dir], { cwd: dir, timeout: SURFACE_RELOAD_TIMEOUT_MS });
+    });
+    if (shown.kind === "shown") {
+      const surface = shown.text.trim();
+      if (surface) parts.push(surface);
+    } else if (shown.kind === "unreadable") {
+      process.stderr.write(`[cortex] Failed to read memory surface ${shown.path}: ${shown.error}\n`);
     }
 
     // 3. Prompt recall (keyword search based on user's prompt)

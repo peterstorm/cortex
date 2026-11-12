@@ -8,10 +8,10 @@
  * aggregation are the pure core in core/eval-*.ts, and the adapters live in
  * eval-adapters.ts.
  *
- * Eval directory (default <cwd>/.memory/eval, where cwd is --cwd or the
- * directory the command runs in; gitignored with .memory/). The memory it
- * snapshots is the project's, at the repository root, so from a subdirectory
- * the two differ: pass --dir, or run from the root.
+ * Eval directory (default <project root>/.memory/eval, beside the memory it
+ * measures and gitignored with it; --dir overrides). The project root is the
+ * one every other command resolves from --cwd, so a subdirectory or a linked
+ * worktree of the repository shares one eval set with the root.
  *   eval.json                 {"authoring_sessions": [...]}
  *   questions.jsonl           confirmed cases
  *   labels.jsonl              optional: your own scores, to check the judge
@@ -94,7 +94,7 @@ export type EvalPaths = Readonly<{
   run: (name: RunName) => RunPaths;
 }>;
 
-export const defaultEvalDir = (cwd: string): string => path.join(cwd, '.memory', 'eval');
+export const defaultEvalDir = (projectRoot: string): string => path.join(projectRoot, '.memory', 'eval');
 
 export function evalPaths(dir: string): EvalPaths {
   return {
@@ -462,13 +462,18 @@ export function renderAgreements(results: readonly RunResult[], labels: readonly
 // ARGUMENTS
 // ============================================================================
 
+/**
+ * `dir` is the eval directory named with --dir, or null for the project's
+ * default. The default hangs off the project root, which takes I/O to find
+ * (git, the filesystem), so parsing leaves it to the shell: defaultEvalDir.
+ */
 export type EvalCommand =
-  | Readonly<{ kind: 'validate'; cwd: string; dir: string }>
-  | Readonly<{ kind: 'answer'; cwd: string; dir: string; run: RunName; condition: Condition }>
+  | Readonly<{ kind: 'validate'; cwd: string; dir: string | null }>
+  | Readonly<{ kind: 'answer'; cwd: string; dir: string | null; run: RunName; condition: Condition }>
   | Readonly<{
       kind: 'score';
       cwd: string;
-      dir: string;
+      dir: string | null;
       runs: readonly [RunName] | readonly [RunName, RunName];
       dryRun: boolean;
     }>;
@@ -504,7 +509,8 @@ export function parseEvalArgs(args: readonly string[], defaultCwd: string): Eval
   if (unknown.length > 0) return `unknown flag(s) for eval ${sub}: --${unknown.join(', --')}\n${EVAL_USAGE}`;
 
   const cwd = path.resolve(flags.get('cwd') ?? defaultCwd);
-  const dir = path.resolve(flags.get('dir') ?? defaultEvalDir(cwd));
+  const given = flags.get('dir');
+  const dir = given === undefined ? null : path.resolve(given);
   const named = positional.map(parseRunName).filter((r): r is RunName => r !== null);
   if (named.length !== positional.length) {
     return 'run names use lowercase letters, digits, ".", "_" and "-", starting with a letter or digit';

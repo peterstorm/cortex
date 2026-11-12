@@ -50,14 +50,18 @@ JSON printed to stdout with these fields (combined across project + global DBs):
 Total number of edges across both databases.
 
 ### `embedding_queue_size`
-Active memories with no embedding yet — the backfill queue.
+The backfill queue: active memories the next `backfill` would embed, across both databases. That is every active memory except `code` ones (never embedded) whose `local_embedding` is missing or was made by a model other than the current one. It is counted with the same query `backfill` runs, so 0 means backfill has nothing to do.
 
 ### `cache_staleness`
 - **exists:** Whether the surface cache directory exists
 - **age_hours:** Age of the most recent cache file (>24h means the surface will regenerate at next session start)
 
-### `last_extraction` (if present)
-Status (`success`/`failure`), timestamp, and error message of the last recorded extraction, read from `.memory/telemetry.json`.
+### `maintenance`
+When each maintenance step last succeeded, read from `.memory/telemetry.json`; `null` means never.
+- **last_lifecycle_at:** last decay/archive/prune pass (due every 2 hours of session activity)
+- **last_ai_prune_at:** last completed AI prune review
+
+A step advances its timestamp only on success, so one that stays old while sessions keep ending is failing on every run.
 
 ## Interpreting Results
 
@@ -74,7 +78,8 @@ Status (`success`/`failure`), timestamp, and error message of the last recorded 
 
 ### Critical Issues
 - Active memories: 0 (extraction pipeline broken)
-- Cache doesn't exist after sessions ended (generate step failing — check `/tmp/cortex-generate.log`)
+- `maintenance.last_lifecycle_at` weeks old while sessions keep ending (lifecycle fails on every run — check the newest `/tmp/cortex-maintenance.<pid>.log`)
+- Cache doesn't exist after sessions ended (generate step failing — check the newest `/tmp/cortex-maintenance.<pid>.log`)
 
 ## When to Use
 
@@ -86,7 +91,8 @@ Status (`success`/`failure`), timestamp, and error message of the last recorded 
 
 **Verification scenarios:**
 - After `/consolidate` → verify active count dropped (merged pairs superseded)
-- After extraction → verify counts grew / `last_extraction` updated
+- After extraction → verify counts grew
+- After maintenance → verify `maintenance.last_lifecycle_at` moved
 - After backfill → verify embedding queue cleared
 
 ## Integration with Other Skills

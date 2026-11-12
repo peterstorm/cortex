@@ -10,18 +10,17 @@
  * - FR-012: Support resumable extraction if transcript >100KB
  *
  * Imperative shell - orchestrates I/O and pure functions:
- * 1. Read transcript file
- * 2. Get extraction checkpoint
- * 3. Truncate if needed (pure)
- * 4. Get git context
- * 5. Build extraction prompt (pure)
- * 6. Call the LLM (direct endpoint first, CLI subprocess as fallback)
- * 7. Parse response (pure)
- * 8. For each candidate:
- *    - Insert memory
- *    - Compute similarity + create edges
- * 9. Save checkpoint
- * 10. Run lifecycle
+ * 1. Get the extraction checkpoint (reset on a projection-version change)
+ * 2. Read a bounded window of projected transcript chunks from the cursor
+ *    (reset and re-read if the transcript shrank)
+ * 3. Get git context and the known entities
+ * 4. For each chunk:
+ *    - Build extraction prompt (pure)
+ *    - Call the LLM (direct endpoint first, CLI subprocess as fallback)
+ *    - Parse response (pure)
+ *    - Dedup (pure), insert, create similarity edges, record entity facts
+ *    - Save the checkpoint at the chunk's end
+ * 5. At the transcript's end: run lifecycle, invalidate the surface cache
  */
 
 import { createHash, randomUUID } from 'node:crypto';
@@ -47,7 +46,7 @@ import {
   hybridSimilarityScored,
   classifySimilarity,
 } from '../core/similarity.js';
-import { embedLocal, ensureModelLoaded } from '../infra/local-embed.ts';
+import { embedLocal, ensureModelLoaded } from '../infra/local-embed.js';
 import {
   insertMemory,
   updateMemory,
@@ -766,8 +765,10 @@ export function deduplicateCandidates(
   const existingTokenSets = existingMemories.map(
     (m) => tokenize(`${m.summary} ${m.content}`)
   );
-  // Only use local_embedding (384-dim) for cosine comparison — avoids dimension
-  // mismatch with candidate embeddings which are always 384-dim local.
+  // Only local_embedding is compared, never the legacy `embedding` column:
+  // candidate vectors come from LOCAL_EMBED_MODEL, so a local vector is the only
+  // kind that can share their space. A stored vector of another width scores on
+  // Jaccard instead (hybridSimilarity checks the lengths).
   const existingEmbeddings = existingMemories.map(
     (m) => m.local_embedding ?? null
   );
@@ -860,9 +861,10 @@ export interface EdgeCandidate {
  * Pure function — no I/O.
  *
  * Classification is SPACE-AWARE: when both sides have local embeddings the
- * score is raw 384-dim BGE cosine (runs hot — same-domain pairs score
- * 0.6-0.75), so the calibrated 'local-cosine' bands apply; Jaccard fallback
- * keeps the original FR-059 bands. Without this, nearly every same-project
+ * score is raw cosine in LOCAL_EMBED_MODEL's space, so the 'local-cosine'
+ * bands apply (calibrated on LOCAL_COSINE_CALIBRATED_MODEL, whose cosine runs
+ * hot — same-domain pairs score 0.6-0.75); Jaccard fallback keeps the original
+ * FR-059 bands. Without this, nearly every same-project
  * pair landed in consolidate/suggest → O(n²) relates_to edges, all fed to
  * the semantic-edges LLM pass.
  *
@@ -883,8 +885,7 @@ export function computeEdgeCandidates(
   maxEdges: number = MAX_EDGES_PER_MEMORY
 ): readonly EdgeCandidate[] {
   const newTokens = tokenize(`${newMem.summary} ${newMem.content}`);
-  // Only use local_embedding (384-dim) for cosine comparison — avoids dimension
-  // Matches the dedup strategy.
+  // Only local_embedding is compared, as in deduplicateCandidates.
   const newEmbedding = newMem.local_embedding ?? null;
 
   const candidates: EdgeCandidate[] = [];

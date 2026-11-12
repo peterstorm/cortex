@@ -192,13 +192,13 @@ export async function runLlmPrompt(prompt: string, timeoutMs: number): Promise<s
   }
 
   const proc = Bun.spawn(
-    args,
+    [...args],
     {
       stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'pipe',
       env: (() => {
-        const env = { ...process.env, CORTEX_EXTRACTING: '1' };
+        const env: NodeJS.ProcessEnv = { ...process.env, CORTEX_EXTRACTING: '1' };
         delete env.CLAUDECODE;
         return env;
       })(),
@@ -217,7 +217,7 @@ export async function runLlmPrompt(prompt: string, timeoutMs: number): Promise<s
 
   // Race between process completion and timeout.
   // Timer must be cleared after resolution to prevent keeping the event loop alive.
-  let timer: ReturnType<typeof setTimeout>;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       proc.kill('SIGKILL');
@@ -229,7 +229,7 @@ export async function runLlmPrompt(prompt: string, timeoutMs: number): Promise<s
   try {
     result = await Promise.race([proc.exited, timeout]);
   } finally {
-    clearTimeout(timer!);
+    clearTimeout(timer);
   }
 
   if (result !== 0) {
@@ -315,6 +315,26 @@ function releaseLlmSlot(): void {
   if (next) next();
 }
 
+/**
+ * The direct endpoint has failed so many times in a row that the subprocess
+ * fallback is suppressed (see getDirectFailureFallbackThreshold).
+ *
+ * A class of its own because the callers that loop over batches need to tell
+ * it apart from one bad call: a single failure says nothing about the next
+ * batch, but this one says every further call in this process will fail the
+ * same way until the endpoint recovers, so the loop should stop asking.
+ */
+export class LlmEndpointSaturatedError extends Error {
+  override readonly name = 'LlmEndpointSaturatedError';
+
+  constructor(readonly consecutiveFailures: number) {
+    super(
+      `direct LLM endpoint saturated: ${consecutiveFailures} consecutive failure(s); ` +
+        `subprocess fallback suppressed to avoid escalating server load`
+    );
+  }
+}
+
 /** Per-process consecutive direct-endpoint failures; gives the operator a recurrence signal. */
 let consecutiveDirectFailures = 0;
 
@@ -394,10 +414,7 @@ async function runLlmPromptDirectUnbounded(
             `failure(s) — deferring work to the next run instead of escalating load ` +
             `(adjust CORTEX_LLM_MAX_DIRECT_FAILURES to change the threshold)\n`
         );
-        throw new Error(
-          `direct LLM endpoint saturated: ${count} consecutive failure(s); ` +
-            `subprocess fallback suppressed to avoid escalating server load`
-        );
+        throw new LlmEndpointSaturatedError(count);
       }
       process.stderr.write(
         `[cortex:llm] WARNING: direct LLM call failed (${failureDetail})${recurrence}; ` +

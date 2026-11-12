@@ -327,10 +327,10 @@ export function parseExtractionResponse(
     }
     const entities: readonly EntityFactCandidate[] = validEntities
       .map((c) => ({
-        entity_name: String((c as any).entity_name).trim(),
-        entity_type: (c as any).entity_type,
-        predicate: String((c as any).predicate).trim(),
-        object: String((c as any).object).trim(),
+        entity_name: c.entity_name.trim(),
+        entity_type: c.entity_type,
+        predicate: c.predicate.trim(),
+        object: c.object.trim(),
       }));
 
     return { kind: 'ok', memories, entities };
@@ -451,12 +451,13 @@ function isValidCandidate(obj: unknown): obj is MemoryCandidate {
  * FR-108: Embedding metadata prefix: '[memory_type] [project:name] summary'
  * (only the summary is embedded, never the full content).
  *
- * @param memory - Memory candidate with type and content
+ * @param memory - The two fields the text is built from; a candidate and a
+ *   stored memory both satisfy it
  * @param projectName - Project name for prefix
  * @returns Formatted text for embedding
  */
 export function buildEmbeddingText(
-  memory: MemoryCandidate,
+  memory: Pick<MemoryCandidate, 'memory_type' | 'summary'>,
   projectName: string
 ): string {
   return `[${memory.memory_type}] [project:${projectName}] ${memory.summary}`;

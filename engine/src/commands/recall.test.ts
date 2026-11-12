@@ -1,6 +1,6 @@
 /**
  * Tests for recall command
- * Uses in-memory SQLite and mocked Voyage API
+ * Uses in-memory SQLite and a mocked local embedder
  */
 
 
@@ -14,7 +14,8 @@ import {
 } from './recall.js';
 import { openDatabase, insertMemory, insertEdge } from '../infra/db.js';
 import { createMemory, createEdge } from '../core/types.js';
-import * as localEmbed from '../infra/local-embed.ts';
+import * as localEmbed from '../infra/local-embed.js';
+import type { MockInstance } from 'vitest';
 
 // Setup test databases
 function setupTestDbs(): { projectDb: Database; globalDb: Database } {
@@ -49,7 +50,7 @@ function createTestMemory(overrides: Partial<Parameters<typeof createMemory>[0]>
 }
 
 describe('recall command', () => {
-  let embedLocalSpy: ReturnType<typeof vi.spyOn>;
+  let embedLocalSpy: MockInstance<typeof localEmbed.embedLocal>;
 
   beforeEach(() => {
     // Reset and recreate mocks for each test
@@ -334,10 +335,12 @@ describe('recall command', () => {
     await executeRecall(projectDb, globalDb, options);
 
     // Verify access_count incremented
-    const stmt = projectDb.prepare('SELECT access_count FROM memories WHERE id = ?');
-    const row = stmt.get(mem.id) as any;
+    const stmt = projectDb.prepare<{ access_count: number }, [string]>(
+      'SELECT access_count FROM memories WHERE id = ?'
+    );
+    const row = stmt.get(mem.id);
 
-    expect(row.access_count).toBe(1);
+    expect(row?.access_count).toBe(1);
   });
 
   test('empty query error', async () => {

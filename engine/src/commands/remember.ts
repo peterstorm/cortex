@@ -368,13 +368,7 @@ export async function executeRemember(
   const embedFn = options.embedFn ?? null;
   if (embedFn !== null) {
     try {
-      const embeddingText = buildEmbeddingText(
-        { memory_type: memory.memory_type, summary: memory.summary } as Pick<
-          Memory,
-          'memory_type' | 'summary'
-        >,
-        options.projectName ?? 'unknown'
-      );
+      const embeddingText = buildEmbeddingText(memory, options.projectName ?? 'unknown');
       candidateEmbedding = await embedFn(embeddingText);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
