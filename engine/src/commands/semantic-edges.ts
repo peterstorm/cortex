@@ -25,7 +25,7 @@ import type { Database } from 'bun:sqlite';
 import type { Memory } from '../core/types.js';
 import { chunk } from '../core/chunk.js';
 import type { MemoryPair, EdgeClassification, LlmPromptTransport } from '../infra/claude-llm.js';
-import { classifyEdges, isClaudeLlmAvailable } from '../infra/claude-llm.js';
+import { classifyEdges, isClaudeLlmAvailable, LlmEndpointSaturatedError } from '../infra/claude-llm.js';
 import {
   getRelatesToEdgesWithMemories,
   deleteEdge,
@@ -304,8 +304,17 @@ export async function executeSemanticEdges(
     // backoff delays the retry instead of re-hammering an unhealthy server.
     let classified = 0;
     let failed = 0;
+    // Set once the LLM reports saturation: every further call in this process
+    // fails the same way, so the batches not yet started are left unasked.
+    // They are not stamped (no attempt was made, so there is nothing to back
+    // off from) and stay candidates for the next run.
+    let saturated = false;
 
     await mapLimit(batches, CONCURRENCY, async (batchPairs) => {
+      if (saturated) {
+        failed += batchPairs.length;
+        return;
+      }
       const attemptedAt = new Date().toISOString();
 
       // One place records a failed batch: stamp last_failed_at on every edge
@@ -348,6 +357,10 @@ export async function executeSemanticEdges(
         const message = err instanceof Error ? err.message : String(err);
         logError(`Classification batch failed: ${message}`);
         recordBatchFailure(batchPairs);
+        if (err instanceof LlmEndpointSaturatedError && !saturated) {
+          saturated = true;
+          logError('LLM endpoint is saturated; leaving the remaining batches for the next run');
+        }
         return;
       }
 

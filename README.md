@@ -30,7 +30,7 @@ Claude Code reads `.claude/cortex-memory.local.md` as context, giving it "memory
 
 ### Session Start
 
-A `SessionStart` hook loads a cached "surface" — a compact markdown summary of the most relevant memories. The cache is keyed by `sha256(branch:cwd)` and valid for 24 hours. If stale or missing, it regenerates from the database — but only for projects that already have a project database, or a stray one waiting to be merged (the hook never creates databases in untouched projects). In Pi, this cache refresh is detached so startup and `/new` do not wait on the engine CLI; an existing surface remains readable until the atomic refresh completes. Additionally, a `UserPromptSubmit` hook pipes the surface file contents on every prompt, and a second `UserPromptSubmit` hook (`prompt-recall.sh`) runs recall against your prompt — semantic-first (cosine floor 0.50, within a 0.15 band of the best hit, memories already in the surface excluded before ranking), supplemented by strict keyword AND matches. Broad keyword OR search only runs as the degraded path when the embedder is unavailable.
+A `SessionStart` hook loads a cached "surface" — a compact markdown summary of the most relevant memories. The cache is keyed by `sha256(branch:cwd)` and valid for 24 hours. If stale or missing, it regenerates from the database — but only for projects that already have a project database, or a stray one waiting to be merged (the hook never creates databases in untouched projects). In Pi, this cache refresh is detached so startup and `/new` do not wait on the engine CLI; an existing surface remains readable until the atomic refresh completes. Additionally, a `UserPromptSubmit` hook (`show-surface.sh`) prints the surface file on every prompt, first reloading it for the checked-out branch if a `git switch` since it was written left it naming another one, and a second `UserPromptSubmit` hook (`prompt-recall.sh`) runs recall against your prompt — semantic-first (cosine floor 0.50, within a 0.15 band of the best hit, memories already in the surface excluded before ranking), supplemented by strict keyword AND matches. Broad keyword OR search only runs as the degraded path when the embedder is unavailable.
 
 ### During a Session
 
@@ -417,7 +417,7 @@ Every change to extraction, ranking or pruning feels like progress. `/eval` tell
 
 **What it measures.** The read path, exactly as the hooks inject it: for each question the answering model gets the push surface plus the prompt-recall block cortex would add for that prompt, and nothing else. It has no tools, so the score is what the memory delivers unprompted, not what an agent could dig up with `/recall`. The `none` condition gives the same prompt with no memory. That is the baseline that says whether memory helps at all.
 
-**The eval directory** (default `<cwd>/.memory/eval`, gitignored with `.memory/`). `<cwd>` is `--cwd`, or the directory the command runs in. The memory a run snapshots is the project's, which lives at the repository root, so from a subdirectory or a linked worktree the two differ: run from the root, or pass `--dir`.
+**The eval directory** (default `<repository root>/.memory/eval`, gitignored with `.memory/`; `--dir` overrides). It sits beside the memory a run snapshots, so a subdirectory or a linked worktree of the repository uses the same eval set as the root.
 
 ```
 eval.json                 {"authoring_sessions": ["<session id>", ...]}
@@ -533,6 +533,7 @@ Extraction, AI pruning, and edge classification prefer a **direct OpenAI-compati
         scripts/
           extract-and-generate.sh   # SessionEnd hook
           load-surface.sh           # SessionStart hook
+          show-surface.sh           # UserPromptSubmit hook (prints the surface, for the current branch)
           prompt-recall.sh          # UserPromptSubmit hook (semantic-first recall)
       engine/src/               # TypeScript source
       commands/                 # Skill markdown files
@@ -584,7 +585,7 @@ bun engine/src/cli.ts inspect <cwd>
 bun engine/src/cli.ts index-code <cwd> <proseId> <codePath>
 bun engine/src/cli.ts traverse <cwd> <memoryId> [maxDepth]
 
-# Evaluation (defaults: --cwd=., --dir=<cwd>/.memory/eval)
+# Evaluation (defaults: --cwd=., --dir=<repository root>/.memory/eval)
 bun engine/src/cli.ts eval validate [--cwd=<project>]
 bun engine/src/cli.ts eval answer <run> [--condition=cortex|none] [--cwd=<project>]
 bun engine/src/cli.ts eval score <run> [<run>] [--dry-run] [--cwd=<project>]

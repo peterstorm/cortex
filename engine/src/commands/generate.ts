@@ -12,7 +12,7 @@ import * as path from 'node:path';
 import { admitAll, type MemoryAdmission } from '../core/admission.js';
 import type { RankedMemory } from '../core/surface.js';
 import type { EntityProfile } from '../core/entities.js';
-import { SURFACE_STALE_HOURS, SURFACE_OVERHEAD_TOKENS } from '../config.js';
+import { SURFACE_STALE_HOURS, SURFACE_OVERHEAD_TOKENS, getStatusPath } from '../config.js';
 import { getActiveMemories, getAllEdges, getAllEntities, getCurrentFacts } from '../infra/db.js';
 import { computeAllCentrality } from '../core/graph.js';
 import { selectForSurface } from '../core/ranking.js';
@@ -86,8 +86,7 @@ export function runGenerate(options: GenerateOptions): GenerateResult {
 
   // I/O: Write telemetry
   const durationMs = Date.now() - startTime;
-  const telemetryPath = path.join(root, '.memory', 'cortex-status.json');
-  writeTelemetry(telemetryPath, {
+  writeTelemetry(getStatusPath(root), {
     last_generation: new Date().toISOString(),
     branch,
     memory_count: surface.memoryCount,

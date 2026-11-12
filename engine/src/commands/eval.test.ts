@@ -470,19 +470,17 @@ describe('renderAgreements', () => {
 describe('parseEvalArgs', () => {
   const cwd = '/work/project';
 
-  test('defaults the eval directory under the project memory dir', () => {
-    expect(parseEvalArgs(['validate'], cwd)).toEqual({
-      kind: 'validate',
-      cwd,
-      dir: '/work/project/.memory/eval',
-    });
+  test('leaves the eval directory to the project root unless --dir names one', () => {
+    expect(parseEvalArgs(['validate'], cwd)).toEqual({ kind: 'validate', cwd, dir: null });
+    expect(parseEvalArgs(['validate', '--dir=/elsewhere/eval'], cwd)).toMatchObject({ dir: '/elsewhere/eval' });
+    expect(parseEvalArgs(['validate', '--dir=sets/a'], cwd)).toMatchObject({ dir: path.resolve('sets/a') });
   });
 
   test('answer defaults to the cortex condition', () => {
     expect(parseEvalArgs(['answer', 'before', '--cwd=/other'], cwd)).toEqual({
       kind: 'answer',
       cwd: '/other',
-      dir: '/other/.memory/eval',
+      dir: null,
       run: 'before',
       condition: 'cortex',
     });

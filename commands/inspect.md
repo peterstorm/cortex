@@ -74,7 +74,7 @@ Status (`success`/`failure`), timestamp, and error message of the last recorded 
 
 ### Critical Issues
 - Active memories: 0 (extraction pipeline broken)
-- Cache doesn't exist after sessions ended (generate step failing — check `/tmp/cortex-generate.log`)
+- Cache doesn't exist after sessions ended (generate step failing — check the newest `/tmp/cortex-maintenance.<pid>.log`)
 
 ## When to Use
 

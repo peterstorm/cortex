@@ -5,7 +5,8 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -55,9 +56,11 @@ function memory(id: string, summary: string, session: string) {
   });
 }
 
-async function cli(...args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+const cli = (...args: string[]) => cliIn(project, ...args);
+
+async function cliIn(cwd: string, ...args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
   const url = `http://127.0.0.1:${server.port}/v1`;
-  const proc = Bun.spawn(['bun', CLI, 'eval', ...args, `--cwd=${project}`], {
+  const proc = Bun.spawn(['bun', CLI, 'eval', ...args, `--cwd=${cwd}`], {
     env: {
       ...process.env,
       HOME: path.join(root, 'home'),
@@ -165,4 +168,21 @@ describe('cortex eval, end to end', () => {
     expect(answerPrompts.filter((p) => p.includes('CORTEX_MEMORY_START'))).toHaveLength(2);
     expect(prompts.some((p) => p.includes('ANSWER KEY'))).toBe(false);
   }, 120_000);
+
+  test('a subdirectory of the repository reads the eval set at the repository root', async () => {
+    const repo = path.join(root, 'repo');
+    mkdirSync(path.join(repo, 'packages', 'app'), { recursive: true });
+    cpSync(path.join(project, '.memory', 'eval', 'eval.json'), path.join(repo, '.memory', 'eval', 'eval.json'));
+    cpSync(
+      path.join(project, '.memory', 'eval', 'questions.jsonl'),
+      path.join(repo, '.memory', 'eval', 'questions.jsonl'),
+    );
+    const init = spawnSync('git', ['init', '-q', '-b', 'main'], { cwd: repo });
+    expect(init.status).toBe(0);
+
+    const { code, stdout, stderr } = await cliIn(path.join(repo, 'packages', 'app'), 'validate');
+
+    expectOk({ code, stderr });
+    expect(stdout).toContain('2 cases: 1 practice, 1 held_out');
+  }, 60_000);
 });

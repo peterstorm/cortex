@@ -128,7 +128,7 @@ SessionStart hook
 
 ### Session End (detached worker)
 
-The hook re-invokes itself as a detached worker (`setsid`, or `spawn({detached: true})` on macOS) so the pipeline survives Claude Code reaping the hook's process group. Steps run **sequentially** — SQLite allows one writer, and lifecycle + ai-prune both read-modify-write telemetry.json. Each step logs to `/tmp/cortex-<step>.log`. The hook needs no API key for embeddings; on NixOS it puts a 64-bit `libstdc++` on `LD_LIBRARY_PATH` for `onnxruntime-node` (`CORTEX_ONNX_LD_PATH` pins the directory, otherwise it probes the nix store).
+The hook re-invokes itself as a detached worker (`setsid`, or `spawn({detached: true})` on macOS) so the pipeline survives Claude Code reaping the hook's process group. Steps run **sequentially** — SQLite allows one writer, and lifecycle + ai-prune both read-modify-write telemetry.json. Each step logs to `/tmp/cortex-<step>.<pid>.log`; the worker deletes such logs once they are a week old. The hook needs no API key for embeddings; on NixOS it puts a 64-bit `libstdc++` on `LD_LIBRARY_PATH` for `onnxruntime-node` (`CORTEX_ONNX_LD_PATH` pins the directory, otherwise it probes the nix store).
 
 ```
 SessionEnd hook (JSON stdin: {session_id, transcript_path, cwd})
@@ -162,7 +162,7 @@ SessionEnd hook (JSON stdin: {session_id, transcript_path, cwd})
                                                Surface Generation Pipeline)
 ```
 
-All hooks exit 0 unconditionally — never block session. Errors surface only in `/tmp/cortex-*.log`.
+All hooks exit 0 unconditionally — never block session. Errors surface only in `/tmp/cortex-*.log` (`load-surface` keeps its log only when it fails).
 
 ## Surface Generation Pipeline
 
@@ -183,6 +183,9 @@ The pipeline that builds `.claude/cortex-memory.local.md`:
      → first pass: fill per-category budgets
      → second pass: overflow high-value into unused budget
 7. generateSurface(ranked, branch, staleness)     [pure: markdown]
+     → Entities section first: selectSurfaceEntities picks up to 5 entities
+       with a current fact, most recently learned-about first, never file
+       paths (`.claude/plans/x.md` is something to open, not to know about)
      → group by category
      → render bullet list with tags
      → truncate if over max budget (4 chars/token heuristic)
@@ -409,8 +412,8 @@ SessionStart fast path. Checks cache and serves if fresh (<24h); on cache miss o
 | Locks | `<repository root>/.memory/locks/` (`surface.lock`, and `merge.lock` while stray databases are merged) | Yes |
 | Generation status | `<repository root>/.memory/cortex-status.json` — written by `generate` after each surface build: `last_generation`, `branch`, `memory_count`, `selected_count`, `duration_ms` | Yes |
 | Telemetry | `<repository root>/.memory/telemetry.json` — maintenance cadence state, read and merged by `lifecycle` (`last_lifecycle_at`) and `ai-prune` (`last_ai_prune_at`); also the file `inspect` reads | Yes |
-| Eval | `<cwd>/.memory/eval/` by default (the directory `eval` runs in, not the repository root; `--dir` overrides) | Yes |
-| Pipeline logs | `/tmp/cortex-{extract,backfill,generate,semantic-edges,lifecycle,ai-prune}.log` | N/A |
+| Eval | `<repository root>/.memory/eval/` by default, beside the memory it measures (`--dir` overrides) | Yes |
+| Pipeline logs | `/tmp/cortex-{extract,backfill,maintenance}.<pid>.log` per session end, `/tmp/cortex-load-surface.<pid>.log` for a failed session start; removed after 7 days | N/A |
 
 `.gitignore` patterns auto-added by `ensureGitignored()`: `.memory/`, `.claude/cortex-memory.local.md`, `.pi/cortex-memory.local.md`.
 

@@ -361,24 +361,85 @@ function capitalizeCategory(category: string): string {
 }
 
 /**
- * Render entity profiles as a compact surface section.
- * Max 5 entities, max 3 facts each. One line per entity.
+ * Whether an entity name is a file-system path rather than a named thing.
  * Pure function.
+ *
+ * Extraction records paths it saw in a transcript (`.claude/plans/x.md`,
+ * `/home/u/repo/src/cli.ts`) as entities. A path is something to open, not
+ * something to know about, and the few entity lines of a surface are worth
+ * more than that. The rules are shapes a path has and a name does not:
+ *
+ * - a home- or dot-relative prefix (`~/`, `./`, `../`);
+ * - a dotfile or dot-directory (`.pi`, `.claude/...`): a dot, then a lowercase
+ *   letter, so `.NET` stays a name;
+ * - two or more slashes (`a/b/c`, any absolute path with a directory);
+ * - one slash and a file extension (`src/cli.ts`).
+ *
+ * One slash alone is not enough: `CI/CD`, `TCP/IP` and `owner/repo` are names.
+ */
+export function isPathLikeEntityName(name: string): boolean {
+  const trimmed = name.trim();
+  if (/^(~|\.{1,2})\//.test(trimmed)) return true;
+  if (/^\.[a-z]/.test(trimmed)) return true;
+  const slashes = trimmed.split('/').length - 1;
+  if (slashes >= 2) return true;
+  return slashes === 1 && /\.[A-Za-z0-9]{1,5}$/.test(trimmed);
+}
+
+/** When an entity was last learned about: its newest current fact. */
+function newestFactAt(profile: EntityProfile): string {
+  return profile.currentFacts.reduce((newest, fact) => (fact.created_at > newest ? fact.created_at : newest), '');
+}
+
+/**
+ * Choose which entities a surface shows. Pure function.
+ *
+ * Drops entities with no current fact and entities that are file paths, then
+ * takes the most recently learned-about first. The order used to be whatever
+ * the caller passed, which is alphabetical from the database: names starting
+ * with `.` or `/` sort before every letter, so a project's surface showed the
+ * same five dot-paths forever.
+ *
+ * The result does not depend on the order of `profiles`: ties on recency fall
+ * back to the name, then the id.
+ */
+export function selectSurfaceEntities(
+  profiles: readonly EntityProfile[],
+  maxEntities: number
+): readonly EntityProfile[] {
+  return profiles
+    .filter((p) => p.currentFacts.length > 0 && !isPathLikeEntityName(p.entity.name))
+    .map((profile) => ({ profile, newest: newestFactAt(profile) }))
+    .sort(
+      (a, b) =>
+        compareText(b.newest, a.newest) ||
+        compareText(a.profile.entity.name, b.profile.entity.name) ||
+        compareText(a.profile.entity.id, b.profile.entity.id)
+    )
+    .slice(0, Math.max(0, maxEntities))
+    .map(({ profile }) => profile);
+}
+
+/** Code-unit order, so the result is the same under every locale. */
+const compareText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+/**
+ * Render entity profiles as a compact surface section.
+ * Max 5 entities (see selectSurfaceEntities), max 3 facts each. One line per
+ * entity. Pure function.
  */
 export function renderEntitySection(
   profiles: readonly EntityProfile[],
   maxEntities: number = 5,
   maxFactsPerEntity: number = 3
 ): string | null {
-  // Filter to entities with at least 1 current fact
-  const withFacts = profiles.filter(p => p.currentFacts.length > 0);
-  if (withFacts.length === 0) return null;
+  const selected = selectSurfaceEntities(profiles, maxEntities);
+  if (selected.length === 0) return null;
 
   const lines: string[] = [];
   lines.push('## Entities');
   lines.push('');
 
-  const selected = withFacts.slice(0, maxEntities);
   for (const profile of selected) {
     const facts = profile.currentFacts
       .slice(0, maxFactsPerEntity)

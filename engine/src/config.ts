@@ -142,6 +142,18 @@ export function getTelemetryPath(projectRoot: string): string {
   return join(projectRoot, '.memory', 'telemetry.json');
 }
 
+/**
+ * Resolve the generation status path: what the last surface generation did
+ * (when, which branch, how many memories). Separate from telemetry.json,
+ * which holds the maintenance watermarks.
+ *
+ * @param projectRoot - Absolute path to project root
+ * @returns Absolute path to the status file
+ */
+export function getStatusPath(projectRoot: string): string {
+  return join(projectRoot, '.memory', 'cortex-status.json');
+}
+
 // ============================================================================
 // CONSTANTS
 // ============================================================================

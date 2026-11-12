@@ -87,6 +87,7 @@ import {
 } from './commands/ingest-session.js';
 import {
   answerCases,
+  defaultEvalDir,
   evalPaths,
   loadEvalSet,
   loadLabels,
@@ -1537,7 +1538,7 @@ async function handleEval(args: string[]): Promise<CommandResult> {
   const command = parseEvalArgs(args, process.cwd());
   if (typeof command === 'string') return { kind: 'failed', error: command };
 
-  const paths = evalPaths(command.dir);
+  const paths = evalPaths(command.dir ?? defaultEvalDir(locate(command.cwd).root));
   const log = (line: string) => process.stderr.write(`[cortex:eval] ${line}\n`);
   try {
     const { cases, settings } = loadEvalSet(paths);

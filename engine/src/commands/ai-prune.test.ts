@@ -13,7 +13,7 @@ import type { Memory } from '../core/types.js';
 import { createMemory } from '../core/types.js';
 import { openDatabase, insertMemory, getMemory } from '../infra/db.js';
 import { AI_PRUNE_MIN_AGE_DAYS } from '../config.js';
-import type { LlmPromptTransport } from '../infra/claude-llm.js';
+import { LlmEndpointSaturatedError, type LlmPromptTransport } from '../infra/claude-llm.js';
 import { withBunWhichUnavailable } from '../infra/llm-test-helpers.js';
 
 // The LLM boundary is the injectable transport, not the whole claude-llm
@@ -521,6 +521,45 @@ describe('AI prune failure telemetry', () => {
     expect(getMemory(projectDb, 'partial-0')?.status).toBe('archived');
     expect(fs.readdirSync(cacheDir).filter((file) => file.endsWith('.json'))).toHaveLength(0);
     expect(fs.existsSync(telemetryPath)).toBe(false);
+    projectDb.close();
+    globalDb.close();
+  });
+
+  it('stops asking once the LLM endpoint is saturated, and still owes the whole review', async () => {
+    transportCall.mockRejectedValue(new LlmEndpointSaturatedError(3));
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    const telemetryPath = makeTelemetryPath();
+    for (let index = 0; index < 241; index++) {
+      insertMemory(projectDb, makeMemory(`saturated-${index}`, 10));
+    }
+
+    const result = await runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport);
+
+    // Four batches were due; the first reported saturation, so three were never sent.
+    expect(transportCall).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ archived: 0, reviewed: 0 });
+    expect(failedPrune(result).error).toContain('All 4 AI prune batches failed');
+    expect(fs.existsSync(telemetryPath)).toBe(false);
+    projectDb.close();
+    globalDb.close();
+  });
+
+  it('keeps asking after an ordinary batch failure, which says nothing about the next batch', async () => {
+    transportCall
+      .mockRejectedValueOnce(new Error('one bad batch'))
+      .mockResolvedValue('{"candidates":[]}');
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    const telemetryPath = makeTelemetryPath();
+    for (let index = 0; index < 161; index++) {
+      insertMemory(projectDb, makeMemory(`flaky-${index}`, 10));
+    }
+
+    const result = await runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport);
+
+    expect(transportCall).toHaveBeenCalledTimes(3);
+    expect(failedPrune(result).error).toContain('1 of 3 AI prune batches failed');
     projectDb.close();
     globalDb.close();
   });

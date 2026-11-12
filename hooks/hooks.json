@@ -28,7 +28,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cat .claude/cortex-memory.local.md 2>/dev/null || true"
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/scripts/show-surface.sh",
+            "timeout": 15
           }
         ]
       },
