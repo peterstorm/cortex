@@ -47,7 +47,7 @@ export type ProjectSession = Readonly<{
 }>;
 
 /** One command run against an open project session. */
-export type ProjectCommand = (session: ProjectSession) => CommandResult | Promise<CommandResult>;
+type ProjectCommand = (session: ProjectSession) => CommandResult | Promise<CommandResult>;
 
 // ============================================================================
 // SESSIONS
