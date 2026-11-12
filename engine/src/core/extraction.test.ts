@@ -171,7 +171,12 @@ describe("truncateTranscript", () => {
       );
     });
 
-    it("truncated content ends with newline or is empty", () => {
+    // This used to assert "ends with newline or is empty", which the function
+    // deliberately does not promise: a line larger than the budget is cut
+    // mid-line so the cursor still advances (see the raw-window branch). The
+    // old wording failed on the seeds that generated such a line, e.g.
+    // ("   \n          \n", 10, 4).
+    it("ends at a line boundary whenever one fits the budget; otherwise it is a cut of one oversized line", () => {
       fc.assert(
         fc.property(
           fc
@@ -183,11 +188,15 @@ describe("truncateTranscript", () => {
             const safeCursor = Math.min(cursor, content.length);
             const result = truncateTranscript(content, maxBytes, safeCursor);
 
-            if (result.truncated.length > 0) {
+            if (result.truncated.includes("\n")) {
               expect(result.truncated.endsWith("\n")).toBe(true);
+            } else if (result.truncated.length > 0) {
+              const firstLine = content.slice(safeCursor).split("\n")[0] + "\n";
+              expect(Buffer.byteLength(firstLine, "utf8")).toBeGreaterThan(maxBytes);
             }
           }
-        )
+        ),
+        { examples: [["   \n          \n", 10, 4]] }
       );
     });
 
