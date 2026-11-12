@@ -384,7 +384,7 @@ BFS graph traversal from a memory ID. Args: `traverse <cwd> <memoryId> [maxDepth
 
 ### inspect
 
-Telemetry display (JSON output). Queries both DBs for stats: active memory counts by type/scope, edge count, embedding queue size, cache staleness. Reads `.memory/telemetry.json` for `maintenance`: when `lifecycle` and `ai-prune` last succeeded (`last_lifecycle_at`, `last_ai_prune_at`; null for never). Each advances its mark only on success, so a date that stops moving is a step failing on every run. It does not read `.memory/cortex-status.json`.
+Telemetry display (JSON output). Queries both DBs for stats: active memory counts by type/scope, edge count, embedding queue size, cache staleness. `memory_counts.unreadable` counts rows stored as active that do not hold a valid memory (for example a priority outside 1–10 written by another tool): every read skips such a row with a `[cortex:db] Skipping memory <id>: <reason>` line on stderr and leaves it in the file, so one bad row costs only itself. Reads `.memory/telemetry.json` for `maintenance`: when `lifecycle` and `ai-prune` last succeeded (`last_lifecycle_at`, `last_ai_prune_at`; null for never). Each advances its mark only on success, so a date that stops moving is a step failing on every run. It does not read `.memory/cortex-status.json`.
 
 ### backfill
 

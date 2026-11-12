@@ -337,6 +337,7 @@ describe('formatTelemetry', () => {
       maintenance: { last_lifecycle_at: '2026-02-09T10:00:00Z', last_ai_prune_at: null },
       memory_counts: {
         total: 5,
+        unreadable: 0,
         by_type: {
           architecture: 3,
           decision: 2,
@@ -563,6 +564,46 @@ describe('collectTelemetry', () => {
     expect(result.memory_counts.by_scope.project).toBe(2);
     expect(result.memory_counts.by_scope.global).toBe(2);
     expect(result.edge_count).toBe(2);
+  });
+
+  test('reports active rows that cannot be read, apart from the readable total', () => {
+    for (const id of ['readable', 'foreign']) {
+      insertMemory(
+        projectDb,
+        createMemory({
+          id,
+          content: 'c',
+          summary: 's',
+          memory_type: 'decision',
+          scope: 'project',
+          confidence: 0.9,
+          priority: 5,
+          source_type: 'manual',
+          source_session: 's1',
+          source_context: '{}',
+        })
+      );
+    }
+    // What another tool writing to the file can leave behind: a priority the
+    // domain does not have.
+    projectDb.prepare('UPDATE memories SET priority = 0 WHERE id = ?').run('foreign');
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const result = collectTelemetry(projectDb, globalDb, telemetryPath, cachePath);
+
+      expect(result.memory_counts.total).toBe(1);
+      expect(result.memory_counts.unreadable).toBe(1);
+      expect(result.memory_counts.by_type.decision).toBe(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test('reports no unreadable rows for a healthy database', () => {
+    const result = collectTelemetry(projectDb, globalDb, telemetryPath, cachePath);
+
+    expect(result.memory_counts.unreadable).toBe(0);
   });
 
   test('reports the maintenance marks lifecycle and ai-prune wrote', () => {
