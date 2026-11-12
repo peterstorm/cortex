@@ -171,6 +171,9 @@ CREATE INDEX IF NOT EXISTS idx_facts_valid ON facts(valid_to);
  */
 export const CURRENT_SCHEMA_VERSION = 1;
 
+/** How long a connection waits for a lock before failing with SQLITE_BUSY. */
+const BUSY_TIMEOUT_MS = 5000;
+
 /**
  * Initialize database schema and enable optimizations
  * I/O: Creates/modifies database file
@@ -190,7 +193,7 @@ function initializeSchema(db: Database): void {
   // MUST be set BEFORE the WAL pragma: journal_mode=WAL itself takes a write
   // lock, so a concurrent writer would otherwise cause an unprotected
   // SQLITE_BUSY on open.
-  db.run('PRAGMA busy_timeout = 5000');
+  db.run(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
 
   // Enable WAL mode for concurrent access (FR-100)
   db.run('PRAGMA journal_mode = WAL');
@@ -349,11 +352,20 @@ export function openDatabase(path: string): Database {
  * wasted work and takes the writer lock. Throws if the file doesn't exist —
  * callers must check first and fall back to openDatabase when creating.
  *
+ * A reader waits for a lock like a writer does. Reading a WAL database is not
+ * lock-free at its edges: the first connection after the last one closed
+ * recovers the WAL under an exclusive lock, and VACUUM INTO (the eval
+ * snapshot) holds a read transaction across a checkpoint. Without a busy
+ * timeout either one fails at once with "database is locked" when another
+ * process is opening or closing the same file at that moment.
+ *
  * @param path - Existing database file path
  * @returns Read-only database instance (writes throw)
  */
 export function openDatabaseReadOnly(path: string): Database {
-  return new Database(path, { readonly: true });
+  const db = new Database(path, { readonly: true });
+  db.run(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
+  return db;
 }
 
 // ============================================================================
@@ -1601,7 +1613,7 @@ export function vacuumPrunedMemories(db: Database, retentionDays: number): numbe
 
 /**
  * Raw extraction_checkpoints row shape. Declared for the same reason as
- * MemoryRow and EdgeRow: an `as any` here lets a column rename drift past the
+ * MemoryRow and EdgeRow: an untyped row here lets a column rename drift past the
  * compiler and reach createExtractionCheckpoint as undefined, which is exactly
  * the silent-column-drift class the typed rows exist to prevent.
  */
