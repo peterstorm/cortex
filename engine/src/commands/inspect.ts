@@ -13,12 +13,19 @@ import type { Memory, MemoryType, MemoryScope } from '../core/types.js';
 // TELEMETRY DATA TYPES
 // ============================================================================
 
+/**
+ * When each maintenance step last SUCCEEDED, from `.memory/telemetry.json`;
+ * null when it never has, or the file's value is not a timestamp. Both steps
+ * advance their mark only on success, so an old date here is how a step that
+ * fails on every run shows itself.
+ */
+export type MaintenanceMarks = Readonly<{
+  last_lifecycle_at: string | null;
+  last_ai_prune_at: string | null;
+}>;
+
 export interface TelemetryData {
-  readonly last_extraction?: {
-    readonly status: 'success' | 'failure';
-    readonly timestamp: string;
-    readonly error?: string;
-  };
+  readonly maintenance: MaintenanceMarks;
   readonly memory_counts: {
     readonly total: number;
     readonly by_type: Record<MemoryType, number>;
@@ -108,37 +115,21 @@ export function calculateStalenessHours(timestamp: string): number | null {
   }
 }
 
+/** A value that is a parseable timestamp, or null. */
+const timestampOrNull = (value: unknown): string | null =>
+  typeof value === 'string' && !Number.isNaN(Date.parse(value)) ? value : null;
+
 /**
- * Parse telemetry file data safely (pure).
- * Validates each field and returns only validated fields.
- * Parse, don't validate: returns typed data, not booleans.
+ * Parse the maintenance marks out of telemetry.json's content (pure).
+ * Total: an absent file (null), a missing key and a value that is not a
+ * timestamp all read as "never", which is also how lifecycle and ai-prune
+ * treat them when deciding whether to run.
  */
-export function parseTelemetryFile(
-  data: Record<string, unknown>
-): Partial<Pick<TelemetryData, 'last_extraction'>> {
-  // Validate last_extraction if present
-  if (data.last_extraction && typeof data.last_extraction === 'object') {
-    const extraction = data.last_extraction as Record<string, unknown>;
-
-    // Validate status field
-    if (
-      extraction.status === 'success' ||
-      extraction.status === 'failure'
-    ) {
-      // Validate timestamp field
-      if (typeof extraction.timestamp === 'string') {
-        return {
-          last_extraction: {
-            status: extraction.status,
-            timestamp: extraction.timestamp,
-            error: typeof extraction.error === 'string' ? extraction.error : undefined,
-          },
-        };
-      }
-    }
-  }
-
-  return {};
+export function parseTelemetryFile(data: Record<string, unknown> | null): MaintenanceMarks {
+  return {
+    last_lifecycle_at: timestampOrNull(data?.last_lifecycle_at),
+    last_ai_prune_at: timestampOrNull(data?.last_ai_prune_at),
+  };
 }
 
 /**
@@ -240,12 +231,9 @@ export function collectTelemetry(
   // Get cache staleness (I/O)
   const cacheStaleness = getCacheStaleness(cachePath);
 
-  // Parse telemetry file safely (pure)
-  const parsedTelemetry = telemetryFile ? parseTelemetryFile(telemetryFile) : {};
-
   // Assemble telemetry data
   return {
-    last_extraction: parsedTelemetry.last_extraction,
+    maintenance: parseTelemetryFile(telemetryFile),
     memory_counts: {
       total: allMemories.length,
       by_type: byType,

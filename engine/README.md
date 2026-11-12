@@ -384,7 +384,7 @@ BFS graph traversal from a memory ID. Args: `traverse <cwd> <memoryId> [maxDepth
 
 ### inspect
 
-Telemetry display (JSON output). Queries both DBs for stats: active memory counts by type/scope, edge count, embedding queue size, cache staleness. Reads `.memory/telemetry.json` (the path `cli.ts` passes, from `getTelemetryPath`) for a `last_extraction` record; nothing in the engine writes that record, so the field is normally absent. It does not read `.memory/cortex-status.json`.
+Telemetry display (JSON output). Queries both DBs for stats: active memory counts by type/scope, edge count, embedding queue size, cache staleness. Reads `.memory/telemetry.json` for `maintenance`: when `lifecycle` and `ai-prune` last succeeded (`last_lifecycle_at`, `last_ai_prune_at`; null for never). Each advances its mark only on success, so a date that stops moving is a step failing on every run. It does not read `.memory/cortex-status.json`.
 
 ### backfill
 
@@ -456,8 +456,9 @@ Dependencies: `vitest`, `fast-check` (property-based). All core/ functions testa
 | `CONSOLIDATION_EXTRACTION_THRESHOLD` | 10 | `config.ts` |
 | `CONSOLIDATION_ACTIVE_THRESHOLD` | 80 | `config.ts` |
 | `PRUNE_THRESHOLD_DAYS` | 30 | `config.ts` |
-| `AI_PRUNE_SESSION_INTERVAL` | 5 | `config.ts` |
-| `AI_PRUNE_MEMORY_THRESHOLD` | 50 | `config.ts` |
+| `AI_PRUNE_MIN_NEW_MEMORIES` | 20 | `config.ts` |
+| `AI_PRUNE_MAX_AGE_DAYS` | 7 | `config.ts` |
+| `AI_PRUNE_MIN_INTERVAL_HOURS` | 6 | `config.ts` |
 | `DEFAULT_SEARCH_LIMIT` | 10 | `config.ts` |
 | `DEFAULT_TRAVERSAL_DEPTH` | 2 | `config.ts` |
 | `LOCAL_EMBEDDING_DIMENSIONS` | 512 | `config.ts` |

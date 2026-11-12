@@ -299,80 +299,42 @@ describe('calculateStalenessHours', () => {
 });
 
 describe('parseTelemetryFile', () => {
-  test('parses valid last_extraction', () => {
-    const data = {
-      last_extraction: {
-        status: 'success',
-        timestamp: '2026-02-09T10:00:00Z',
-      },
-    };
-
-    const result = parseTelemetryFile(data);
-    expect(result.last_extraction?.status).toBe('success');
-    expect(result.last_extraction?.timestamp).toBe('2026-02-09T10:00:00Z');
+  test('reads both maintenance marks', () => {
+    expect(
+      parseTelemetryFile({
+        last_lifecycle_at: '2026-11-11T19:30:12.494Z',
+        last_ai_prune_at: '2026-09-14T12:12:26.730Z',
+        sessions_since_ai_prune: 6,
+      }),
+    ).toEqual({
+      last_lifecycle_at: '2026-11-11T19:30:12.494Z',
+      last_ai_prune_at: '2026-09-14T12:12:26.730Z',
+    });
   });
 
-  test('parses last_extraction with error', () => {
-    const data = {
-      last_extraction: {
-        status: 'failure',
-        timestamp: '2026-02-09T10:00:00Z',
-        error: 'test error',
-      },
-    };
-
-    const result = parseTelemetryFile(data);
-    expect(result.last_extraction?.status).toBe('failure');
-    expect(result.last_extraction?.error).toBe('test error');
+  test('a step that never succeeded reads as null, and so does a missing file', () => {
+    expect(parseTelemetryFile({ last_ai_prune_at: '2026-09-14T12:12:26.730Z' })).toEqual({
+      last_lifecycle_at: null,
+      last_ai_prune_at: '2026-09-14T12:12:26.730Z',
+    });
+    expect(parseTelemetryFile(null)).toEqual({ last_lifecycle_at: null, last_ai_prune_at: null });
   });
 
-  test('returns empty object when last_extraction missing', () => {
-    const data = {};
-
-    const result = parseTelemetryFile(data);
-    expect(result.last_extraction).toBeUndefined();
-  });
-
-  test('ignores invalid status', () => {
-    const data = {
-      last_extraction: {
-        status: 'invalid',
-        timestamp: '2026-02-09T10:00:00Z',
-      },
-    };
-
-    const result = parseTelemetryFile(data);
-    expect(result.last_extraction).toBeUndefined();
-  });
-
-  test('ignores missing timestamp', () => {
-    const data = {
-      last_extraction: {
-        status: 'success',
-      },
-    };
-
-    const result = parseTelemetryFile(data);
-    expect(result.last_extraction).toBeUndefined();
-  });
-
-  test('ignores non-object last_extraction', () => {
-    const data = {
-      last_extraction: 'invalid',
-    };
-
-    const result = parseTelemetryFile(data);
-    expect(result.last_extraction).toBeUndefined();
-  });
+  test.each([['not-a-timestamp'], [''], [1762889412494], [null], [{ at: '2026-11-11' }]])(
+    'a mark of %j is not a timestamp, so it reads as never',
+    (value) => {
+      expect(parseTelemetryFile({ last_lifecycle_at: value, last_ai_prune_at: value })).toEqual({
+        last_lifecycle_at: null,
+        last_ai_prune_at: null,
+      });
+    },
+  );
 });
 
 describe('formatTelemetry', () => {
   test('formats telemetry as JSON', () => {
     const data: TelemetryData = {
-      last_extraction: {
-        status: 'success',
-        timestamp: '2026-02-09T10:00:00Z',
-      },
+      maintenance: { last_lifecycle_at: '2026-02-09T10:00:00Z', last_ai_prune_at: null },
       memory_counts: {
         total: 5,
         by_type: {
@@ -398,39 +360,13 @@ describe('formatTelemetry', () => {
     const result = formatTelemetry(data);
     const parsed = JSON.parse(result);
 
-    expect(parsed.last_extraction.status).toBe('success');
+    expect(parsed.maintenance).toEqual({ last_lifecycle_at: '2026-02-09T10:00:00Z', last_ai_prune_at: null });
     expect(parsed.memory_counts.total).toBe(5);
     expect(parsed.edge_count).toBe(3);
     expect(parsed.embedding_queue_size).toBe(1);
     expect(parsed.cache_staleness.exists).toBe(true);
   });
 
-  test('handles missing last_extraction', () => {
-    const data: TelemetryData = {
-      memory_counts: {
-        total: 0,
-        by_type: {
-          architecture: 0,
-          decision: 0,
-          pattern: 0,
-          gotcha: 0,
-          context: 0,
-          progress: 0,
-          code_description: 0,
-          code: 0,
-        },
-        by_scope: { project: 0, global: 0 },
-      },
-      edge_count: 0,
-      embedding_queue_size: 0,
-    };
-
-    const result = formatTelemetry(data);
-    const parsed = JSON.parse(result);
-
-    expect(parsed.last_extraction).toBeUndefined();
-    expect(parsed.memory_counts.total).toBe(0);
-  });
 });
 
 // ============================================================================
@@ -451,7 +387,7 @@ describe('collectTelemetry', () => {
 
     // Create temp directory
     tempDir = fs.mkdtempSync('/tmp/cortex-inspect-test-');
-    telemetryPath = path.join(tempDir, 'cortex-status.json');
+    telemetryPath = path.join(tempDir, 'telemetry.json');
     cachePath = path.join(tempDir, 'surface-cache');
   });
 
@@ -474,7 +410,7 @@ describe('collectTelemetry', () => {
     expect(result.edge_count).toBe(0);
     expect(result.embedding_queue_size).toBe(0);
     expect(result.cache_staleness?.exists).toBe(false);
-    expect(result.last_extraction).toBeUndefined();
+    expect(result.maintenance).toEqual({ last_lifecycle_at: null, last_ai_prune_at: null });
   });
 
   test('collects telemetry from project DB', () => {
@@ -629,27 +565,27 @@ describe('collectTelemetry', () => {
     expect(result.edge_count).toBe(2);
   });
 
-  test('reads telemetry file', () => {
-    // Write telemetry file
-    const telemetryData = {
-      last_extraction: {
-        status: 'success',
-        timestamp: '2026-02-09T10:00:00Z',
-      },
-    };
-
-    fs.writeFileSync(telemetryPath, JSON.stringify(telemetryData), 'utf8');
+  test('reports the maintenance marks lifecycle and ai-prune wrote', () => {
+    fs.writeFileSync(
+      telemetryPath,
+      JSON.stringify({ last_lifecycle_at: '2026-05-09T22:02:43.589Z', last_ai_prune_at: '2026-11-09T19:37:26.980Z' }),
+      'utf8',
+    );
 
     const result = collectTelemetry(projectDb, globalDb, telemetryPath, cachePath);
 
-    expect(result.last_extraction?.status).toBe('success');
-    expect(result.last_extraction?.timestamp).toBe('2026-02-09T10:00:00Z');
+    expect(result.maintenance).toEqual({
+      last_lifecycle_at: '2026-05-09T22:02:43.589Z',
+      last_ai_prune_at: '2026-11-09T19:37:26.980Z',
+    });
   });
 
-  test('handles missing telemetry file', () => {
+  test('a telemetry file that is not JSON reads as no marks', () => {
+    fs.writeFileSync(telemetryPath, '{ torn', 'utf8');
+
     const result = collectTelemetry(projectDb, globalDb, telemetryPath, cachePath);
 
-    expect(result.last_extraction).toBeUndefined();
+    expect(result.maintenance).toEqual({ last_lifecycle_at: null, last_ai_prune_at: null });
   });
 
   test('detects cache staleness', () => {
