@@ -297,19 +297,21 @@ describe('Cortex Pi extension diagnostics and surface contract', () => {
     expect(result.systemPrompt).toContain('Cortex Memory CLI');
   });
 
-  it('reports an unreadable existing Gemini environment file', () => {
+  it('loading the extension leaves the host process environment as it was', () => {
+    // It used to export every variable in ~/.config/sops-nix/secrets/rendered/
+    // gemini-env into pi's own process: a Gemini key for an embedder cortex no
+    // longer has, leaked into pi and every child it spawns.
     const home = tempProject();
-    const envPath = join(home, '.config', 'sops-nix', 'secrets', 'rendered', 'gemini-env');
-    mkdirSync(envPath, { recursive: true });
+    const envDir = join(home, '.config', 'sops-nix', 'secrets', 'rendered');
+    mkdirSync(envDir, { recursive: true });
+    writeFileSync(join(envDir, 'gemini-env'), 'export CORTEX_TEST_PLANTED_KEY="planted"\n');
     process.env.HOME = home;
-    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const before = { ...process.env };
 
-    try {
-      registerHandlers(fakeCli().runner);
-      expect(stderr).toHaveBeenCalledWith(expect.stringContaining(`Failed to read Gemini environment file ${envPath}`));
-    } finally {
-      stderr.mockRestore();
-    }
+    registerHandlers(fakeCli().runner);
+
+    expect(process.env.CORTEX_TEST_PLANTED_KEY).toBeUndefined();
+    expect({ ...process.env }).toEqual(before);
   });
 
   it('reads only the unified .claude surface and reports read failures', async () => {

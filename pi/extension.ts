@@ -34,24 +34,6 @@ function getCortexLlmEnvironment(model: PiModelSelection | undefined): NodeJS.Pr
     : {};
 }
 
-/** Source Gemini API key if available */
-function loadGeminiEnv(): void {
-  const envFile = join(process.env.HOME ?? "", ".config/sops-nix/secrets/rendered/gemini-env");
-  if (existsSync(envFile)) {
-    try {
-      const content = readFileSync(envFile, "utf-8");
-      for (const line of content.split("\n")) {
-        const match = line.match(/^export\s+(\w+)=["']?(.+?)["']?\s*$/);
-        if (match) process.env[match[1]] = match[2];
-      }
-    } catch (error) {
-      process.stderr.write(
-        `[cortex] Failed to read Gemini environment file ${envFile}: ${describeError(error)}\n`
-      );
-    }
-  }
-}
-
 /**
  * @param pi - The Pi extension API
  * @param cli - The engine boundary. Defaults to the real subprocess adapter;
@@ -59,8 +41,6 @@ function loadGeminiEnv(): void {
  *   framework and cannot be broken by one.
  */
 export default function (pi: ExtensionAPI, cli: CliRunner = defaultCliRunner) {
-  loadGeminiEnv();
-
   /** Best-effort stdout adapter for lifecycle hooks that intentionally degrade. */
   const runCli = (args: readonly string[], options?: Parameters<CliRunner["run"]>[1]): string => {
     const result = cli.run(args, options);
