@@ -1701,30 +1701,32 @@ export function getExtractionCheckpoint(
 }
 
 /**
+ * A checkpoint as a writer states it: every field a resume reads, none null.
+ *
+ * The stored row allows null transcript_length and projection_version, but
+ * only for legacy rows written before those columns existed. A row written
+ * now with a null projection_version would read back as legacy and have its
+ * cursor reset to 0 on the next load, discarding the progress it records; a
+ * null transcript_length would disable the shrunk-transcript check. So the
+ * write type leaves no way to produce either, and the caller states
+ * extracted_at rather than the write reading the clock.
+ */
+export type ExtractionCheckpointWrite = Readonly<
+  Omit<ExtractionCheckpoint, 'id' | 'transcript_length' | 'projection_version'> & {
+    transcript_length: number;
+    projection_version: number;
+  }
+>;
+
+/**
  * Save or update extraction checkpoint
  * I/O: Writes to database
  *
  * @param db - Database instance
- * @param checkpoint - Checkpoint to save (without id)
+ * @param checkpoint - Checkpoint to save (the row id is assigned here)
  */
-export function saveExtractionCheckpoint(
-  db: Database,
-  checkpoint: Omit<ExtractionCheckpoint, 'id' | 'transcript_length' | 'projection_version'> & {
-    readonly transcript_length?: number | null;
-    readonly projection_version?: number | null;
-  }
-): void {
-  // Respect caller's extracted_at if provided, otherwise use current timestamp
-  const extracted_at = checkpoint.extracted_at ?? new Date().toISOString();
-
-  const validated = createExtractionCheckpoint({
-    id: randomUUID(),
-    session_id: checkpoint.session_id,
-    cursor_position: checkpoint.cursor_position,
-    extracted_at,
-    transcript_length: checkpoint.transcript_length ?? null,
-    projection_version: checkpoint.projection_version ?? null,
-  });
+export function saveExtractionCheckpoint(db: Database, checkpoint: ExtractionCheckpointWrite): void {
+  const validated = createExtractionCheckpoint({ id: randomUUID(), ...checkpoint });
 
   // Atomic UPSERT — a check-then-insert would let two concurrent workers
   // both observe "no checkpoint" and insert duplicate rows.
