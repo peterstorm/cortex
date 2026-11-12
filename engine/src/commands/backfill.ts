@@ -24,22 +24,12 @@ export type BackfillResult =
   | { ok: false; error: string };
 
 /**
- * Functional Core: build embedding texts with metadata prefix
- */
-function buildEmbeddingTexts(
-  memories: readonly Memory[],
-  projectName: string
-): readonly string[] {
-  return memories.map((m) => buildEmbeddingText(m, projectName));
-}
-
-/**
  * Imperative Shell: Backfill missing embeddings via local model
  */
 async function backfillLocal(
   db: Database,
   memories: readonly Memory[],
-  texts: readonly string[]
+  projectName: string
 ): Promise<{ processed: number; failed: number; errors: readonly string[] }> {
   let processed = 0;
   let failed = 0;
@@ -63,12 +53,9 @@ async function backfillLocal(
   }
 
   // Process individually (local model doesn't batch)
-  for (let i = 0; i < memories.length; i++) {
-    const memory = memories[i];
-    const text = texts[i];
-
+  for (const memory of memories) {
     try {
-      const embedding = await embedLocal(text);
+      const embedding = await embedLocal(buildEmbeddingText(memory, projectName));
       updateMemory(db, memory.id, { local_embedding: embedding });
       processed++;
     } catch (err) {
@@ -111,9 +98,8 @@ export async function backfill(
     // but that no longer makes the vectors unread.
     const localUnembedded = getActiveMemoriesNeedingEmbedding(db);
     if (localUnembedded.length > 0) {
-      const texts = buildEmbeddingTexts(localUnembedded, projectName);
       process.stderr.write(`[cortex:backfill] INFO: Backfilling local embeddings for ${localUnembedded.length} memories\n`);
-      const { processed, failed, errors } = await backfillLocal(db, localUnembedded, texts);
+      const { processed, failed, errors } = await backfillLocal(db, localUnembedded, projectName);
       totalProcessed += processed;
       totalFailed += failed;
       allErrors.push(...errors);
