@@ -5,9 +5,6 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Database } from 'bun:sqlite';
-import { existsSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import {
   extractionToCommandResult,
   openPromptRecallDatabase,
@@ -15,9 +12,8 @@ import {
   parseRecallArgs,
   runIngestSessionInput,
   summarizeBackfillResults,
-  validateCwd,
 } from './cli.js';
-import type { CommandResult } from './cli.js';
+import type { CommandResult } from './command-result.js';
 import { openDatabase, insertMemory } from './infra/db.js';
 import { createMemory } from './core/types.js';
 import { runCli } from './test-support.js';
@@ -496,63 +492,6 @@ describe('cli - integration flows', () => {
 
     expect(globalMemories).toHaveLength(1);
     expect(globalMemories[0].id).toBe('mem-search-2');
-  });
-});
-
-describe('cli - validateCwd', () => {
-  let tmpDir: string;
-
-  beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), 'cortex-cwd-test-'));
-  });
-
-  it('accepts an existing absolute directory', () => {
-    expect(validateCwd(tmpDir)).toBeNull();
-  });
-
-  it('rejects dash-prefixed values (flags mistaken for cwd)', () => {
-    for (const arg of ['--session', '-x', '--if-needed']) {
-      const error = validateCwd(arg);
-      expect(error).not.toBeNull();
-      expect(error).toContain('looks like a flag');
-    }
-  });
-
-  it('rejects relative paths', () => {
-    const error = validateCwd('some/relative/dir');
-    expect(error).not.toBeNull();
-    expect(error).toContain('must be an absolute path');
-  });
-
-  it('rejects nonexistent directories without creating them', () => {
-    const missing = join(tmpDir, 'does-not-exist');
-
-    const error = validateCwd(missing);
-
-    expect(error).not.toBeNull();
-    expect(error).toContain('does not exist');
-    // Validation must be side-effect free — no phantom directories
-    expect(existsSync(missing)).toBe(false);
-  });
-
-  it('rejects paths pointing at a file, not a directory', () => {
-    const filePath = join(tmpDir, 'file.txt');
-    writeFileSync(filePath, 'not a dir', 'utf8');
-
-    const error = validateCwd(filePath);
-
-    expect(error).not.toBeNull();
-    expect(error).toContain('not a directory');
-  });
-
-  it('reports non-ENOENT filesystem failures instead of calling them missing', () => {
-    const loop = join(tmpDir, 'symlink-loop');
-    symlinkSync(loop, loop);
-
-    const error = validateCwd(loop);
-
-    expect(error).toContain('ELOOP');
-    expect(error).not.toContain('directory does not exist');
   });
 });
 

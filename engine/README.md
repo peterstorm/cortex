@@ -46,6 +46,10 @@ engine/src/
 │
 ├── cli.ts          ← Entry point. Thin dispatcher: subcommand → handler.
 ├── show-surface-hook.ts ← Per-prompt entry for show-surface.sh (kept off cli.ts's import graph)
+├── project-session.ts ← Shell. Locates the project a cwd belongs to, opens
+│                     its database and the global one, runs one command,
+│                     always closes both; a throw becomes "<Command> failed".
+├── command-result.ts  ← The CLI command outcome: succeeded | deferred | failed.
 └── config.ts       ← Pure path resolution + constants. No I/O.
 ```
 
