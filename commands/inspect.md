@@ -50,7 +50,7 @@ JSON printed to stdout with these fields (combined across project + global DBs):
 Total number of edges across both databases.
 
 ### `embedding_queue_size`
-Active memories with no embedding yet — the backfill queue.
+The backfill queue: active memories the next `backfill` would embed, across both databases. That is every active memory except `code` ones (never embedded) whose `local_embedding` is missing or was made by a model other than the current one. It is counted with the same query `backfill` runs, so 0 means backfill has nothing to do.
 
 ### `cache_staleness`
 - **exists:** Whether the surface cache directory exists

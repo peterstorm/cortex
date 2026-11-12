@@ -7,12 +7,12 @@
 import { Database } from 'bun:sqlite';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { openDatabase, insertMemory, insertEdge } from '../infra/db.js';
+import { openDatabase, insertMemory, insertEdge, getActiveMemoriesNeedingEmbedding } from '../infra/db.js';
 import { createMemory, createEdge, type MemoryType } from '../core/types.js';
+import { LOCAL_EMBEDDING_DIMENSIONS } from '../config.js';
 import {
   countByType,
   countByScope,
-  countPendingEmbeddings,
   calculateStalenessHours,
   formatTelemetry,
   collectTelemetry,
@@ -177,99 +177,6 @@ describe('countByScope', () => {
     const result = countByScope(memories);
     expect(result.project).toBe(2);
     expect(result.global).toBe(1);
-  });
-});
-
-describe('countPendingEmbeddings', () => {
-  test('empty array returns 0', () => {
-    const result = countPendingEmbeddings([]);
-    expect(result).toBe(0);
-  });
-
-  test('counts memories with null embeddings', () => {
-    const memories = [
-      createMemory({
-        id: 'm1',
-        content: 'test',
-        summary: 'test',
-        memory_type: 'decision',
-        scope: 'project',
-        confidence: 0.9,
-        priority: 5,
-        source_type: 'extraction',
-        source_session: 's1',
-        source_context: '{}',
-        embedding: null,
-        local_embedding: null,
-      }),
-      createMemory({
-        id: 'm2',
-        content: 'test',
-        summary: 'test',
-        memory_type: 'architecture',
-        scope: 'project',
-        confidence: 0.8,
-        priority: 7,
-        source_type: 'extraction',
-        source_session: 's1',
-        source_context: '{}',
-        embedding: new Float64Array(3),
-        local_embedding: null,
-      }),
-      createMemory({
-        id: 'm3',
-        content: 'test',
-        summary: 'test',
-        memory_type: 'pattern',
-        scope: 'project',
-        confidence: 0.7,
-        priority: 6,
-        source_type: 'extraction',
-        source_session: 's1',
-        source_context: '{}',
-        embedding: null,
-        local_embedding: null,
-      }),
-    ];
-
-    const result = countPendingEmbeddings(memories);
-    expect(result).toBe(2);
-  });
-
-  test('ignores memories with at least one embedding', () => {
-    const memories = [
-      createMemory({
-        id: 'm1',
-        content: 'test',
-        summary: 'test',
-        memory_type: 'decision',
-        scope: 'project',
-        confidence: 0.9,
-        priority: 5,
-        source_type: 'extraction',
-        source_session: 's1',
-        source_context: '{}',
-        embedding: new Float64Array(3),
-        local_embedding: null,
-      }),
-      createMemory({
-        id: 'm2',
-        content: 'test',
-        summary: 'test',
-        memory_type: 'architecture',
-        scope: 'project',
-        confidence: 0.8,
-        priority: 7,
-        source_type: 'extraction',
-        source_session: 's1',
-        source_context: '{}',
-        embedding: null,
-        local_embedding: new Float32Array(3),
-      }),
-    ];
-
-    const result = countPendingEmbeddings(memories);
-    expect(result).toBe(0);
   });
 });
 
@@ -469,7 +376,61 @@ describe('collectTelemetry', () => {
     expect(result.memory_counts.by_type.architecture).toBe(1);
     expect(result.memory_counts.by_scope.project).toBe(2);
     expect(result.edge_count).toBe(1);
-    expect(result.embedding_queue_size).toBe(1);
+    // Both are queued: m2's vector is in the legacy `embedding` column, which
+    // recall never reads, so backfill still has to give it a local one.
+    expect(result.embedding_queue_size).toBe(2);
+  });
+
+  describe('embedding_queue_size is the queue backfill processes', () => {
+    const queued = (id: string, fields: Partial<Parameters<typeof createMemory>[0]> = {}) =>
+      createMemory({
+        id,
+        content: `content ${id}`,
+        summary: `summary ${id}`,
+        memory_type: 'decision',
+        scope: 'project',
+        confidence: 0.9,
+        priority: 5,
+        source_type: 'extraction',
+        source_session: 's1',
+        source_context: '{}',
+        ...fields,
+      });
+    const currentVector = () => new Float32Array(LOCAL_EMBEDDING_DIMENSIONS).fill(0.1);
+
+    const backfillQueueSize = () =>
+      getActiveMemoriesNeedingEmbedding(projectDb).length + getActiveMemoriesNeedingEmbedding(globalDb).length;
+
+    test('counts what backfill would embed, in both databases, and nothing else', () => {
+      insertMemory(projectDb, queued('no-vector'));
+      insertMemory(projectDb, queued('legacy-vector-only', { embedding: new Float64Array(3) }));
+      insertMemory(projectDb, queued('current-vector', { local_embedding: currentVector() }));
+      insertMemory(projectDb, queued('other-model', { local_embedding: currentVector() }));
+      projectDb.prepare(`UPDATE memories SET local_embedding_model = 'some/older-model' WHERE id = ?`).run('other-model');
+      insertMemory(projectDb, queued('untagged', { local_embedding: currentVector() }));
+      projectDb.prepare(`UPDATE memories SET local_embedding_model = NULL WHERE id = ?`).run('untagged');
+      insertMemory(projectDb, queued('raw-code', { memory_type: 'code' }));
+      insertMemory(projectDb, queued('archived', { status: 'archived', archived_at: new Date().toISOString() }));
+      insertMemory(globalDb, queued('global-no-vector', { scope: 'global' }));
+
+      const result = collectTelemetry(projectDb, globalDb, telemetryPath, cachePath);
+
+      // no-vector, legacy-vector-only, other-model, untagged, global-no-vector.
+      // Not current-vector (recall can see it), raw-code (never embedded,
+      // FR-053) or archived (backfill only reads active memories).
+      expect(result.embedding_queue_size).toBe(5);
+      expect(result.embedding_queue_size).toBe(backfillQueueSize());
+    });
+
+    test('reads 0 once every memory backfill would touch carries a current vector', () => {
+      insertMemory(projectDb, queued('embedded', { local_embedding: currentVector() }));
+      insertMemory(projectDb, queued('raw-code', { memory_type: 'code' }));
+
+      const result = collectTelemetry(projectDb, globalDb, telemetryPath, cachePath);
+
+      expect(result.embedding_queue_size).toBe(0);
+      expect(backfillQueueSize()).toBe(0);
+    });
   });
 
   test('collects telemetry from both DBs', () => {

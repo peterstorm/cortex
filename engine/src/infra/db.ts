@@ -939,6 +939,9 @@ function embeddingPredicate(): {
  * skips them, and recall filters them out. `code` memories are unembedded by
  * design (FR-053) and excluded.
  *
+ * The one definition of the embedding queue: `backfill` embeds what this
+ * returns, and `inspect` reports its length as `embedding_queue_size`.
+ *
  * The predicate is wrapped in COALESCE(..., 0): for an untagged row
  * `local_embedding_model = ?` is NULL (not false), and `NOT NULL` is NULL —
  * SQL would drop exactly the legacy rows this query exists to find.

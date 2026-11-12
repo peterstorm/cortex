@@ -311,7 +311,7 @@ Each row records the model that embedded it in `local_embedding_model`. Recall o
 
 The `local-cosine` bands and thresholds (edge classification, dedup, consolidation) were calibrated on a different model, `Xenova/bge-small-en-v1.5`. While `LOCAL_EMBED_MODEL` is not that model, `LOCAL_COSINE_CALIBRATED` is false: extraction embeds nothing (so its dedup and its edge classification run on Jaccard), and `remember`'s duplicate check and `consolidate` use Jaccard instead of cosine. Recall ranking still uses cosine: it needs relative order, not absolute cutoffs.
 
-**The `embedding` column** (Float64 BLOB) is what remains of the removed remote provider. No code computes a vector for it. It is still part of the `Memory` type, so it is stored when a caller passes one and read back with the row; `remember`'s duplicate check falls back to it when its length matches the candidate vector, and `inspect` counts a memory as queued only when both `embedding` and `local_embedding` are null.
+**The `embedding` column** (Float64 BLOB) is what remains of the removed remote provider. No code computes a vector for it. It is still part of the `Memory` type, so it is stored when a caller passes one and read back with the row; `remember`'s duplicate check falls back to it when its length matches the candidate vector. Recall never reads it, so a memory holding only this vector is still in the backfill queue, and `inspect` counts it there.
 
 ### Embedding Text Format
 
@@ -335,6 +335,8 @@ Prefix alignment ensures type-aware and project-aware similarity.
 4. Write `local_embedding` and its model tag
 
 If the model cannot load, every queued memory is reported as failed, with the load error.
+
+`inspect`'s `embedding_queue_size` is the length of that same query over both databases, so it is the number of memories the next `backfill` will try to embed: 0 means backfill has nothing to do.
 
 ### Code Memory Rule
 
@@ -384,7 +386,7 @@ BFS graph traversal from a memory ID. Args: `traverse <cwd> <memoryId> [maxDepth
 
 ### inspect
 
-Telemetry display (JSON output). Queries both DBs for stats: active memory counts by type/scope, edge count, embedding queue size, cache staleness. `memory_counts.unreadable` counts rows stored as active that do not hold a valid memory (for example a priority outside 1–10 written by another tool): every read skips such a row with a `[cortex:db] Skipping memory <id>: <reason>` line on stderr and leaves it in the file, so one bad row costs only itself. Reads `.memory/telemetry.json` for `maintenance`: when `lifecycle` and `ai-prune` last succeeded (`last_lifecycle_at`, `last_ai_prune_at`; null for never). Each advances its mark only on success, so a date that stops moving is a step failing on every run. It does not read `.memory/cortex-status.json`.
+Telemetry display (JSON output). Queries both DBs for stats: active memory counts by type/scope, edge count, embedding queue size (what the next `backfill` would embed; see [Backfill](#backfill)), cache staleness. `memory_counts.unreadable` counts rows stored as active that do not hold a valid memory (for example a priority outside 1–10 written by another tool): every read skips such a row with a `[cortex:db] Skipping memory <id>: <reason>` line on stderr and leaves it in the file, so one bad row costs only itself. Reads `.memory/telemetry.json` for `maintenance`: when `lifecycle` and `ai-prune` last succeeded (`last_lifecycle_at`, `last_ai_prune_at`; null for never). Each advances its mark only on success, so a date that stops moving is a step failing on every run. It does not read `.memory/cortex-status.json`.
 
 ### backfill
 

@@ -6,7 +6,12 @@
 
 import { Database } from 'bun:sqlite';
 import * as fs from 'node:fs';
-import { countActiveMemoryRows, getActiveMemories, getAllEdges } from '../infra/db.js';
+import {
+  countActiveMemoryRows,
+  getActiveMemories,
+  getActiveMemoriesNeedingEmbedding,
+  getAllEdges,
+} from '../infra/db.js';
 import type { Memory, MemoryType, MemoryScope } from '../core/types.js';
 
 // ============================================================================
@@ -38,6 +43,10 @@ export interface TelemetryData {
     readonly by_scope: Record<MemoryScope, number>;
   };
   readonly edge_count: number;
+  /**
+   * Memories the next `backfill` would embed, across both databases: exactly
+   * getActiveMemoriesNeedingEmbedding, the query backfill itself runs.
+   */
   readonly embedding_queue_size: number;
   readonly cache_staleness?: {
     readonly exists: boolean;
@@ -89,16 +98,6 @@ export function countByScope(memories: readonly Memory[]): Record<MemoryScope, n
   }
 
   return counts;
-}
-
-/**
- * Count memories with null embeddings (pending embedding queue).
- * Pure function.
- */
-export function countPendingEmbeddings(memories: readonly Memory[]): number {
-  return memories.filter(
-    (m) => m.embedding === null && m.local_embedding === null
-  ).length;
 }
 
 /**
@@ -235,10 +234,14 @@ export function collectTelemetry(
   const globalEdges = getAllEdges(globalDb);
   const totalEdges = projectEdges.length + globalEdges.length;
 
+  // The backfill queue, read through backfill's own query so the two cannot
+  // disagree about what is waiting (I/O)
+  const pendingEmbeddings =
+    getActiveMemoriesNeedingEmbedding(projectDb).length + getActiveMemoriesNeedingEmbedding(globalDb).length;
+
   // Pure transformations
   const byType = countByType(allMemories);
   const byScope = countByScope(allMemories);
-  const pendingEmbeddings = countPendingEmbeddings(allMemories);
 
   // Get cache staleness (I/O)
   const cacheStaleness = getCacheStaleness(cachePath);
