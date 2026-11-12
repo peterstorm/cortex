@@ -27,7 +27,7 @@ export const CLI_PATH = fileURLToPath(new URL('./cli.ts', import.meta.url));
  * A fresh, empty HOME. It lands under the per-file temp directory
  * test-preload.ts sets, which is removed after the file's tests.
  */
-export const isolatedHome = (): string => mkdtempSync(join(tmpdir(), 'cortex-test-home-'));
+const isolatedHome = (): string => mkdtempSync(join(tmpdir(), 'cortex-test-home-'));
 
 export type RunCliOptions = Readonly<{
   cwd?: string;

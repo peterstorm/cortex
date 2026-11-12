@@ -16,7 +16,6 @@ import type {
   MemoryType,
   MemoryStatus,
   SourceType,
-  EdgeRelation,
 } from '../core/types.js';
 import { createMemory, createEdge, createExtractionCheckpoint, isEdgeRelation, isEdgeStatus, isMemoryType, isMemoryStatus, isMemoryScope, isSourceType, resolveArchiveAnchor } from '../core/types.js';
 import type { Entity, Fact, EntityType } from '../core/entities.js';

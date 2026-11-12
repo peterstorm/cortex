@@ -87,25 +87,18 @@ export async function backfill(
   projectName: string
 ): Promise<BackfillResult> {
   try {
-    // Imperative Shell: fetch data (I/O)
-
-    let totalProcessed = 0;
-    let totalFailed = 0;
-    const allErrors: string[] = [];
     // Embed every memory recall cannot see. These are consumed by recall and
     // prompt-recall, which is the whole point of storing them; dedup and
     // consolidation deliberately do NOT use cosine (see LOCAL_COSINE_CALIBRATED),
     // but that no longer makes the vectors unread.
     const localUnembedded = getActiveMemoriesNeedingEmbedding(db);
-    if (localUnembedded.length > 0) {
-      process.stderr.write(`[cortex:backfill] INFO: Backfilling local embeddings for ${localUnembedded.length} memories\n`);
-      const { processed, failed, errors } = await backfillLocal(db, localUnembedded, projectName);
-      totalProcessed += processed;
-      totalFailed += failed;
-      allErrors.push(...errors);
+    if (localUnembedded.length === 0) {
+      return { ok: true, processed: 0, failed: 0, errors: [], method: 'local' };
     }
 
-    return { ok: true, processed: totalProcessed, failed: totalFailed, errors: allErrors, method: 'local' };
+    process.stderr.write(`[cortex:backfill] INFO: Backfilling local embeddings for ${localUnembedded.length} memories\n`);
+    const { processed, failed, errors } = await backfillLocal(db, localUnembedded, projectName);
+    return { ok: true, processed, failed, errors, method: 'local' };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { ok: false, error: `Backfill failed: ${message}` };

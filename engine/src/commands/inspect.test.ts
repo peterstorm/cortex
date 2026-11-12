@@ -8,7 +8,7 @@ import { Database } from 'bun:sqlite';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { openDatabase, insertMemory, insertEdge, getActiveMemoriesNeedingEmbedding } from '../infra/db.js';
-import { createMemory, createEdge, type MemoryType } from '../core/types.js';
+import { createMemory } from '../core/types.js';
 import { LOCAL_EMBEDDING_DIMENSIONS } from '../config.js';
 import {
   countByType,
