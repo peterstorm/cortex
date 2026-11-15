@@ -373,6 +373,75 @@ describe('resolveOpenAiCompatEndpoint', () => {
     expect(resolveOpenAiCompatEndpoint()?.model).toBe('explicit-model');
   });
 
+  it('treats a field of the wrong type as absent', () => {
+    // A numeric model id is not a model: the provider is rejected with the
+    // same warning as a missing one, and a numeric defaultProvider selects
+    // nothing at all.
+    withEnv({ PI_PROVIDER: 'numeric', HOME: fixtureHome });
+    fs.mkdirSync(nodePath.join(fixtureHome, '.pi', 'agent'), { recursive: true });
+    fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'models.json'), JSON.stringify({
+      providers: { numeric: { baseUrl: 'http://x/v1', apiKey: 'k', models: [{ id: 42 }] } },
+    }));
+    const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    try {
+      expect(resolveOpenAiCompatEndpoint()).toBeNull();
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/no models\[0\]\.id/));
+
+      withEnv({ PI_PROVIDER: undefined });
+      fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'settings.json'), JSON.stringify({ defaultProvider: 7 }));
+      expect(resolveOpenAiCompatEndpoint()).toBeNull();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('resolves any models.json to an endpoint or to null, never a throw', () => {
+    // models.json is wire data the user edits by hand. Whatever its shape,
+    // resolution must answer, and whatever it answers must be well typed.
+    // An apiKey starting with '!' is a shell command, so no generated value
+    // holds such a string at any depth: arbitrary text must not reach bash.
+    const noCommand = fc.jsonValue().filter((v) => !JSON.stringify(v).includes('"!'));
+    // Valid values mixed in, so the resolving branch is reached, not only the rejections.
+    const providerShaped = fc.record(
+      {
+        api: fc.oneof(noCommand, fc.constant('openai-completions')),
+        baseUrl: fc.oneof(noCommand, fc.constant('http://fixture:9000/v1')),
+        apiKey: fc.oneof(noCommand, fc.constant('k')),
+        models: fc.oneof(noCommand, fc.constant([{ id: 'fixture-model' }])),
+      },
+      { requiredKeys: [] },
+    );
+    const config = fc.oneof(
+      noCommand,
+      fc.record({ providers: noCommand }),
+      fc.record({ providers: fc.record({ p: providerShaped }) }),
+    );
+    withEnv({ PI_PROVIDER: 'p', HOME: fixtureHome });
+    fs.mkdirSync(nodePath.join(fixtureHome, '.pi', 'agent'), { recursive: true });
+    const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    let resolved = 0;
+
+    try {
+      fc.assert(
+        fc.property(config, (models) => {
+          fs.writeFileSync(nodePath.join(fixtureHome, '.pi', 'agent', 'models.json'), JSON.stringify(models));
+          const endpoint = resolveOpenAiCompatEndpoint();
+          if (endpoint === null) return;
+          resolved++;
+          expect(endpoint.baseUrl.startsWith('http')).toBe(true);
+          expect(typeof endpoint.apiKey).toBe('string');
+          expect(endpoint.apiKey.length).toBeGreaterThan(0);
+          expect(typeof endpoint.model).toBe('string');
+        }),
+        { numRuns: 300 },
+      );
+    } finally {
+      warn.mockRestore();
+    }
+    expect(resolved).toBeGreaterThan(0);
+  });
+
   it('falls back to settings.defaultProvider when no env provider is set', () => {
     withEnv({ CORTEX_LLM_PROVIDER: undefined, PI_PROVIDER: undefined, HOME: fixtureHome });
     fs.mkdirSync(nodePath.join(fixtureHome, '.pi', 'agent'), { recursive: true });

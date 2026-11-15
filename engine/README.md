@@ -146,7 +146,9 @@ SessionEnd hook (JSON stdin: {session_id, transcript_path, cwd})
            when its projection_version is not the current one
         2. readProjectedChunks(transcript_path, cursor) → up to 5 chunks of
            ≤100KB of what the model saw, streamed from the cursor; reset to 0
-           and re-read if the transcript shrank below the checkpoint
+           and re-read if the transcript shrank below the checkpoint; no
+           transcript file at all (a session that ended before its first
+           line) succeeds with nothing extracted, any other read error fails
         3. getGitContext(cwd) → {branch, commits, files}; known entities
         4. For each chunk:
            a. buildExtractionPrompt(chunk, git, project, entities) [pure]
@@ -180,7 +182,7 @@ SessionEnd hook (JSON stdin: {session_id, transcript_path, cwd})
                                                Surface Generation Pipeline)
 ```
 
-Pi runs the same three commands in one detached `ingest-session` worker, which retries a deferred or transiently failed extract until the transcript is drained before it backfills.
+Pi runs the same three commands in one detached `ingest-session` worker, which retries a deferred or transiently failed extract until the transcript is drained before it backfills. Every detached Pi child appends to `<cwd>/.memory/logs/pi-detached.log`, each run opened by a `===== <ISO time> <command> =====` header (the engine's own lines carry no timestamps). Past 5 MiB the log is renamed to `pi-detached.log.1` before the next run opens it, so one previous generation is kept.
 
 All hooks exit 0 unconditionally — never block session. Errors surface only in `/tmp/cortex-*.log` (`load-surface` keeps its log only when it fails).
 
@@ -440,6 +442,7 @@ SessionStart fast path. Checks cache and serves if fresh (<24h); on cache miss o
 | Telemetry | `<repository root>/.memory/telemetry.json` — maintenance cadence state, read and merged by `lifecycle` (`last_lifecycle_at`) and `ai-prune` (`last_ai_prune_at`); also the file `inspect` reads | Yes |
 | Eval | `<repository root>/.memory/eval/` by default, beside the memory it measures (`--dir` overrides) | Yes |
 | Pipeline logs | `/tmp/cortex-{extract,backfill,maintenance}.<pid>.log` per session end, `/tmp/cortex-load-surface.<pid>.log` for a failed session start; removed after 7 days | N/A |
+| Pi detached log | `<session directory>/.memory/logs/pi-detached.log` — every detached Pi child, one dated header per run; rotated to `.log.1` past 5 MiB | Yes |
 
 `.gitignore` patterns auto-added by `ensureGitignored()`: `.memory/`, `.claude/cortex-memory.local.md`, `.pi/cortex-memory.local.md`.
 
@@ -464,6 +467,10 @@ cd engine && bun run typecheck    # tsc --noEmit -p . (also a CI step)
 
 Use the scripts, not a bare `bun test`: `vi.mock` is process-wide under Bun, so
 per-file `--isolate` is what keeps one file's module mocks out of the others.
+The scripts also run the suite through `src/with-native-library-path.ts`, which
+puts onnxruntime's libstdc++ on the loader path the way the CLI does for itself
+(on NixOS it is not on the default path; elsewhere the wrapper changes nothing).
+Without it the local-embedding tests cannot import the model on NixOS.
 
 The engine pins `onnxruntime-node` to 1.24.3 through `overrides` in
 `package.json`: earlier versions make Bun panic at process exit (status 134)

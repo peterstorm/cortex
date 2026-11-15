@@ -15,9 +15,36 @@
  * stdio wiring, detachment) stay behind it.
  */
 
-import { closeSync, mkdirSync, openSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, renameSync, statSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
+
+/**
+ * The project log every detached child appends to. Past this size it is
+ * renamed to `pi-detached.log.1` (one previous generation kept) before the next
+ * run opens it: the log used to grow without bound, 36 MB in one busy project.
+ * A child still writing to the old file keeps its descriptor, so a rename
+ * never loses lines.
+ */
+export const DETACHED_LOG_NAME = "pi-detached.log";
+export const DETACHED_LOG_MAX_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Pure: the line that opens one detached run's output. Children write raw
+ * engine output with no timestamps of their own, so this header is what dates
+ * every line below it and separates one run from the next.
+ */
+export function detachedRunHeader(args: readonly string[], startedAt: Date): string {
+  return `\n===== ${startedAt.toISOString()} ${args.join(" ")} =====\n`;
+}
+
+/** Open the project log for appending, rotating it first once it is too big. */
+function openDetachedLog(logDir: string): number {
+  const logPath = join(logDir, DETACHED_LOG_NAME);
+  const size = statSync(logPath, { throwIfNoEntry: false })?.size ?? 0;
+  if (size > DETACHED_LOG_MAX_BYTES) renameSync(logPath, `${logPath}.1`);
+  return openSync(logPath, "a", 0o600);
+}
 
 export type CliRunResult =
   | Readonly<{ ok: true; output: string }>
@@ -59,8 +86,13 @@ export function describeError(error: unknown): string {
  *
  * @param cliPath - Absolute path to the engine's cli.ts
  * @param baseEnv - Environment every child inherits on top of process.env
+ * @param now - Clock for the detached log's run headers
  */
-export function nodeCliRunner(cliPath: string, baseEnv: NodeJS.ProcessEnv): CliRunner {
+export function nodeCliRunner(
+  cliPath: string,
+  baseEnv: NodeJS.ProcessEnv,
+  now: () => Date = () => new Date(),
+): CliRunner {
   // One env builder for both methods: they differ in how they start a child,
   // never in what environment it gets, and two copies of this spread is how a
   // variable ends up passed to one path and not the other.
@@ -123,7 +155,8 @@ export function nodeCliRunner(cliPath: string, baseEnv: NodeJS.ProcessEnv): CliR
         if (options?.cwd) {
           const logDir = join(options.cwd, ".memory", "logs");
           mkdirSync(logDir, { recursive: true });
-          logFd = openSync(join(logDir, "pi-detached.log"), "a", 0o600);
+          logFd = openDetachedLog(logDir);
+          writeSync(logFd, detachedRunHeader(args, now()));
           outputTarget = logFd;
         }
       } catch (error) {

@@ -104,12 +104,21 @@ export function thinkingLevelFor(model: string | undefined, requested: Backgroun
   return requested === 'off' && model !== undefined && REJECTS_THINKING_OFF.test(model) ? 'low' : requested;
 }
 
-export interface LlmInvocation {
-  readonly binary: 'claude' | 'pi';
-  readonly args: readonly string[];
-  readonly provider?: string;
-  readonly model?: string;
-}
+/**
+ * One resolved headless call. `claude` has no thinking switch and always
+ * names its model. `pi` carries the `--thinking` level it actually sends,
+ * which differs from the one asked for on a model that refuses `off`, so
+ * whatever reports the call reads that decision instead of re-deriving it.
+ */
+export type LlmInvocation =
+  | Readonly<{ binary: 'claude'; args: readonly string[]; model: string }>
+  | Readonly<{
+      binary: 'pi';
+      args: readonly string[];
+      provider: string | undefined;
+      model: string | undefined;
+      thinking: BackgroundThinking;
+    }>;
 
 /** Detect which CLI binary to use for headless LLM calls. An explicit
  * CORTEX_LLM_BINARY override always wins; otherwise the active pi harness
@@ -165,11 +174,8 @@ function getDefaultProvider(env: NodeJS.ProcessEnv): string | undefined {
 export function buildLlmInvocation(env: NodeJS.ProcessEnv, thinking: BackgroundThinking = 'off'): LlmInvocation {
   const binary = getLlmBinary(env);
   if (binary === 'claude') {
-    return {
-      binary,
-      args: [binary, '-p', '--model', env.CORTEX_LLM_MODEL || 'haiku', '--output-format', 'text'],
-      model: env.CORTEX_LLM_MODEL || 'haiku',
-    };
+    const model = env.CORTEX_LLM_MODEL || 'haiku';
+    return { binary, args: [binary, '-p', '--model', model, '--output-format', 'text'], model };
   }
 
   const activeProvider = env.CORTEX_PI_PROVIDER || env.PI_PROVIDER;
@@ -185,9 +191,10 @@ export function buildLlmInvocation(env: NodeJS.ProcessEnv, thinking: BackgroundT
   // Structured ingestion does not benefit from hidden reasoning. Pinning this
   // also prevents the headless child from inheriting the interactive session's
   // PI_REASONING_LEVEL through its environment.
-  args.push('--thinking', thinkingLevelFor(model, thinking), '--no-session');
+  const sent = thinkingLevelFor(model, thinking);
+  args.push('--thinking', sent, '--no-session');
 
-  return { binary, args, provider, model };
+  return { binary, args, provider, model, thinking: sent };
 }
 
 /**
@@ -217,21 +224,21 @@ export async function runLlmPrompt(
   thinking: BackgroundThinking = 'off'
 ): Promise<string> {
   const env = typeof Bun !== 'undefined' ? Bun.env : process.env;
-  const { binary, args, provider, model } = buildLlmInvocation(env, thinking);
+  const invocation = buildLlmInvocation(env, thinking);
 
   if (!isClaudeLlmAvailable()) {
-    throw new Error(`${binary} CLI not found on PATH`);
+    throw new Error(`${invocation.binary} CLI not found on PATH`);
   }
 
-  if (binary === 'pi') {
+  if (invocation.binary === 'pi') {
     process.stderr.write(
-      // The level actually sent, which differs from `thinking` for a model that refuses `off`.
-      `[cortex:llm] INFO: Pi extraction model: ${provider ?? 'default'}/${model ?? 'default'} (thinking: ${thinkingLevelFor(model, thinking)})\n`
+      `[cortex:llm] INFO: Pi extraction model: ${invocation.provider ?? 'default'}/${invocation.model ?? 'default'} ` +
+        `(thinking: ${invocation.thinking})\n`
     );
   }
 
   const proc = Bun.spawn(
-    [...args],
+    [...invocation.args],
     {
       stdin: 'pipe',
       stdout: 'pipe',

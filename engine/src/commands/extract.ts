@@ -220,6 +220,19 @@ export async function executeExtract(
         read = await readWindow(0);
       }
     } catch (err) {
+      // A session that ended before writing a single line has no transcript
+      // file at all. That is an empty input, not a failure: reporting it as
+      // one logged an ERROR and made the hook skip its follow-up work for a
+      // session that had nothing to extract.
+      if (isMissingFile(err)) {
+        logInfo(`No transcript at ${input.transcript_path} — nothing to extract`);
+        return {
+          kind: 'succeeded',
+          extracted_count: 0,
+          edge_count: 0,
+          cursor_position: cursor,
+        };
+      }
       const message = err instanceof Error ? err.message : String(err);
       logError(`Failed to read transcript: ${message}`);
       return {
@@ -1162,6 +1175,11 @@ function buildKnownEntityProfiles(db: Database): readonly EntityProfile[] {
   }
 
   return profiles;
+}
+
+/** Whether a filesystem error says the path does not exist. */
+function isMissingFile(err: unknown): boolean {
+  return err instanceof Error && 'code' in err && err.code === 'ENOENT';
 }
 
 /**

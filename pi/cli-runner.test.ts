@@ -1,9 +1,15 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { describeError, nodeCliRunner } from './cli-runner.js';
+import {
+  DETACHED_LOG_MAX_BYTES,
+  DETACHED_LOG_NAME,
+  describeError,
+  detachedRunHeader,
+  nodeCliRunner,
+} from './cli-runner.js';
 
 // The adapter is the one place that touches node:child_process, and it is
 // tested against REAL subprocesses rather than a mocked module: the behaviour
@@ -248,5 +254,63 @@ describe('nodeCliRunner.runDetached', () => {
     const cli = nodeCliRunner(join(workdir, 'missing.ts'), {});
 
     expect(() => cli.runDetached(['load-surface', workdir], { cwd: workdir })).not.toThrow();
+  });
+
+  describe('the project log', () => {
+    const startedAt = new Date('2026-11-15T12:34:56.789Z');
+
+    /** Run one detached child that prints `line`, and wait until it has. */
+    async function runPrinting(workdir: string, line: string): Promise<string> {
+      const dir = tempDir();
+      const cli = nodeCliRunner(script(dir, `console.log(${JSON.stringify(line)});`), {}, () => startedAt);
+      cli.runDetached(['ingest-session', workdir], { cwd: workdir });
+      const logPath = join(workdir, '.memory', 'logs', DETACHED_LOG_NAME);
+      await waitFor(() => existsSync(logPath) && readFileSync(logPath, 'utf-8').includes(line));
+      return logPath;
+    }
+
+    it('dates each run with a header written before the child\'s output', async () => {
+      const workdir = tempDir();
+
+      const logPath = await runPrinting(workdir, 'first run output');
+
+      expect(readFileSync(logPath, 'utf-8')).toBe(
+        `\n===== 2026-11-15T12:34:56.789Z ingest-session ${workdir} =====\nfirst run output\n`,
+      );
+    });
+
+    it('appends below the limit, one header per run', async () => {
+      const workdir = tempDir();
+
+      await runPrinting(workdir, 'run one');
+      const logPath = await runPrinting(workdir, 'run two');
+
+      const log = readFileSync(logPath, 'utf-8');
+      expect(log.match(/^===== /gm)).toHaveLength(2);
+      expect(log.indexOf('run one')).toBeLessThan(log.indexOf('run two'));
+      expect(existsSync(`${logPath}.1`)).toBe(false);
+    });
+
+    it('keeps one previous generation once the log outgrows the limit', async () => {
+      const workdir = tempDir();
+      const logPath = join(workdir, '.memory', 'logs', DETACHED_LOG_NAME);
+      mkdirSync(join(workdir, '.memory', 'logs'), { recursive: true });
+      const old = 'x'.repeat(DETACHED_LOG_MAX_BYTES + 1);
+      writeFileSync(logPath, old);
+
+      await runPrinting(workdir, 'after rotation');
+
+      expect(readFileSync(`${logPath}.1`, 'utf-8')).toBe(old);
+      expect(readFileSync(logPath, 'utf-8')).toBe(
+        `\n===== 2026-11-15T12:34:56.789Z ingest-session ${workdir} =====\nafter rotation\n`,
+      );
+    });
+  });
+});
+
+describe('detachedRunHeader', () => {
+  it('puts the start time and the command on a line of its own', () => {
+    expect(detachedRunHeader(['maintenance', '/p'], new Date('2026-01-02T03:04:05.000Z')))
+      .toBe('\n===== 2026-01-02T03:04:05.000Z maintenance /p =====\n');
   });
 });

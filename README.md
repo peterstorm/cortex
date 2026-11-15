@@ -560,8 +560,10 @@ bun run typecheck    # tsc --noEmit -p .
 
 Run the suite through these scripts, not a bare `bun test`: tests mock modules
 with `vi.mock`, which Bun applies process-wide, so only `--isolate` keeps one
-file's mocks out of the others. CI runs the typecheck and the test script on
-Ubuntu and macOS.
+file's mocks out of the others. The scripts also put onnxruntime's libstdc++ on
+the loader path first (`src/with-native-library-path.ts`, a no-op off NixOS),
+as the CLI does for itself. CI runs the typecheck and the test script on Ubuntu
+and macOS.
 
 ### CLI Usage
 

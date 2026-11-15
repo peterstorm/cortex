@@ -83,7 +83,7 @@ describe('extract command - core logic', () => {
     // lock under `<cwd>/.memory/locks` before the LLM gate, so a cwd that
     // cannot be created (e.g. /home/user/project) defers on `lock io-error`
     // and never reaches the branch under test. The transcript is deliberately
-    // absent, so a run that passes the gate fails on reading it.
+    // absent, so a run that passes the gate ends there with nothing to extract.
     const cwd = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'cortex-extract-gate-'));
     projectDirs.push(cwd);
     input = {
@@ -100,15 +100,15 @@ describe('extract command - core logic', () => {
   describe('LLM availability gate', () => {
     it('proceeds when the direct endpoint is configured and no CLI is available', async () => {
       // The A01 fix: the gate accepts either transport, so a direct-endpoint
-      // user without the CLI binary is NOT skipped. The run then fails on the
-      // missing transcript (proving the gate was passed), not on availability.
+      // user without the CLI binary is NOT skipped. The run then reaches the
+      // missing transcript and succeeds with nothing to extract, which only a
+      // run past the gate can do.
       mockIsClaudeLlmAvailable.mockReturnValue(false);
       mockResolveEndpoint.mockReturnValue({ baseUrl: 'http://llm.example/v1', apiKey: 'k', model: 'm' });
 
       const result = await executeExtract(input, db);
 
-      expect(result.kind).toBe('failed');
-      if (result.kind === 'failed') expect(result.error).toMatch(/failed to read transcript/i);
+      expect(result).toMatchObject({ kind: 'succeeded', extracted_count: 0 });
     });
 
     it('skips extraction when no transport is available at all', async () => {
@@ -750,6 +750,56 @@ describe('executeExtract (mocked LLM)', () => {
     });
     expect(mockExtractMemories).not.toHaveBeenCalled();
     db.close();
+  });
+
+  it('succeeds with nothing extracted when the session never wrote a transcript', async () => {
+    // A session that ends before its first line leaves no file behind. That
+    // is an empty input: an ERROR and a failed result made the hook skip its
+    // follow-up work for a session that had nothing to give.
+    const { cwd } = makeTestProject('');
+    const db = openDatabase(':memory:');
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    try {
+      const result = await executeExtract(
+        { session_id: 's-no-transcript', transcript_path: nodePath.join(cwd, 'never-written.jsonl'), cwd }, db
+      );
+
+      expect(result).toEqual({ kind: 'succeeded', extracted_count: 0, edge_count: 0, cursor_position: 0 });
+      expect(mockExtractMemories).not.toHaveBeenCalled();
+      expect(getExtractionCheckpoint(db, 's-no-transcript')).toBeNull();
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining('nothing to extract'));
+      expect(stderr).not.toHaveBeenCalledWith(expect.stringContaining('ERROR'));
+    } finally {
+      stderr.mockRestore();
+      db.close();
+    }
+  });
+
+  it('still fails, terminally, on a transcript that exists but cannot be read', async () => {
+    // Only absence is an empty input. A path that cannot be read is a real
+    // fault, and asking again right away would meet the same fault.
+    const { cwd } = makeTestProject('');
+    const unreadable = nodePath.join(cwd, 'a-directory.jsonl');
+    fs.mkdirSync(unreadable);
+    const db = openDatabase(':memory:');
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    try {
+      const result = await executeExtract(
+        { session_id: 's-unreadable', transcript_path: unreadable, cwd }, db
+      );
+
+      expect(result).toMatchObject({
+        kind: 'failed',
+        retryable: false,
+        error: expect.stringContaining('Failed to read transcript'),
+      });
+      expect(mockExtractMemories).not.toHaveBeenCalled();
+    } finally {
+      stderr.mockRestore();
+      db.close();
+    }
   });
 
   it('does NOT advance the checkpoint on LLM parse failure', async () => {

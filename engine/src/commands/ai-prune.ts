@@ -339,6 +339,39 @@ export function isProtectedStableMemory(
   );
 }
 
+/** Why the code keeps a memory the model asked to archive. */
+export type ArchiveGuard = 'pinned' | 'stable' | 'too-young';
+
+/**
+ * Pure: the guard that forbids archiving this memory, or null when it may be
+ * archived. Checked in this order, so each kept memory is counted once.
+ */
+export function archiveGuardFor(
+  memory: Pick<Memory, 'pinned' | 'memory_type' | 'confidence' | 'created_at'>,
+  now: Date
+): ArchiveGuard | null {
+  if (memory.pinned) return 'pinned';
+  if (isProtectedStableMemory(memory)) return 'stable';
+  if (isTooYoungToArchive(memory.created_at, now)) return 'too-young';
+  return null;
+}
+
+/**
+ * Pure: one line for the memories the guards kept in a run, or null when they
+ * kept none. The model names protected memories run after run (they stay in
+ * the prompt as context for judging their weaker duplicates), and one line per
+ * memory per run was most of pi-detached.log: 5,000+ "Skipping …" lines.
+ */
+export function describeGuardedKeeps(kept: Readonly<Record<ArchiveGuard, number>>): string | null {
+  const total = kept.pinned + kept.stable + kept['too-young'];
+  if (total === 0) return null;
+  return (
+    `Kept ${total} memor${total === 1 ? 'y' : 'ies'} the model named but the guards protect: ` +
+    `${kept.pinned} pinned, ${kept.stable} high-confidence architecture/decision, ` +
+    `${kept['too-young']} younger than ${AI_PRUNE_MIN_AGE_DAYS} days`
+  );
+}
+
 /**
  * Run AI prune unconditionally (for manual /ai-prune invocation).
  * Batches memories into chunks of AI_PRUNE_BATCH_SIZE for large stores.
@@ -442,11 +475,8 @@ async function prune(
   // Build ID lookup sets for archive routing
   const projectIds = new Set(projectMemories.map(m => m.id));
   const globalIds = new Set(globalMemories.map(m => m.id));
-  const pinnedIds = new Set(allMemories.filter(m => m.pinned).map(m => m.id));
-  const protectedStableIds = new Set(
-    allMemories.filter(isProtectedStableMemory).map(m => m.id)
-  );
-  const createdAtById = new Map(allMemories.map(m => [m.id, m.created_at]));
+  const memoryById = new Map(allMemories.map(m => [m.id, m]));
+  const guardedKeeps: Record<ArchiveGuard, number> = { pinned: 0, stable: 0, 'too-young': 0 };
 
   const batches = chunk(memoryData, AI_PRUNE_BATCH_SIZE);
   const totalBatches = batches.length;
@@ -505,21 +535,12 @@ async function prune(
     progress.reviewed += batch.length;
 
     for (const candidate of parsed.candidates) {
-      if (pinnedIds.has(candidate.id)) {
-        logInfo(`Skipping pinned memory ${candidate.id.slice(0, 8)}`);
-        continue;
-      }
-
-      if (protectedStableIds.has(candidate.id)) {
-        logInfo(`Skipping high-confidence architecture/decision memory ${candidate.id.slice(0, 8)}`);
-        continue;
-      }
-
-      // Age guard enforced in code, not just prompt: never archive
-      // memories younger than AI_PRUNE_MIN_AGE_DAYS regardless of LLM output
-      const createdAt = createdAtById.get(candidate.id);
-      if (createdAt && isTooYoungToArchive(createdAt, new Date())) {
-        logInfo(`Skipping too-young memory ${candidate.id.slice(0, 8)} (< ${AI_PRUNE_MIN_AGE_DAYS} days old)`);
+      // The prompt states every guard, but model output is untrusted: each is
+      // enforced here. Unknown IDs were rejected above, so the lookup succeeds.
+      const memory = memoryById.get(candidate.id);
+      const guard = memory === undefined ? null : archiveGuardFor(memory, new Date());
+      if (guard !== null) {
+        guardedKeeps[guard]++;
         continue;
       }
 
@@ -547,6 +568,9 @@ async function prune(
       logInfo(`Archived ${candidate.id.slice(0, 8)}: ${candidate.reason}`);
     }
   }
+
+  const guardedSummary = describeGuardedKeeps(guardedKeeps);
+  if (guardedSummary !== null) logInfo(guardedSummary);
 
   // Successful batches may already have archived memories even when a sibling
   // batch failed, so invalidate the surface before returning a partial error.

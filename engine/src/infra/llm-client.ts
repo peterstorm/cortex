@@ -78,6 +78,16 @@ function getEnv(name: string): string | undefined {
   return process.env[name] ?? undefined;
 }
 
+/** A property of an untrusted value, or undefined when it is not an object holding one. */
+function property(value: unknown, key: string): unknown {
+  if (typeof value !== 'object' || value === null) return undefined;
+  return Reflect.get(value, key);
+}
+
+const text = (value: unknown): string | undefined => (typeof value === 'string' ? value : undefined);
+
+const describeError = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
 /**
  * Read a JSON config file, or null when it does not exist (a legitimately
  * absent config is the normal case). A file that EXISTS but cannot be read
@@ -86,10 +96,10 @@ function getEnv(name: string): string | undefined {
  */
 function readJsonConfig(path: string): unknown {
   try {
-    return JSON.parse(readFileSync(path, 'utf8')) as unknown;
+    return JSON.parse(readFileSync(path, 'utf8'));
   } catch (err) {
     if (existsSync(path)) {
-      warnResolution(`config ${path} exists but could not be read/parsed: ${(err as Error).message}`);
+      warnResolution(`config ${path} exists but could not be read/parsed: ${describeError(err)}`);
     }
     return null;
   }
@@ -115,7 +125,7 @@ function runShellCommand(command: string): string | null {
     // The command itself never ran (spawn ENOENT, EACCES, signal) — a
     // different failure class from "the command printed nothing", and the
     // caller's 'resolved empty' warning would misattribute it.
-    warnResolution(`apiKey shell command could not be started: ${err instanceof Error ? err.message : String(err)}`);
+    warnResolution(`apiKey shell command could not be started: ${describeError(err)}`);
     return null;
   }
 }
@@ -152,20 +162,13 @@ export function resolveOpenAiCompatEndpoint(): LlmEndpoint | null {
     );
   }
 
+  // Both files are wire data: read as unknown and narrowed field by field, so
+  // a config of any shape resolves to an endpoint or to null, never a throw.
   const piDir = join(getEnv('HOME') ?? homedir(), '.pi', 'agent');
-  const models = readJsonConfig(join(piDir, 'models.json'));
-  if (!models || typeof models !== 'object') return null;
+  const providers = property(readJsonConfig(join(piDir, 'models.json')), 'providers');
+  if (typeof providers !== 'object' || providers === null) return null;
 
-  const providers = (models as { providers?: unknown }).providers;
-  if (!providers || typeof providers !== 'object') return null;
-
-  const settings = readJsonConfig(join(piDir, 'settings.json')) as
-    | { defaultProvider?: unknown }
-    | null;
-  const defaultProvider =
-    settings && typeof settings.defaultProvider === 'string'
-      ? settings.defaultProvider
-      : undefined;
+  const defaultProvider = text(property(readJsonConfig(join(piDir, 'settings.json')), 'defaultProvider'));
 
   const explicitProvider = getEnv('CORTEX_LLM_PROVIDER');
   const activeProvider = getEnv('CORTEX_PI_PROVIDER') || getEnv('PI_PROVIDER');
@@ -176,31 +179,28 @@ export function resolveOpenAiCompatEndpoint(): LlmEndpoint | null {
     defaultProvider;
   if (!providerId) return null;
 
-  const provider = (providers as Record<string, unknown>)[providerId];
-  if (!provider || typeof provider !== 'object') {
+  const provider = property(providers, providerId);
+  if (typeof provider !== 'object' || provider === null) {
     warnResolution(`provider '${providerId}' is not defined in ~/.pi/agent/models.json`);
     return null;
   }
-  const providerRecord = provider as Record<string, unknown>;
 
-  if (
-    typeof providerRecord.api === 'string' &&
-    !OPENAI_CHAT_COMPLETIONS_APIS.has(providerRecord.api)
-  ) {
+  const api = text(property(provider, 'api'));
+  if (api !== undefined && !OPENAI_CHAT_COMPLETIONS_APIS.has(api)) {
     warnResolution(
-      `provider '${providerId}' uses api '${providerRecord.api}', not the OpenAI chat-completions adapter`
+      `provider '${providerId}' uses api '${api}', not the OpenAI chat-completions adapter`
     );
     return null;
   }
 
-  const baseUrl = providerRecord.baseUrl;
-  if (typeof baseUrl !== 'string' || !baseUrl.startsWith('http')) {
+  const baseUrl = text(property(provider, 'baseUrl'));
+  if (baseUrl === undefined || !baseUrl.startsWith('http')) {
     warnResolution(`provider '${providerId}' has no http baseUrl`);
     return null;
   }
 
-  const rawKey = providerRecord.apiKey;
-  if (typeof rawKey !== 'string' || rawKey.length === 0) {
+  const rawKey = text(property(provider, 'apiKey'));
+  if (rawKey === undefined || rawKey.length === 0) {
     warnResolution(`provider '${providerId}' has no apiKey; direct LLM calls disabled, falling back to subprocess`);
     return null;
   }
@@ -210,11 +210,8 @@ export function resolveOpenAiCompatEndpoint(): LlmEndpoint | null {
     return null;
   }
 
-  const modelsList = providerRecord.models;
-  const models0 =
-    Array.isArray(modelsList) && modelsList.length > 0
-      ? (modelsList[0] as { id?: unknown })?.id
-      : undefined;
+  const modelsList = property(provider, 'models');
+  const models0 = text(property(Array.isArray(modelsList) ? modelsList[0] : undefined, 'id'));
   // Prefer the active session's model when this endpoint is the session's own
   // provider (mirrors the subprocess path): the live session is actively
   // using that exact model, so it is guaranteed to exist — unlike models[0],
@@ -515,14 +512,6 @@ export type CompletionReply = Readonly<{
   completionTokens: number | null;
 }>;
 
-/** A property of an untrusted value, or undefined when it is not an object holding one. */
-function property(value: unknown, key: string): unknown {
-  if (typeof value !== 'object' || value === null) return undefined;
-  return Reflect.get(value, key);
-}
-
-const text = (value: unknown): string | undefined => (typeof value === 'string' ? value : undefined);
-
 /** Pure: read the fields chatCompletion uses from a reply body; anything malformed reads as absent. */
 export function parseCompletionReply(payload: unknown): CompletionReply {
   const choices = property(payload, 'choices');
@@ -651,8 +640,7 @@ export async function chatCompletion(
     // The timeout aborts with a reason; surface it as a timeout-named error
     // so operators can distinguish "prompt exceeded the deadline" from a
     // generic network/abort failure.
-    const message = err instanceof Error ? err.message : String(err);
-    if ((err as Error)?.name === 'AbortError' || message.includes('timed out after')) {
+    if (property(err, 'name') === 'AbortError' || describeError(err).includes('timed out after')) {
       throw new Error(`LLM request timed out after ${effectiveTimeoutMs}ms`);
     }
     throw err;

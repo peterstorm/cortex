@@ -33,6 +33,7 @@ describe('buildLlmInvocation', () => {
       args: ['pi', '-p', '--provider', 'openai-codex', '--model', 'gpt-5.4-mini', '--thinking', 'off', '--no-session'],
       provider: 'openai-codex',
       model: 'gpt-5.4-mini',
+      thinking: 'off',
     });
   });
 
@@ -48,6 +49,7 @@ describe('buildLlmInvocation', () => {
       args: ['pi', '-p', '--provider', 'anthropic', '--model', 'claude-haiku-4-5', '--thinking', 'off', '--no-session'],
       provider: 'anthropic',
       model: 'claude-haiku-4-5',
+      thinking: 'off',
     });
   });
 
@@ -63,6 +65,7 @@ describe('buildLlmInvocation', () => {
       args: ['pi', '-p', '--provider', 'desktop-vllm', '--model', 'glm-5.3-flash-exl3-k4-vision-fp8kv-mtp-359k-v11.1', '--thinking', 'off', '--no-session'],
       provider: 'desktop-vllm',
       model: 'glm-5.3-flash-exl3-k4-vision-fp8kv-mtp-359k-v11.1',
+      thinking: 'off',
     });
   });
 
@@ -79,6 +82,7 @@ describe('buildLlmInvocation', () => {
       args: ['pi', '-p', '--provider', 'google', '--model', 'gemini-2.5-flash-lite', '--thinking', 'off', '--no-session'],
       provider: 'google',
       model: 'gemini-2.5-flash-lite',
+      thinking: 'off',
     });
   });
 
@@ -94,6 +98,7 @@ describe('buildLlmInvocation', () => {
       args: ['pi', '-p', '--provider', 'company-proxy', '--model', 'memory-fast-v2', '--thinking', 'off', '--no-session'],
       provider: 'company-proxy',
       model: 'memory-fast-v2',
+      thinking: 'off',
     });
   });
 
@@ -111,6 +116,7 @@ describe('buildLlmInvocation', () => {
       args: ['pi', '-p', '--provider', 'some-unknown-provider', '--thinking', 'off', '--no-session'],
       provider: 'some-unknown-provider',
       model: undefined,
+      thinking: 'off',
     });
   });
 
@@ -142,6 +148,7 @@ describe('buildLlmInvocation', () => {
       args: ['pi', '-p', '--thinking', 'off', '--no-session'],
       provider: undefined,
       model: undefined,
+      thinking: 'off',
     });
   });
 
@@ -177,6 +184,7 @@ describe('buildLlmInvocation', () => {
       args: ['pi', '-p', '--provider', 'github-copilot', '--model', 'claude-haiku-5.5', '--thinking', 'low', '--no-session'],
       provider: 'github-copilot',
       model: 'claude-haiku-5.5',
+      thinking: 'low',
     });
   });
 
@@ -304,6 +312,27 @@ describe('subprocess fallback thinking level', () => {
     Bun.env.CORTEX_LLM_REASONING_EFFORT = 'high';
     const args = await fallbackArgs('warmind-1017-native');
     expect(args[args.indexOf('--thinking') + 1]).toBe('high');
+  });
+
+  it('logs the thinking level it sends, not the one it was asked for', async () => {
+    // Claude 5.5 refuses `off`, so `off` goes out as `low`. The log line is
+    // what an operator reads when a run misbehaves; it must name what pi got.
+    Bun.env.CORTEX_LLM_MODEL = 'claude-haiku-5.5';
+    const written: string[] = [];
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      written.push(String(chunk));
+      return true;
+    });
+
+    try {
+      await runLlmPrompt('extract', 10_000, 'off');
+    } finally {
+      stderr.mockRestore();
+    }
+
+    const args = fs.readFileSync(argsFile, 'utf8').trim().split('\n');
+    expect(args[args.indexOf('--thinking') + 1]).toBe('low');
+    expect(written.join('')).toContain('/claude-haiku-5.5 (thinking: low)');
   });
 
   /** Replace the fake `pi` with one that fails the way a real run did. */
