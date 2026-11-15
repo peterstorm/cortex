@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
+import { planNativeLibraryPath } from './infra/native-library-path.js';
 
 // Real subprocesses: what this launcher promises (the command runs, sees a
 // loader path where libstdc++ resolves, and hands back its own exit status)
@@ -12,7 +13,19 @@ const launch = (...command: string[]) =>
   spawnSync(process.execPath, [LAUNCHER, ...command], { encoding: 'utf8' });
 
 describe('with-native-library-path', () => {
-  it('gives the command a loader path on which libstdc++ resolves', () => {
+  it('gives the command exactly the loader path the plan prescribes', () => {
+    // The contract on every platform: a re-exec plan's path on NixOS, the
+    // inherited value untouched everywhere else (macOS has no libstdc++.so.6
+    // to find, so its plan is always to proceed).
+    const plan = planNativeLibraryPath();
+    const expected = plan.kind === 're-exec' ? plan.libraryPath : (process.env.LD_LIBRARY_PATH ?? '');
+
+    const result = launch('sh', '-c', 'printf "%s" "${LD_LIBRARY_PATH:-}"');
+
+    expect(result.stdout).toBe(expected);
+  });
+
+  it.skipIf(process.platform !== 'linux')('gives the command a loader path on which libstdc++ resolves', () => {
     const check =
       `const { resolvesNatively } = await import(${JSON.stringify(NATIVE_PATH_MODULE)});` +
       `process.exit(resolvesNatively(process.env) ? 0 : 9);`;

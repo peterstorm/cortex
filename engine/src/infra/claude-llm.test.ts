@@ -10,6 +10,7 @@ import * as nodePath from 'node:path';
 import {
   buildEdgeClassificationPrompt,
   buildLlmInvocation,
+  isClaudeLlmAvailable,
   parseEdgeClassificationResponse,
   resetConsecutiveDirectFailuresForTests,
   resetLlmConcurrencyForTests,
@@ -312,6 +313,17 @@ describe('subprocess fallback thinking level', () => {
     Bun.env.CORTEX_LLM_REASONING_EFFORT = 'high';
     const args = await fallbackArgs('warmind-1017-native');
     expect(args[args.indexOf('--thinking') + 1]).toBe('high');
+  });
+
+  it('looks for the binary on the PATH the call will use', () => {
+    // Bun.which without an explicit PATH ignores one changed at runtime, so a
+    // machine with pi installed passed this suite and a CI runner without pi
+    // failed it. The fake pi is on PATH here; an empty directory has none.
+    expect(isClaudeLlmAvailable()).toBe(true);
+
+    const empty = fs.mkdtempSync(nodePath.join(scratch, 'empty-path-'));
+    Bun.env.PATH = empty;
+    expect(isClaudeLlmAvailable()).toBe(false);
   });
 
   it('logs the thinking level it sends, not the one it was asked for', async () => {

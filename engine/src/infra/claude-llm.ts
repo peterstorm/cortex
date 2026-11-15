@@ -199,10 +199,14 @@ export function buildLlmInvocation(env: NodeJS.ProcessEnv, thinking: BackgroundT
 
 /**
  * Check if the LLM binary is available on PATH.
+ *
+ * The PATH is passed explicitly: without it Bun.which does not see a PATH
+ * changed after startup, while the spawn in runLlmPrompt does, so the check
+ * and the call could disagree about which binary exists.
  */
 export function isClaudeLlmAvailable(): boolean {
   const env = typeof Bun !== 'undefined' ? Bun.env : process.env;
-  return Bun.which(getLlmBinary(env)) !== null;
+  return Bun.which(getLlmBinary(env), { PATH: env.PATH }) !== null;
 }
 
 /**
