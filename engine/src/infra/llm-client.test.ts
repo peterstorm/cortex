@@ -15,12 +15,18 @@ import {
   chatCompletionText,
   findServedModelMismatch,
   resetServedModelCheck,
+  backgroundThinking,
+  parseEffortOverride,
+  parseServedModelIds,
+  reasoningEffortFor,
+  thinkingCannotBeDisabled,
   THINKING_DISABLED_KWARGS,
   type LlmEndpoint,
 } from './llm-client.js';
 
 const ENV_KEYS = ['CORTEX_LLM_API_URL', 'CORTEX_LLM_API_KEY', 'CORTEX_LLM_MODEL',
-  'CORTEX_LLM_PROVIDER', 'CORTEX_PI_PROVIDER', 'CORTEX_PI_MODEL', 'PI_PROVIDER', 'PI_MODEL', 'HOME'];
+  'CORTEX_LLM_PROVIDER', 'CORTEX_PI_PROVIDER', 'CORTEX_PI_MODEL', 'PI_PROVIDER', 'PI_MODEL', 'HOME',
+  'CORTEX_LLM_REASONING_EFFORT'];
 
 function withEnv(values: Record<string, string | undefined>): void {
   for (const [key, value] of Object.entries(values)) {
@@ -558,6 +564,273 @@ describe('chatCompletionText', () => {
         /Unexpected token|Unexpected end|JSON/
       );
     });
+  });
+});
+
+describe('thinkingCannotBeDisabled', () => {
+  it.each([
+    'glm-5.3-flash-hyperflare-tp2-v16',
+    'glm-5.3-flash-hyperflare-tp2-cyber-hybrid',
+    'GLM-5.3-Flash',
+    'glm-5.3-flash-exl3-k4-vision-fp8kv-mtp-359k-v11.1',
+  ])('is true for the GLM-family id %s', (id) => {
+    expect(thinkingCannotBeDisabled([id])).toBe(true);
+  });
+
+  it.each(['warmind-1017-native', 'deepseek-v4.1-flash-native', 'qwen3.8-27b', 'm'])(
+    'is false for %s, whose template has an off switch',
+    (id) => {
+      expect(thinkingCannotBeDisabled([id])).toBe(false);
+    },
+  );
+
+  it('is false when nothing is known and true when any served model is GLM-family', () => {
+    expect(thinkingCannotBeDisabled([])).toBe(false);
+    expect(thinkingCannotBeDisabled(['qwen3.8-27b', 'glm-5.3-flash-hyperflare-tp2-v16'])).toBe(true);
+  });
+});
+
+describe('parseEffortOverride', () => {
+  it('treats unset and blank as auto', () => {
+    expect(parseEffortOverride(undefined)).toEqual({ kind: 'auto' });
+    expect(parseEffortOverride('  ')).toEqual({ kind: 'auto' });
+  });
+
+  it.each(['low', 'medium', 'high', 'max'] as const)('accepts %s, ignoring case and whitespace', (effort) => {
+    expect(parseEffortOverride(` ${effort.toUpperCase()} `)).toEqual({ kind: 'effort', effort });
+  });
+
+  it.each(['none', 'off', 'NONE'])('reads %s as "send no effort"', (raw) => {
+    expect(parseEffortOverride(raw)).toEqual({ kind: 'none' });
+  });
+
+  it('keeps an unrecognised value so it can be reported', () => {
+    expect(parseEffortOverride('turbo')).toEqual({ kind: 'invalid', raw: 'turbo' });
+  });
+});
+
+describe('reasoningEffortFor', () => {
+  const glm = ['glm-5.3-flash-hyperflare-tp2-cyber-hybrid'];
+  const warmind = ['warmind-1017-native'];
+
+  it('asks a GLM-family model for the lowest effort it accepts', () => {
+    expect(reasoningEffortFor(glm, { kind: 'auto' })).toBe('low');
+    expect(reasoningEffortFor(glm, { kind: 'invalid', raw: 'turbo' })).toBe('low');
+  });
+
+  it('sends nothing to a model with an off switch', () => {
+    expect(reasoningEffortFor(warmind, { kind: 'auto' })).toBeUndefined();
+    expect(reasoningEffortFor([], { kind: 'auto' })).toBeUndefined();
+  });
+
+  it('lets an explicit effort win on any model', () => {
+    expect(reasoningEffortFor(warmind, { kind: 'effort', effort: 'high' })).toBe('high');
+    expect(reasoningEffortFor(glm, { kind: 'effort', effort: 'max' })).toBe('max');
+  });
+
+  it('lets none suppress the hint even for a GLM-family model', () => {
+    expect(reasoningEffortFor(glm, { kind: 'none' })).toBeUndefined();
+  });
+});
+
+/** Swap globalThis.fetch for one test (runner-agnostic), restoring it afterwards. */
+async function stubFetch(
+  impl: (url: string | URL, init?: RequestInit) => Promise<Response>,
+  run: () => Promise<void>,
+): Promise<void> {
+  const original = globalThis.fetch;
+  globalThis.fetch = impl as typeof fetch;
+  try {
+    await run();
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+describe('reasoning effort on the direct path', () => {
+  // The session is pinned to WARMIND; what the server answers with is another matter.
+  const pinned: LlmEndpoint = { baseUrl: 'http://llm.example/v1', apiKey: 'secret', model: 'warmind-1017-native' };
+  const ok = () => new Response(JSON.stringify({ choices: [{ message: { content: '{}' }, finish_reason: 'stop' }] }), { status: 200 });
+
+  beforeEach(() => {
+    delete Bun.env.CORTEX_LLM_REASONING_EFFORT;
+    resetServedModelCheck();
+  });
+  afterEach(() => {
+    delete Bun.env.CORTEX_LLM_REASONING_EFFORT;
+  });
+
+  /** Serve these ids from /models and return the completion request body Cortex sent. */
+  async function sentBody(servedIds: readonly string[], endpoint: LlmEndpoint = pinned): Promise<Record<string, unknown>> {
+    let body: Record<string, unknown> = {};
+    await stubFetch(async (url, init) => {
+      if (String(url).endsWith('/models')) {
+        return new Response(JSON.stringify({ data: servedIds.map((id) => ({ id })) }), { status: 200 });
+      }
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return ok();
+    }, async () => {
+      await chatCompletionText(endpoint, 'extract', { jsonMode: true });
+    });
+    return body;
+  }
+
+  it('asks for the lowest effort when GLM answers although the session is pinned to WARMIND', async () => {
+    const body = await sentBody(['glm-5.3-flash-hyperflare-tp2-cyber-hybrid']);
+    expect(body.reasoning_effort).toBe('low');
+    // Still sent: harmless to GLM and right for every engine whose template has an off switch.
+    expect(body.chat_template_kwargs).toEqual({ thinking: false, enable_thinking: false });
+  });
+
+  it('sends exactly the request it always sent to a model with an off switch', async () => {
+    expect(await sentBody(['warmind-1017-native'])).not.toHaveProperty('reasoning_effort');
+    resetServedModelCheck();
+    expect(await sentBody(['qwen3.8-27b'])).not.toHaveProperty('reasoning_effort');
+  });
+
+  it('trusts what the server serves over what the config says', async () => {
+    const configuredGlm: LlmEndpoint = { ...pinned, model: 'glm-5.3-flash-hyperflare-tp2-v16' };
+    // A ds4 engine behind a GLM-named config must not be handed a thinking budget it never asked for.
+    expect(await sentBody(['warmind-1017-native'], configuredGlm)).not.toHaveProperty('reasoning_effort');
+  });
+
+  it('falls back to the configured name when the server cannot be asked', async () => {
+    const failedProbe = async (endpoint: LlmEndpoint): Promise<Record<string, unknown>> => {
+      let body: Record<string, unknown> = {};
+      await stubFetch(async (url, init) => {
+        if (String(url).endsWith('/models')) return new Response('boom', { status: 500 });
+        body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return ok();
+      }, async () => {
+        await chatCompletionText(endpoint, 'extract');
+      });
+      return body;
+    };
+    expect((await failedProbe({ ...pinned, model: 'glm-5.3-flash-hyperflare-tp2-v16' })).reasoning_effort).toBe('low');
+    resetServedModelCheck();
+    expect(await failedProbe({ ...pinned, model: 'qwen3.8-27b' })).not.toHaveProperty('reasoning_effort');
+  });
+
+  it('honours an explicit effort on any model', async () => {
+    Bun.env.CORTEX_LLM_REASONING_EFFORT = 'high';
+    expect((await sentBody(['warmind-1017-native'])).reasoning_effort).toBe('high');
+  });
+
+  it('lets none suppress the hint even for a GLM-family model', async () => {
+    Bun.env.CORTEX_LLM_REASONING_EFFORT = 'none';
+    expect(await sentBody(['glm-5.3-flash-hyperflare-tp2-cyber-hybrid'])).not.toHaveProperty('reasoning_effort');
+  });
+
+  it('reports an unrecognised override once and still protects a GLM server', async () => {
+    Bun.env.CORTEX_LLM_REASONING_EFFORT = 'turbo';
+    const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const first = await sentBody(['glm-5.3-flash-hyperflare-tp2-cyber-hybrid']);
+    const second = await sentBody(['glm-5.3-flash-hyperflare-tp2-cyber-hybrid']);
+    const warnings = warn.mock.calls.filter(([text]) => /CORTEX_LLM_REASONING_EFFORT/.test(String(text)));
+    warn.mockRestore();
+    expect(first.reasoning_effort).toBe('low');
+    expect(second.reasoning_effort).toBe('low');
+    expect(warnings).toHaveLength(1);
+    expect(String(warnings[0]?.[0])).toMatch(/turbo/);
+  });
+
+  it('probes once per minute, so a primary switch is noticed mid-run', async () => {
+    const modelCalls: string[] = [];
+    const now = vi.spyOn(Date, 'now');
+    let served = 'warmind-1017-native';
+    const bodies: Array<Record<string, unknown>> = [];
+    await stubFetch(async (url, init) => {
+      if (String(url).endsWith('/models')) {
+        modelCalls.push(String(url));
+        return new Response(JSON.stringify({ data: [{ id: served }] }), { status: 200 });
+      }
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return ok();
+    }, async () => {
+      now.mockReturnValue(1_000_000);
+      await chatCompletionText(pinned, 'one');
+      now.mockReturnValue(1_030_000);
+      await chatCompletionText(pinned, 'two');
+      served = 'glm-5.3-flash-hyperflare-tp2-cyber-hybrid';
+      now.mockReturnValue(1_061_000);
+      await chatCompletionText(pinned, 'three');
+    });
+    now.mockRestore();
+    expect(modelCalls).toHaveLength(2);
+    expect(bodies.map((body) => body.reasoning_effort)).toEqual([undefined, undefined, 'low']);
+  });
+
+  it('names the override in the reasoning-only failure', async () => {
+    await stubFetch(async (url) => {
+      if (String(url).endsWith('/models')) {
+        return new Response(JSON.stringify({ data: [{ id: 'm' }] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: '', reasoning_content: 'thinking...' }, finish_reason: 'length' }],
+      }), { status: 200 });
+    }, async () => {
+      await expect(chatCompletionText({ ...pinned, model: 'm' }, 'x', { maxTokens: 8 }))
+        .rejects.toThrow(/CORTEX_LLM_REASONING_EFFORT/);
+    });
+  });
+});
+
+describe('backgroundThinking', () => {
+  const pinned: LlmEndpoint = { baseUrl: 'http://llm.example/v1', apiKey: 'secret', model: 'warmind-1017-native' };
+
+  beforeEach(() => {
+    delete Bun.env.CORTEX_LLM_REASONING_EFFORT;
+    resetServedModelCheck();
+  });
+  afterEach(() => {
+    delete Bun.env.CORTEX_LLM_REASONING_EFFORT;
+  });
+
+  const serving = (...ids: string[]) => async (url: string | URL): Promise<Response> =>
+    String(url).endsWith('/models')
+      ? new Response(JSON.stringify({ data: ids.map((id) => ({ id })) }), { status: 200 })
+      : new Response('unexpected', { status: 500 });
+
+  it('is off for a model with an off switch', async () => {
+    await stubFetch(serving('warmind-1017-native'), async () => {
+      expect(await backgroundThinking(pinned)).toBe('off');
+    });
+  });
+
+  it('is low for a GLM server behind a session pinned to WARMIND', async () => {
+    await stubFetch(serving('glm-5.3-flash-hyperflare-tp2-cyber-hybrid'), async () => {
+      expect(await backgroundThinking(pinned)).toBe('low');
+    });
+  });
+
+  it('follows an explicit effort or none', async () => {
+    await stubFetch(serving('glm-5.3-flash-hyperflare-tp2-cyber-hybrid'), async () => {
+      Bun.env.CORTEX_LLM_REASONING_EFFORT = 'high';
+      expect(await backgroundThinking(pinned)).toBe('high');
+      Bun.env.CORTEX_LLM_REASONING_EFFORT = 'none';
+      expect(await backgroundThinking(pinned)).toBe('off');
+    });
+  });
+});
+
+describe('parseServedModelIds', () => {
+  it('reads the ids of an OpenAI /models payload, in order', () => {
+    expect(parseServedModelIds({ object: 'list', data: [{ id: 'a' }, { id: 'b', owned_by: 'x' }] })).toEqual(['a', 'b']);
+  });
+
+  it('skips entries without a string id instead of failing the whole payload', () => {
+    expect(parseServedModelIds({ data: [{ id: 'a' }, { id: 7 }, {}, null, 'b', { id: 'c' }] })).toEqual(['a', 'c']);
+  });
+
+  it.each([
+    ['null', null],
+    ['a string', 'models'],
+    ['an array', [{ id: 'a' }]],
+    ['an object without data', { models: [{ id: 'a' }] }],
+    ['data that is not a list', { data: { id: 'a' } }],
+    ['an empty list', { data: [] }],
+  ])('yields nothing for %s', (_label, payload) => {
+    expect(parseServedModelIds(payload)).toEqual([]);
   });
 });
 

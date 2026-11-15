@@ -25,7 +25,7 @@
 import type { EdgeRelation, MemoryType } from '../core/types.js';
 import { isEdgeRelation, EDGE_RELATIONS } from '../core/types.js';
 import { extractJsonSlice } from '../core/json-utils.js';
-import { resolveOpenAiCompatEndpoint, chatCompletionText } from './llm-client.js';
+import { resolveOpenAiCompatEndpoint, chatCompletionText, backgroundThinking, type BackgroundThinking } from './llm-client.js';
 import { readFileSync } from 'node:fs';
 
 const EXTRACTION_TIMEOUT_MS = 90_000;
@@ -132,8 +132,12 @@ function getDefaultProvider(env: NodeJS.ProcessEnv): string | undefined {
  * (local vLLM, custom proxies) reuse the active session's model when the
  * resolved provider is the active provider. Explicit CORTEX_LLM_* values
  * always win.
+ *
+ * `thinking` is `off` unless the caller knows the model cannot turn thinking off
+ * (GLM on Hyperflare ignores `--thinking off` and runs at maximum effort); see
+ * backgroundThinking in llm-client.ts. Ignored for the `claude` binary.
  */
-export function buildLlmInvocation(env: NodeJS.ProcessEnv): LlmInvocation {
+export function buildLlmInvocation(env: NodeJS.ProcessEnv, thinking: BackgroundThinking = 'off'): LlmInvocation {
   const binary = getLlmBinary(env);
   if (binary === 'claude') {
     return {
@@ -156,7 +160,7 @@ export function buildLlmInvocation(env: NodeJS.ProcessEnv): LlmInvocation {
   // Structured ingestion does not benefit from hidden reasoning. Pinning this
   // also prevents the headless child from inheriting the interactive session's
   // PI_REASONING_LEVEL through its environment.
-  args.push('--thinking', 'off', '--no-session');
+  args.push('--thinking', thinking, '--no-session');
 
   return { binary, args, provider, model };
 }
@@ -176,19 +180,26 @@ export function isClaudeLlmAvailable(): boolean {
  *
  * @param prompt - Prompt to send via stdin
  * @param timeoutMs - Timeout in milliseconds
+ * @param thinking - `pi --thinking` level; `off` unless the model has no off-switch
  * @returns Raw response text
  * @throws Error if binary not found, non-zero exit, timeout, or empty response
  */
-export async function runLlmPrompt(prompt: string, timeoutMs: number): Promise<string> {
+export async function runLlmPrompt(
+  prompt: string,
+  timeoutMs: number,
+  thinking: BackgroundThinking = 'off'
+): Promise<string> {
   const env = typeof Bun !== 'undefined' ? Bun.env : process.env;
-  const { binary, args, provider, model } = buildLlmInvocation(env);
+  const { binary, args, provider, model } = buildLlmInvocation(env, thinking);
 
   if (!isClaudeLlmAvailable()) {
     throw new Error(`${binary} CLI not found on PATH`);
   }
 
   if (binary === 'pi') {
-    process.stderr.write(`[cortex:llm] INFO: Pi extraction model: ${provider ?? 'default'}/${model ?? 'default'}\n`);
+    process.stderr.write(
+      `[cortex:llm] INFO: Pi extraction model: ${provider ?? 'default'}/${model ?? 'default'} (thinking: ${thinking})\n`
+    );
   }
 
   const proc = Bun.spawn(
@@ -422,7 +433,12 @@ async function runLlmPromptDirectUnbounded(
       );
     }
   }
-  return { text: await runLlmPrompt(prompt, timeoutMs), direct: false };
+  // The fallback runs a whole agent loop, so it must not hand a model that has
+  // no thinking off-switch (GLM on Hyperflare) the `--thinking off` it ignores:
+  // that model then reasons at maximum effort for minutes. Ask it for the
+  // lowest effort it accepts instead; the served model decides, not the config.
+  const thinking = endpoint ? await backgroundThinking(endpoint) : 'off';
+  return { text: await runLlmPrompt(prompt, timeoutMs, thinking), direct: false };
 }
 
 /**

@@ -2,13 +2,20 @@
  * Tests for edge classification pure functions (prompt building + response parsing).
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as nodePath from 'node:path';
 import {
   buildEdgeClassificationPrompt,
   buildLlmInvocation,
   parseEdgeClassificationResponse,
+  resetConsecutiveDirectFailuresForTests,
+  resetLlmConcurrencyForTests,
+  runLlmPromptDirect,
   type MemoryPair,
 } from './claude-llm.js';
+import { resetServedModelCheck } from './llm-client.js';
 
 describe('buildLlmInvocation', () => {
   it('uses the cheap supported Codex model for an active Codex session', () => {
@@ -133,6 +140,103 @@ describe('buildLlmInvocation', () => {
       provider: undefined,
       model: undefined,
     });
+  });
+
+  it('passes a requested thinking level through to pi', () => {
+    // GLM on Hyperflare has no off switch: asking for "off" gets maximum reasoning, so the
+    // fallback asks for the lowest effort the model accepts instead.
+    const invocation = buildLlmInvocation({
+      PI_CODING_AGENT: 'true',
+      CORTEX_PI_PROVIDER: 'desktop-vllm',
+      CORTEX_PI_MODEL: 'warmind-1017-native',
+    }, 'low');
+
+    expect(invocation.args).toEqual([
+      'pi', '-p', '--provider', 'desktop-vllm', '--model', 'warmind-1017-native', '--thinking', 'low', '--no-session',
+    ]);
+  });
+
+  it('has no thinking flag to set for claude', () => {
+    expect(buildLlmInvocation({}, 'low').args).toEqual(['claude', '-p', '--model', 'haiku', '--output-format', 'text']);
+  });
+});
+
+describe('subprocess fallback thinking level', () => {
+  const ENV = ['PATH', 'HOME', 'PI_CODING_AGENT', 'CORTEX_LLM_API_URL', 'CORTEX_LLM_API_KEY', 'CORTEX_LLM_MODEL',
+    'CORTEX_LLM_PROVIDER', 'CORTEX_PI_PROVIDER', 'CORTEX_PI_MODEL', 'PI_PROVIDER', 'PI_MODEL',
+    'CORTEX_LLM_REASONING_EFFORT'];
+  const saved = new Map<string, string | undefined>();
+  let scratch = '';
+  let argsFile = '';
+
+  beforeEach(() => {
+    for (const key of ENV) saved.set(key, Bun.env[key]);
+    scratch = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'cortex-fallback-'));
+    argsFile = nodePath.join(scratch, 'pi-args');
+    // A fake `pi` that records its argv and answers like a headless run.
+    fs.writeFileSync(
+      nodePath.join(scratch, 'pi'),
+      `#!/bin/sh\nprintf '%s\\n' "$@" > "${argsFile}"\ncat > /dev/null\nprintf '{"memories":[]}'\n`,
+      { mode: 0o755 },
+    );
+    Bun.env.PATH = `${scratch}:${saved.get('PATH') ?? ''}`;
+    Bun.env.HOME = scratch; // no ~/.pi: the direct endpoint comes from the explicit variables below
+    Bun.env.PI_CODING_AGENT = 'true';
+    Bun.env.CORTEX_LLM_API_URL = 'http://llm.example/v1';
+    Bun.env.CORTEX_LLM_API_KEY = 'k';
+    Bun.env.CORTEX_LLM_MODEL = 'warmind-1017-native'; // the session is pinned to WARMIND
+    Bun.env.CORTEX_PI_PROVIDER = 'desktop-vllm';
+    for (const key of ['CORTEX_LLM_PROVIDER', 'PI_PROVIDER', 'PI_MODEL', 'CORTEX_PI_MODEL', 'CORTEX_LLM_REASONING_EFFORT']) {
+      delete Bun.env[key];
+    }
+    resetServedModelCheck();
+    resetConsecutiveDirectFailuresForTests();
+    resetLlmConcurrencyForTests();
+  });
+
+  afterEach(() => {
+    for (const key of ENV) {
+      const value = saved.get(key);
+      if (value === undefined) delete Bun.env[key];
+      else Bun.env[key] = value;
+    }
+    fs.rmSync(scratch, { recursive: true, force: true });
+  });
+
+  /** Fail the direct call the way a GLM server that ignored the request does, then return pi's argv. */
+  async function fallbackArgs(servedId: string): Promise<string[]> {
+    const original = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL) =>
+      String(url).endsWith('/models')
+        ? new Response(JSON.stringify({ data: [{ id: servedId }] }), { status: 200 })
+        : new Response(JSON.stringify({
+          choices: [{ message: { content: '', reasoning_content: 'hmm' }, finish_reason: 'length' }],
+        }), { status: 200 })) as typeof fetch;
+    const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const result = await runLlmPromptDirect('extract', 10_000, { jsonMode: true });
+      expect(result.direct).toBe(false);
+    } finally {
+      globalThis.fetch = original;
+      warn.mockRestore();
+    }
+    return fs.readFileSync(argsFile, 'utf8').trim().split('\n');
+  }
+
+  it('asks a GLM server for the lowest effort instead of "off", which it ignores', async () => {
+    const args = await fallbackArgs('glm-5.3-flash-hyperflare-tp2-cyber-hybrid');
+    expect(args[args.indexOf('--thinking') + 1]).toBe('low');
+  });
+
+  it('keeps off for a model that honours it', async () => {
+    const args = await fallbackArgs('warmind-1017-native');
+    expect(args[args.indexOf('--thinking') + 1]).toBe('off');
+  });
+
+  it('follows CORTEX_LLM_REASONING_EFFORT', async () => {
+    Bun.env.CORTEX_LLM_REASONING_EFFORT = 'high';
+    const args = await fallbackArgs('warmind-1017-native');
+    expect(args[args.indexOf('--thinking') + 1]).toBe('high');
   });
 });
 

@@ -21,6 +21,14 @@
  *   change underneath a fixed config, which is why a one-shot served-model
  *   check warns on name mismatch and why an empty-content response that
  *   carries reasoning_content names the thinking failure explicitly.
+ * - Some templates have no thinking switch at all. GLM served by Hyperflare
+ *   thinks regardless of chat_template_kwargs and of `thinking: disabled`, and
+ *   treats a request without `reasoning_effort` as MAX effort: a one-sentence
+ *   extraction burns thousands of tokens and returns empty content. For such
+ *   a served model the only bound on hidden reasoning is `reasoning_effort`,
+ *   so it is sent too (`low`, the lowest the model accepts), decided from the
+ *   model the server reports it is serving, not from the configured name.
+ *   CORTEX_LLM_REASONING_EFFORT overrides (low|medium|high|max|none).
  *
  * Endpoint resolution order:
  *  1. Explicit env: CORTEX_LLM_API_URL + CORTEX_LLM_API_KEY + CORTEX_LLM_MODEL
@@ -42,6 +50,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { match } from 'ts-pattern';
 
 export interface LlmEndpoint {
   /** Base URL without trailing slash, no /chat/completions suffix. */
@@ -240,6 +249,71 @@ export const THINKING_DISABLED_KWARGS: Readonly<Record<string, boolean>> = Objec
   enable_thinking: false,
 });
 
+/** Efforts an OpenAI-compatible server may accept in `reasoning_effort`. */
+export type ReasoningEffort = 'low' | 'medium' | 'high' | 'max';
+const REASONING_EFFORTS: readonly ReasoningEffort[] = ['low', 'medium', 'high', 'max'];
+
+/** What `pi -p --thinking` should be for a background call: off, or an effort. */
+export type BackgroundThinking = 'off' | ReasoningEffort;
+
+/**
+ * CORTEX_LLM_REASONING_EFFORT, parsed once. `auto` (unset) lets the served model
+ * decide, `none` sends no effort at all, and `invalid` keeps the raw value so it
+ * can be reported; it behaves as `auto`.
+ */
+export type EffortOverride =
+  | { readonly kind: 'auto' }
+  | { readonly kind: 'none' }
+  | { readonly kind: 'effort'; readonly effort: ReasoningEffort }
+  | { readonly kind: 'invalid'; readonly raw: string };
+
+/** Pure: parse the override variable's value. */
+export function parseEffortOverride(raw: string | undefined): EffortOverride {
+  const value = raw?.trim().toLowerCase() ?? '';
+  if (value === '') return { kind: 'auto' };
+  if (value === 'none' || value === 'off') return { kind: 'none' };
+  const effort = REASONING_EFFORTS.find((candidate) => candidate === value);
+  return effort === undefined ? { kind: 'invalid', raw: raw ?? '' } : { kind: 'effort', effort };
+}
+
+/** GLM ids (`glm-5.3-flash-hyperflare-tp2-v16`, `GLM-5.3-Flash`, ...). */
+const NO_THINKING_OFF_SWITCH = /^glm/i;
+
+/**
+ * Pure: whether any of these models has no thinking off-switch. Sending an
+ * effort to a GLM served by an engine that does honour the template switches
+ * is harmless; sending none to Hyperflare's GLM is a runaway.
+ */
+export function thinkingCannotBeDisabled(served: readonly string[]): boolean {
+  return served.some((id) => NO_THINKING_OFF_SWITCH.test(id));
+}
+
+/**
+ * Pure: the models to judge the family by. The server's own list is the
+ * evidence (routing servers answer with whatever is loaded, whatever the
+ * session is pinned to); the configured name is only the fallback when the
+ * server could not be asked.
+ */
+export function answeringModels(requested: string, served: readonly string[]): readonly string[] {
+  return served.length > 0 ? served : [requested];
+}
+
+/**
+ * Pure and total: the `reasoning_effort` to send, or undefined to send none.
+ * An explicit effort wins, `none` suppresses, and otherwise a model with no
+ * off-switch is asked for `low`.
+ */
+export function reasoningEffortFor(
+  models: readonly string[],
+  override: EffortOverride,
+): ReasoningEffort | undefined {
+  return match(override)
+    .with({ kind: 'none' }, () => undefined)
+    .with({ kind: 'effort' }, ({ effort }) => effort)
+    .with({ kind: 'auto' }, { kind: 'invalid' }, () => (thinkingCannotBeDisabled(models) ? ('low' as const) : undefined))
+    .exhaustive();
+}
+
 /**
  * Pure: detect a requested-model / served-model mismatch, or null when the
  * check is inconclusive (empty served list) or clean (name is served).
@@ -263,50 +337,112 @@ export function findServedModelMismatch(
 }
 
 /**
- * One-shot per-process served-model check. Best-effort by contract: an
- * unreachable /models endpoint, a slow server, or an unexpected payload
- * degrades to "no warning" — the diagnostic must never break or delay a
- * completion by more than SERVED_MODEL_CHECK_TIMEOUT_MS.
+ * Served-model probe. Best-effort by contract: an unreachable /models
+ * endpoint, a slow server, or an unexpected payload degrades to "unknown"
+ * (no ids) — the diagnostic must never break or delay a completion by more
+ * than SERVED_MODEL_CHECK_TIMEOUT_MS. The answer is cached per endpoint for
+ * SERVED_MODELS_TTL_MS: the served model only changes when an operator
+ * switches primaries, so a minute keeps a long-running ingestion honest
+ * without probing on every call.
  */
 const SERVED_MODEL_CHECK_TIMEOUT_MS = 2000;
+const SERVED_MODELS_TTL_MS = 60_000;
+
+type ServedProbe = Readonly<{ at: number; ids: Promise<readonly string[]> }>;
+const servedProbes = new Map<string, ServedProbe>();
 let servedModelCheckDone = false;
+const warnedEffortOverrides = new Set<string>();
 
 /**
- * Test/reset hook: the one-shot guard is process state; tests that exercise
- * the probe twice in a row need a way to re-arm it.
+ * Test/reset hook: the one-shot warn guard, the probe cache and the reported
+ * overrides are process state; tests that exercise them twice in a row need a
+ * way to re-arm them.
  */
 export function resetServedModelCheck(): void {
   servedModelCheckDone = false;
+  servedProbes.clear();
+  warnedEffortOverrides.clear();
 }
 
-async function checkServedModelOnce(endpoint: LlmEndpoint): Promise<void> {
-  if (servedModelCheckDone) return;
-  servedModelCheckDone = true;
+/** Pure: the model ids in a `/models` payload; anything unrecognisable yields none. */
+export function parseServedModelIds(payload: unknown): readonly string[] {
+  if (typeof payload !== 'object' || payload === null || !('data' in payload)) return [];
+  const { data } = payload;
+  if (!Array.isArray(data)) return [];
+  return data.flatMap((entry: unknown) =>
+    typeof entry === 'object' && entry !== null && 'id' in entry && typeof entry.id === 'string'
+      ? [entry.id]
+      : [],
+  );
+}
+
+async function probeServedModels(endpoint: LlmEndpoint): Promise<readonly string[]> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SERVED_MODEL_CHECK_TIMEOUT_MS);
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), SERVED_MODEL_CHECK_TIMEOUT_MS);
     const response = await fetch(`${endpoint.baseUrl}/models`, {
       headers: { Authorization: `Bearer ${endpoint.apiKey}` },
       signal: controller.signal,
     });
-    clearTimeout(timer);
-    if (!response.ok) return;
-    const data = (await response.json()) as { data?: Array<{ id?: unknown }> };
-    const served = (data.data ?? [])
-      .map((entry) => (typeof entry?.id === 'string' ? entry.id : null))
-      .filter((id): id is string => id !== null);
-    const warning = findServedModelMismatch(endpoint.model, served);
-    if (warning !== null) {
-      process.stderr.write(`[cortex:llm] WARN: ${warning}\n`);
-    }
+    if (!response.ok) return [];
+    const payload: unknown = await response.json();
+    return parseServedModelIds(payload);
   } catch {
     // Best-effort diagnostic: any failure here is not actionable for the caller.
+    return [];
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+/** The ids the endpoint reports serving (cached for a minute); empty when unknown. Never throws. */
+function servedModelIds(endpoint: LlmEndpoint): Promise<readonly string[]> {
+  const cached = servedProbes.get(endpoint.baseUrl);
+  if (cached !== undefined && Date.now() - cached.at < SERVED_MODELS_TTL_MS) return cached.ids;
+  const ids = probeServedModels(endpoint);
+  servedProbes.set(endpoint.baseUrl, { at: Date.now(), ids });
+  return ids;
+}
+
+/** One WARN per process when the configured name is not what the server serves. */
+function warnOnServedMismatchOnce(requested: string, served: readonly string[]): void {
+  if (servedModelCheckDone) return;
+  servedModelCheckDone = true;
+  const warning = findServedModelMismatch(requested, served);
+  if (warning !== null) {
+    process.stderr.write(`[cortex:llm] WARN: ${warning}\n`);
+  }
+}
+
+/** The override from the environment, with an unrecognised value reported once per process. */
+function readEffortOverride(): EffortOverride {
+  const override = parseEffortOverride(getEnv('CORTEX_LLM_REASONING_EFFORT'));
+  if (override.kind === 'invalid' && !warnedEffortOverrides.has(override.raw)) {
+    warnedEffortOverrides.add(override.raw);
+    warnResolution(
+      `ignoring CORTEX_LLM_REASONING_EFFORT='${override.raw}' (expected low, medium, high, max or none); ` +
+        'the effort is chosen from the served model instead'
+    );
+  }
+  return override;
+}
+
+/**
+ * What `pi -p --thinking` should be for a background call to this endpoint:
+ * the effort a model with no off-switch must be given, else `off`. The
+ * subprocess fallback uses it so it does not run an agent loop at the maximum
+ * reasoning that `--thinking off` falls back to on such a model.
+ */
+export async function backgroundThinking(endpoint: LlmEndpoint): Promise<BackgroundThinking> {
+  const served = await servedModelIds(endpoint);
+  return reasoningEffortFor(answeringModels(endpoint.model, served), readEffortOverride()) ?? 'off';
 }
 
 /**
  * Run a single chat completion and return the assistant's text content.
- * Always disables thinking (THINKING_DISABLED_KWARGS, both known conventions).
+ * Always disables thinking (THINKING_DISABLED_KWARGS, both known conventions)
+ * and, when the model answering has no thinking off-switch (GLM), also bounds
+ * its reasoning with `reasoning_effort` (see reasoningEffortFor).
  *
  * @throws Error on HTTP/network/empty-content failures — callers decide
  *         whether to fall back to the subprocess path.
@@ -352,10 +488,12 @@ export async function chatCompletion(
     timeoutMs = 90_000,
   } = options;
 
-  // One-shot served-model check: on local routing servers the configured name
-  // is not the model that answers, so warn where the operator is already
-  // looking (first LLM call of the process) instead of never.
-  await checkServedModelOnce(endpoint);
+  // On local routing servers the configured name is not the model that
+  // answers: warn once where the operator is already looking, and let the
+  // model that IS answering decide whether it needs an effort bound.
+  const served = await servedModelIds(endpoint);
+  warnOnServedMismatchOnce(endpoint.model, served);
+  const effort = reasoningEffortFor(answeringModels(endpoint.model, served), readEffortOverride());
 
   const body: Record<string, unknown> = {
     model: endpoint.model,
@@ -364,6 +502,7 @@ export async function chatCompletion(
     temperature,
     stream: false,
     chat_template_kwargs: { ...THINKING_DISABLED_KWARGS },
+    ...(effort === undefined ? {} : { reasoning_effort: effort }),
   };
   if (options.jsonSchema) {
     // Request strict schema-guided decoding where the provider supports it;
@@ -424,7 +563,8 @@ export async function chatCompletion(
           'LLM API returned only reasoning_content (content empty): the served model is thinking and ' +
             `ignored chat_template_kwargs ${JSON.stringify(THINKING_DISABLED_KWARGS)}; check which model ` +
             'is actually loaded at the endpoint (routing servers serve whatever weights are loaded ' +
-            'regardless of the requested name) and how its chat template names the thinking switch'
+            'regardless of the requested name) and how its chat template names the thinking switch; ' +
+            'a model with no thinking switch needs CORTEX_LLM_REASONING_EFFORT=low to bound its reasoning'
         );
       }
       throw new Error('LLM API returned empty content');
