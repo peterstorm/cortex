@@ -2,13 +2,24 @@
  * Tests for edge classification pure functions (prompt building + response parsing).
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import fc from 'fast-check';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as nodePath from 'node:path';
 import {
   buildEdgeClassificationPrompt,
   buildLlmInvocation,
+  isClaudeLlmAvailable,
   parseEdgeClassificationResponse,
+  resetConsecutiveDirectFailuresForTests,
+  resetLlmConcurrencyForTests,
+  runLlmPrompt,
+  runLlmPromptDirect,
+  thinkingLevelFor,
   type MemoryPair,
 } from './claude-llm.js';
+import { resetServedModelCheck } from './llm-client.js';
 
 describe('buildLlmInvocation', () => {
   it('uses the cheap supported Codex model for an active Codex session', () => {
@@ -23,6 +34,7 @@ describe('buildLlmInvocation', () => {
       args: ['pi', '-p', '--provider', 'openai-codex', '--model', 'gpt-5.4-mini', '--thinking', 'off', '--no-session'],
       provider: 'openai-codex',
       model: 'gpt-5.4-mini',
+      thinking: 'off',
     });
   });
 
@@ -38,6 +50,7 @@ describe('buildLlmInvocation', () => {
       args: ['pi', '-p', '--provider', 'anthropic', '--model', 'claude-haiku-4-5', '--thinking', 'off', '--no-session'],
       provider: 'anthropic',
       model: 'claude-haiku-4-5',
+      thinking: 'off',
     });
   });
 
@@ -53,6 +66,7 @@ describe('buildLlmInvocation', () => {
       args: ['pi', '-p', '--provider', 'desktop-vllm', '--model', 'glm-5.3-flash-exl3-k4-vision-fp8kv-mtp-359k-v11.1', '--thinking', 'off', '--no-session'],
       provider: 'desktop-vllm',
       model: 'glm-5.3-flash-exl3-k4-vision-fp8kv-mtp-359k-v11.1',
+      thinking: 'off',
     });
   });
 
@@ -69,6 +83,7 @@ describe('buildLlmInvocation', () => {
       args: ['pi', '-p', '--provider', 'google', '--model', 'gemini-2.5-flash-lite', '--thinking', 'off', '--no-session'],
       provider: 'google',
       model: 'gemini-2.5-flash-lite',
+      thinking: 'off',
     });
   });
 
@@ -84,6 +99,7 @@ describe('buildLlmInvocation', () => {
       args: ['pi', '-p', '--provider', 'company-proxy', '--model', 'memory-fast-v2', '--thinking', 'off', '--no-session'],
       provider: 'company-proxy',
       model: 'memory-fast-v2',
+      thinking: 'off',
     });
   });
 
@@ -101,6 +117,7 @@ describe('buildLlmInvocation', () => {
       args: ['pi', '-p', '--provider', 'some-unknown-provider', '--thinking', 'off', '--no-session'],
       provider: 'some-unknown-provider',
       model: undefined,
+      thinking: 'off',
     });
   });
 
@@ -132,6 +149,229 @@ describe('buildLlmInvocation', () => {
       args: ['pi', '-p', '--thinking', 'off', '--no-session'],
       provider: undefined,
       model: undefined,
+      thinking: 'off',
+    });
+  });
+
+  it('passes a requested thinking level through to pi', () => {
+    // GLM on Hyperflare has no off switch: asking for "off" gets maximum reasoning, so the
+    // fallback asks for the lowest effort the model accepts instead.
+    const invocation = buildLlmInvocation({
+      PI_CODING_AGENT: 'true',
+      CORTEX_PI_PROVIDER: 'desktop-vllm',
+      CORTEX_PI_MODEL: 'warmind-1017-native',
+    }, 'low');
+
+    expect(invocation.args).toEqual([
+      'pi', '-p', '--provider', 'desktop-vllm', '--model', 'warmind-1017-native', '--thinking', 'low', '--no-session',
+    ]);
+  });
+
+  it('has no thinking flag to set for claude', () => {
+    expect(buildLlmInvocation({}, 'low').args).toEqual(['claude', '-p', '--model', 'haiku', '--output-format', 'text']);
+  });
+
+  // pi-detached.log: a Copilot session ran every extraction on its own
+  // claude-sonnet-5.5 with `--thinking off`, and all 582 calls came back 400.
+  it('runs a Copilot session on Haiku 5.5 at the lowest thinking level it accepts', () => {
+    const invocation = buildLlmInvocation({
+      PI_CODING_AGENT: 'true',
+      CORTEX_PI_PROVIDER: 'github-copilot',
+      CORTEX_PI_MODEL: 'claude-sonnet-5.5',
+    });
+
+    expect(invocation).toEqual({
+      binary: 'pi',
+      args: ['pi', '-p', '--provider', 'github-copilot', '--model', 'claude-haiku-5.5', '--thinking', 'low', '--no-session'],
+      provider: 'github-copilot',
+      model: 'claude-haiku-5.5',
+      thinking: 'low',
+    });
+  });
+
+  it('turns off into low for an explicitly configured Claude 5.5 model too', () => {
+    const invocation = buildLlmInvocation({
+      PI_CODING_AGENT: 'true',
+      CORTEX_LLM_PROVIDER: 'github-copilot',
+      CORTEX_LLM_MODEL: 'claude-sonnet-5.5',
+    });
+
+    expect(invocation.args).toEqual([
+      'pi', '-p', '--provider', 'github-copilot', '--model', 'claude-sonnet-5.5', '--thinking', 'low', '--no-session',
+    ]);
+  });
+});
+
+describe('thinkingLevelFor', () => {
+  const levels = ['off', 'low', 'medium', 'high'] as const;
+
+  it.each(['claude-haiku-5.5', 'claude-sonnet-5.5', 'claude-opus-5.5', 'Claude-Opus-5.5', 'claude-sonnet-5.5-20261001'])(
+    'sends low instead of off to %s, which refuses off',
+    (model) => {
+      expect(thinkingLevelFor(model, 'off')).toBe('low');
+    },
+  );
+
+  it.each([
+    'claude-haiku-4-5',
+    'claude-sonnet-5',
+    'claude-sonnet-5.50',
+    'gpt-5.4-mini',
+    'glm-5.3-flash-hyperflare-tp2-uncensored',
+    'my-claude-sonnet-5.5-proxy',
+  ])('keeps off for %s', (model) => {
+    expect(thinkingLevelFor(model, 'off')).toBe('off');
+  });
+
+  it('keeps off when no model is pinned', () => {
+    expect(thinkingLevelFor(undefined, 'off')).toBe('off');
+  });
+
+  it('only ever raises off, and only to the cheapest level', () => {
+    fc.assert(
+      fc.property(fc.option(fc.string(), { nil: undefined }), fc.constantFrom(...levels), (model, requested) => {
+        const sent = thinkingLevelFor(model, requested);
+        expect(sent === requested || (requested === 'off' && sent === 'low')).toBe(true);
+      }),
+    );
+  });
+});
+
+describe('subprocess fallback thinking level', () => {
+  const ENV = ['PATH', 'HOME', 'PI_CODING_AGENT', 'CORTEX_LLM_API_URL', 'CORTEX_LLM_API_KEY', 'CORTEX_LLM_MODEL',
+    'CORTEX_LLM_PROVIDER', 'CORTEX_PI_PROVIDER', 'CORTEX_PI_MODEL', 'PI_PROVIDER', 'PI_MODEL',
+    'CORTEX_LLM_REASONING_EFFORT'];
+  const saved = new Map<string, string | undefined>();
+  let scratch = '';
+  let argsFile = '';
+
+  beforeEach(() => {
+    for (const key of ENV) saved.set(key, Bun.env[key]);
+    scratch = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'cortex-fallback-'));
+    argsFile = nodePath.join(scratch, 'pi-args');
+    // A fake `pi` that records its argv and answers like a headless run.
+    fs.writeFileSync(
+      nodePath.join(scratch, 'pi'),
+      `#!/bin/sh\nprintf '%s\\n' "$@" > "${argsFile}"\ncat > /dev/null\nprintf '{"memories":[]}'\n`,
+      { mode: 0o755 },
+    );
+    Bun.env.PATH = `${scratch}:${saved.get('PATH') ?? ''}`;
+    Bun.env.HOME = scratch; // no ~/.pi: the direct endpoint comes from the explicit variables below
+    Bun.env.PI_CODING_AGENT = 'true';
+    Bun.env.CORTEX_LLM_API_URL = 'http://llm.example/v1';
+    Bun.env.CORTEX_LLM_API_KEY = 'k';
+    Bun.env.CORTEX_LLM_MODEL = 'warmind-1017-native'; // the session is pinned to WARMIND
+    Bun.env.CORTEX_PI_PROVIDER = 'desktop-vllm';
+    for (const key of ['CORTEX_LLM_PROVIDER', 'PI_PROVIDER', 'PI_MODEL', 'CORTEX_PI_MODEL', 'CORTEX_LLM_REASONING_EFFORT']) {
+      delete Bun.env[key];
+    }
+    resetServedModelCheck();
+    resetConsecutiveDirectFailuresForTests();
+    resetLlmConcurrencyForTests();
+  });
+
+  afterEach(() => {
+    for (const key of ENV) {
+      const value = saved.get(key);
+      if (value === undefined) delete Bun.env[key];
+      else Bun.env[key] = value;
+    }
+    fs.rmSync(scratch, { recursive: true, force: true });
+  });
+
+  /** Fail the direct call the way a GLM server that ignored the request does, then return pi's argv. */
+  async function fallbackArgs(servedId: string): Promise<string[]> {
+    const original = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL) =>
+      String(url).endsWith('/models')
+        ? new Response(JSON.stringify({ data: [{ id: servedId }] }), { status: 200 })
+        : new Response(JSON.stringify({
+          choices: [{ message: { content: '', reasoning_content: 'hmm' }, finish_reason: 'length' }],
+        }), { status: 200 })) as typeof fetch;
+    const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const result = await runLlmPromptDirect('extract', 10_000, { jsonMode: true });
+      expect(result.direct).toBe(false);
+    } finally {
+      globalThis.fetch = original;
+      warn.mockRestore();
+    }
+    return fs.readFileSync(argsFile, 'utf8').trim().split('\n');
+  }
+
+  it('asks a GLM server for the lowest effort instead of "off", which it ignores', async () => {
+    const args = await fallbackArgs('glm-5.3-flash-hyperflare-tp2-cyber-hybrid');
+    expect(args[args.indexOf('--thinking') + 1]).toBe('low');
+  });
+
+  it('keeps off for a model that honours it', async () => {
+    const args = await fallbackArgs('warmind-1017-native');
+    expect(args[args.indexOf('--thinking') + 1]).toBe('off');
+  });
+
+  it('follows CORTEX_LLM_REASONING_EFFORT', async () => {
+    Bun.env.CORTEX_LLM_REASONING_EFFORT = 'high';
+    const args = await fallbackArgs('warmind-1017-native');
+    expect(args[args.indexOf('--thinking') + 1]).toBe('high');
+  });
+
+  it('looks for the binary on the PATH the call will use', () => {
+    // Bun.which without an explicit PATH ignores one changed at runtime, so a
+    // machine with pi installed passed this suite and a CI runner without pi
+    // failed it. The fake pi is on PATH here; an empty directory has none.
+    expect(isClaudeLlmAvailable()).toBe(true);
+
+    const empty = fs.mkdtempSync(nodePath.join(scratch, 'empty-path-'));
+    Bun.env.PATH = empty;
+    expect(isClaudeLlmAvailable()).toBe(false);
+  });
+
+  it('logs the thinking level it sends, not the one it was asked for', async () => {
+    // Claude 5.5 refuses `off`, so `off` goes out as `low`. The log line is
+    // what an operator reads when a run misbehaves; it must name what pi got.
+    Bun.env.CORTEX_LLM_MODEL = 'claude-haiku-5.5';
+    const written: string[] = [];
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      written.push(String(chunk));
+      return true;
+    });
+
+    try {
+      await runLlmPrompt('extract', 10_000, 'off');
+    } finally {
+      stderr.mockRestore();
+    }
+
+    const args = fs.readFileSync(argsFile, 'utf8').trim().split('\n');
+    expect(args[args.indexOf('--thinking') + 1]).toBe('low');
+    expect(written.join('')).toContain('/claude-haiku-5.5 (thinking: low)');
+  });
+
+  /** Replace the fake `pi` with one that fails the way a real run did. */
+  function piFailsWith(stderr: string): void {
+    fs.writeFileSync(
+      nodePath.join(scratch, 'pi'),
+      `#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '${stderr}' >&2\nexit 1\n`,
+      { mode: 0o755 },
+    );
+  }
+
+  it('throws a provider refusal when pi reports one, so loops stop asking', async () => {
+    piFailsWith('429 quota exceeded');
+
+    await expect(runLlmPrompt('extract', 10_000)).rejects.toMatchObject({
+      name: 'LlmProviderRefusedError',
+      refusal: { kind: 'http-status', status: 429 },
+      detail: expect.stringContaining('Extraction LLM CLI exited with code 1: 429 quota exceeded'),
+    });
+  });
+
+  it('throws a plain error for a failure that may pass on the next call', async () => {
+    piFailsWith('Connection error.');
+
+    await expect(runLlmPrompt('extract', 10_000)).rejects.toMatchObject({
+      name: 'Error',
+      message: expect.stringContaining('Extraction LLM CLI exited with code 1: Connection error.'),
     });
   });
 });

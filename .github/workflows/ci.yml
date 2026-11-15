@@ -56,8 +56,15 @@ jobs:
           path: engine/node_modules/@huggingface/transformers/.cache
           key: hf-model-${{ runner.os }}-${{ hashFiles('engine/src/config.ts') }}
       - name: Test
-        # The script runs `bun test --isolate`: the suite mocks modules with
-        # vi.mock, which Bun applies process-wide, so without per-file
-        # isolation one file's mock leaks into every file that runs after it.
+        # The script runs `bun test --isolate` (through with-native-library-path,
+        # a no-op off NixOS): the suite mocks modules with vi.mock, which Bun
+        # applies process-wide, so without per-file isolation one file's mock
+        # leaks into every file that runs after it.
         working-directory: engine
         run: bun run test
+      - name: Test the Pi extension
+        # Its own suite (the CLI runner, the shutdown policy, the extension's
+        # hooks) never ran in CI. Its imports of engine sources resolve their
+        # dependencies from engine/node_modules, installed above.
+        working-directory: pi
+        run: bun test --isolate

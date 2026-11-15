@@ -557,7 +557,8 @@ describe('cli - detached ingestion adapter', () => {
       backfill: async () => { calls.push('backfill'); return { kind: 'succeeded', output: 'embedded' }; },
       maintenance: async () => { calls.push('maintenance'); return { kind: 'succeeded', output: 'maintained' }; },
     }, {
-      maxExtractionAttempts: 2,
+      maxDeferredAttempts: 2,
+      maxFailedAttempts: 2,
       retryDelayMs: () => 0,
       sleep: async () => {},
     });
@@ -597,7 +598,8 @@ describe('cli - detached ingestion adapter', () => {
       backfill: async () => { calls.push('backfill'); return { kind: 'succeeded' }; },
       maintenance: async () => { calls.push('maintenance'); return { kind: 'succeeded' }; },
     }, {
-      maxExtractionAttempts: 2,
+      maxDeferredAttempts: 2,
+      maxFailedAttempts: 2,
       retryDelayMs: () => 0,
       sleep: async () => {},
     });

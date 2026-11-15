@@ -17,7 +17,8 @@ import * as nodePath from 'node:path';
 import { createMemory } from '../core/types.js';
 import { openDatabase, insertMemory, insertEdge, getAllEdges, updateMemory } from '../infra/db.js';
 import { acquireLock } from '../infra/lock.js';
-import { LlmEndpointSaturatedError, type LlmPromptTransport } from '../infra/claude-llm.js';
+import type { LlmPromptTransport } from '../infra/claude-llm.js';
+import { LlmEndpointSaturatedError, LlmProviderRefusedError } from '../infra/llm-failure.js';
 import { withBunWhichUnavailable } from '../infra/llm-test-helpers.js';
 import {
   executeSemanticEdges,
@@ -71,6 +72,47 @@ describe('executeSemanticEdges', () => {
       memory_type: 'context', scope: 'project', confidence: 0.8, priority: 5,
       source_type: 'manual', source_session: 'sess', source_context: '{}',
     }));
+  }
+
+  /**
+   * Run once and require the one edge to have failed the way every failure
+   * must: counted, still unclassified (a failure is never a decline, so it is
+   * retried), and stamped with the failure so the backoff delays the retry
+   * instead of re-hammering every run.
+   */
+  async function expectOneEdgeFailedForBackoff(edgeId: string): Promise<void> {
+    const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
+    expect(result).toEqual({ ok: true, classified: 0, failed: 1 });
+    const kept = getAllEdges(db).find((e) => e.id === edgeId)!;
+    expect(kept.classified_at).toBeNull();
+    expect(kept.last_failed_at).not.toBeNull();
+    expect(kept.classify_hash).not.toBeNull();
+  }
+
+  /**
+   * Twelve pairs, so two batches (BATCH_SIZE=10): the first answered with
+   * garbage (10 failures), the second classifying its two pairs.
+   */
+  function seedTwelvePairsAnsweredGarbageThenTwo(): void {
+    for (let i = 0; i < 12; i++) {
+      seedMemory(`m${i}`);
+      seedMemory(`m${i}-t`);
+      insertEdge(db, {
+        source_id: `m${i}`, target_id: `m${i}-t`, relation_type: 'relates_to',
+        strength: 0.5, bidirectional: true, status: 'active',
+      });
+    }
+    transportCall
+      .mockResolvedValueOnce({ text: 'garbage', direct: false })
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          edges: [
+            { pair_index: 1, source_id: 'm10', target_id: 'm10-t', relation_type: 'refines', strength: 0.8 },
+            { pair_index: 2, source_id: 'm11', target_id: 'm11-t', relation_type: 'supersedes', strength: 0.9 },
+          ],
+        }),
+        direct: true,
+      });
   }
 
   beforeEach(() => {
@@ -141,19 +183,15 @@ describe('executeSemanticEdges', () => {
     const edgeId = insertEdge(db, { source_id: 'a', target_id: 'b', relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active' });
     transportCall.mockRejectedValue(new Error('LLM API 503'));
 
-    const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
-
-    expect(result).toEqual({ ok: true, classified: 0, failed: 1 });
-    const kept = getAllEdges(db).find((e) => e.id === edgeId)!;
-    // A failure is never a decline: the edge stays unclassified so it is
-    // retried, but the failure is recorded (timestamp + content hash) so
-    // the backoff delays the retry instead of re-hammering every run.
-    expect(kept.classified_at).toBeNull();
-    expect(kept.last_failed_at).not.toBeNull();
-    expect(kept.classify_hash).not.toBeNull();
+    await expectOneEdgeFailedForBackoff(edgeId);
   });
 
-  it('stops asking once the LLM endpoint is saturated and leaves the unasked edges unstamped', async () => {
+  // A saturated endpoint and a refusing provider (pi-detached.log: the same 400
+  // or "Unknown provider" once per batch) both fail every later call the same way.
+  it.each([
+    ['the LLM endpoint is saturated', new LlmEndpointSaturatedError(3)],
+    ['the provider refuses the request', new LlmProviderRefusedError({ kind: 'unknown-provider' }, 'Unknown provider "desktop-muse"')],
+  ])('stops asking once %s and leaves the unasked edges unstamped', async (_why, error) => {
     // 60 edges = 6 batches of 10, two in flight at a time.
     const edgeIds: string[] = [];
     for (let index = 0; index < 60; index++) {
@@ -161,11 +199,11 @@ describe('executeSemanticEdges', () => {
       seedMemory(`t${index}`);
       edgeIds.push(insertEdge(db, { source_id: `s${index}`, target_id: `t${index}`, relation_type: 'relates_to', strength: 0.5, bidirectional: true, status: 'active' }));
     }
-    transportCall.mockRejectedValue(new LlmEndpointSaturatedError(3));
+    transportCall.mockRejectedValue(error);
 
     const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
 
-    // Both in-flight batches hit saturation; the other four were never sent.
+    // Both in-flight batches failed that way; the other four were never sent.
     expect(transportCall).toHaveBeenCalledTimes(2);
     expect(result).toEqual({ ok: true, classified: 0, failed: 60 });
     const edges = getAllEdges(db).filter((e) => edgeIds.includes(e.id));
@@ -184,17 +222,9 @@ describe('executeSemanticEdges', () => {
     // 'unparseable' rather than throwing.
     transportCall.mockResolvedValue({ text: 'not json at all', direct: false });
 
-    const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
-
     // The run must not report a green ok:true/failed:0 while permanently
-    // retiring the pair: the batch counts as failed and the edge stays
-    // unclassified (with a failure record for the backoff) so a later run
-    // retries it.
-    expect(result).toEqual({ ok: true, classified: 0, failed: 1 });
-    const kept = getAllEdges(db).find((e) => e.id === edgeId)!;
-    expect(kept.classified_at).toBeNull();
-    expect(kept.last_failed_at).not.toBeNull();
-    expect(kept.classify_hash).not.toBeNull();
+    // retiring the pair.
+    await expectOneEdgeFailedForBackoff(edgeId);
   });
 
   it('retires a replace-edge unique-constraint conflict instead of re-asking forever', async () => {
@@ -247,13 +277,7 @@ describe('executeSemanticEdges', () => {
       { source_id: 'b', target_id: 'a', relation_type: 'refines', strength: 0.7 },
     ]);
 
-    const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
-
-    expect(result).toEqual({ ok: true, classified: 0, failed: 1 });
-    const kept = getAllEdges(db).find((edge) => edge.id === edgeId)!;
-    expect(kept.classified_at).toBeNull();
-    expect(kept.last_failed_at).not.toBeNull();
-    expect(kept.classify_hash).not.toBeNull();
+    await expectOneEdgeFailedForBackoff(edgeId);
   });
 
   it('does not re-ask an edge whose last failure is recent and content is unchanged (backoff)', async () => {
@@ -455,25 +479,7 @@ describe('executeSemanticEdges', () => {
     // one is unparseable (10 failures, each needing a backoff stamp), batch two
     // classifies 2. With markEdgeFailed throwing, the run used to lose all of
     // it; the counts below are what survives.
-    for (let i = 0; i < 12; i++) {
-      seedMemory(`m${i}`);
-      seedMemory(`m${i}-t`);
-      insertEdge(db, {
-        source_id: `m${i}`, target_id: `m${i}-t`, relation_type: 'relates_to',
-        strength: 0.5, bidirectional: true, status: 'active',
-      });
-    }
-    transportCall
-      .mockResolvedValueOnce({ text: 'garbage', direct: false })
-      .mockResolvedValueOnce({
-        text: JSON.stringify({
-          edges: [
-            { pair_index: 1, source_id: 'm10', target_id: 'm10-t', relation_type: 'refines', strength: 0.8 },
-            { pair_index: 2, source_id: 'm11', target_id: 'm11-t', relation_type: 'supersedes', strength: 0.9 },
-          ],
-        }),
-        direct: true,
-      });
+    seedTwelvePairsAnsweredGarbageThenTwo();
     const failedSpy = vi.spyOn(await import('../infra/db.js'), 'markEdgeFailed')
       .mockImplementation(() => { throw new Error('SQLITE_BUSY: database is locked'); });
 
@@ -517,25 +523,7 @@ describe('executeSemanticEdges', () => {
     // 12 pairs → batches of 10 + 2 (BATCH_SIZE=10). The first batch's
     // response is unparseable (all 10 fail, unmarked); the second batch
     // classifies both pairs.
-    for (let i = 0; i < 12; i++) {
-      seedMemory(`m${i}`);
-      seedMemory(`m${i}-t`);
-      insertEdge(db, {
-        source_id: `m${i}`, target_id: `m${i}-t`, relation_type: 'relates_to',
-        strength: 0.5, bidirectional: true, status: 'active',
-      });
-    }
-    transportCall
-      .mockResolvedValueOnce({ text: 'garbage', direct: false })
-      .mockResolvedValueOnce({
-        text: JSON.stringify({
-          edges: [
-            { pair_index: 1, source_id: 'm10', target_id: 'm10-t', relation_type: 'refines', strength: 0.8 },
-            { pair_index: 2, source_id: 'm11', target_id: 'm11-t', relation_type: 'supersedes', strength: 0.9 },
-          ],
-        }),
-        direct: true,
-      });
+    seedTwelvePairsAnsweredGarbageThenTwo();
 
     const result = await executeSemanticEdges(db, { limit: 0, lockDir, transport });
 

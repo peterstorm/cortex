@@ -13,7 +13,8 @@ import type { Memory } from '../core/types.js';
 import { createMemory } from '../core/types.js';
 import { openDatabase, insertMemory, getMemory } from '../infra/db.js';
 import { AI_PRUNE_MIN_AGE_DAYS } from '../config.js';
-import { LlmEndpointSaturatedError, type LlmPromptTransport } from '../infra/claude-llm.js';
+import type { LlmPromptTransport } from '../infra/claude-llm.js';
+import { LlmEndpointSaturatedError, LlmProviderRefusedError } from '../infra/llm-failure.js';
 import { withBunWhichUnavailable } from '../infra/llm-test-helpers.js';
 
 // The LLM boundary is the injectable transport, not the whole claude-llm
@@ -36,6 +37,8 @@ vi.mock('../infra/llm-client.js', () => ({
 }));
 
 import {
+  archiveGuardFor,
+  describeGuardedKeeps,
   runAiPrune,
   runAiPruneIfNeeded,
   isProtectedStableMemory,
@@ -119,6 +122,50 @@ describe('isProtectedStableMemory', () => {
 
   it('does not protect other memory types solely because confidence is high', () => {
     expect(isProtectedStableMemory({ memory_type: 'pattern', confidence: 1 })).toBe(false);
+  });
+});
+
+describe('archiveGuardFor', () => {
+  const now = new Date('2026-07-06T12:00:00Z');
+  const daysOld = (days: number) => new Date(now.getTime() - days * 24 * 60 * 60 * 1000).toISOString();
+  const memory = (overrides: Partial<Pick<Memory, 'pinned' | 'memory_type' | 'confidence' | 'created_at'>>) => ({
+    pinned: false,
+    memory_type: 'context' as const,
+    confidence: 0.6,
+    created_at: daysOld(30),
+    ...overrides,
+  });
+
+  it('lets an ordinary old memory be archived', () => {
+    expect(archiveGuardFor(memory({}), now)).toBeNull();
+  });
+
+  it.each([
+    ['pinned', memory({ pinned: true })],
+    ['stable', memory({ memory_type: 'decision', confidence: 0.9 })],
+    ['too-young', memory({ created_at: daysOld(1) })],
+  ] as const)('names the %s guard', (guard, guarded) => {
+    expect(archiveGuardFor(guarded, now)).toBe(guard);
+  });
+
+  it('counts a memory under one guard only, pinned first, then stable', () => {
+    const everything = memory({ pinned: true, memory_type: 'architecture', confidence: 0.95, created_at: daysOld(1) });
+    expect(archiveGuardFor(everything, now)).toBe('pinned');
+    expect(archiveGuardFor({ ...everything, pinned: false }, now)).toBe('stable');
+  });
+});
+
+describe('describeGuardedKeeps', () => {
+  it('says nothing when the guards kept nothing', () => {
+    expect(describeGuardedKeeps({ pinned: 0, stable: 0, 'too-young': 0 })).toBeNull();
+  });
+
+  it('counts each guard in one line', () => {
+    expect(describeGuardedKeeps({ pinned: 1, stable: 3, 'too-young': 2 })).toBe(
+      'Kept 6 memories the model named but the guards protect: 1 pinned, ' +
+        `3 high-confidence architecture/decision, 2 younger than ${AI_PRUNE_MIN_AGE_DAYS} days`,
+    );
+    expect(describeGuardedKeeps({ pinned: 0, stable: 1, 'too-young': 0 })).toMatch(/^Kept 1 memory /);
   });
 });
 
@@ -250,6 +297,38 @@ describe('runAiPrune age guard (enforced in code, not just prompt)', () => {
 
     projectDb.close();
     globalDb.close();
+  });
+
+  it('reports the guarded memories in one summary line, not one line each', async () => {
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    const telemetryPath = makeTelemetryPath();
+    for (let i = 0; i < 5; i++) {
+      insertMemory(projectDb, makeMemory(`plain-${i}`, 30));
+    }
+    insertMemory(projectDb, makeMemory('kept-pinned', 30, { pinned: true }));
+    insertMemory(projectDb, makeMemory('kept-stable', 30, { memory_type: 'decision', confidence: 0.9 }));
+    insertMemory(projectDb, makeMemory('kept-young', 1));
+    transportCall.mockResolvedValue(JSON.stringify({ candidates: [
+      { id: 'kept-pinned', reason: 'r' },
+      { id: 'kept-stable', reason: 'r' },
+      { id: 'kept-young', reason: 'r' },
+    ] }));
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    try {
+      await runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport);
+      const lines = stderr.mock.calls.map(([chunk]) => String(chunk));
+      expect(lines.filter((line) => line.includes('Skipping'))).toEqual([]);
+      expect(lines.filter((line) => line.includes('the guards protect'))).toEqual([
+        '[cortex:ai-prune] INFO: Kept 3 memories the model named but the guards protect: 1 pinned, ' +
+          `1 high-confidence architecture/decision, 1 younger than ${AI_PRUNE_MIN_AGE_DAYS} days\n`,
+      ]);
+    } finally {
+      stderr.mockRestore();
+      projectDb.close();
+      globalDb.close();
+    }
   });
 });
 
@@ -539,6 +618,26 @@ describe('AI prune failure telemetry', () => {
     // Four batches were due; the first reported saturation, so three were never sent.
     expect(transportCall).toHaveBeenCalledTimes(1);
     expect(result).toMatchObject({ archived: 0, reviewed: 0 });
+    expect(failedPrune(result).error).toContain('All 4 AI prune batches failed');
+    expect(fs.existsSync(telemetryPath)).toBe(false);
+    projectDb.close();
+    globalDb.close();
+  });
+
+  // pi-detached.log before this: one prune run sent the same refused request
+  // (a 400 for `--thinking off`, a 429 quota, an unknown provider) once per batch.
+  it('stops asking once the provider refuses the request, and still owes the whole review', async () => {
+    transportCall.mockRejectedValue(new LlmProviderRefusedError({ kind: 'http-status', status: 429 }, '429 quota exceeded'));
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    const telemetryPath = makeTelemetryPath();
+    for (let index = 0; index < 241; index++) {
+      insertMemory(projectDb, makeMemory(`refused-${index}`, 10));
+    }
+
+    const result = await runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport);
+
+    expect(transportCall).toHaveBeenCalledTimes(1);
     expect(failedPrune(result).error).toContain('All 4 AI prune batches failed');
     expect(fs.existsSync(telemetryPath)).toBe(false);
     projectDb.close();

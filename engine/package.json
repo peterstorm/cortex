@@ -3,8 +3,8 @@
   "version": "0.2.0",
   "type": "module",
   "scripts": {
-    "test": "bun test --isolate",
-    "test:watch": "bun test --isolate --watch",
+    "test": "bun src/with-native-library-path.ts bun test --isolate",
+    "test:watch": "bun src/with-native-library-path.ts bun test --isolate --watch",
     "typecheck": "tsc --noEmit -p ."
   },
   "dependencies": {

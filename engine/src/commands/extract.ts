@@ -62,6 +62,7 @@ import {
   getAllEntities,
 } from '../infra/db.js';
 import { extractMemories, isClaudeLlmAvailable } from '../infra/claude-llm.js';
+import { stopsFurtherLlmCalls } from '../infra/llm-failure.js';
 import { resolveOpenAiCompatEndpoint } from '../infra/llm-client.js';
 import { getGitContext } from '../infra/git-context.js';
 import { acquireLock, releaseLock } from '../infra/lock.js';
@@ -219,6 +220,19 @@ export async function executeExtract(
         read = await readWindow(0);
       }
     } catch (err) {
+      // A session that ended before writing a single line has no transcript
+      // file at all. That is an empty input, not a failure: reporting it as
+      // one logged an ERROR and made the hook skip its follow-up work for a
+      // session that had nothing to extract.
+      if (isMissingFile(err)) {
+        logInfo(`No transcript at ${input.transcript_path} — nothing to extract`);
+        return {
+          kind: 'succeeded',
+          extracted_count: 0,
+          edge_count: 0,
+          cursor_position: cursor,
+        };
+      }
       const message = err instanceof Error ? err.message : String(err);
       logError(`Failed to read transcript: ${message}`);
       return {
@@ -248,10 +262,11 @@ export async function executeExtract(
 
     // Per-chunk failure result: cursor stays at the failed chunk's start so
     // the next run retries it; progress from earlier chunks in this run is
-    // already checkpointed.
-    const chunkFailure = (error: string): ExtractionResult => ({
+    // already checkpointed. `retryable` only says whether the detached worker
+    // may ask again right away.
+    const chunkFailure = (error: string, retryable = true): ExtractionResult => ({
       kind: 'failed',
-      retryable: true,
+      retryable,
       extracted_count: totalInserted,
       edge_count: edgeCount,
       cursor_position: cursor,
@@ -311,8 +326,10 @@ export async function executeExtract(
         logError(`Claude extraction failed: ${message}`);
         // Leave the cursor where it was: a transient LLM failure (timeout,
         // rate limit) must not permanently discard up to 100KB of transcript.
-        // The next extract run for this session retries the same chunk.
-        return chunkFailure(`Claude extraction failed: ${message}`);
+        // The next extract run for this session retries the same chunk. A
+        // saturated endpoint or a refusing provider answers an immediate
+        // retry the same way, so only the next run may ask again.
+        return chunkFailure(`Claude extraction failed: ${message}`, !stopsFurtherLlmCalls(err));
       }
 
       // Pure: Parse extraction response (memories + entities)
@@ -1158,6 +1175,11 @@ function buildKnownEntityProfiles(db: Database): readonly EntityProfile[] {
   }
 
   return profiles;
+}
+
+/** Whether a filesystem error says the path does not exist. */
+function isMissingFile(err: unknown): boolean {
+  return err instanceof Error && 'code' in err && err.code === 'ENOENT';
 }
 
 /**
