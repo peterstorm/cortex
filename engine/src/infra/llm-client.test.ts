@@ -7,13 +7,16 @@
  */
 
 import { describe, it, expect, beforeEach, afterAll, afterEach, vi } from 'vitest';
+import fc from 'fast-check';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as nodePath from 'node:path';
 import {
   resolveOpenAiCompatEndpoint,
   chatCompletionText,
+  completionBudget,
   findServedModelMismatch,
+  parseCompletionReply,
   resetServedModelCheck,
   backgroundThinking,
   parseEffortOverride,
@@ -721,6 +724,34 @@ describe('reasoning effort on the direct path', () => {
     expect(await sentBody(['glm-5.3-flash-hyperflare-tp2-cyber-hybrid'])).not.toHaveProperty('reasoning_effort');
   });
 
+  // GLM at effort low still spent a prune batch's whole max_tokens thinking and
+  // answered nothing; the budget closes the reasoning and leaves the answer its share.
+  it('caps a GLM server\'s reasoning and keeps the whole answer budget on top', async () => {
+    const body = await sentBody(['glm-5.3-flash-hyperflare-tp2-cyber-hybrid']);
+    expect(body.thinking_token_budget).toBe(1_024);
+    expect(body.max_tokens).toBe(2_048 + 1_024);
+  });
+
+  it('sends neither a reasoning budget nor extra tokens to a model with an off switch', async () => {
+    const body = await sentBody(['warmind-1017-native']);
+    expect(body).not.toHaveProperty('thinking_token_budget');
+    expect(body.max_tokens).toBe(2_048);
+  });
+
+  it('sizes the reasoning budget by the explicit effort', async () => {
+    Bun.env.CORTEX_LLM_REASONING_EFFORT = 'high';
+    const body = await sentBody(['warmind-1017-native']);
+    expect(body.thinking_token_budget).toBe(8_192);
+    expect(body.max_tokens).toBe(2_048 + 8_192);
+  });
+
+  it('drops the reasoning budget with the hint when the effort is none', async () => {
+    Bun.env.CORTEX_LLM_REASONING_EFFORT = 'none';
+    const body = await sentBody(['glm-5.3-flash-hyperflare-tp2-cyber-hybrid']);
+    expect(body).not.toHaveProperty('thinking_token_budget');
+    expect(body.max_tokens).toBe(2_048);
+  });
+
   it('reports an unrecognised override once and still protects a GLM server', async () => {
     Bun.env.CORTEX_LLM_REASONING_EFFORT = 'turbo';
     const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
@@ -810,6 +841,104 @@ describe('backgroundThinking', () => {
       Bun.env.CORTEX_LLM_REASONING_EFFORT = 'none';
       expect(await backgroundThinking(pinned)).toBe('off');
     });
+  });
+});
+
+describe('completionBudget', () => {
+  const efforts = ['low', 'medium', 'high', 'max'] as const;
+  const answerTokens = fc.integer({ min: 1, max: 65_536 });
+
+  it('gives the whole budget to the answer when no reasoning is expected', () => {
+    expect(completionBudget(2_048, undefined)).toEqual({ kind: 'answer-only', maxTokens: 2_048 });
+  });
+
+  it.each([['low', 1_024], ['medium', 4_096], ['high', 8_192], ['max', 16_384]] as const)(
+    'bounds %s reasoning at %i tokens',
+    (effort, thinkingTokens) => {
+      expect(completionBudget(2_048, effort)).toEqual({
+        kind: 'reasoning-bounded',
+        maxTokens: 2_048 + thinkingTokens,
+        thinkingTokens,
+      });
+    },
+  );
+
+  it('never lets reasoning take tokens the answer was sized for', () => {
+    fc.assert(
+      fc.property(answerTokens, fc.option(fc.constantFrom(...efforts), { nil: undefined }), (answer, effort) => {
+        const budget = completionBudget(answer, effort);
+        const reasoning = budget.kind === 'reasoning-bounded' ? budget.thinkingTokens : 0;
+        expect(budget.maxTokens - reasoning).toBe(answer);
+        expect(reasoning).toBeGreaterThanOrEqual(0);
+      }),
+    );
+  });
+
+  it('allows more reasoning for a higher effort', () => {
+    fc.assert(
+      fc.property(answerTokens, (answer) => {
+        const reasoning = efforts.map((effort) => {
+          const budget = completionBudget(answer, effort);
+          return budget.kind === 'reasoning-bounded' ? budget.thinkingTokens : 0;
+        });
+        expect(reasoning).toEqual([...reasoning].sort((a, b) => a - b));
+        expect(new Set(reasoning).size).toBe(efforts.length);
+      }),
+    );
+  });
+});
+
+describe('parseCompletionReply', () => {
+  it('reads every field of a well-formed reply', () => {
+    expect(parseCompletionReply({
+      model: 'glm-5.3-flash-hyperflare-tp2-uncensored',
+      choices: [{ message: { content: '{}', reasoning_content: 'hmm' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 12, completion_tokens: 3 },
+    })).toEqual({
+      model: 'glm-5.3-flash-hyperflare-tp2-uncensored',
+      content: '{}',
+      reasoning: 'hmm',
+      finishReason: 'stop',
+      promptTokens: 12,
+      completionTokens: 3,
+    });
+  });
+
+  const absent = {
+    model: undefined,
+    content: undefined,
+    reasoning: undefined,
+    finishReason: undefined,
+    promptTokens: null,
+    completionTokens: null,
+  };
+
+  it.each([
+    ['null', null],
+    ['a string', 'gateway error'],
+    ['an empty object', {}],
+    ['choices that are not a list', { choices: { message: { content: 'x' } } }],
+    ['an empty choices list', { choices: [] }],
+    ['a choice that is not an object', { choices: ['x'] }],
+    ['a message that is not an object', { choices: [{ message: 'x' }] }],
+  ])('reads %s as a reply with nothing in it', (_what, payload) => {
+    expect(parseCompletionReply(payload)).toEqual(absent);
+  });
+
+  it('drops each mistyped field on its own, keeping the rest', () => {
+    expect(parseCompletionReply({
+      model: 7,
+      choices: [{ message: { content: 'answer', reasoning_content: ['x'] }, finish_reason: null }],
+      usage: { prompt_tokens: -1, completion_tokens: 2.5 },
+    })).toEqual({ ...absent, content: 'answer' });
+  });
+
+  it('never throws, whatever the server sends', () => {
+    fc.assert(
+      fc.property(fc.jsonValue(), (payload) => {
+        expect(() => parseCompletionReply(payload)).not.toThrow();
+      }),
+    );
   });
 });
 

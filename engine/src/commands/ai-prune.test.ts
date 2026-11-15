@@ -13,7 +13,8 @@ import type { Memory } from '../core/types.js';
 import { createMemory } from '../core/types.js';
 import { openDatabase, insertMemory, getMemory } from '../infra/db.js';
 import { AI_PRUNE_MIN_AGE_DAYS } from '../config.js';
-import { LlmEndpointSaturatedError, type LlmPromptTransport } from '../infra/claude-llm.js';
+import type { LlmPromptTransport } from '../infra/claude-llm.js';
+import { LlmEndpointSaturatedError, LlmProviderRefusedError } from '../infra/llm-failure.js';
 import { withBunWhichUnavailable } from '../infra/llm-test-helpers.js';
 
 // The LLM boundary is the injectable transport, not the whole claude-llm
@@ -539,6 +540,26 @@ describe('AI prune failure telemetry', () => {
     // Four batches were due; the first reported saturation, so three were never sent.
     expect(transportCall).toHaveBeenCalledTimes(1);
     expect(result).toMatchObject({ archived: 0, reviewed: 0 });
+    expect(failedPrune(result).error).toContain('All 4 AI prune batches failed');
+    expect(fs.existsSync(telemetryPath)).toBe(false);
+    projectDb.close();
+    globalDb.close();
+  });
+
+  // pi-detached.log before this: one prune run sent the same refused request
+  // (a 400 for `--thinking off`, a 429 quota, an unknown provider) once per batch.
+  it('stops asking once the provider refuses the request, and still owes the whole review', async () => {
+    transportCall.mockRejectedValue(new LlmProviderRefusedError({ kind: 'http-status', status: 429 }, '429 quota exceeded'));
+    const projectDb = openDatabase(':memory:');
+    const globalDb = openDatabase(':memory:');
+    const telemetryPath = makeTelemetryPath();
+    for (let index = 0; index < 241; index++) {
+      insertMemory(projectDb, makeMemory(`refused-${index}`, 10));
+    }
+
+    const result = await runAiPrune(projectDb, globalDb, telemetryPath, undefined, transport);
+
+    expect(transportCall).toHaveBeenCalledTimes(1);
     expect(failedPrune(result).error).toContain('All 4 AI prune batches failed');
     expect(fs.existsSync(telemetryPath)).toBe(false);
     projectDb.close();

@@ -25,10 +25,11 @@
  *   thinks regardless of chat_template_kwargs and of `thinking: disabled`, and
  *   treats a request without `reasoning_effort` as MAX effort: a one-sentence
  *   extraction burns thousands of tokens and returns empty content. For such
- *   a served model the only bound on hidden reasoning is `reasoning_effort`,
- *   so it is sent too (`low`, the lowest the model accepts), decided from the
- *   model the server reports it is serving, not from the configured name.
- *   CORTEX_LLM_REASONING_EFFORT overrides (low|medium|high|max|none).
+ *   a served model the bounds on hidden reasoning are `reasoning_effort`
+ *   (`low`, the lowest the model accepts) and `thinking_token_budget`, which
+ *   caps the reasoning on top of the caller's answer budget (completionBudget),
+ *   both decided from the model the server reports it is serving, not from the
+ *   configured name. CORTEX_LLM_REASONING_EFFORT overrides (low|medium|high|max|none).
  *
  * Endpoint resolution order:
  *  1. Explicit env: CORTEX_LLM_API_URL + CORTEX_LLM_API_KEY + CORTEX_LLM_MODEL
@@ -315,6 +316,39 @@ export function reasoningEffortFor(
 }
 
 /**
+ * Hidden-reasoning tokens a background call may spend at each effort before
+ * it must answer. `reasoning_effort` alone only steers how long the model
+ * thinks; GLM on Hyperflare at `low` still spent a prune batch's whole
+ * 2,048-token `max_tokens` thinking and returned no answer. vLLM's
+ * `thinking_token_budget` closes the reasoning at the budget and lets the
+ * answer follow (measured: a reasoning-heavy prompt went from 731 reasoning
+ * characters and 15 s to 136 characters, a correct answer and 6 s at 512).
+ */
+const THINKING_TOKEN_BUDGETS: Readonly<Record<ReasoningEffort, number>> = Object.freeze({
+  low: 1_024,
+  medium: 4_096,
+  high: 8_192,
+  max: 16_384,
+});
+
+/** The token limits of one request: the whole completion, and its reasoning share if bounded. */
+export type CompletionBudget =
+  | Readonly<{ kind: 'answer-only'; maxTokens: number }>
+  | Readonly<{ kind: 'reasoning-bounded'; maxTokens: number; thinkingTokens: number }>;
+
+/**
+ * Pure: the limits for a call whose answer needs `answerTokens`. Without an
+ * effort the model is not expected to think, and the answer gets the whole
+ * budget. With one, the reasoning gets its own budget ON TOP of the answer's,
+ * so thinking can never eat the tokens the answer was sized for.
+ */
+export function completionBudget(answerTokens: number, effort: ReasoningEffort | undefined): CompletionBudget {
+  if (effort === undefined) return { kind: 'answer-only', maxTokens: answerTokens };
+  const thinkingTokens = THINKING_TOKEN_BUDGETS[effort];
+  return { kind: 'reasoning-bounded', maxTokens: answerTokens + thinkingTokens, thinkingTokens };
+}
+
+/**
  * Pure: detect a requested-model / served-model mismatch, or null when the
  * check is inconclusive (empty served list) or clean (name is served).
  *
@@ -442,7 +476,8 @@ export async function backgroundThinking(endpoint: LlmEndpoint): Promise<Backgro
  * Run a single chat completion and return the assistant's text content.
  * Always disables thinking (THINKING_DISABLED_KWARGS, both known conventions)
  * and, when the model answering has no thinking off-switch (GLM), also bounds
- * its reasoning with `reasoning_effort` (see reasoningEffortFor).
+ * its reasoning with `reasoning_effort` and `thinking_token_budget` (see
+ * reasoningEffortFor and completionBudget). `maxTokens` is the ANSWER's budget.
  *
  * @throws Error on HTTP/network/empty-content failures — callers decide
  *         whether to fall back to the subprocess path.
@@ -470,6 +505,40 @@ export interface ChatCompletion {
 const tokenCount = (value: unknown): number | null =>
   typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : null;
 
+/** What one `/chat/completions` reply says, each field absent when the wire lacked it. */
+export type CompletionReply = Readonly<{
+  model: string | undefined;
+  content: string | undefined;
+  reasoning: string | undefined;
+  finishReason: string | undefined;
+  promptTokens: number | null;
+  completionTokens: number | null;
+}>;
+
+/** A property of an untrusted value, or undefined when it is not an object holding one. */
+function property(value: unknown, key: string): unknown {
+  if (typeof value !== 'object' || value === null) return undefined;
+  return Reflect.get(value, key);
+}
+
+const text = (value: unknown): string | undefined => (typeof value === 'string' ? value : undefined);
+
+/** Pure: read the fields chatCompletion uses from a reply body; anything malformed reads as absent. */
+export function parseCompletionReply(payload: unknown): CompletionReply {
+  const choices = property(payload, 'choices');
+  const choice: unknown = Array.isArray(choices) ? choices[0] : undefined;
+  const message = property(choice, 'message');
+  const usage = property(payload, 'usage');
+  return {
+    model: text(property(payload, 'model')),
+    content: text(property(message, 'content')),
+    reasoning: text(property(message, 'reasoning_content')),
+    finishReason: text(property(choice, 'finish_reason')),
+    promptTokens: tokenCount(property(usage, 'prompt_tokens')),
+    completionTokens: tokenCount(property(usage, 'completion_tokens')),
+  };
+}
+
 /**
  * chatCompletionText's contract, plus the reported model and token usage —
  * what an evaluation records to keep its runs comparable.
@@ -494,15 +563,17 @@ export async function chatCompletion(
   const served = await servedModelIds(endpoint);
   warnOnServedMismatchOnce(endpoint.model, served);
   const effort = reasoningEffortFor(answeringModels(endpoint.model, served), readEffortOverride());
+  const budget = completionBudget(maxTokens, effort);
 
   const body: Record<string, unknown> = {
     model: endpoint.model,
     messages: [{ role: 'user', content: prompt }],
-    max_tokens: maxTokens,
+    max_tokens: budget.maxTokens,
     temperature,
     stream: false,
     chat_template_kwargs: { ...THINKING_DISABLED_KWARGS },
     ...(effort === undefined ? {} : { reasoning_effort: effort }),
+    ...(budget.kind === 'reasoning-bounded' ? { thinking_token_budget: budget.thinkingTokens } : {}),
   };
   if (options.jsonSchema) {
     // Request strict schema-guided decoding where the provider supports it;
@@ -541,24 +612,16 @@ export async function chatCompletion(
       throw new Error(`LLM API ${response.status}: ${detail.slice(0, 300)}`);
     }
 
-    const data = (await response.json()) as {
-      model?: unknown;
-      usage?: { prompt_tokens?: unknown; completion_tokens?: unknown };
-      choices?: Array<{
-        message?: { content?: unknown; reasoning_content?: unknown };
-        finish_reason?: unknown;
-      }>;
-    };
-    const choice = data.choices?.[0];
-    const content = choice?.message?.content;
-    if (typeof content !== 'string' || content.trim().length === 0) {
+    const payload: unknown = await response.json();
+    const reply = parseCompletionReply(payload);
+    const { content, reasoning } = reply;
+    if (content === undefined || content.trim().length === 0) {
       // A thinking model that ignored both thinking-disable conventions burns
       // its whole token budget on reasoning_content and returns empty
       // content. Name that failure mode explicitly: "empty content" otherwise
       // reads like a network glitch and never gets connected to the served
       // model's chat template.
-      const reasoning = choice?.message?.reasoning_content;
-      if (typeof reasoning === 'string' && reasoning.trim().length > 0) {
+      if (reasoning !== undefined && reasoning.trim().length > 0) {
         throw new Error(
           'LLM API returned only reasoning_content (content empty): the served model is thinking and ' +
             `ignored chat_template_kwargs ${JSON.stringify(THINKING_DISABLED_KWARGS)}; check which model ` +
@@ -569,20 +632,20 @@ export async function chatCompletion(
       }
       throw new Error('LLM API returned empty content');
     }
-    if (choice?.finish_reason === 'length') {
+    if (reply.finishReason === 'length') {
       // Truncation produces cut-off JSON that parses as a generic error
       // downstream; name the real cause so the operator can raise maxTokens
       // or shrink the prompt instead of hunting a phantom malformed response.
       throw new Error(
-        `LLM output truncated (max_tokens=${maxTokens} reached, finish_reason=length); ` +
+        `LLM output truncated (max_tokens=${budget.maxTokens} reached, finish_reason=length); ` +
           `raise maxTokens or reduce prompt size`
       );
     }
     return {
       content,
-      model: typeof data.model === 'string' && data.model !== '' ? data.model : endpoint.model,
-      promptTokens: tokenCount(data.usage?.prompt_tokens),
-      completionTokens: tokenCount(data.usage?.completion_tokens),
+      model: reply.model !== undefined && reply.model !== '' ? reply.model : endpoint.model,
+      promptTokens: reply.promptTokens,
+      completionTokens: reply.completionTokens,
     };
   } catch (err) {
     // The timeout aborts with a reason; surface it as a timeout-named error

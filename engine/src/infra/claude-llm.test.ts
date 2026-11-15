@@ -3,6 +3,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import fc from 'fast-check';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as nodePath from 'node:path';
@@ -12,7 +13,9 @@ import {
   parseEdgeClassificationResponse,
   resetConsecutiveDirectFailuresForTests,
   resetLlmConcurrencyForTests,
+  runLlmPrompt,
   runLlmPromptDirect,
+  thinkingLevelFor,
   type MemoryPair,
 } from './claude-llm.js';
 import { resetServedModelCheck } from './llm-client.js';
@@ -159,6 +162,70 @@ describe('buildLlmInvocation', () => {
   it('has no thinking flag to set for claude', () => {
     expect(buildLlmInvocation({}, 'low').args).toEqual(['claude', '-p', '--model', 'haiku', '--output-format', 'text']);
   });
+
+  // pi-detached.log: a Copilot session ran every extraction on its own
+  // claude-sonnet-5.5 with `--thinking off`, and all 582 calls came back 400.
+  it('runs a Copilot session on Haiku 5.5 at the lowest thinking level it accepts', () => {
+    const invocation = buildLlmInvocation({
+      PI_CODING_AGENT: 'true',
+      CORTEX_PI_PROVIDER: 'github-copilot',
+      CORTEX_PI_MODEL: 'claude-sonnet-5.5',
+    });
+
+    expect(invocation).toEqual({
+      binary: 'pi',
+      args: ['pi', '-p', '--provider', 'github-copilot', '--model', 'claude-haiku-5.5', '--thinking', 'low', '--no-session'],
+      provider: 'github-copilot',
+      model: 'claude-haiku-5.5',
+    });
+  });
+
+  it('turns off into low for an explicitly configured Claude 5.5 model too', () => {
+    const invocation = buildLlmInvocation({
+      PI_CODING_AGENT: 'true',
+      CORTEX_LLM_PROVIDER: 'github-copilot',
+      CORTEX_LLM_MODEL: 'claude-sonnet-5.5',
+    });
+
+    expect(invocation.args).toEqual([
+      'pi', '-p', '--provider', 'github-copilot', '--model', 'claude-sonnet-5.5', '--thinking', 'low', '--no-session',
+    ]);
+  });
+});
+
+describe('thinkingLevelFor', () => {
+  const levels = ['off', 'low', 'medium', 'high'] as const;
+
+  it.each(['claude-haiku-5.5', 'claude-sonnet-5.5', 'claude-opus-5.5', 'Claude-Opus-5.5', 'claude-sonnet-5.5-20261001'])(
+    'sends low instead of off to %s, which refuses off',
+    (model) => {
+      expect(thinkingLevelFor(model, 'off')).toBe('low');
+    },
+  );
+
+  it.each([
+    'claude-haiku-4-5',
+    'claude-sonnet-5',
+    'claude-sonnet-5.50',
+    'gpt-5.4-mini',
+    'glm-5.3-flash-hyperflare-tp2-uncensored',
+    'my-claude-sonnet-5.5-proxy',
+  ])('keeps off for %s', (model) => {
+    expect(thinkingLevelFor(model, 'off')).toBe('off');
+  });
+
+  it('keeps off when no model is pinned', () => {
+    expect(thinkingLevelFor(undefined, 'off')).toBe('off');
+  });
+
+  it('only ever raises off, and only to the cheapest level', () => {
+    fc.assert(
+      fc.property(fc.option(fc.string(), { nil: undefined }), fc.constantFrom(...levels), (model, requested) => {
+        const sent = thinkingLevelFor(model, requested);
+        expect(sent === requested || (requested === 'off' && sent === 'low')).toBe(true);
+      }),
+    );
+  });
 });
 
 describe('subprocess fallback thinking level', () => {
@@ -237,6 +304,34 @@ describe('subprocess fallback thinking level', () => {
     Bun.env.CORTEX_LLM_REASONING_EFFORT = 'high';
     const args = await fallbackArgs('warmind-1017-native');
     expect(args[args.indexOf('--thinking') + 1]).toBe('high');
+  });
+
+  /** Replace the fake `pi` with one that fails the way a real run did. */
+  function piFailsWith(stderr: string): void {
+    fs.writeFileSync(
+      nodePath.join(scratch, 'pi'),
+      `#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '${stderr}' >&2\nexit 1\n`,
+      { mode: 0o755 },
+    );
+  }
+
+  it('throws a provider refusal when pi reports one, so loops stop asking', async () => {
+    piFailsWith('429 quota exceeded');
+
+    await expect(runLlmPrompt('extract', 10_000)).rejects.toMatchObject({
+      name: 'LlmProviderRefusedError',
+      refusal: { kind: 'http-status', status: 429 },
+      detail: expect.stringContaining('Extraction LLM CLI exited with code 1: 429 quota exceeded'),
+    });
+  });
+
+  it('throws a plain error for a failure that may pass on the next call', async () => {
+    piFailsWith('Connection error.');
+
+    await expect(runLlmPrompt('extract', 10_000)).rejects.toMatchObject({
+      name: 'Error',
+      message: expect.stringContaining('Extraction LLM CLI exited with code 1: Connection error.'),
+    });
   });
 });
 

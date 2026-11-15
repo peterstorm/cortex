@@ -5,6 +5,8 @@
  * replacement and shutdown never wait for transcript extraction or LLM work.
  */
 
+import { match } from 'ts-pattern';
+
 export type IngestionStepResult =
   | Readonly<{ kind: 'succeeded'; output?: string }>
   | Readonly<{ kind: 'failed'; retryable: boolean; error: string; output?: string }>
@@ -26,20 +28,78 @@ export type SessionIngestionOperations = Readonly<{
   maintenance: () => Promise<IngestionStepResult>;
 }>;
 
+/**
+ * How long the detached worker keeps asking, with one budget per reason.
+ *
+ * Waiting for a lock and retrying a failure are different bets. A deferral
+ * means another extraction holds the per-project lock and will release it, so
+ * waiting is cheap and almost certain to pay off. A retryable failure means
+ * the LLM call or a write failed; a few tries cover a blip, and past that the
+ * chunk cursor carries the work to the next run. One shared budget of 121
+ * spent ten minutes re-sending a failing extraction to a struggling server.
+ */
 export type SessionIngestionRetryPolicy = Readonly<{
-  maxExtractionAttempts: number;
+  /** Attempts in total while extraction keeps reporting the lock as held. */
+  maxDeferredAttempts: number;
+  /** Attempts in total while extraction keeps failing retryably. */
+  maxFailedAttempts: number;
   retryDelayMs: (completedAttempts: number) => number;
   sleep: (milliseconds: number) => Promise<void>;
 }>;
 
-const DEFAULT_RETRY_POLICY: SessionIngestionRetryPolicy = {
+export const DEFAULT_RETRY_POLICY: SessionIngestionRetryPolicy = {
   // A detached worker may wait up to roughly ten minutes for an extraction
   // already holding the per-project lock. This serializes overlapping session
   // shutdowns without delaying /new or /q in the parent Pi process.
-  maxExtractionAttempts: 121,
+  maxDeferredAttempts: 121,
+  maxFailedAttempts: 3,
   retryDelayMs: (completedAttempts) => Math.min(250 * (2 ** Math.min(completedAttempts - 1, 5)), 5_000),
   sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
 };
+
+/** Extraction attempts made so far, counted by why each was retried. */
+export type ExtractionAttempts = Readonly<{ deferred: number; failed: number }>;
+
+type ExtractionOutcome = Exclude<IngestionStepResult, { kind: 'deferred' }>;
+
+/** What the worker does after one extraction attempt. */
+export type ExtractionRetryDecision =
+  | Readonly<{ kind: 'stop'; outcome: ExtractionOutcome }>
+  | Readonly<{ kind: 'retry'; attempts: ExtractionAttempts }>;
+
+/**
+ * Pure and total: stop with an outcome, or retry with the attempt counted
+ * against its own budget. Every retry raises one counter toward its maximum,
+ * so the loop driving this always ends.
+ */
+export function decideExtractionRetry(
+  result: IngestionStepResult,
+  before: ExtractionAttempts,
+  policy: Pick<SessionIngestionRetryPolicy, 'maxDeferredAttempts' | 'maxFailedAttempts'>,
+): ExtractionRetryDecision {
+  return match(result)
+    .returnType<ExtractionRetryDecision>()
+    .with({ kind: 'succeeded' }, (outcome) => ({ kind: 'stop', outcome }))
+    .with({ kind: 'failed', retryable: false }, (outcome) => ({ kind: 'stop', outcome }))
+    .with({ kind: 'failed', retryable: true }, ({ error }) => {
+      const attempts = { ...before, failed: before.failed + 1 };
+      return attempts.failed < policy.maxFailedAttempts
+        ? { kind: 'retry', attempts }
+        : exhausted(`extraction still failing after ${attempts.failed} attempt(s): ${error}`);
+    })
+    .with({ kind: 'deferred' }, ({ reason }) => {
+      const attempts = { ...before, deferred: before.deferred + 1 };
+      return attempts.deferred < policy.maxDeferredAttempts
+        ? { kind: 'retry', attempts }
+        : exhausted(`extraction remained deferred after ${attempts.deferred} attempt(s): ${reason}`);
+    })
+    .exhaustive();
+}
+
+const exhausted = (error: string): ExtractionRetryDecision => ({
+  kind: 'stop',
+  outcome: { kind: 'failed', retryable: false, error },
+});
 
 async function runStep(operation: () => Promise<IngestionStepResult>): Promise<IngestionStepResult> {
   try {
@@ -56,26 +116,14 @@ async function runStep(operation: () => Promise<IngestionStepResult>): Promise<I
 async function runExtractionWithRetry(
   extract: () => Promise<IngestionStepResult>,
   policy: SessionIngestionRetryPolicy,
-): Promise<Exclude<IngestionStepResult, { kind: 'deferred' }>> {
-  for (let attempt = 1; attempt <= policy.maxExtractionAttempts; attempt++) {
-    const result = await runStep(extract);
-    if (result.kind === 'succeeded' || (result.kind === 'failed' && !result.retryable)) {
-      return result;
-    }
-    const retryReason = result.kind === 'deferred' ? result.reason : result.error;
-
-    if (attempt === policy.maxExtractionAttempts) {
-      return {
-        kind: 'failed',
-        retryable: false,
-        error: `extraction remained retryable after ${attempt} attempt(s): ${retryReason}`,
-      };
-    }
-
-    await policy.sleep(policy.retryDelayMs(attempt));
+): Promise<ExtractionOutcome> {
+  let attempts: ExtractionAttempts = { deferred: 0, failed: 0 };
+  for (;;) {
+    const decision = decideExtractionRetry(await runStep(extract), attempts, policy);
+    if (decision.kind === 'stop') return decision.outcome;
+    attempts = decision.attempts;
+    await policy.sleep(policy.retryDelayMs(attempts.deferred + attempts.failed));
   }
-
-  return { kind: 'failed', retryable: false, error: 'extraction retry policy had no attempts' };
 }
 
 /**

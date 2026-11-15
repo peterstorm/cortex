@@ -31,6 +31,7 @@ import {
 } from './extract.js';
 import { locateProject } from '../core/project-location.js';
 import { PROJECTION_VERSION } from '../core/transcript-projection.js';
+import { LlmProviderRefusedError } from '../infra/llm-failure.js';
 
 /** Extract for a session whose directory is its own project: it is in no repository. */
 const executeExtract = (input: HookInput, projectDb: Database, globalDb: Database | null = null) =>
@@ -1458,7 +1459,17 @@ describe('executeExtract (mocked LLM)', () => {
     globalDb.close();
   });
 
-  it('stops the chunk loop at a failed chunk without advancing past it', async () => {
+  // A timeout may pass on the worker's next attempt; a provider refusal will be
+  // refused again, so retrying it in the same run only burns quota. Either way
+  // the cursor stays at the failed chunk and the next run resumes there.
+  it.each([
+    ['a failure that may pass', new Error('LLM timeout'), true],
+    [
+      'a provider refusal',
+      new LlmProviderRefusedError({ kind: 'http-status', status: 429 }, 'Extraction LLM CLI exited with code 1: 429 quota exceeded'),
+      false,
+    ],
+  ])('stops the chunk loop at %s without advancing past it', async (_what, error, retryable) => {
     const line = JSON.stringify({ role: 'user', content: 'y'.repeat(90) }) + '\n';
     const transcript = line.repeat(Math.ceil(250_000 / line.length));
     const { cwd, transcriptPath } = makeTestProject(transcript);
@@ -1466,13 +1477,13 @@ describe('executeExtract (mocked LLM)', () => {
 
     mockExtractMemories
       .mockResolvedValueOnce(memoriesResponse('alpha bravo first unique insight'))
-      .mockRejectedValueOnce(new Error('LLM timeout'));
+      .mockRejectedValueOnce(error);
 
     const result = await executeExtract(
       { session_id: 's-chunk-fail', transcript_path: transcriptPath, cwd }, db
     );
 
-    expect(result.kind).toBe('failed');
+    expect(result).toMatchObject({ kind: 'failed', retryable });
     if (result.kind === 'failed') expect(result.error).toContain('Claude extraction failed');
     // First chunk's progress persisted; cursor parked at the failed chunk
     expect(result.extracted_count).toBe(1);
