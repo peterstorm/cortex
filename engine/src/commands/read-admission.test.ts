@@ -19,6 +19,8 @@ vi.mock('../infra/local-embed.js', () => ({
 
 // The remainder of each vector lies on its own axis: two memories on one axis
 // would be restatements of each other, and distinct recall keeps only one.
+// Two memories at query score s on different axes are s² apart, so s = 0.85
+// keeps them distinct (0.72) under potion's 0.80 distinct-recall cosine.
 const unit = (score: number, axis = 1): Float32Array => {
   const v = new Float32Array(512);
   v[0] = score;
@@ -45,7 +47,7 @@ function add(id: string, summary: string, session: string, axis: number): void {
       source_context: '{}',
       tags: [],
       status: 'active',
-      local_embedding: unit(0.9, axis),
+      local_embedding: unit(0.85, axis),
     }),
   );
 }

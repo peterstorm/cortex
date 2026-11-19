@@ -177,7 +177,7 @@ Each new memory keeps at most its 3 strongest edges — a structural guard again
 | `/remember` duplicate refusal | ≥ 0.75 | ≥ 0.92 | ≥ 0.75 |
 | `/consolidate` candidates | ≥ 0.5 | ≥ 0.85 | ≥ 0.8 |
 | `dedupe` restatements | — | ≥ 0.90 | — |
-| Distinct recall | — | ≥ 0.85 | — |
+| Distinct recall | — | ≥ 0.80 | — |
 
 Each score is read only against its own space's thresholds; when a side has no current-model vector the pair is compared on Jaccard. Extraction embeds its candidates with the active model whenever the model has a dedup calibration (and stores the vector it computed), so paraphrases are caught by cosine and the backfill has less to do.
 
@@ -189,7 +189,7 @@ Extraction catches a restatement only while both copies are new. Older copies ar
 
 ### Distinct recall
 
-Prompt recall has three semantic slots, and a fact stored five times used to fill all of them. `/recall` and the prompt-recall hook now pass their ranked list through `distinctFacts` (`core/restatement.ts`) **before** cutting it to the limit: a hit is dropped when a higher-ranked, already-kept hit of the same memory type is at or above the distinct-recall cosine (0.85 on potion). Hits without a current-model vector are always kept. Prompt recall applies it on the semantic hits before their slot cut and again on the merged semantic + strict-keyword list — both after admission and surface filtering, so a refused or already-surfaced copy can never hide the hit it restates.
+Prompt recall has three semantic slots, and a fact stored five times used to fill all of them. `/recall` and the prompt-recall hook now pass their ranked list through `distinctFacts` (`core/restatement.ts`) **before** cutting it to the limit: a hit is dropped when a higher-ranked, already-kept hit of the same memory type is at or above the distinct-recall cosine (0.80 on potion, lower than the 0.90 `dedupe` uses because hiding a hit is display-only and the copy stays stored). Hits without a current-model vector are always kept. Prompt recall applies it on the semantic hits before their slot cut and again on the merged semantic + strict-keyword list — both after admission and surface filtering, so a refused or already-surfaced copy can never hide the hit it restates.
 
 ### Explicit replacement (`/remember --replaces=<tag>`)
 

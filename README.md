@@ -367,9 +367,9 @@ Used by `/recall` for search ranking (relative order, no calibration needed) and
 | `/remember` duplicate refusal | ≥ 0.75 | ≥ 0.92 | ≥ 0.75 |
 | `/consolidate` candidate pairs | ≥ 0.5 | ≥ 0.85 | ≥ 0.8 |
 | `dedupe` restatement cleanup | off | ≥ 0.90 | off |
-| Distinct recall | off | ≥ 0.85 | off |
+| Distinct recall | off | ≥ 0.80 | off |
 
-The potion numbers come from 9,260 real memories, with pairs hand-graded per band: every pair at ≥ 0.90 was one fact restated, while 0.85-0.90 still holds pairs of different rules on one subject — which is why dedup never merges on potion (appending one rule to another loses both). About 5% of memories restated a newer one at ≥ 0.85; the harm was in prompt recall, whose few slots filled with copies of one fact.
+The potion numbers come from 9,260 real memories, with pairs hand-graded per band: every pair at ≥ 0.90 was one fact restated, while 0.85-0.90 still holds pairs of different rules on one subject — which is why dedup never merges on potion (appending one rule to another loses both). About 5% of memories restated a newer one at ≥ 0.85; the harm was in prompt recall, whose few slots filled with copies of one fact. Distinct recall sits lower, at 0.80, because hiding a hit only affects display: after `dedupe`, every same-type pair that recall still returned at 0.80-0.85 (9 of 9, over 75 probe prompts) was one fact restated.
 
 ### Restatement Cleanup (`dedupe`)
 

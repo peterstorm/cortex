@@ -349,7 +349,7 @@ cosineCalibrationFor(model): CosineCalibration | null   // null: uncalibrated �
 | `consolidate` candidates | 0.5 | 0.85 | 0.8 |
 | edge bands | Jaccard bands | none | 0.6 / 0.75 / 0.82 |
 | `dedupe` restatement | — | 0.90 | — |
-| distinct recall | — | 0.85 | — |
+| distinct recall | — | 0.80 | — |
 
 The measurement behind each record (corpus, graded pairs per band, failure modes) is the comment above it in `config.ts`.
 

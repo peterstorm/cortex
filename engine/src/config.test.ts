@@ -145,7 +145,7 @@ describe('config - cosine calibration per model', () => {
       consolidationCandidate: 0.85,
       edgeBands: null,
       restatement: 0.9,
-      distinctRecall: 0.85,
+      distinctRecall: 0.8,
     });
   });
 

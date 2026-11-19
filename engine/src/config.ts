@@ -333,8 +333,13 @@ const BGE_SMALL_EN_V1_5: CosineCalibration = {
  * - consolidation lists from 0.85: a human reviews every pair.
  * - restatement (dedupe) supersedes from 0.90: 30/30 graded pairs above it
  *   were one fact, and the newer memory is kept.
- * - distinct recall hides from 0.85: hiding a hit costs little (it is still
+ * - distinct recall hides from 0.80: hiding a hit costs little (it is still
  *   stored and searchable), while a slot filled with a copy costs a real hit.
+ *   Re-measured after dedupe had run on copies of the real databases: 75
+ *   prompts built from memories that still had a 0.80-0.90 neighbour (cortex,
+ *   fugue, loom) returned 9 same-type pairs at 0.80-0.85, and all 9 were one
+ *   fact restated. 0.85 left every one of them in the slots. Below 0.80 the
+ *   graded rate falls (0.70-0.80 needed a shared rare tag), so it stops here.
  * - no edge bands: the relates_to bands were never measured on this model, so
  *   edges keep the Jaccard bands.
  */
@@ -346,7 +351,7 @@ const POTION_RETRIEVAL_32M: CosineCalibration = {
   consolidationCandidate: 0.85,
   edgeBands: null,
   restatement: 0.9,
-  distinctRecall: 0.85,
+  distinctRecall: 0.8,
 };
 
 /**

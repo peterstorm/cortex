@@ -130,6 +130,30 @@ describe('executeDedupe', () => {
     expect(getFactsByMemory(project, 'new').map((f) => f.id)).toEqual(['fact-1']);
   });
 
+  it('reuses a supersedes edge the graph already holds instead of aborting the transaction', () => {
+    // The retired semantic-edges pass labelled some restating pairs
+    // `supersedes` (newer → older) without retiring the older memory.
+    seed(project, 'old', 0, 0);
+    seed(project, 'new', 3, 1);
+    seed(project, 'other-old', 90, 0);
+    seed(project, 'other-new', 92, 1);
+    insertEdge(project, {
+      source_id: 'new', target_id: 'old',
+      relation_type: 'supersedes', strength: 0.6, bidirectional: false, status: 'suggested',
+    });
+
+    const outcome = executeDedupe(targets, THRESHOLD, false);
+
+    expect(formatDedupeOutcome(outcome)).toBe('Dedupe superseded 2 restatement(s) (project 2, global 0)');
+    expect(getMemory(project, 'old')?.status).toBe('superseded');
+    expect(getMemory(project, 'other-old')?.status).toBe('superseded');
+    const supersedes = getAllEdges(project).filter((e) => e.relation_type === 'supersedes');
+    expect(supersedes).toHaveLength(2);
+    expect(supersedes.find((e) => e.target_id === 'old')).toEqual(
+      expect.objectContaining({ source_id: 'new', strength: 1, bidirectional: false, status: 'active' })
+    );
+  });
+
   it('is idempotent: a second run supersedes nothing', () => {
     seed(project, 'a', 0, 0);
     seed(project, 'b', 2, 1);

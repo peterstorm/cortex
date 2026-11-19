@@ -1669,6 +1669,18 @@ export function supersedeMemory(db: Database, oldId: string, replacementId: stri
   repointEdgesToMemory(db, oldId, replacementId);
   repointFactSources(db, oldId, replacementId);
   updateMemory(db, oldId, { status: 'superseded' });
+  // The graph may already hold this exact edge: the retired semantic-edges pass
+  // labelled restating pairs `supersedes` without retiring the older memory, so
+  // a later dedupe meets the edge it would write. Edges are unique per
+  // (source, target, relation), so the edge is asserted rather than inserted
+  // blindly — otherwise one such pair aborts the whole database's transaction.
+  const existing = db
+    .prepare(`SELECT id FROM edges WHERE source_id = ? AND target_id = ? AND relation_type = 'supersedes'`)
+    .get(replacementId, oldId) as { id: string } | null;
+  if (existing) {
+    db.prepare(`UPDATE edges SET strength = 1.0, bidirectional = 0, status = 'active' WHERE id = ?`).run(existing.id);
+    return;
+  }
   insertEdge(db, {
     source_id: replacementId,
     target_id: oldId,
