@@ -17,10 +17,12 @@ import { randomUUID } from 'crypto';
 import type { Database } from 'bun:sqlite';
 import type { MemoryType, MemoryScope, Memory } from '../core/types.js';
 import { createMemory, isMemoryType, serializeSourceContext } from '../core/types.js';
-import { insertMemory, routeToDatabase, getActiveMemories } from '../infra/db.js';
-import { tokenize, hybridSimilarity } from '../core/similarity.js';
+import { insertMemory, routeToDatabase, getActiveMemories, supersedeMemory } from '../infra/db.js';
+import { tokenize } from '../core/similarity.js';
+import { compareForDedup, duplicateFloor, type DedupPolicy } from '../core/calibration.js';
+import { parseReplacementTag, replacedBy, type ReplacementTag } from '../core/replacement.js';
 import { buildEmbeddingText } from '../core/extraction.js';
-import { DEDUP_SIMILARITY_THRESHOLD } from '../config.js';
+import { ACTIVE_DEDUP_POLICY } from '../config.js';
 import { invalidateSurfaceCache } from './generate.js';
 
 /**
@@ -28,7 +30,7 @@ import { invalidateSurfaceCache } from './generate.js';
  * The imperative shell (cli.ts) injects the real local embedder;
  * tests inject a deterministic fake.
  */
-export type EmbedFn = (text: string) => Promise<Float32Array | Float64Array>;
+export type EmbedFn = (text: string) => Promise<Float32Array>;
 
 // ============================================================================
 // FUNCTIONAL CORE - PURE FUNCTIONS
@@ -46,6 +48,12 @@ export interface RememberArgs {
   readonly pinned: boolean;
   readonly tags: readonly string[];
   readonly sessionId: string;
+  /**
+   * `--replaces=<tag>`: the new memory is the current version of every other
+   * active memory carrying this tag, which it supersedes. The tag is also in
+   * `tags`, so the next replacement finds this memory.
+   */
+  readonly replaces: ReplacementTag | null;
 }
 
 export type ParseResult =
@@ -61,7 +69,7 @@ export function parseRememberArgs(
   sessionId: string
 ): ParseResult {
   // Expected format:
-  // remember <content> [--type=TYPE] [--priority=N] [--scope=SCOPE] [--pinned] [--tags=tag1,tag2]
+  // remember <content> [--type=TYPE] [--priority=N] [--scope=SCOPE] [--pinned] [--tags=tag1,tag2] [--replaces=TAG]
 
   if (argv.length === 0) {
     return {
@@ -86,6 +94,7 @@ export function parseRememberArgs(
   let scope: MemoryScope = 'project'; // default
   let pinned = false; // default
   let tags: string[] = [];
+  let replaces: ReplacementTag | null = null;
 
   for (let i = 1; i < argv.length; i++) {
     const arg = argv[i];
@@ -122,6 +131,12 @@ export function parseRememberArgs(
     } else if (arg.startsWith('--tags=')) {
       const value = arg.substring(7);
       tags = value.split(',').map((t) => t.trim()).filter((t) => t !== '');
+    } else if (arg.startsWith('--replaces=')) {
+      const parsed = parseReplacementTag(arg.substring('--replaces='.length));
+      if (!parsed.ok) {
+        return { success: false, error: parsed.error };
+      }
+      replaces = parsed.tag;
     } else {
       return {
         success: false,
@@ -138,8 +153,9 @@ export function parseRememberArgs(
       priority,
       scope,
       pinned,
-      tags,
+      tags: replaces === null || tags.includes(replaces) ? tags : [...tags, replaces],
       sessionId,
+      replaces,
     },
   };
 }
@@ -193,62 +209,39 @@ export function buildMemoryFromArgs(args: RememberArgs): Memory {
 }
 
 /**
- * Pick an existing memory's embedding whose dimensions match the candidate's.
- * Pure function — returns null when no matching-dimension embedding exists.
- */
-function pickMatchingEmbedding(
-  candidateEmbedding: Float64Array | Float32Array | null,
-  existing: Memory
-): Float64Array | Float32Array | null {
-  if (candidateEmbedding === null) {
-    return existing.local_embedding ?? existing.embedding ?? null;
-  }
-  if (existing.local_embedding?.length === candidateEmbedding.length) {
-    return existing.local_embedding;
-  }
-  if (existing.embedding?.length === candidateEmbedding.length) {
-    return existing.embedding;
-  }
-  return null;
-}
-
-/**
  * Check if content is a near-duplicate of any existing memory.
  * Pure function — uses hybrid Jaccard+cosine similarity.
  *
- * When a candidate embedding is provided, it is compared against existing
- * memories' embeddings with matching dimensions (cosine path — catches
- * paraphrased duplicates). Without one, dedup degrades to Jaccard-only.
+ * When a candidate embedding is provided and the policy is calibrated for
+ * cosine, it is compared against existing memories' current-model embeddings
+ * (catches paraphrased duplicates). Otherwise, and for any existing memory
+ * without a vector, the comparison is Jaccard. Each score is read against its
+ * own space's duplicate floor: the lowest score at which extraction would not
+ * store the new memory on its own either.
  *
  * @param content - New memory content to check
  * @param summary - New memory summary (derived from content)
  * @param existingMemories - Active memories from DB
- * @param candidateEmbedding - Optional embedding of the new memory
- * @param threshold - Similarity threshold (default DEDUP_THRESHOLD)
+ * @param candidateEmbedding - Optional current-model embedding of the new memory
+ * @param policy - Duplicate thresholds per space (default: the active model's)
  * @returns The matching memory summary if duplicate, null otherwise
  */
 export function findDuplicate(
   content: string,
   summary: string,
   existingMemories: readonly Memory[],
-  candidateEmbedding: Float64Array | Float32Array | null = null,
-  threshold: number = DEDUP_SIMILARITY_THRESHOLD
+  candidateEmbedding: Float32Array | null = null,
+  policy: DedupPolicy = ACTIVE_DEDUP_POLICY
 ): string | null {
   // Symmetric tokenization: summary+content for both candidate and existing
   const candidateTokens = tokenize(`${summary} ${content}`);
 
   for (const existing of existingMemories) {
     const existingTokens = tokenize(`${existing.summary} ${existing.content}`);
-    const existingEmbedding = pickMatchingEmbedding(candidateEmbedding, existing);
-    // Cosine when both embeddings present with matching dimensions,
-    // otherwise Jaccard fallback inside hybridSimilarity
-    const score = hybridSimilarity(
-      candidateTokens,
-      existingTokens,
-      existingEmbedding !== null ? candidateEmbedding : null,
-      existingEmbedding
+    const { score, thresholds } = compareForDedup(
+      candidateTokens, existingTokens, candidateEmbedding, existing.local_embedding, policy
     );
-    if (score >= threshold) {
+    if (score >= duplicateFloor(thresholds.existing)) {
       return existing.summary;
     }
   }
@@ -265,14 +258,17 @@ export interface RememberResult {
   readonly memory_id: string;
   readonly scope: MemoryScope;
   readonly message: string;
+  /** Ids of the memories `--replaces` superseded; empty without the flag. */
+  readonly superseded: readonly string[];
 }
 
-export function formatSuccessResult(memory: Memory): RememberResult {
+export function formatSuccessResult(memory: Memory, superseded: readonly string[] = []): RememberResult {
   return {
     success: true,
     memory_id: memory.id,
     scope: memory.scope,
     message: `Memory created (${memory.scope} scope, priority ${memory.priority}${memory.pinned ? ', pinned' : ''})`,
+    superseded,
   };
 }
 
@@ -356,43 +352,29 @@ export async function executeRemember(
   // Route to appropriate database based on scope (pure routing)
   const targetDb = routeToDatabase(memory.scope, projectDb, globalDb);
 
-  // Embed the candidate for cosine dedup (catches paraphrased duplicates).
-  // Degrades to Jaccard-only if the embedder is unavailable or fails.
-  //
-  // Whether cosine dedup is safe at all is a deployment decision, so it is made
-  // at the composition root (cli.ts), which supplies embedFn only when the
-  // active local model matches the calibrated one. A threshold hit here DROPS
-  // the new memory as an existing duplicate, and an uncalibrated space produces
-  // those hits on unrelated content — see LOCAL_COSINE_CALIBRATED.
-  let candidateEmbedding: Float64Array | Float32Array | null = null;
-  const embedFn = options.embedFn ?? null;
-  if (embedFn !== null) {
-    try {
-      const embeddingText = buildEmbeddingText(memory, options.projectName ?? 'unknown');
-      candidateEmbedding = await embedFn(embeddingText);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      process.stderr.write(
-        `[cortex:remember] WARN: candidate embedding failed, dedup degrades to Jaccard: ${message}\n`
-      );
+  // --replaces: the caller states this is a new version, so it is not checked
+  // for duplicates — the memory it replaces is, by design, its near-duplicate.
+  if (args.replaces === null) {
+    const duplicateOf = await findDuplicateIn(targetDb, memory, options);
+    if (duplicateOf.kind === 'duplicate') {
+      return formatErrorResult(`near-duplicate of existing memory: "${duplicateOf.summary}"`);
+    }
+    if (duplicateOf.kind === 'failed') {
+      return formatErrorResult(`dedup check failed; memory not inserted: ${duplicateOf.message}`);
     }
   }
 
-  // Dedup check against existing memories in target database
+  // Insert, and supersede what it replaces, in one transaction: a crash
+  // between the two would leave two current versions of one fact (I/O).
+  let superseded: readonly string[];
   try {
-    const existingMemories = getActiveMemories(targetDb);
-    const duplicateOf = findDuplicate(memory.content, memory.summary, existingMemories, candidateEmbedding);
-    if (duplicateOf) {
-      return formatErrorResult(`near-duplicate of existing memory: "${duplicateOf}"`);
-    }
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return formatErrorResult(`dedup check failed; memory not inserted: ${message}`);
-  }
-
-  // Insert into database (I/O)
-  try {
-    insertMemory(targetDb, memory);
+    superseded = targetDb.transaction((): readonly string[] => {
+      insertMemory(targetDb, memory);
+      if (args.replaces === null) return [];
+      const replaced = replacedBy(memory.id, args.replaces, getActiveMemories(targetDb));
+      for (const old of replaced) supersedeMemory(targetDb, old.id, memory.id);
+      return replaced.map((old) => old.id);
+    })();
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return formatErrorResult(`failed to insert memory: ${message}`);
@@ -419,5 +401,49 @@ export async function executeRemember(
   }
 
   // Format success result (pure)
-  return formatSuccessResult(memory);
+  return formatSuccessResult(memory, superseded);
+}
+
+type DuplicateCheck =
+  | Readonly<{ kind: 'unique' }>
+  | Readonly<{ kind: 'duplicate'; summary: string }>
+  | Readonly<{ kind: 'failed'; message: string }>;
+
+/**
+ * Check the new memory against the active memories of its database (I/O).
+ *
+ * Embeds the candidate for cosine dedup (catches paraphrased duplicates) and
+ * degrades to Jaccard-only when the embedder is absent or fails. Whether
+ * cosine dedup is safe at all is a deployment decision, made at the
+ * composition root (cli.ts), which supplies embedFn only when the active local
+ * model has a dedup calibration: a hit here DROPS the new memory, and an
+ * uncalibrated space produces hits on unrelated content.
+ */
+async function findDuplicateIn(
+  targetDb: Database,
+  memory: Memory,
+  options: RememberOptions
+): Promise<DuplicateCheck> {
+  let candidateEmbedding: Float32Array | null = null;
+  const embedFn = options.embedFn ?? null;
+  if (embedFn !== null) {
+    try {
+      const embeddingText = buildEmbeddingText(memory, options.projectName ?? 'unknown');
+      candidateEmbedding = await embedFn(embeddingText);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `[cortex:remember] WARN: candidate embedding failed, dedup degrades to Jaccard: ${message}\n`
+      );
+    }
+  }
+
+  try {
+    const duplicateOf = findDuplicate(
+      memory.content, memory.summary, getActiveMemories(targetDb), candidateEmbedding
+    );
+    return duplicateOf === null ? { kind: 'unique' } : { kind: 'duplicate', summary: duplicateOf };
+  } catch (err) {
+    return { kind: 'failed', message: err instanceof Error ? err.message : String(err) };
+  }
 }

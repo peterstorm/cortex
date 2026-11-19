@@ -88,9 +88,9 @@ export async function backfill(
 ): Promise<BackfillResult> {
   try {
     // Embed every memory recall cannot see. These are consumed by recall and
-    // prompt-recall, which is the whole point of storing them; dedup and
-    // consolidation deliberately do NOT use cosine (see LOCAL_COSINE_CALIBRATED),
-    // but that no longer makes the vectors unread.
+    // prompt-recall, and — for each use the active model is calibrated for
+    // (COSINE_CALIBRATIONS in config.ts) — by dedup, consolidation, distinct
+    // recall and dedupe; a memory without a vector falls back to Jaccard there.
     const localUnembedded = getActiveMemoriesNeedingEmbedding(db);
     if (localUnembedded.length === 0) {
       return { ok: true, processed: 0, failed: 0, errors: [], method: 'local' };

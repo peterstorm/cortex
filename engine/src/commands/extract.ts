@@ -42,10 +42,17 @@ import {
 import type { EntityFactCandidate, EntityProfile } from '../core/entities.js';
 import {
   tokenize,
-  hybridSimilarity,
   hybridSimilarityScored,
   classifySimilarity,
 } from '../core/similarity.js';
+import {
+  compareForDedup,
+  dedupVerdict,
+  type CosineCalibration,
+  type CosineEdgeBands,
+  type DedupPolicy,
+  type DedupVerdict,
+} from '../core/calibration.js';
 import { embedLocal, ensureModelLoaded } from '../infra/local-embed.js';
 import {
   insertMemory,
@@ -69,14 +76,11 @@ import { acquireLock, releaseLock } from '../infra/lock.js';
 import { runLifecycle } from './lifecycle.js';
 import { invalidateSurfaceCache } from './generate.js';
 import {
-  DEDUP_SIMILARITY_THRESHOLD,
-  MERGE_CEILING_THRESHOLD,
-  INTRA_BATCH_DEDUP_THRESHOLD,
+  ACTIVE_COSINE_CALIBRATION,
+  ACTIVE_DEDUP_POLICY,
   EXTRACT_MAX_CHUNKS_PER_RUN,
   MAX_EDGES_PER_MEMORY,
   MAX_TRANSCRIPT_BYTES,
-  LOCAL_COSINE_CALIBRATED,
-  LOCAL_COSINE_CALIBRATED_MODEL,
   LOCAL_EMBED_MODEL,
   getLockDir,
 } from '../config.js';
@@ -364,14 +368,20 @@ export async function executeExtract(
       // see memories inserted by earlier chunks in this run
       const existingMemories = getActiveMemories(projectDb);
 
-      // I/O: Generate local embeddings for candidates (async, for hybrid dedup)
-      // Non-fatal: if embedding fails, dedup falls back to Jaccard-only
-      const candidateEmbeddings = await generateCandidateEmbeddings(candidates, projectName);
-
       // Route by scope (FR-008): global-scoped candidates go to the global DB
       // so they're visible from other projects; without this the scope
       // classification is dead weight. Falls back to project when no global
       // DB was provided (tests, legacy callers).
+      const routesToGlobal = (candidate: MemoryCandidate): boolean =>
+        globalDb !== null && candidate.scope === 'global';
+
+      // I/O: Generate local embeddings for candidates (async, for hybrid dedup)
+      // Non-fatal: if embedding fails, dedup falls back to Jaccard-only
+      const candidateEmbeddings = await generateCandidateEmbeddings(
+        candidates,
+        (candidate) => (routesToGlobal(candidate) ? 'global' : projectName),
+      );
+
       const projectCandidates: MemoryCandidate[] = [];
       const projectEmbeddings = new Map<number, Float32Array>();
       const globalCandidates: MemoryCandidate[] = [];
@@ -379,7 +389,7 @@ export async function executeExtract(
 
       candidates.forEach((candidate, i) => {
         const embedding = candidateEmbeddings.get(i);
-        if (globalDb && candidate.scope === 'global') {
+        if (routesToGlobal(candidate)) {
           if (embedding) globalEmbeddings.set(globalCandidates.length, embedding);
           globalCandidates.push(candidate);
         } else {
@@ -396,7 +406,7 @@ export async function executeExtract(
         existing: readonly Memory[]
       ): { inserted: Memory[]; reused: Memory[]; skipped: number; merged: number; writeFailures: number } => {
         const { kept, reused, skipped, merges } = deduplicateCandidates(
-          scopedCandidates, existing, DEDUP_SIMILARITY_THRESHOLD, scopedEmbeddings, MERGE_CEILING_THRESHOLD
+          scopedCandidates, existing, scopedEmbeddings
         );
 
         // Process merges: append new content to existing memories. Dead
@@ -750,47 +760,44 @@ export function applyDedupMerges(
   return { merged, fallbackInserted, writeFailures };
 }
 
+/** How strongly a verdict claims the candidate: a skip outranks a merge outranks a keep. */
+const VERDICT_RANK: Readonly<Record<DedupVerdict, number>> = { keep: 0, merge: 1, skip: 2 };
+
 /**
  * Deduplicate extraction candidates against existing memories and each other.
  * Pure function — uses hybrid Jaccard+cosine similarity to filter near-duplicates.
  *
+ * Every comparison is read against the thresholds of the space it was scored
+ * in (compareForDedup): cosine only when the policy is calibrated for it and
+ * both sides carry a vector, Jaccard otherwise. Across existing memories the
+ * strongest verdict wins (skip, then merge, then keep; the higher score breaks
+ * a tie), because scores from two spaces are not comparable with each other.
+ *
  * Four outcomes per candidate:
- * - intra-batch duplicate (score >= intraBatchThreshold vs an already-kept
- *   candidate): **always skip**, regardless of the existing-memory match outcome
- * - score >= mergeCeiling: **skip** (true duplicate)
- * - score in [threshold, mergeCeiling): **merge** into existing memory
- * - score < threshold: **keep** (new memory)
+ * - intra-batch duplicate (score at or above its space's intraBatch against an
+ *   already-kept candidate): **always skip**, regardless of the
+ *   existing-memory match outcome
+ * - 'skip' verdict against an existing memory: **skip** (true duplicate)
+ * - 'merge' verdict: **merge** into that existing memory (only a
+ *   merge-then-skip space has a merge band)
+ * - otherwise: **keep** (new memory)
  *
  * @param candidates - Parsed extraction candidates
  * @param existingMemories - All active memories from DB
- * @param threshold - Similarity threshold for dedup (default DEDUP_SIMILARITY_THRESHOLD)
- * @param candidateEmbeddings - Map of candidate index → local embedding (optional)
- * @param mergeCeiling - Score at or above which candidates are skipped instead of merged (default MERGE_CEILING_THRESHOLD)
- * @param intraBatchThreshold - Intra-batch dedup threshold (default
- *   INTRA_BATCH_DEDUP_THRESHOLD); candidates scoring >= it against an
- *   already-kept candidate are skipped whether or not they also match an
- *   existing memory
+ * @param candidateEmbeddings - Map of candidate index → current-model embedding (optional)
+ * @param policy - Duplicate thresholds per space (default: the active model's)
  * @returns Kept candidates, exact existing matches reusable for idempotent
  * persistence retries, count of skipped duplicates, and merge targets
  */
 export function deduplicateCandidates(
   candidates: readonly MemoryCandidate[],
   existingMemories: readonly Memory[],
-  threshold: number = DEDUP_SIMILARITY_THRESHOLD,
-  candidateEmbeddings: Map<number, Float32Array> = new Map(),
-  mergeCeiling: number = MERGE_CEILING_THRESHOLD,
-  intraBatchThreshold: number = INTRA_BATCH_DEDUP_THRESHOLD
+  candidateEmbeddings: ReadonlyMap<number, Float32Array> = new Map(),
+  policy: DedupPolicy = ACTIVE_DEDUP_POLICY
 ): { kept: MemoryCandidate[]; reused: Memory[]; skipped: number; merges: DeduplicateMerge[] } {
   // Pre-tokenize existing memories once
   const existingTokenSets = existingMemories.map(
     (m) => tokenize(`${m.summary} ${m.content}`)
-  );
-  // Only local_embedding is compared, never the legacy `embedding` column:
-  // candidate vectors come from LOCAL_EMBED_MODEL, so a local vector is the only
-  // kind that can share their space. A stored vector of another width scores on
-  // Jaccard instead (hybridSimilarity checks the lengths).
-  const existingEmbeddings = existingMemories.map(
-    (m) => m.local_embedding ?? null
   );
 
   const kept: MemoryCandidate[] = [];
@@ -805,20 +812,24 @@ export function deduplicateCandidates(
     const candidateTokens = tokenize(`${candidate.summary} ${candidate.content}`);
     const candidateEmbedding = candidateEmbeddings.get(i) ?? null;
 
-    // Check against existing memories (hybrid)
-    let bestScore = 0;
-    let bestMatchIndex = -1;
+    // Check against existing memories. Only local_embedding is compared, and
+    // the read boundary fills it only with a current-model vector, so a row
+    // embedded by another model scores on Jaccard.
+    let best: Readonly<{ verdict: DedupVerdict; score: number; index: number }> = {
+      verdict: 'keep', score: 0, index: -1,
+    };
     for (let j = 0; j < existingTokenSets.length; j++) {
-      const score = hybridSimilarity(
+      const { score, thresholds } = compareForDedup(
         candidateTokens,
         existingTokenSets[j],
         candidateEmbedding,
-        existingEmbeddings[j]
+        existingMemories[j].local_embedding,
+        policy
       );
-      if (score > bestScore) {
-        bestScore = score;
-        bestMatchIndex = j;
-      }
+      const verdict = dedupVerdict(score, thresholds.existing);
+      const stronger = VERDICT_RANK[verdict] > VERDICT_RANK[best.verdict]
+        || (verdict === best.verdict && score > best.score);
+      if (stronger) best = { verdict, score, index: j };
     }
 
     // Check against already-kept candidates in this batch (intra-batch dedup).
@@ -827,36 +838,26 @@ export function deduplicateCandidates(
     // matches an existing memory — otherwise near-identical content lands
     // both as a new memory (the kept candidate) and appended to an existing
     // one (this candidate merged into its match).
-    // The intra-batch threshold equals the cross-session threshold (0.75);
-    // the real difference is that this check runs unconditionally, which is
-    // what stops near-identical content from landing twice within one session.
-    let intraBatchDuplicate = false;
-    for (let j = 0; j < keptTokenSets.length; j++) {
-      const score = hybridSimilarity(
-        candidateTokens,
-        keptTokenSets[j],
-        candidateEmbedding,
-        keptEmbeddings[j]
+    const intraBatchDuplicate = keptTokenSets.some((keptTokens, j) => {
+      const { score, thresholds } = compareForDedup(
+        candidateTokens, keptTokens, candidateEmbedding, keptEmbeddings[j], policy
       );
-      if (score >= intraBatchThreshold) {
-        intraBatchDuplicate = true;
-        break;
-      }
-    }
+      return score >= thresholds.intraBatch;
+    });
 
     if (intraBatchDuplicate) {
       // Intra-batch duplicates are always skipped (no merge target)
       skipped++;
-    } else if (bestScore >= mergeCeiling) {
+    } else if (best.verdict === 'skip') {
       // True duplicate — do not insert again, but retain the persisted match
       // so checkpoint retries can replay idempotent edge/fact writes.
       skipped++;
-      if (bestMatchIndex >= 0) reused.push(existingMemories[bestMatchIndex]);
-    } else if (bestScore >= threshold && bestMatchIndex >= 0) {
+      reused.push(existingMemories[best.index]);
+    } else if (best.verdict === 'merge') {
       // Similar but not identical — merge into existing memory
       merges.push({
         candidate,
-        existingMemoryId: existingMemories[bestMatchIndex].id,
+        existingMemoryId: existingMemories[best.index].id,
       });
     } else {
       kept.push(candidate);
@@ -880,13 +881,14 @@ export interface EdgeCandidate {
  * Compute the edges a single new memory should get against existing memories.
  * Pure function — no I/O.
  *
- * Classification is SPACE-AWARE: when both sides have local embeddings the
- * score is raw cosine in LOCAL_EMBED_MODEL's space, so the 'local-cosine'
- * bands apply (calibrated on LOCAL_COSINE_CALIBRATED_MODEL, whose cosine runs
- * hot — same-domain pairs score 0.6-0.75); Jaccard fallback keeps the original
- * FR-059 bands. Without this, nearly every same-project
- * pair landed in consolidate/suggest → O(n²) relates_to edges, all fed to
- * the semantic-edges LLM pass.
+ * Classification is SPACE-AWARE: when the active model has calibrated edge
+ * bands and both sides have current-model embeddings, the score is cosine and
+ * those bands apply (BGE's cosine runs hot — same-domain pairs score
+ * 0.6-0.75); otherwise the score is Jaccard with the original FR-059 bands.
+ * Without this, nearly every same-project pair landed in consolidate/suggest →
+ * O(n²) relates_to edges, all fed to the semantic-edges LLM pass. A model
+ * calibrated for dedup but not for edges (potion) compares on Jaccard here
+ * even though its memories carry vectors.
  *
  * Structural guard: only the `maxEdges` strongest non-ignore candidates are
  * kept per new memory.
@@ -897,16 +899,21 @@ export interface EdgeCandidate {
  * @param newMem - Newly inserted memory
  * @param existingMemories - Active memories to compare against
  * @param maxEdges - Cap on edges per new memory (default MAX_EDGES_PER_MEMORY)
+ * @param edgeBands - Cosine edge bands, or null to classify on Jaccard
+ *   (default: the active model's)
  * @returns Edge candidates sorted by score descending, capped at maxEdges
  */
 export function computeEdgeCandidates(
   newMem: Memory,
   existingMemories: readonly Memory[],
-  maxEdges: number = MAX_EDGES_PER_MEMORY
+  maxEdges: number = MAX_EDGES_PER_MEMORY,
+  edgeBands: CosineEdgeBands | null = ACTIVE_COSINE_CALIBRATION?.edgeBands ?? null
 ): readonly EdgeCandidate[] {
   const newTokens = tokenize(`${newMem.summary} ${newMem.content}`);
-  // Only local_embedding is compared, as in deduplicateCandidates.
-  const newEmbedding = newMem.local_embedding ?? null;
+  // Vectors are compared only where cosine bands exist for them.
+  const embeddingOf = (memory: Memory): Float32Array | null =>
+    edgeBands === null ? null : memory.local_embedding;
+  const newEmbedding = embeddingOf(newMem);
 
   const candidates: EdgeCandidate[] = [];
 
@@ -914,16 +921,11 @@ export function computeEdgeCandidates(
     if (newMem.id === existingMem.id) continue;
 
     const existingTokens = tokenize(`${existingMem.summary} ${existingMem.content}`);
-    const existingEmbedding = existingMem.local_embedding ?? null;
 
     const { score, method } = hybridSimilarityScored(
-      newTokens, existingTokens, newEmbedding, existingEmbedding
+      newTokens, existingTokens, newEmbedding, embeddingOf(existingMem)
     );
-    // Cosine here always means the local space (see above). It is only ever
-    // reached when generateCandidateEmbeddings supplied vectors, which it
-    // declines to do unless LOCAL_COSINE_CALIBRATED — so 'local-cosine' bands
-    // are never applied to a model they were not calibrated for.
-    const action = classifySimilarity(score, method === 'cosine' ? 'local-cosine' : 'jaccard');
+    const action = classifySimilarity(score, method === 'cosine' ? edgeBands : null);
 
     if (action.action === 'ignore') continue;
 
@@ -994,25 +996,28 @@ export function computeSimilarityAndCreateEdges(
  * I/O boundary — calls async local embedding model.
  * Returns Map<candidateIndex, Float32Array> for successfully embedded candidates.
  * Non-fatal: returns empty map if model unavailable.
+ *
+ * Each candidate is embedded with the project prefix its database's backfill
+ * would use (`global` for a global-scoped candidate routed to the global DB),
+ * so a stored vector is the one backfill would have written.
  */
 async function generateCandidateEmbeddings(
   candidates: readonly MemoryCandidate[],
-  projectName: string,
-  allowLocalCosine: boolean = LOCAL_COSINE_CALIBRATED
+  prefixFor: (candidate: MemoryCandidate) => string,
+  calibration: CosineCalibration | null = ACTIVE_COSINE_CALIBRATION
 ): Promise<Map<number, Float32Array>> {
   const embeddings = new Map<number, Float32Array>();
 
-  // Fail closed when the active local model is not the one the dedup thresholds
-  // were calibrated against. An empty map routes every comparison through
-  // Jaccard, which is the already-tested degraded path. Supplying vectors from
-  // an uncalibrated space would let MERGE_CEILING_THRESHOLD discard genuinely
-  // new memories as duplicates — see LOCAL_COSINE_CALIBRATED for the data.
+  // Fail closed when the active local model has no dedup calibration. An
+  // empty map routes every comparison through Jaccard, which is the
+  // already-tested degraded path. Supplying vectors from an uncalibrated space
+  // would let a cosine threshold discard genuinely new memories as duplicates —
+  // see COSINE_CALIBRATIONS in config.ts for the data.
   //
-  // Checked before attempting a load: the model costs seconds and ~1.6 GB to
-  // bring up, and none of it would be used.
-  if (!allowLocalCosine) {
+  // Checked before attempting a load: none of the model would be used.
+  if (calibration === null) {
     logInfo(
-      `Local cosine dedup disabled: ${LOCAL_EMBED_MODEL} is not the calibrated model (${LOCAL_COSINE_CALIBRATED_MODEL}) — using Jaccard-only dedup`
+      `Local cosine dedup disabled: ${LOCAL_EMBED_MODEL} has no cosine calibration — using Jaccard-only dedup`
     );
     return embeddings;
   }
@@ -1031,7 +1036,7 @@ async function generateCandidateEmbeddings(
 
   for (let i = 0; i < candidates.length; i++) {
     try {
-      const text = buildEmbeddingText(candidates[i], projectName);
+      const text = buildEmbeddingText(candidates[i], prefixFor(candidates[i]));
       const embedding = await embedLocal(text);
       embeddings.set(i, embedding);
     } catch (err) {

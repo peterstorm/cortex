@@ -16,6 +16,7 @@ import {
 } from './similarity';
 import { createMemory } from './types';
 import type { Memory, SimilarityAction } from './types';
+import { cosineCalibrationFor } from '../config';
 
 describe('cosineSimilarity', () => {
   describe('example-based tests', () => {
@@ -75,36 +76,30 @@ describe('cosineSimilarity', () => {
   });
 
   describe('property-based tests', () => {
+    /** Two vectors of one length, components in [-10, 10]. */
+    const vectorPair = fc
+      .tuple(
+        fc.array(fc.float({ min: -10, max: 10, noNaN: true }), { minLength: 1, maxLength: 100 }),
+        fc.array(fc.float({ min: -10, max: 10, noNaN: true }), { minLength: 1, maxLength: 100 })
+      )
+      .map(([arrA, arrB]) => {
+        const len = Math.min(arrA.length, arrB.length);
+        return [new Float64Array(arrA.slice(0, len)), new Float64Array(arrB.slice(0, len))] as const;
+      });
+
     it('is symmetric: sim(a,b) = sim(b,a)', () => {
       fc.assert(
-        fc.property(
-          fc.array(fc.float({ min: -10, max: 10, noNaN: true }), { minLength: 1, maxLength: 100 }),
-          fc.array(fc.float({ min: -10, max: 10, noNaN: true }), { minLength: 1, maxLength: 100 }),
-          (arrA, arrB) => {
-            // Ensure same length
-            const len = Math.min(arrA.length, arrB.length);
-            const a = new Float64Array(arrA.slice(0, len));
-            const b = new Float64Array(arrB.slice(0, len));
-
-            const simAB = cosineSimilarity(a, b);
-            const simBA = cosineSimilarity(b, a);
-
-            expect(simAB).toBeCloseTo(simBA, 10);
-          }
-        )
+        fc.property(vectorPair, ([a, b]) => {
+          expect(cosineSimilarity(a, b)).toBeCloseTo(cosineSimilarity(b, a), 10);
+        })
       );
     });
 
     it('is bounded in [-1, 1]', () => {
       fc.assert(
         fc.property(
-          fc.array(fc.float({ min: -10, max: 10, noNaN: true }), { minLength: 1, maxLength: 100 }),
-          fc.array(fc.float({ min: -10, max: 10, noNaN: true }), { minLength: 1, maxLength: 100 }),
-          (arrA, arrB) => {
-            const len = Math.min(arrA.length, arrB.length);
-            const a = new Float64Array(arrA.slice(0, len));
-            const b = new Float64Array(arrB.slice(0, len));
-
+          vectorPair,
+          ([a, b]) => {
             const sim = cosineSimilarity(a, b);
             expect(sim).toBeGreaterThanOrEqual(-1.0);
             expect(sim).toBeLessThanOrEqual(1.0);
@@ -350,47 +345,53 @@ describe('classifySimilarity', () => {
     });
   });
 
-  describe('space-aware bands (local-cosine calibration)', () => {
-    it('an explicit jaccard space uses the FR-059 bands, not the local-cosine ones', () => {
-      expect(classifySimilarity(0.05, 'jaccard').action).toBe('ignore');
-      expect(classifySimilarity(0.25, 'jaccard').action).toBe('relate');
-      expect(classifySimilarity(0.45, 'jaccard').action).toBe('suggest');
-      expect(classifySimilarity(0.55, 'jaccard').action).toBe('consolidate');
+  describe('space-aware bands (cosine bands from a model calibration)', () => {
+    const BGE = cosineCalibrationFor('Xenova/bge-small-en-v1.5')?.edgeBands ?? null;
+
+    it('BGE is calibrated for edge bands', () => {
+      expect(BGE).not.toBeNull();
     });
 
-    it('local-cosine ignores same-domain background similarity (< 0.6)', () => {
+    it('null bands (a Jaccard score) use the FR-059 bands, not the cosine ones', () => {
+      expect(classifySimilarity(0.05, null).action).toBe('ignore');
+      expect(classifySimilarity(0.25, null).action).toBe('relate');
+      expect(classifySimilarity(0.45, null).action).toBe('suggest');
+      expect(classifySimilarity(0.55, null).action).toBe('consolidate');
+    });
+
+    it('BGE cosine ignores same-domain background similarity (< 0.6)', () => {
       // 0.6-0.75 is the routine same-domain-different-aspect band for raw
       // 384-dim BGE cosine — under jaccard bands these were all consolidate
-      expect(classifySimilarity(0.45, 'local-cosine').action).toBe('ignore');
-      expect(classifySimilarity(0.55, 'local-cosine').action).toBe('ignore');
-      expect(classifySimilarity(0.59999, 'local-cosine').action).toBe('ignore');
+      expect(classifySimilarity(0.45, BGE).action).toBe('ignore');
+      expect(classifySimilarity(0.55, BGE).action).toBe('ignore');
+      expect(classifySimilarity(0.59999, BGE).action).toBe('ignore');
     });
 
-    it('local-cosine relates in [0.6, 0.75)', () => {
-      const r = classifySimilarity(0.65, 'local-cosine');
+    it('BGE cosine relates in [0.6, 0.75)', () => {
+      const r = classifySimilarity(0.65, BGE);
       expect(r.action).toBe('relate');
       if (r.action === 'relate') expect(r.strength).toBe(0.65);
-      expect(classifySimilarity(0.6, 'local-cosine').action).toBe('relate');
-      expect(classifySimilarity(0.74999, 'local-cosine').action).toBe('relate');
+      expect(classifySimilarity(0.6, BGE).action).toBe('relate');
+      expect(classifySimilarity(0.74999, BGE).action).toBe('relate');
     });
 
-    it('local-cosine suggests in [0.75, 0.82)', () => {
-      const r = classifySimilarity(0.78, 'local-cosine');
+    it('BGE cosine suggests in [0.75, 0.82)', () => {
+      const r = classifySimilarity(0.78, BGE);
       expect(r.action).toBe('suggest');
       if (r.action === 'suggest') expect(r.strength).toBe(0.78);
-      expect(classifySimilarity(0.75, 'local-cosine').action).toBe('suggest');
-      expect(classifySimilarity(0.81999, 'local-cosine').action).toBe('suggest');
+      expect(classifySimilarity(0.75, BGE).action).toBe('suggest');
+      expect(classifySimilarity(0.81999, BGE).action).toBe('suggest');
     });
 
-    it('local-cosine consolidates at >= 0.82', () => {
-      expect(classifySimilarity(0.82, 'local-cosine').action).toBe('consolidate');
-      expect(classifySimilarity(0.9, 'local-cosine').action).toBe('consolidate');
-      expect(classifySimilarity(1.0, 'local-cosine').action).toBe('consolidate');
+    it('BGE cosine consolidates at >= 0.82', () => {
+      expect(classifySimilarity(0.82, BGE).action).toBe('consolidate');
+      expect(classifySimilarity(0.9, BGE).action).toBe('consolidate');
+      expect(classifySimilarity(1.0, BGE).action).toBe('consolidate');
     });
 
-    it('defaults to jaccard bands when space is omitted (backwards compat)', () => {
+    it('defaults to jaccard bands when no cosine bands are given', () => {
       expect(classifySimilarity(0.65).action).toBe('consolidate');
-      expect(classifySimilarity(0.65, 'jaccard').action).toBe('consolidate');
+      expect(classifySimilarity(0.65, null).action).toBe('consolidate');
     });
   });
 });

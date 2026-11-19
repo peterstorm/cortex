@@ -546,11 +546,15 @@ describe('access stats limited to top results (finding 13)', () => {
 
     const oldTimestamp = '2020-01-01T00:00:00.000Z';
     for (let i = 0; i < 5; i++) {
+      // Orthogonal vectors: five distinct facts, none a restatement of another.
+      const oneHot = new Float32Array(512);
+      oneHot[i] = 1;
       insertMemory(projectDb, createTestMemory({
         id: `hit-${i}`,
         content: `frobnicator subsystem detail number ${i}`,
         summary: `frobnicator detail ${i}`,
         embedding: null,
+        local_embedding: oneHot,
         access_count: 0,
         last_accessed_at: oldTimestamp,
       }));
@@ -579,5 +583,41 @@ describe('access stats limited to top results (finding 13)', () => {
       expect(mem.access_count).toBe(0);
       expect(mem.last_accessed_at).toBe(oldTimestamp);
     }
+  });
+});
+
+describe('distinct facts (restatements do not take result slots)', () => {
+  // Query along axis 0; a memory's remainder on `axis`, so same-axis memories
+  // restate each other and different-axis memories are distinct facts.
+  const vec = (score: number, axis: number): Float32Array => {
+    const v = new Float32Array(512);
+    v[0] = score;
+    v[axis] = Math.sqrt(1 - score * score);
+    return v;
+  };
+  let spy: MockInstance<typeof localEmbed.embedLocal>;
+
+  beforeEach(() => {
+    spy = vi.spyOn(localEmbed, 'embedLocal').mockImplementation(async () => vec(1, 1));
+  });
+
+  afterEach(() => {
+    spy.mockRestore();
+  });
+
+  test('a restatement in either database gives its slot to the next distinct fact', async () => {
+    const { projectDb, globalDb } = setupTestDbs();
+    const seed = (db: Database, id: string, score: number, axis: number, scope: 'project' | 'global' = 'project') =>
+      insertMemory(db, createTestMemory({ id, scope, content: `zz ${id}`, summary: `zz ${id}`, local_embedding: vec(score, axis) }));
+    seed(projectDb, 'fact', 0.8, 1);
+    seed(projectDb, 'fact-reworded', 0.79, 1);
+    seed(globalDb, 'fact-in-global', 0.78, 1, 'global');
+    seed(projectDb, 'other-fact', 0.6, 2);
+
+    const result = await executeRecall(projectDb, globalDb, { query: 'unrelated words', limit: 2 });
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.result.results.map((r) => r.memory.id)).toEqual(['fact', 'other-fact']);
   });
 });

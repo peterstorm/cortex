@@ -58,6 +58,44 @@ function makeMemory(
   });
 }
 
+/**
+ * A file database holding the memories table as it was before any column
+ * migration, left open so a test can add its own legacy tables and rows.
+ */
+function createLegacyDatabase(prefix: string): { dir: string; dbPath: string; legacy: Database } {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  const dbPath = join(dir, 'legacy.db');
+  const legacy = new Database(dbPath);
+  legacy.run(`
+    CREATE TABLE memories (
+      id TEXT PRIMARY KEY, content TEXT NOT NULL, summary TEXT NOT NULL,
+      memory_type TEXT NOT NULL, scope TEXT NOT NULL,
+      embedding BLOB, local_embedding BLOB,
+      confidence REAL NOT NULL, priority INTEGER NOT NULL,
+      pinned INTEGER NOT NULL DEFAULT 0,
+      source_type TEXT NOT NULL, source_session TEXT NOT NULL, source_context TEXT NOT NULL,
+      tags TEXT NOT NULL, access_count INTEGER NOT NULL DEFAULT 0,
+      last_accessed_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active'
+    )
+  `);
+  return { dir, dbPath, legacy };
+}
+
+/** Two memories, a and b, joined by one unclassified relates_to edge; returns the edge id. */
+function seedRelatesToPair(db: Database): string {
+  for (const id of ['a', 'b']) {
+    insertMemory(db, makeMemory(id, {
+      content: `content ${id}`, summary: `summary ${id}`,
+      confidence: 0.8, source_session: 'sess',
+    }));
+  }
+  return insertEdge(db, {
+    source_id: 'a', target_id: 'b', relation_type: 'relates_to',
+    strength: 0.5, bidirectional: true, status: 'active',
+  });
+}
+
 describe('Database Layer', () => {
   describe('openDatabase', () => {
     it('creates schema on new database', () => {
@@ -725,6 +763,29 @@ describe('Database Layer', () => {
       );
     });
 
+    it('reads a Memory with local_embedding only when the vector is from the current model', () => {
+      // Every Memory consumer (dedup, consolidation, restatement cleanup,
+      // distinct recall) compares memory.local_embedding directly, so a
+      // foreign or untagged vector must never reach the domain object.
+      const m = makeMemory('mem-local-domain', {
+        content: 'domain vector',
+        summary: 'domain vector',
+        confidence: 0.8,
+        source_type: 'extraction',
+        source_session: 'session-local',
+        local_embedding: new Float32Array([0.3, 0.2, 0.1]),
+      });
+      insertMemory(db, m);
+      expect(getMemory(db, 'mem-local-domain')?.local_embedding).toEqual(new Float32Array([0.3, 0.2, 0.1]));
+
+      db.run('UPDATE memories SET local_embedding_model = ? WHERE id = ?', ['foreign/model', 'mem-local-domain']);
+      expect(getMemory(db, 'mem-local-domain')?.local_embedding).toBeNull();
+      expect(getActiveMemories(db).find((x) => x.id === 'mem-local-domain')?.local_embedding).toBeNull();
+
+      db.run('UPDATE memories SET local_embedding_model = NULL WHERE id = ?', ['mem-local-domain']);
+      expect(getMemory(db, 'mem-local-domain')?.local_embedding).toBeNull();
+    });
+
     it('warns when an ID-filtered non-null embedding cannot be deserialized', () => {
       db.run('UPDATE memories SET local_embedding = 0 WHERE id = ?', ['mem-emb-1']);
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
@@ -1163,29 +1224,8 @@ describe('Database Layer', () => {
 
   describe('schema migrations (idempotent, tables exist in the wild)', () => {
     it('adds archived_at and transcript_length to a legacy database', () => {
-      const fs = require('node:fs');
-      const os = require('node:os');
-      const path = require('node:path');
-      const { Database } = require('bun:sqlite');
-
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-migration-'));
-      const dbPath = path.join(dir, 'legacy.db');
-
       // Simulate a legacy database created before the columns existed
-      const legacy = new Database(dbPath);
-      legacy.run(`
-        CREATE TABLE memories (
-          id TEXT PRIMARY KEY, content TEXT NOT NULL, summary TEXT NOT NULL,
-          memory_type TEXT NOT NULL, scope TEXT NOT NULL,
-          embedding BLOB, local_embedding BLOB,
-          confidence REAL NOT NULL, priority INTEGER NOT NULL,
-          pinned INTEGER NOT NULL DEFAULT 0,
-          source_type TEXT NOT NULL, source_session TEXT NOT NULL, source_context TEXT NOT NULL,
-          tags TEXT NOT NULL, access_count INTEGER NOT NULL DEFAULT 0,
-          last_accessed_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-          status TEXT NOT NULL DEFAULT 'active'
-        )
-      `);
+      const { dir, dbPath, legacy } = createLegacyDatabase('cortex-migration-');
       legacy.run(`
         CREATE TABLE extraction_checkpoints (
           id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
@@ -1227,7 +1267,7 @@ describe('Database Layer', () => {
       expect(getMemory(again, 'legacy-1')).not.toBeNull();
       again.close();
 
-      fs.rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
     });
 
     it('persists archived_at through insert, update, and read', () => {
@@ -1249,29 +1289,8 @@ describe('Database Layer', () => {
     });
 
     it('adds classified_at to a legacy edges table', () => {
-      const fs = require('node:fs');
-      const os = require('node:os');
-      const path = require('node:path');
-      const { Database } = require('bun:sqlite');
-
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-edge-migration-'));
-      const dbPath = path.join(dir, 'legacy.db');
-
       // Simulate a legacy database whose edges table predates classified_at
-      const legacy = new Database(dbPath);
-      legacy.run(`
-        CREATE TABLE memories (
-          id TEXT PRIMARY KEY, content TEXT NOT NULL, summary TEXT NOT NULL,
-          memory_type TEXT NOT NULL, scope TEXT NOT NULL,
-          embedding BLOB, local_embedding BLOB,
-          confidence REAL NOT NULL, priority INTEGER NOT NULL,
-          pinned INTEGER NOT NULL DEFAULT 0,
-          source_type TEXT NOT NULL, source_session TEXT NOT NULL, source_context TEXT NOT NULL,
-          tags TEXT NOT NULL, access_count INTEGER NOT NULL DEFAULT 0,
-          last_accessed_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-          status TEXT NOT NULL DEFAULT 'active'
-        )
-      `);
+      const { dir, dbPath, legacy } = createLegacyDatabase('cortex-edge-migration-');
       legacy.run(`
         CREATE TABLE edges (
           id TEXT PRIMARY KEY, source_id TEXT NOT NULL, target_id TEXT NOT NULL,
@@ -1296,7 +1315,7 @@ describe('Database Layer', () => {
       expect(edgeCols2).toContain('last_failed_at');
       again.close();
 
-      fs.rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
     });
 
     it('classifiable edges respect attempt tracking and content changes', () => {
@@ -1358,20 +1377,7 @@ describe('Database Layer', () => {
 
     it('failure backoff gates re-classification until expiry or content change', () => {
       const db = openDatabase(':memory:');
-
-      function seedMemory(id: string): void {
-        insertMemory(db, makeMemory(id, {
-          content: `content ${id}`, summary: `summary ${id}`,
-          confidence: 0.8, source_session: 'sess',
-        }));
-      }
-      seedMemory('a');
-      seedMemory('b');
-
-      const e1 = insertEdge(db, {
-        source_id: 'a', target_id: 'b', relation_type: 'relates_to',
-        strength: 0.5, bidirectional: true, status: 'active',
-      });
+      const e1 = seedRelatesToPair(db);
 
       const rows = getRelatesToEdgesWithMemories(db);
       const row = rows.find(r => r.edge.id === e1)!;
@@ -1415,20 +1421,7 @@ describe('Database Layer', () => {
       const { getRelatesToEdges, getRelatesToEdgesWithMemories, markEdgeClassified, markEdgeFailed } = require('./db.js');
       const { pairContentHash } = require('../commands/semantic-edges.js');
       const db = openDatabase(':memory:');
-
-      function seedMemory(id: string): void {
-        insertMemory(db, makeMemory(id, {
-          content: `content ${id}`, summary: `summary ${id}`,
-          confidence: 0.8, source_session: 'sess',
-        }));
-      }
-      seedMemory('a');
-      seedMemory('b');
-
-      const e1 = insertEdge(db, {
-        source_id: 'a', target_id: 'b', relation_type: 'relates_to',
-        strength: 0.5, bidirectional: true, status: 'active',
-      });
+      const e1 = seedRelatesToPair(db);
 
       // Never attempted → null on both fields
       const fresh = getRelatesToEdges(db).find((e: { id: string }) => e.id === e1)!;

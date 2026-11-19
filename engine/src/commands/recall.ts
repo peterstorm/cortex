@@ -18,7 +18,8 @@ import {
 } from '../infra/db.js';
 import { rankByFusedSimilarity, tokenize, extractUnigrams } from '../core/similarity.js';
 import { mergeResults } from '../core/ranking.js';
-import { MIN_COSINE_SCORE, SEMANTIC_PRE_FILTER_LIMIT } from '../config.js';
+import { distinctFacts } from '../core/restatement.js';
+import { ACTIVE_COSINE_CALIBRATION, MIN_COSINE_SCORE, SEMANTIC_PRE_FILTER_LIMIT } from '../config.js';
 import { traverseGraph } from '../core/graph.js';
 
 /** Only the top N recall results get their access stats bumped (FR-037). */
@@ -216,9 +217,10 @@ export async function executeRecall(
   const query = options.query.trim();
   const limit = options.limit ?? 10;
   const forceKeyword = options.keyword ?? false;
-  // When a branch filter will discard results post-ranking, over-fetch so
-  // the filtered pool can still fill `limit`.
-  const fetchLimit = options.branch ? limit * 5 : limit;
+  const distinctThreshold = ACTIVE_COSINE_CALIBRATION?.distinctRecall ?? null;
+  // When a branch filter or the distinct-fact filter will discard results
+  // post-ranking, over-fetch so the filtered pool can still fill `limit`.
+  const fetchLimit = options.branch || distinctThreshold !== null ? limit * 5 : limit;
 
   // Validate query
   if (query === '') {
@@ -336,11 +338,18 @@ export async function executeRecall(
     globalSearchResults = [...filterByBranch(globalSearchResults, options.branch)];
   }
 
-  const mergedResults = mergeResults(
-    projectSearchResults,
-    globalSearchResults,
-    limit
-  );
+  // Restatements of a better-ranked hit are dropped BEFORE the cut to
+  // `limit`, so the slot goes to the next distinct hit (the over-fetch above
+  // supplies it).
+  const mergedResults = distinctFacts(
+    mergeResults(
+      projectSearchResults,
+      globalSearchResults,
+      projectSearchResults.length + globalSearchResults.length
+    ),
+    (result) => result.memory,
+    distinctThreshold
+  ).slice(0, limit);
 
   // Pre-fetch all edges once per DB (avoid per-result queries).
   // NOTE: Loads entire edge table into memory — acceptable for current scale,

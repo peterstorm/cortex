@@ -46,6 +46,7 @@ describe('Remember Command', () => {
         pinned: false,
         tags: [],
         sessionId,
+        replaces: null,
       });
     });
 
@@ -71,6 +72,7 @@ describe('Remember Command', () => {
         pinned: true,
         tags: ['architecture', 'database', 'critical'],
         sessionId,
+        replaces: null,
       });
     });
 
@@ -210,6 +212,7 @@ describe('Remember Command', () => {
         pinned: true,
         tags: ['tag1', 'tag2'],
         sessionId: 'session-123',
+        replaces: null,
       };
 
       const memory = buildMemoryFromArgs(args);
@@ -253,6 +256,7 @@ describe('Remember Command', () => {
         pinned: false,
         tags: [],
         sessionId: 'session-123',
+        replaces: null,
       };
 
       const memory = buildMemoryFromArgs(args);
@@ -272,6 +276,7 @@ describe('Remember Command', () => {
         pinned: false,
         tags: [],
         sessionId: 'session-123',
+        replaces: null,
       };
 
       const memory = buildMemoryFromArgs(args);
@@ -289,6 +294,7 @@ describe('Remember Command', () => {
         pinned: false,
         tags: [],
         sessionId: 'session-123',
+        replaces: null,
       };
 
       const mem1 = buildMemoryFromArgs(args);
@@ -306,6 +312,7 @@ describe('Remember Command', () => {
         pinned: false,
         tags: [],
         sessionId: 'session-123',
+        replaces: null,
       };
 
       const memory = buildMemoryFromArgs(args);
@@ -324,6 +331,7 @@ describe('Remember Command', () => {
         pinned: true,
         tags: [],
         sessionId: 'session-123',
+        replaces: null,
       });
 
       const result = formatSuccessResult(memory);
@@ -345,6 +353,7 @@ describe('Remember Command', () => {
         pinned: false,
         tags: [],
         sessionId: 'session-123',
+        replaces: null,
       });
 
       const result = formatSuccessResult(memory);

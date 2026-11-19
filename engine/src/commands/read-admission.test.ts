@@ -17,17 +17,19 @@ vi.mock('../infra/local-embed.js', () => ({
   embedLocal: (text: string) => mockEmbedLocal(text),
 }));
 
-const unit = (score: number): Float32Array => {
+// The remainder of each vector lies on its own axis: two memories on one axis
+// would be restatements of each other, and distinct recall keeps only one.
+const unit = (score: number, axis = 1): Float32Array => {
   const v = new Float32Array(512);
   v[0] = score;
-  v[1] = Math.sqrt(1 - score * score);
+  v[axis] = Math.sqrt(1 - score * score);
   return v;
 };
 
 let projectDb: Database;
 let globalDb: Database;
 
-function add(id: string, summary: string, session: string): void {
+function add(id: string, summary: string, session: string, axis: number): void {
   insertMemory(
     projectDb,
     createMemory({
@@ -43,7 +45,7 @@ function add(id: string, summary: string, session: string): void {
       source_context: '{}',
       tags: [],
       status: 'active',
-      local_embedding: unit(0.9),
+      local_embedding: unit(0.9, axis),
     }),
   );
 }
@@ -53,8 +55,8 @@ const refuseAuthor: MemoryAdmission = (m) => m.source_session !== 'author';
 beforeEach(() => {
   projectDb = openDatabase(':memory:');
   globalDb = openDatabase(':memory:');
-  add('kept', 'pilot start date moved to November fifteenth', 'work');
-  add('refused', 'pilot start date answer key November fifteenth', 'author');
+  add('kept', 'pilot start date moved to November fifteenth', 'work', 1);
+  add('refused', 'pilot start date answer key November fifteenth', 'author', 2);
   insertFact(projectDb, {
     id: 'f-refused',
     entity_id: upsertEntity(projectDb, 'pilot', 'project'),
@@ -114,6 +116,18 @@ describe('prompt recall', () => {
     const all = await executePromptRecallWithFallback(projectDb, globalDb, options);
     const admitted = await executePromptRecallWithFallback(projectDb, globalDb, { ...options, admit: refuseAuthor });
     expect(all.map((m) => m.id).sort()).toEqual(['kept', 'refused']);
+    expect(admitted.map((m) => m.id)).toEqual(['kept']);
+  });
+
+  test('a refused restatement cannot crowd out the admitted memory it restates', async () => {
+    // Admission runs before distinct recall: were it the other way round, the
+    // refused copy (ranked first) would drop `kept` and then be refused itself.
+    projectDb.run('UPDATE memories SET local_embedding = ? WHERE id = ?', [
+      new Uint8Array(unit(0.95, 1).buffer),
+      'refused',
+    ]);
+    mockEmbedLocal.mockResolvedValue(unit(1));
+    const admitted = await executePromptRecallWithFallback(projectDb, globalDb, { ...options, admit: refuseAuthor });
     expect(admitted.map((m) => m.id)).toEqual(['kept']);
   });
 

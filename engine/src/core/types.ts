@@ -217,19 +217,6 @@ export interface MemoryCandidate {
   readonly tags: readonly string[];
 }
 
-/**
- * Similarity space a score was computed in. Scores are NOT comparable across
- * spaces: raw cosine on local BGE-small-en-v1.5 embeddings runs "hot"
- * (same-domain memories about different aspects routinely score 0.6-0.75),
- * while Jaccard is much better separated. Thresholds and classification bands
- * must be calibrated per space.
- *
- * A space is also per MODEL, not merely per family: the 'local-cosine' bands
- * belong to BGE-small-en-v1.5 specifically. See LOCAL_COSINE_CALIBRATED, which
- * keeps an uncalibrated local model out of destructive comparisons entirely.
- */
-export type SimilaritySpace = 'jaccard' | 'local-cosine';
-
 // Similarity Action (discriminated union)
 export type SimilarityAction =
   | { action: 'ignore' }

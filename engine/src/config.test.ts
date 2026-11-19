@@ -18,11 +18,13 @@ import {
   DEFAULT_SEARCH_LIMIT,
   GITIGNORE_PATTERNS,
   CONSOLIDATION_SIMILARITY_THRESHOLD,
-  CONSOLIDATION_LOCAL_COSINE_THRESHOLD,
-  DEDUP_SIMILARITY_THRESHOLD,
-  MERGE_CEILING_THRESHOLD,
   MAX_EDGES_PER_MEMORY,
-  consolidationThresholdFor,
+  ACTIVE_COSINE_CALIBRATION,
+  ACTIVE_DEDUP_POLICY,
+  JACCARD_DEDUP,
+  LOCAL_EMBED_MODEL,
+  cosineCalibrationFor,
+  dedupPolicyFor,
 } from './config.js';
 
 describe('config - path resolution', () => {
@@ -115,20 +117,75 @@ describe('config - constants', () => {
   });
 });
 
-describe('config - consolidationThresholdFor', () => {
-  it('uses the well-separated default for jaccard', () => {
-    expect(consolidationThresholdFor('jaccard')).toBe(CONSOLIDATION_SIMILARITY_THRESHOLD);
+describe('config - cosine calibration per model', () => {
+  const BGE = 'Xenova/bge-small-en-v1.5';
+  const POTION = 'minishlab/potion-retrieval-32M';
+
+  it('an unknown model is uncalibrated, so every comparison fails closed to Jaccard', () => {
+    expect(cosineCalibrationFor('google/embeddinggemma-300m')).toBeNull();
+    expect(dedupPolicyFor(null)).toEqual({ jaccard: JACCARD_DEDUP, cosine: null });
   });
 
-  it('uses the calibrated hot-space threshold for local-cosine', () => {
-    expect(consolidationThresholdFor('local-cosine')).toBe(CONSOLIDATION_LOCAL_COSINE_THRESHOLD);
+  it('BGE keeps exactly the numbers it was tuned with, edge bands included', () => {
+    expect(cosineCalibrationFor(BGE)).toEqual({
+      dedup: {
+        existing: { kind: 'merge-then-skip', mergeFrom: 0.75, skipFrom: 0.85 },
+        intraBatch: 0.75,
+      },
+      consolidationCandidate: 0.8,
+      edgeBands: { relateFrom: 0.6, suggestFrom: 0.75, consolidateFrom: 0.82 },
+      restatement: null,
+      distinctRecall: null,
+    });
   });
 
-  it('local-cosine threshold sits above the same-domain band (0.6-0.75) and below the true-duplicate band (0.85+)', () => {
-    expect(CONSOLIDATION_LOCAL_COSINE_THRESHOLD).toBeGreaterThan(0.75);
-    expect(CONSOLIDATION_LOCAL_COSINE_THRESHOLD).toBeLessThan(MERGE_CEILING_THRESHOLD);
-    // Consistent with the dedup threshold calibrated for the same space
-    expect(CONSOLIDATION_LOCAL_COSINE_THRESHOLD).toBeGreaterThanOrEqual(DEDUP_SIMILARITY_THRESHOLD);
+  it('potion skips from 0.92 with no merge band and has no edge bands', () => {
+    expect(cosineCalibrationFor(POTION)).toEqual({
+      dedup: { existing: { kind: 'skip-only', skipFrom: 0.92 }, intraBatch: 0.92 },
+      consolidationCandidate: 0.85,
+      edgeBands: null,
+      restatement: 0.9,
+      distinctRecall: 0.85,
+    });
+  });
+
+  it('the active calibration is the one recorded for LOCAL_EMBED_MODEL', () => {
+    expect(ACTIVE_COSINE_CALIBRATION).toBe(cosineCalibrationFor(LOCAL_EMBED_MODEL));
+    expect(ACTIVE_DEDUP_POLICY).toEqual(dedupPolicyFor(ACTIVE_COSINE_CALIBRATION));
+  });
+
+  it('every recorded threshold is a cosine in (0, 1] and every band is ordered', () => {
+    for (const model of [BGE, POTION]) {
+      const calibration = cosineCalibrationFor(model);
+      expect(calibration).not.toBeNull();
+      if (calibration === null) continue;
+      const { existing } = calibration.dedup;
+      if (existing.kind === 'merge-then-skip') expect(existing.mergeFrom).toBeLessThan(existing.skipFrom);
+      const bands = calibration.edgeBands;
+      if (bands !== null) {
+        expect(bands.relateFrom).toBeLessThan(bands.suggestFrom);
+        expect(bands.suggestFrom).toBeLessThan(bands.consolidateFrom);
+      }
+      const thresholds = [
+        existing.skipFrom,
+        calibration.dedup.intraBatch,
+        calibration.consolidationCandidate,
+        calibration.restatement ?? 1,
+        calibration.distinctRecall ?? 1,
+      ];
+      for (const t of thresholds) {
+        expect(t).toBeGreaterThan(0);
+        expect(t).toBeLessThanOrEqual(1);
+      }
+    }
+  });
+
+  it('the Jaccard fallback keeps the effective thresholds of today: merge 0.75, skip 0.85, intra-batch 0.75', () => {
+    expect(JACCARD_DEDUP).toEqual({
+      existing: { kind: 'merge-then-skip', mergeFrom: 0.75, skipFrom: 0.85 },
+      intraBatch: 0.75,
+    });
+    expect(CONSOLIDATION_SIMILARITY_THRESHOLD).toBe(0.5);
   });
 });
 
