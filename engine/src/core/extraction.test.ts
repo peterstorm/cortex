@@ -13,6 +13,7 @@ import {
   stripInjectedMemorySurface,
 } from "./extraction";
 import type { MemoryCandidate, GitContext, MemoryType } from "./types";
+import { ENTITY_TYPES, isEntityType } from "./entities";
 
 describe("truncateTranscript", () => {
   it("returns full content when under maxBytes", () => {
@@ -470,7 +471,7 @@ describe("parseExtractionResponse", () => {
   it("accepts an omitted entities field for backward compatibility", () => {
     const result = parseExtractionResponse(JSON.stringify({ memories: [] }));
 
-    expect(result).toEqual({ kind: "ok", memories: [], entities: [] });
+    expect(result).toEqual({ kind: "ok", memories: [], entities: [], refiledEntityTypes: [] });
   });
 
   it.each([null, {}, "not-an-array", 42, true])(
@@ -710,6 +711,69 @@ describe("parseExtractionResponse", () => {
       kind: "parse_error",
       raw: response,
       reason: "1 of 2 entity candidate(s) had invalid shape",
+    });
+  });
+
+  describe("entity types outside the vocabulary", () => {
+    it("files an invented type under 'other' and reports it, instead of failing the chunk", () => {
+      // The commonest recorded failure: the model labels a product 'product'.
+      const response = JSON.stringify({
+        memories: [],
+        entities: [
+          { entity_name: "Cortex", entity_type: "project", predicate: "uses", object: "SQLite" },
+          { entity_name: "DGX Spark", entity_type: "product", predicate: "has", object: "128 GB unified memory" },
+        ],
+      });
+
+      expect(parseExtractionResponse(response)).toEqual({
+        kind: "ok",
+        memories: [],
+        entities: [
+          { entity_name: "Cortex", entity_type: "project", predicate: "uses", object: "SQLite" },
+          { entity_name: "DGX Spark", entity_type: "other", predicate: "has", object: "128 GB unified memory" },
+        ],
+        refiledEntityTypes: ["product"],
+      });
+    });
+
+    it.each([
+      ["a missing type", { entity_name: "X", predicate: "is", object: "y" }],
+      ["a non-string type", { entity_name: "X", entity_type: 7, predicate: "is", object: "y" }],
+      ["an empty type", { entity_name: "X", entity_type: " ", predicate: "is", object: "y" }],
+      ["a refiled type on an otherwise broken entity", { entity_name: "", entity_type: "product", predicate: "is", object: "y" }],
+    ])("still fails the chunk for %s", (_label, entity) => {
+      const response = JSON.stringify({ memories: [], entities: [entity] });
+      expect(parseExtractionResponse(response)).toEqual({
+        kind: "parse_error",
+        raw: response,
+        reason: "1 of 1 entity candidate(s) had invalid shape",
+      });
+    });
+
+    it("refiles exactly the out-of-vocabulary labels and leaves every other field as written", () => {
+      const nonBlank = fc.string({ minLength: 1 }).filter((s) => s.trim() !== "");
+      const entityArb = fc.record({
+        entity_name: nonBlank,
+        entity_type: fc.oneof(fc.constantFrom(...ENTITY_TYPES), nonBlank),
+        predicate: nonBlank,
+        object: nonBlank,
+      });
+      fc.assert(
+        fc.property(fc.array(entityArb), (entities) => {
+          const result = okParse(parseExtractionResponse(JSON.stringify({ memories: [], entities })));
+          expect(result.refiledEntityTypes).toEqual(
+            entities.filter((e) => !isEntityType(e.entity_type)).map((e) => e.entity_type)
+          );
+          expect(result.entities).toEqual(
+            entities.map((e) => ({
+              entity_name: e.entity_name.trim(),
+              entity_type: isEntityType(e.entity_type) ? e.entity_type : "other",
+              predicate: e.predicate.trim(),
+              object: e.object.trim(),
+            }))
+          );
+        })
+      );
     });
   });
 

@@ -343,6 +343,9 @@ export async function executeExtract(
       }
       const candidates = parseOutcome.memories;
       const entityCandidates = parseOutcome.entities;
+      if (parseOutcome.refiledEntityTypes.length > 0) {
+        logInfo(`Filed ${parseOutcome.refiledEntityTypes.length} entity type(s) outside the vocabulary under 'other': ${parseOutcome.refiledEntityTypes.join(', ')}`);
+      }
 
       if (candidates.length === 0 && entityCandidates.length === 0) {
         // Genuinely-empty chunk — advance checkpoint and move on

@@ -4,16 +4,21 @@
  */
 
 import type { MemoryType, MemoryScope, MemoryCandidate, GitContext } from './types.js';
-import { MEMORY_TYPES, isMemoryType } from './types.js';
+import { MEMORY_TYPES } from './types.js';
 import { SUMMARY_MAX_CHARS } from '../config.js';
 import type { EntityFactCandidate, EntityProfile } from './entities.js';
-import { isValidEntityFactCandidate } from './entities.js';
+import { isEntityType, isValidEntityFactCandidate } from './entities.js';
 import { extractJsonSlice } from './json-utils.js';
 
 /** Result of parsing an extraction response — memories and optional entity-facts */
 export interface ParsedExtractionResult {
   readonly memories: readonly MemoryCandidate[];
   readonly entities: readonly EntityFactCandidate[];
+  /**
+   * The entity types the model wrote that are outside the vocabulary, one per
+   * entity, in response order. Those entities were filed under 'other'.
+   */
+  readonly refiledEntityTypes: readonly string[];
 }
 
 /**
@@ -308,16 +313,20 @@ export function parseExtractionResponse(
     const memories: readonly MemoryCandidate[] = validMemories.map((c) => ({
       content: String(c.content),
       summary: truncateSummary(String(c.summary)),
-      memory_type: isMemoryType(c.memory_type) ? c.memory_type : 'context',
+      memory_type: c.memory_type,
       scope: c.scope === 'global' ? 'global' as const : 'project' as const,
       confidence: Number(c.confidence),
       priority: Number(c.priority),
       tags: Array.isArray(c.tags) ? c.tags.map(String) : [],
     }));
 
-    // Entity facts share the same all-or-retry checkpoint contract.
-    const validEntities = rawEntities.filter(isValidEntityFactCandidate);
-    const invalidEntityCount = rawEntities.length - validEntities.length;
+    // Entity facts share the same all-or-retry checkpoint contract, except for
+    // the type label: see fileUnknownEntityTypeAsOther.
+    const refiled = rawEntities.map(fileUnknownEntityTypeAsOther);
+    const refiledEntityTypes = refiled.flatMap((r) => (r.refiledFrom === null ? [] : [r.refiledFrom]));
+    const filedEntities = refiled.map((r) => r.entity);
+    const validEntities = filedEntities.filter(isValidEntityFactCandidate);
+    const invalidEntityCount = filedEntities.length - validEntities.length;
     if (invalidEntityCount > 0) {
       return {
         kind: 'parse_error',
@@ -333,11 +342,30 @@ export function parseExtractionResponse(
         object: c.object.trim(),
       }));
 
-    return { kind: 'ok', memories, entities };
+    return { kind: 'ok', memories, entities, refiledEntityTypes };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { kind: 'parse_error', raw: response, reason: `JSON parse failure: ${message}` };
   }
+}
+
+/**
+ * File an entity whose type label is outside the vocabulary under 'other',
+ * the vocabulary's own catch-all (pure).
+ *
+ * The models extraction runs on invent labels ('product', 'code', 'service',
+ * 'skill'…) for otherwise sound facts. Rejecting the response for the label
+ * re-sends the whole transcript chunk (up to 100 KB) and, when the model
+ * keeps inventing, re-sends it again: one recorded chunk took 21 attempts.
+ * Filing it under 'other' loses only the invented label. Only a non-empty
+ * string label is refiled; a missing or non-string type, like any other
+ * malformed field, still fails the response so the chunk is retried.
+ */
+function fileUnknownEntityTypeAsOther(raw: unknown): { readonly entity: unknown; readonly refiledFrom: string | null } {
+  if (typeof raw !== 'object' || raw === null) return { entity: raw, refiledFrom: null };
+  const type: unknown = Reflect.get(raw, 'entity_type');
+  if (typeof type !== 'string' || type.trim() === '' || isEntityType(type)) return { entity: raw, refiledFrom: null };
+  return { entity: { ...raw, entity_type: 'other' }, refiledFrom: type };
 }
 
 /**
