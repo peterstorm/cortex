@@ -238,15 +238,17 @@ function recordSuccessfulAiPrune(telemetryPath: string, at: Date): void {
 // ============================================================================
 
 /**
- * Call the LLM with the prune prompt.
- * Prefers the direct OpenAI-compatible endpoint (thinking disabled); falls
- * back to the headless CLI subprocess (claude -p / pi -p).
+ * Ask the LLM which memories of one prune batch to archive; returns the raw
+ * response for parsePruneResponse. Prefers the direct OpenAI-compatible
+ * endpoint (thinking disabled); falls back to the headless CLI subprocess
+ * (claude -p / pi -p).
  *
  * @param transport - Injectable LLM boundary; defaults to the real direct
  *   endpoint. Tests pass a plain function fake so they drive the real prompt
- *   building and response parsing instead of mocking the whole module.
+ *   building and response parsing instead of mocking the whole module; a model
+ *   benchmark passes its own so it sends exactly this job's schema and timeout.
  */
-async function callClaudePrune(
+export async function requestPruneCandidates(
   prompt: string,
   transport: LlmPromptTransport = runLlmPromptDirect
 ): Promise<string> {
@@ -497,7 +499,7 @@ async function prune(
 
     let response: string;
     try {
-      response = await callClaudePrune(prompt, transport);
+      response = await requestPruneCandidates(prompt, transport);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logError(`Batch ${i + 1} LLM call failed: ${message}`);

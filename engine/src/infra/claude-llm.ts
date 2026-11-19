@@ -471,12 +471,19 @@ async function runLlmPromptDirectUnbounded(
  * for parsing via parseExtractionResponse.
  *
  * @param prompt - Extraction prompt (from buildExtractionPrompt)
+ * @param transport - Injectable LLM boundary, as for classifyEdges; defaults
+ *   to the real direct endpoint. The request this job sends (JSON mode, answer
+ *   budget, timeout) stays here, so a test or a model benchmark that swaps the
+ *   transport still exercises exactly what production asks for.
  * @returns Raw LLM response text
  * @throws Error if the LLM binary not found, non-zero exit, timeout, empty
  * response, or the direct endpoint is saturated (subprocess fallback suppressed)
  */
-export async function extractMemories(prompt: string): Promise<string> {
-  const { text } = await runLlmPromptDirect(prompt, EXTRACTION_TIMEOUT_MS, {
+export async function extractMemories(
+  prompt: string,
+  transport: LlmPromptTransport = runLlmPromptDirect
+): Promise<string> {
+  const { text } = await transport(prompt, EXTRACTION_TIMEOUT_MS, {
     jsonMode: true,
     maxTokens: 8192,
   });

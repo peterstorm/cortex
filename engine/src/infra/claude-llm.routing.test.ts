@@ -14,6 +14,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { withBunWhichUnavailable } from './llm-test-helpers.js';
 import {
   classifyEdges,
+  extractMemories,
   resetConsecutiveDirectFailuresForTests,
   runLlmPromptDirect,
   type LlmPromptTransport,
@@ -253,5 +254,26 @@ describe('classifyEdges transport routing', () => {
       bunGlobal.spawn = originalSpawn;
       stderr.mockRestore();
     }
+  });
+});
+
+describe('extractMemories transport seam', () => {
+  it('sends the extraction request through an injected transport and returns its text', async () => {
+    // A test or a model benchmark swaps the transport; the request itself
+    // (JSON mode, answer budget, timeout) must still be extraction's own.
+    mockChatCompletionText.mockReset();
+    const seen: Array<{ prompt: string; timeoutMs: number; options: unknown }> = [];
+    const transport: LlmPromptTransport = async (prompt, timeoutMs, options) => {
+      seen.push({ prompt, timeoutMs, options });
+      return { text: '{"memories": [], "entities": []}', direct: true };
+    };
+
+    const text = await extractMemories('the prompt', transport);
+
+    expect(text).toBe('{"memories": [], "entities": []}');
+    expect(seen).toEqual([
+      { prompt: 'the prompt', timeoutMs: 90_000, options: { jsonMode: true, maxTokens: 8192 } },
+    ]);
+    expect(mockChatCompletionText).not.toHaveBeenCalled();
   });
 });
