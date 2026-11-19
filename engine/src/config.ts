@@ -374,7 +374,7 @@ export const AI_PRUNE_MIN_INTERVAL_HOURS = 6;
  * Semantic-edges failure backoff: an edge whose last classification attempt
  * FAILED is not re-asked within this window while its endpoint content is
  * unchanged. Without it, a saturated/unhealthy server gets the same failed
- * batches re-sent on every maintenance run. Content changes reset the
+ * batches re-sent on every `semantic-edges` run. Content changes reset the
  * backoff immediately (new information is worth one more try).
  */
 export const EDGE_FAILURE_BACKOFF_HOURS = 24;
@@ -466,8 +466,8 @@ export function consolidationThresholdFor(space: SimilaritySpace): number {
  * Max relates_to edges created per newly inserted memory during extraction.
  * Structural guard against edge explosion: even with calibrated bands, a new
  * memory in a dense project can clear the relate band against many existing
- * memories; only the strongest few edges carry signal (and every active edge
- * is fed to the semantic-edges LLM pass).
+ * memories; only the strongest few edges carry signal, and every edge counts
+ * toward the surface's in-degree centrality.
  */
 export const MAX_EDGES_PER_MEMORY = 3;
 

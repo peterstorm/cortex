@@ -42,14 +42,13 @@ A `SessionEnd` hook detaches a background worker (so nothing blocks the session)
 
 1. **Extract** — Stream the session transcript (JSONL), project it to what the model actually saw (dropping subagent `details`, tool-result siblings and snapshots — ~96% of bytes on subagent-heavy sessions) and read it in resumable 100KB chunks of that projection, add git context (branch, commits, changed files), and use the configured direct OpenAI-compatible endpoint with thinking disabled (under both known chat-template conventions — `thinking` and `enable_thinking` — since the served model family is not known in advance), falling back to a headless coding-agent CLI when no direct endpoint is available; each invocation is bounded to five chunks, and in Claude Code the rest waits for the next run on the same session (Pi's detached ingestion worker instead keeps extracting before backfill, with one budget per reason: up to 121 attempts, about ten minutes, while another extraction holds the lock, but only 3 while extraction keeps failing, and none for a provider refusal; whatever is left resumes from the chunk cursor next run); global-scoped candidates are routed to the global DB, while entity-only/global-only responses receive a project-local provenance memory so extracted facts are retained; once the transcript's end is reached, extract also runs a lifecycle pass
 2. **Backfill** — Compute embeddings for newly extracted memories (local static model, no API)
-3. **Semantic Edges** — Classify similarity-created `relates_to` edges into typed relationships
-4. **Lifecycle** — Decay confidence, archive stale memories, prune old ones
-5. **AI Prune** — When due, the LLM evaluates active memories and archives low-value ones
-6. **Generate** — Rebuild the surface file LAST, after all archival, so the next session never starts from a surface containing just-archived memories
+3. **Lifecycle** — Decay confidence, archive stale memories, prune old ones
+4. **AI Prune** — When due, the LLM evaluates active memories and archives low-value ones
+5. **Generate** — Rebuild the surface file LAST, after all archival, so the next session never starts from a surface containing just-archived memories
 
-Steps 3-6 run through one per-project-locked `maintenance` command. Simultaneous session shutdowns therefore cannot multiply expensive LLM workers, and a separate AI-prune lock protects manual invocations. Claude Code's detached hook worker writes PID-scoped extraction, backfill, and maintenance logs under `/tmp`.
+Steps 3-5 run through one per-project-locked `maintenance` command. Simultaneous session shutdowns therefore cannot multiply expensive LLM workers, and a separate AI-prune lock protects manual invocations. Claude Code's detached hook worker writes PID-scoped extraction, backfill, and maintenance logs under `/tmp`. Maintenance does not ask an LLM to type the similarity edges; `semantic-edges` is a manual command (see [Memory Graph](#memory-graph) for why).
 
-The Pi extension launches extract → backfill → maintenance as one detached `ingest-session` worker. Its `session_shutdown` handler returns immediately, so `/new` and `/q` do not wait for transcript ingestion. Ephemeral sessions — subagent spawns run `pi -p --no-session` — have no persisted transcript, so their shutdown spawns **nothing** (no extraction, no maintenance): nothing new entered the store, and running ai-prune/semantic-edges would only spend LLM budget competing with the live agents that spawned the session. The spawning session's own ingestion pipeline maintains the store, and manual `bun engine/src/cli.ts maintenance <cwd>` remains available for catch-up.
+The Pi extension launches extract → backfill → maintenance as one detached `ingest-session` worker. Its `session_shutdown` handler returns immediately, so `/new` and `/q` do not wait for transcript ingestion. Ephemeral sessions — subagent spawns run `pi -p --no-session` — have no persisted transcript, so their shutdown spawns **nothing** (no extraction, no maintenance): nothing new entered the store, and running ai-prune would only spend LLM budget competing with the live agents that spawned the session. The spawning session's own ingestion pipeline maintains the store, and manual `bun engine/src/cli.ts maintenance <cwd>` remains available for catch-up.
 
 Nested extraction LLMs inherit `CORTEX_EXTRACTING=1`; both Pi and Claude Code shutdown handlers treat that marker as a terminal no-op. This invariant prevents a headless extraction process from recursively spawning another maintenance pipeline. All hooks remain non-blocking and never fail the parent session.
 
@@ -222,7 +221,7 @@ A subdirectory database in a directory no session starts from again is not found
 
 | Service | Purpose | Required |
 |---|---|---|
-| OpenAI-compatible LLM endpoint | Preferred transport for memory extraction, AI pruning, and edge classification; configure `CORTEX_LLM_API_URL`, `CORTEX_LLM_API_KEY`, and `CORTEX_LLM_MODEL`, or a compatible Pi provider | No (falls back to a headless CLI) |
+| OpenAI-compatible LLM endpoint | Preferred transport for memory extraction, AI pruning, and the manual `semantic-edges` command; configure `CORTEX_LLM_API_URL`, `CORTEX_LLM_API_KEY`, and `CORTEX_LLM_MODEL`, or a compatible Pi provider | No (falls back to a headless CLI) |
 | Headless agent CLI (`claude -p --model haiku`, or `pi -p` under the Pi agent) | Fallback transport when no direct OpenAI-compatible endpoint is configured, or a single direct call fails | No (required only when the direct endpoint is unavailable; override with `CORTEX_LLM_BINARY`/`CORTEX_LLM_MODEL`. After 3 consecutive direct failures the fallback is suppressed — the server is saturated and escalation would only add load — and the work is deferred to the next run; tune with `CORTEX_LLM_MAX_DIRECT_FAILURES`. A provider refusal reported by the CLI — an HTTP 4xx other than 408, an unknown provider, a failed API key, a model the account may not use — ends the run's LLM work the same way, since the same request would be refused again) |
 | @huggingface/transformers (model2vec static model) | Local embedding (`minishlab/potion-retrieval-32M`, 512-dim, CPU-only) | Bundled |
 
@@ -318,9 +317,15 @@ Memories are connected through typed edges, forming a knowledge graph.
 | `supersedes` | Replaces or obsoletes | Directional |
 | `source_of` | Links prose description to code | Directional |
 
+### Where Types Come From
+
+Every edge starts as similarity-created `relates_to` (below). The other types are written by code that knows the relation for certain: `/consolidate` merges write `supersedes`, `/index-code` writes `source_of` (and `supersedes` when it re-indexes). An LLM can also type `relates_to` edges, but only when you run `bun engine/src/cli.ts semantic-edges <cwd>` yourself.
+
+That pass used to run in every session-end maintenance. It was taken out because it bought nothing. On 139,123 recorded pairs it typed 545 (0.4%); the rest stayed `relates_to` or were judged unrelated, which leaves the edge unchanged too. And only `traverse` reads the type: centrality counts every edge whatever its type, and prompt recall reads no edges. Its calls also used the same subscription quota whose limits were failing AI prune.
+
 ### Graph Uses
 
-- **Centrality** — Memories connected to many others rank higher in the surface
+- **Centrality** — Memories connected to many others rank higher in the surface (in-degree over all edges, any type)
 - **Search enrichment** — `/recall` follows edges (depth-2 BFS) to find related memories
 - **Code discovery** — `source_of` edges link prose descriptions to raw code blocks
 
@@ -489,7 +494,7 @@ The report has one table per split over the cases both runs scored, with the cha
 | `CORTEX_EVAL_JUDGE_API_URL` / `_API_KEY` / `_MODEL` | Endpoint for the `/eval` judge | No (all three or none; default: cortex's direct endpoint) |
 | `CLAUDE_PLUGIN_ROOT` | Plugin directory | Auto-set by Claude Code |
 
-Extraction, AI pruning, and edge classification prefer a **direct OpenAI-compatible endpoint** when one is configured: `CORTEX_LLM_API_URL`, `CORTEX_LLM_API_KEY`, and `CORTEX_LLM_MODEL` (or the pi provider config in `~/.pi/agent/models.json` — the active provider's `baseUrl`/`apiKey`/first model). Calls disable model thinking and use schema-guided JSON output where supported. Without a configured endpoint they fall back to a headless coding-agent CLI: `claude -p --model haiku` by default, or `pi -p --thinking off` when running under the pi agent. Under pi the provider's inexpensive model is used where one is known (a `github-copilot` session extracts with `claude-haiku-5.5`, not the session's own model), and a Claude 5.5 model gets `--thinking low` instead of `off`, because it refuses `thinking: disabled` with a 400. When the CLI reports that the provider refused the request (an HTTP 4xx other than 408, an unknown provider, a failed API key, a model the account may not use), the batch loops stop asking for the rest of the run: the same request would be refused again, and each retry spends quota. A single direct-call failure still falls back, but once failures reach the saturation threshold (default 3, `CORTEX_LLM_MAX_DIRECT_FAILURES`) the fallback is suppressed and the call throws: a saturated local server (empty content, timeouts) would only get worse from full agent-loop subprocesses, so the caller defers the work (unmarked edges, un-advanced checkpoints) and retries on the next run. All LLM calls also draw from a per-process concurrency pool (default 2, `CORTEX_LLM_MAX_CONCURRENCY`), so background work cannot flood a shared server — even when the server merely queues rather than errors. The decision whether a model needs an effort bound comes from the model the endpoint reports serving (`/models`, cached for a minute), not from the configured name: local routing servers answer with whatever weights are loaded, so a session pinned to one model can be served another.
+Extraction, AI pruning, and `semantic-edges` prefer a **direct OpenAI-compatible endpoint** when one is configured: `CORTEX_LLM_API_URL`, `CORTEX_LLM_API_KEY`, and `CORTEX_LLM_MODEL` (or the pi provider config in `~/.pi/agent/models.json` — the active provider's `baseUrl`/`apiKey`/first model). Calls disable model thinking and use schema-guided JSON output where supported. Without a configured endpoint they fall back to a headless coding-agent CLI: `claude -p --model haiku` by default, or `pi -p --thinking off` when running under the pi agent. Under pi the provider's inexpensive model is used where one is known (a `github-copilot` session extracts with `claude-haiku-5.5`, not the session's own model), and a Claude 5.5 model gets `--thinking low` instead of `off`, because it refuses `thinking: disabled` with a 400. When the CLI reports that the provider refused the request (an HTTP 4xx other than 408, an unknown provider, a failed API key, a model the account may not use), the batch loops stop asking for the rest of the run: the same request would be refused again, and each retry spends quota. A single direct-call failure still falls back, but once failures reach the saturation threshold (default 3, `CORTEX_LLM_MAX_DIRECT_FAILURES`) the fallback is suppressed and the call throws: a saturated local server (empty content, timeouts) would only get worse from full agent-loop subprocesses, so the caller defers the work (unmarked edges, un-advanced checkpoints) and retries on the next run. All LLM calls also draw from a per-process concurrency pool (default 2, `CORTEX_LLM_MAX_CONCURRENCY`), so background work cannot flood a shared server — even when the server merely queues rather than errors. The decision whether a model needs an effort bound comes from the model the endpoint reports serving (`/models`, cached for a minute), not from the configured name: local routing servers answer with whatever weights are loaded, so a session pinned to one model can be served another.
 
 ### Key Constants
 
@@ -575,10 +580,10 @@ bun engine/src/cli.ts load-surface <cwd>
 bun engine/src/cli.ts backfill <cwd>
 bun engine/src/cli.ts lifecycle <cwd> --if-needed
 bun engine/src/cli.ts ai-prune <cwd> --if-needed
-bun engine/src/cli.ts semantic-edges <cwd>
 bun engine/src/cli.ts maintenance <cwd>
 
 # Manual commands
+bun engine/src/cli.ts semantic-edges <cwd>   # LLM edge typing; maintenance never runs it
 bun engine/src/cli.ts remember <cwd> "content" --type=pattern
 bun engine/src/cli.ts recall <cwd> "query"
 bun engine/src/cli.ts forget <cwd> "id-or-query"

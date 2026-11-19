@@ -184,8 +184,9 @@ const BUSY_TIMEOUT_MS = 5000;
  *   touch (and potentially corrupt) a newer database
  */
 function initializeSchema(db: Database): void {
-  // WAL allows only one writer; the SessionEnd pipeline spawns detached
-  // workers (semantic-edges, lifecycle, ai-prune) that can collide. Without
+  // WAL allows only one writer; every session end starts a detached worker
+  // (extract, backfill, maintenance), and workers from parallel sessions and
+  // manual commands write the same file, so they can collide. Without
   // a busy timeout a collision throws SQLITE_BUSY immediately. Pi records
   // detached output in .memory/logs/pi-detached.log (or inherits output if
   // log setup fails), but the write still needs a bounded retry window.
@@ -246,7 +247,7 @@ function migrateArchivedAt(db: Database): void {
  * edges.last_failed_at for existing databases. classified_at + classify_hash
  * record when an edge was last answered by the semantic-edges LLM pass (and
  * the endpoint content hash at that time) so declined/typed edges are not
- * re-classified on every maintenance run. last_failed_at records the last
+ * re-classified on every `semantic-edges` run. last_failed_at records the last
  * FAILED attempt so a same-content failure is not re-asked within the backoff
  * window (an unhealthy server is not re-hammered every run).
  */

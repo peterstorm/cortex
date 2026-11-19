@@ -211,7 +211,7 @@ describe('Cortex Pi extension shutdown', () => {
 
       // Ephemeral sessions (subagent spawns use --no-session) never run
       // extraction, so nothing new entered the store. Maintenance would only
-      // burn LLM budget (ai-prune, semantic-edges) competing with the live
+      // burn LLM budget (ai-prune) competing with the live
       // agents that spawned the session, and the spawning session's own
       // ingest-session pipeline already maintains the store.
       expect(cli.detached).toHaveLength(0);

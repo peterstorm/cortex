@@ -25,8 +25,8 @@
  * - backfill: Process embedding queue
  * - prompt-recall: Semantic-first recall from user prompt, strict keyword AND supplement (UserPromptSubmit hook)
  * - ai-prune: AI-powered memory pruning
- * - maintenance: Combined lifecycle + ai-prune + semantic-edges maintenance
- * - semantic-edges: Typed-edge classification
+ * - maintenance: Combined lifecycle + ai-prune + surface maintenance
+ * - semantic-edges: Typed-edge classification by LLM, on demand only
  * - load-surface: Surface load cache
  * - entity-query: Entity/fact graph queries
  * - eval: Score agent answers from memory against an eval set
@@ -890,6 +890,7 @@ async function handleBackfill(args: string[]): Promise<CommandResult> {
  * Handle 'semantic-edges' subcommand
  * Classify relates_to edges with typed relationships via the configured LLM
  * (direct OpenAI-compatible endpoint first, CLI subprocess as fallback).
+ * Run on demand only; maintenance does not call it (see handleMaintenance).
  */
 async function handleSemanticEdges(args: string[]): Promise<CommandResult> {
   if (args.length < 1) {
@@ -1172,8 +1173,11 @@ async function handleMaintenance(args: string[]): Promise<CommandResult> {
   }
 
   try {
+    // No typed-edge classification here: on 139,123 recorded pairs the LLM
+    // left 99.6% as plain relates_to, and only `traverse` reads the type, so
+    // it spent subscription quota for nothing the surface or recall uses.
+    // `semantic-edges` stays available as an explicit command.
     const steps: readonly (() => Promise<CommandResult>)[] = [
-      () => handleSemanticEdges([cwd]),
       () => handleLifecycle([cwd, '--if-needed']),
       () => handleAiPrune([cwd, '--if-needed']),
       () => handleGenerate([cwd]),
