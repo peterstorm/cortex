@@ -12,7 +12,7 @@ import * as nodePath from 'node:path';
 import type { Memory } from '../core/types.js';
 import { createMemory } from '../core/types.js';
 import { openDatabase, insertMemory, getMemory } from '../infra/db.js';
-import { AI_PRUNE_MIN_AGE_DAYS } from '../config.js';
+import { AI_PRUNE_MIN_AGE_DAYS, AI_PRUNE_TIMEOUT_MS } from '../config.js';
 import type { LlmPromptTransport } from '../infra/claude-llm.js';
 import { LlmEndpointSaturatedError, LlmProviderRefusedError } from '../infra/llm-failure.js';
 import { withBunWhichUnavailable } from '../infra/llm-test-helpers.js';
@@ -45,6 +45,7 @@ import {
   isTooYoungToArchive,
   shouldRunAiPrune,
   parsePruneResponse,
+  requestPruneCandidates,
 } from './ai-prune.js';
 import type { AiPruneResult } from './ai-prune.js';
 
@@ -363,6 +364,40 @@ describe('parsePruneResponse / shouldRunAiPrune (sanity)', () => {
     expect(parsePruneResponse('{"candidates":[{"id":"abc"}]}').kind).toBe('unparseable');
   });
 
+});
+
+describe('requestPruneCandidates (transport seam)', () => {
+  it('sends one batch prompt with the prune timeout and the strict candidates schema', async () => {
+    // A model benchmark drives this with its own transport: what reaches the
+    // transport must be exactly the production request.
+    const seen: Array<{ prompt: string; timeoutMs: number; options: unknown }> = [];
+    const recording: LlmPromptTransport = async (prompt, timeoutMs, options) => {
+      seen.push({ prompt, timeoutMs, options });
+      return { text: '{"candidates":[]}', direct: true };
+    };
+
+    const text = await requestPruneCandidates('batch prompt', recording);
+
+    expect(text).toBe('{"candidates":[]}');
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({
+      prompt: 'batch prompt',
+      timeoutMs: AI_PRUNE_TIMEOUT_MS,
+      options: {
+        jsonSchema: {
+          type: 'object',
+          required: ['candidates'],
+          additionalProperties: false,
+          properties: {
+            candidates: {
+              type: 'array',
+              items: { required: ['id', 'reason'], additionalProperties: false },
+            },
+          },
+        },
+      },
+    });
+  });
 });
 
 describe('shouldRunAiPrune (watermark trigger)', () => {
