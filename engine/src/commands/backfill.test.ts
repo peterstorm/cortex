@@ -126,8 +126,9 @@ embedLocalSpy
       expect(embedLocalSpy).toHaveBeenCalledWith(
         '[decision] [project:test-project] Chose microservices'
       );
+      // A global memory embeds as global whatever project backfill runs for.
       expect(embedLocalSpy).toHaveBeenCalledWith(
-        '[pattern] [project:test-project] Use Either type'
+        '[pattern] [project:global] Use Either type'
       );
     });
 

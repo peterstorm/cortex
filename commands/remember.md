@@ -38,7 +38,7 @@ bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts generate <cwd>
 - `--scope=SCOPE` - 'project' or 'global' (default: project)
 - `--pinned` - Pin memory (prevents decay/archival)
 - `--tags=tag1,tag2` - Comma-separated tags
-- `--replaces=TAG` - This memory is the new version of whatever is stored under `TAG`. Every other active memory carrying `TAG` in the same database (project or global, following `--scope`) is marked superseded — pinned ones too — with a `supersedes` edge from the new memory. `TAG` is added to this memory's tags, so the next version finds it. The near-duplicate check is skipped (the old version is a near-duplicate by design). `TAG` must be non-empty with no commas or whitespace
+- `--replaces=TAG` - This memory is the new version of whatever is stored under `TAG`. Every other active memory carrying `TAG` in the same database (project or global, following `--scope`) is marked superseded — pinned ones too — with a `supersedes` edge from the new memory. `TAG` is added to this memory's tags, so the next version finds it. If any replaced version was pinned this one is pinned too, at the highest priority among them. The near-duplicate check is skipped (the old version is a near-duplicate by design). `TAG` must be non-empty with no commas or whitespace
 
 A memory that restates a stored one is refused as a near-duplicate. To update a fact on purpose, use `--replaces` rather than rewording until it gets through.
 

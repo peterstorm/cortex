@@ -896,7 +896,7 @@ describe("buildEmbeddingText", () => {
       content: "Full content",
       summary: "Test summary",
       memory_type: "pattern",
-      scope: "global",
+      scope: "project",
       confidence: 0.9,
       priority: 8,
       tags: [],
@@ -905,6 +905,21 @@ describe("buildEmbeddingText", () => {
     const result = buildEmbeddingText(memory, "my-app");
 
     expect(result).toContain("[project:my-app]");
+  });
+
+  it("embeds a global memory as global, whichever project the call runs in", () => {
+    const memory: MemoryCandidate = {
+      content: "Full content",
+      summary: "Test summary",
+      memory_type: "pattern",
+      scope: "global",
+      confidence: 0.9,
+      priority: 8,
+      tags: [],
+    };
+
+    expect(buildEmbeddingText(memory, "my-app")).toBe("[pattern] [project:global] Test summary");
+    expect(buildEmbeddingText(memory, "other-app")).toBe(buildEmbeddingText(memory, "my-app"));
   });
 
   it("formats all memory types correctly", () => {
@@ -975,12 +990,27 @@ describe("buildEmbeddingText", () => {
       );
     });
 
-    it("always includes project name", () => {
+    it("a project memory carries its project name", () => {
       fc.assert(
         fc.property(memoryArb, fc.string({ minLength: 1 }), (memory, project) => {
-          const result = buildEmbeddingText(memory, project);
+          const result = buildEmbeddingText({ ...memory, scope: "project" }, project);
           expect(result).toContain(`[project:${project}]`);
         })
+      );
+    });
+
+    it("a global memory's text does not depend on the project the call runs in", () => {
+      fc.assert(
+        fc.property(
+          memoryArb,
+          fc.string({ minLength: 1 }),
+          fc.string({ minLength: 1 }),
+          (memory, projectA, projectB) => {
+            const global = { ...memory, scope: "global" as const };
+            expect(buildEmbeddingText(global, projectA)).toBe(buildEmbeddingText(global, projectB));
+            expect(buildEmbeddingText(global, projectA)).toContain("[project:global]");
+          }
+        )
       );
     });
 
@@ -997,7 +1027,8 @@ describe("buildEmbeddingText", () => {
       fc.assert(
         fc.property(memoryArb, fc.string({ minLength: 1 }), (memory, project) => {
           const result = buildEmbeddingText(memory, project);
-          const expected = `[${memory.memory_type}] [project:${project}] ${memory.summary}`;
+          const prefix = memory.scope === "global" ? "global" : project;
+          const expected = `[${memory.memory_type}] [project:${prefix}] ${memory.summary}`;
           expect(result).toBe(expected);
         })
       );

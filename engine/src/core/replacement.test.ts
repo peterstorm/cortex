@@ -1,9 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import * as fc from 'fast-check';
-import { parseReplacementTag, replacedBy, type ReplacementTag } from './replacement.js';
+import { carryForward, parseReplacementTag, replacedBy, type ReplacementTag } from './replacement.js';
 import { createMemory, type Memory, type MemoryStatus } from './types.js';
 
-const tagged = (id: string, tags: readonly string[], extra: { pinned?: boolean; status?: MemoryStatus } = {}): Memory =>
+const tagged = (
+  id: string,
+  tags: readonly string[],
+  extra: { pinned?: boolean; priority?: number; status?: MemoryStatus } = {}
+): Memory =>
   createMemory({
     id,
     content: id,
@@ -58,5 +62,34 @@ describe('replacedBy', () => {
   it('matches the tag exactly, not as a substring or case-insensitively', () => {
     const memories = [tagged('a', ['deploy-old']), tagged('b', ['Deploy'])];
     expect(replacedBy('new', tag('deploy'), memories)).toEqual([]);
+  });
+});
+
+describe('carryForward', () => {
+  it('moves the pin and the highest priority to the replacement', () => {
+    const current = carryForward(tagged('new', ['deploy']), [
+      tagged('old', ['deploy'], { pinned: true, priority: 9 }),
+      tagged('older', ['deploy'], { priority: 2 }),
+    ]);
+    expect(current).toMatchObject({ id: 'new', pinned: true, priority: 9 });
+  });
+
+  it('replacing nothing leaves the memory as it was', () => {
+    const memory = tagged('new', ['deploy'], { priority: 4 });
+    expect(carryForward(memory, [])).toEqual(memory);
+  });
+
+  it('property: pinned iff any of them was, priority is the maximum, every other field unchanged', () => {
+    const arb = fc.record({ pinned: fc.boolean(), priority: fc.integer({ min: 1, max: 10 }) });
+    fc.assert(
+      fc.property(arb, fc.array(arb, { maxLength: 5 }), (head, olds) => {
+        const memory = tagged('new', ['deploy'], head);
+        const replaced = olds.map((extra, i) => tagged(`old-${i}`, ['deploy'], extra));
+        const current = carryForward(memory, replaced);
+        expect(current.pinned).toBe([head, ...olds].some((m) => m.pinned));
+        expect(current.priority).toBe(Math.max(...[head, ...olds].map((m) => m.priority)));
+        expect({ ...current, pinned: memory.pinned, priority: memory.priority }).toEqual(memory);
+      })
+    );
   });
 });

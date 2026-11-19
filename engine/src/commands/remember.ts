@@ -20,7 +20,7 @@ import { createMemory, isMemoryType, serializeSourceContext } from '../core/type
 import { insertMemory, routeToDatabase, getActiveMemories, supersedeMemory } from '../infra/db.js';
 import { tokenize } from '../core/similarity.js';
 import { compareForDedup, duplicateFloor, type DedupPolicy } from '../core/calibration.js';
-import { parseReplacementTag, replacedBy, type ReplacementTag } from '../core/replacement.js';
+import { carryForward, parseReplacementTag, replacedBy, type ReplacementTag } from '../core/replacement.js';
 import { buildEmbeddingText } from '../core/extraction.js';
 import { ACTIVE_DEDUP_POLICY } from '../config.js';
 import { invalidateSurfaceCache } from './generate.js';
@@ -298,7 +298,11 @@ export function formatErrorResult(error: string): RememberError {
 export interface RememberOptions {
   /** Embedding function for cosine dedup (injected by shell; null = Jaccard-only) */
   readonly embedFn?: EmbedFn | null;
-  /** Project name for the embedding metadata prefix (must match backfill's) */
+  /**
+   * Project name for a project-scoped memory's embedding prefix; a global
+   * memory embeds as `global` whatever this is (buildEmbeddingText), so the
+   * candidate's vector matches the one backfill stores for it
+   */
   readonly projectName?: string;
   /** Project root; when provided, the surface cache is invalidated after insert */
   readonly projectRoot?: string;
@@ -365,15 +369,22 @@ export async function executeRemember(
   }
 
   // Insert, and supersede what it replaces, in one transaction: a crash
-  // between the two would leave two current versions of one fact (I/O).
-  let superseded: readonly string[];
+  // between the two would leave two current versions of one fact (I/O). The
+  // replaced set is read inside the transaction, before the insert, so the
+  // written memory can carry their pin and priority forward.
+  let written: Readonly<{ memory: Memory; superseded: readonly string[] }>;
   try {
-    superseded = targetDb.transaction((): readonly string[] => {
-      insertMemory(targetDb, memory);
-      if (args.replaces === null) return [];
-      const replaced = replacedBy(memory.id, args.replaces, getActiveMemories(targetDb));
-      for (const old of replaced) supersedeMemory(targetDb, old.id, memory.id);
-      return replaced.map((old) => old.id);
+    written = targetDb.transaction(() => {
+      const replacesTag = args.replaces;
+      if (replacesTag === null) {
+        insertMemory(targetDb, memory);
+        return { memory, superseded: [] };
+      }
+      const replaced = replacedBy(memory.id, replacesTag, getActiveMemories(targetDb));
+      const current = carryForward(memory, replaced);
+      insertMemory(targetDb, current);
+      for (const old of replaced) supersedeMemory(targetDb, old.id, current.id);
+      return { memory: current, superseded: replaced.map((old) => old.id) };
     })();
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -391,7 +402,7 @@ export async function executeRemember(
   // the memory stays queued and the next backfill catches up.
   if (options.flushEmbedding !== undefined) {
     try {
-      await options.flushEmbedding(targetDb, memory);
+      await options.flushEmbedding(targetDb, written.memory);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       process.stderr.write(
@@ -401,7 +412,7 @@ export async function executeRemember(
   }
 
   // Format success result (pure)
-  return formatSuccessResult(memory, superseded);
+  return formatSuccessResult(written.memory, written.superseded);
 }
 
 type DuplicateCheck =

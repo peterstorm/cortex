@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import * as fc from 'fast-check';
-import { distinctFacts, planRestatements, type Restatement } from './restatement.js';
+import { absorb, distinctFacts, isMergeProduct, planRestatements, type Restatement } from './restatement.js';
 import { cosineSimilarity } from './similarity.js';
+import { MERGED_CONTENT_SEPARATOR } from './extraction.js';
 import { createMemory, MEMORY_TYPES, type Memory, type MemoryType } from './types.js';
 
 /** A unit vector at `degrees` in the first plane: cos(a°, b°) = cos(a - b). */
@@ -16,12 +17,20 @@ type Spec = Readonly<{
   type?: MemoryType;
   createdAt?: string;
   pinned?: boolean;
+  merged?: boolean;
 }>;
 
-const memory = ({ id, vector = null, type = 'decision', createdAt = '2026-01-01T00:00:00.000Z', pinned = false }: Spec): Memory =>
+const memory = ({
+  id,
+  vector = null,
+  type = 'decision',
+  createdAt = '2026-01-01T00:00:00.000Z',
+  pinned = false,
+  merged = false,
+}: Spec): Memory =>
   createMemory({
     id,
-    content: `content of ${id}`,
+    content: merged ? `content of ${id}${MERGED_CONTENT_SEPARATOR}merged detail` : `content of ${id}`,
     summary: `summary of ${id}`,
     memory_type: type,
     scope: 'project',
@@ -159,6 +168,15 @@ describe('planRestatements', () => {
     expect(plan(memories).map((r) => [r.kept, r.superseded])).toEqual([['pinned', 'oldest']]);
   });
 
+  it('never supersedes a merge product, but a merge product may supersede an older copy', () => {
+    const memories = [
+      memory({ id: 'oldest', vector: at(0), createdAt: day(0) }),
+      memory({ id: 'merged', vector: at(1), createdAt: day(1), merged: true }),
+      memory({ id: 'newest', vector: at(2), createdAt: day(2) }),
+    ];
+    expect(plan(memories).map((r) => [r.kept, r.superseded])).toEqual([['merged', 'oldest']]);
+  });
+
   it('ignores code memories, other types and memories without a current-model vector', () => {
     const memories = [
       memory({ id: 'code-old', vector: at(0), type: 'code', createdAt: day(0) }),
@@ -184,13 +202,21 @@ describe('planRestatements', () => {
         day: fc.integer({ min: 0, max: 5 }),
         type: fc.constantFrom<MemoryType>(...MEMORY_TYPES),
         pinned: fc.boolean(),
+        merged: fc.boolean(),
         embedded: fc.boolean(),
       }),
       { maxLength: 30 }
     )
     .map((specs) =>
       specs.map((s, i) =>
-        memory({ id: `m${String(i).padStart(2, '0')}`, vector: s.embedded ? at(s.degrees) : null, type: s.type, createdAt: day(s.day), pinned: s.pinned })
+        memory({
+          id: `m${String(i).padStart(2, '0')}`,
+          vector: s.embedded ? at(s.degrees) : null,
+          type: s.type,
+          createdAt: day(s.day),
+          pinned: s.pinned,
+          merged: s.merged,
+        })
       )
     );
   const thresholdArb = fc.double({ min: 0.8, max: 0.99, noNaN: true });
@@ -200,7 +226,7 @@ describe('planRestatements', () => {
     return memories.filter((m) => !gone.has(m.id));
   };
 
-  it('property: every pair is same-type, newer-kept, at or above the threshold, and never touches pinned/code', () => {
+  it('property: every pair is same-type, newer-kept, at or above the threshold, and never retires pinned/merged/code', () => {
     fc.assert(
       fc.property(corpusArb, thresholdArb, (memories, threshold) => {
         const byId = new Map(memories.map((m) => [m.id, m]));
@@ -211,6 +237,7 @@ describe('planRestatements', () => {
           expect(kept.memory_type).toBe(old.memory_type);
           expect(old.memory_type).not.toBe('code');
           expect(old.pinned).toBe(false);
+          expect(isMergeProduct(old)).toBe(false);
           expect(old.created_at <= kept.created_at).toBe(true);
           expect(r.similarity).toBeGreaterThanOrEqual(threshold);
         }
@@ -242,6 +269,46 @@ describe('planRestatements', () => {
     fc.assert(
       fc.property(corpusArb, thresholdArb, (memories, threshold) => {
         expect(planRestatements([...memories].reverse(), threshold)).toEqual(planRestatements(memories, threshold));
+      })
+    );
+  });
+});
+
+describe('isMergeProduct', () => {
+  it('is true exactly when an extraction merge appended content', () => {
+    expect(isMergeProduct({ content: `rule A${MERGED_CONTENT_SEPARATOR}rule B` })).toBe(true);
+    expect(isMergeProduct({ content: 'rule A --- not a merge' })).toBe(false);
+  });
+});
+
+describe('absorb', () => {
+  const tagsArb = fc.array(fc.constantFrom('a', 'b', 'c', 'd', 'e'), { maxLength: 6 });
+  const sideArb = fc.record({ tags: tagsArb, priority: fc.integer({ min: 1, max: 10 }) });
+
+  it("keeps the kept memory's tags first, adds the copy's missing ones in order, and takes the higher priority", () => {
+    expect(absorb({ tags: ['deploy', 'ops'], priority: 4 }, { tags: ['ops', 'release', 'release'], priority: 8 })).toEqual({
+      tags: ['deploy', 'ops', 'release'],
+      priority: 8,
+    });
+  });
+
+  it('property: the result starts with the kept tags, holds every tag of both, adds no repeat, priority is the max', () => {
+    fc.assert(
+      fc.property(sideArb, sideArb, (kept, copy) => {
+        const { tags, priority } = absorb(kept, copy);
+        expect(tags.slice(0, kept.tags.length)).toEqual(kept.tags);
+        expect(new Set(tags)).toEqual(new Set([...kept.tags, ...copy.tags]));
+        expect(tags.slice(kept.tags.length)).toEqual([...new Set(copy.tags.filter((t) => !kept.tags.includes(t)))]);
+        expect(priority).toBe(Math.max(kept.priority, copy.priority));
+      })
+    );
+  });
+
+  it('property: idempotent — absorbing the same copy twice equals absorbing it once', () => {
+    fc.assert(
+      fc.property(sideArb, sideArb, (kept, copy) => {
+        const once = absorb(kept, copy);
+        expect(absorb(once, copy)).toEqual(once);
       })
     );
   });

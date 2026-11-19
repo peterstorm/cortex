@@ -15,7 +15,13 @@ const DEPLOY_STEPS = 'Deploy by running the release script, then tagging the com
 const seedTagged = (
   db: Database,
   id: string,
-  extra: Readonly<{ tags?: readonly string[]; pinned?: boolean; status?: MemoryStatus; scope?: MemoryScope }> = {}
+  extra: Readonly<{
+    tags?: readonly string[];
+    pinned?: boolean;
+    priority?: number;
+    status?: MemoryStatus;
+    scope?: MemoryScope;
+  }> = {}
 ): void => {
   insertMemory(
     db,
@@ -26,7 +32,7 @@ const seedTagged = (
       memory_type: 'decision',
       scope: extra.scope ?? 'project',
       confidence: 1,
-      priority: 5,
+      priority: extra.priority ?? 5,
       pinned: extra.pinned ?? false,
       source_type: 'manual',
       source_session: 'older',
@@ -111,6 +117,27 @@ describe('executeRemember --replaces', () => {
     expect(supersedes.map((e) => [e.source_id, e.target_id]).sort()).toEqual(
       [[result.memory_id, 'v1'], [result.memory_id, 'v1-pinned']].sort()
     );
+  });
+
+  it('carries the pin and the highest priority forward to the replacement', async () => {
+    seedTagged(projectDb, 'v1-pinned', { pinned: true, priority: 9 });
+    seedTagged(projectDb, 'v1-plain', { priority: 3 });
+
+    const result = succeeded(await executeRemember(['deploy v2', '--replaces=deploy'], 's', projectDb, globalDb));
+
+    const created = getMemory(projectDb, result.memory_id);
+    expect(created).toMatchObject({ pinned: true, priority: 9, status: 'active' });
+    expect(result.message).toContain('priority 9, pinned');
+  });
+
+  it('leaves an unpinned replacement unpinned at its own priority when nothing it replaces outranks it', async () => {
+    seedTagged(projectDb, 'v1', { priority: 3 });
+
+    const result = succeeded(
+      await executeRemember(['deploy v2', '--replaces=deploy', '--priority=6'], 's', projectDb, globalDb)
+    );
+
+    expect(getMemory(projectDb, result.memory_id)).toMatchObject({ pinned: false, priority: 6 });
   });
 
   it('replaces in the global database when the new memory is global', async () => {

@@ -9,6 +9,7 @@
 
 import type { Memory } from './types.js';
 import { cosineSimilarity } from './similarity.js';
+import { MERGED_CONTENT_SEPARATOR } from './extraction.js';
 
 /**
  * Cosine of two memories of the same type, or null when they cannot be
@@ -93,9 +94,9 @@ type Leader = Readonly<{ id: string; vector: Float32Array }>;
  * close to a superseded one but not to its leader stays.
  *
  * Never superseded: pinned memories (pinning protects the memory itself, so a
- * pinned memory is a leader and may supersede an older unpinned copy), `code`
- * memories, and memories without a current-model embedding (neither leaders
- * nor superseded).
+ * pinned memory is a leader and may supersede an older unpinned copy), merge
+ * products (likewise leaders, see isMergeProduct), `code` memories, and
+ * memories without a current-model embedding (neither leaders nor superseded).
  *
  * @param memories - The active memories of ONE database.
  * @returns The plan, newest restatement first. Applying it and planning again
@@ -105,6 +106,7 @@ export function planRestatements(
   memories: readonly Memory[],
   threshold: number
 ): readonly Restatement[] {
+  const retirable = (memory: Memory): boolean => !memory.pinned && !isMergeProduct(memory);
   const comparable = memories
     .flatMap((memory) =>
       memory.memory_type !== 'code' && memory.local_embedding !== null
@@ -121,7 +123,7 @@ export function planRestatements(
     const leaders = leadersByType.get(memory.memory_type) ?? [];
 
     let best: Readonly<{ leader: Leader; similarity: number }> | null = null;
-    if (!memory.pinned) {
+    if (retirable(memory)) {
       for (const leader of leaders) {
         if (leader.vector.length !== vector.length) continue;
         const similarity = dot(vector, leader.vector);
@@ -140,4 +142,41 @@ export function planRestatements(
   }
 
   return plan;
+}
+
+/**
+ * Whether an extraction merge appended content to this memory.
+ *
+ * Restatement is judged on the summary vector, and a merge appends content
+ * without touching the summary. A newer memory restating the summary may lack
+ * everything the merges added, so retiring the merged one would drop that
+ * content from the active set. It may still lead: a copy it absorbs loses
+ * nothing it holds.
+ */
+export function isMergeProduct(memory: Pick<Memory, 'content'>): boolean {
+  return memory.content.includes(MERGED_CONTENT_SEPARATOR);
+}
+
+/** What the kept memory takes over from a copy it supersedes. */
+export type Absorbed = Readonly<{ tags: readonly string[]; priority: number }>;
+
+/**
+ * The kept memory's tags and priority after it supersedes `superseded`: its
+ * own tags first, then the copy's tags it lacked, in order and without
+ * repeats; the higher of the two priorities.
+ *
+ * Superseding retires the copy, and with it whatever it carried that the kept
+ * memory does not. A tag is how `remember --replaces=<tag>` finds the current
+ * version of a fact, so a copy's tag lost here would leave the next
+ * replacement superseding nothing while the old version stayed active.
+ * Idempotent: absorbing the same copy twice changes nothing the second time.
+ */
+export function absorb(
+  kept: Pick<Memory, 'tags' | 'priority'>,
+  superseded: Pick<Memory, 'tags' | 'priority'>
+): Absorbed {
+  return {
+    tags: [...kept.tags, ...superseded.tags.filter((tag, i, all) => !kept.tags.includes(tag) && all.indexOf(tag) === i)],
+    priority: Math.max(kept.priority, superseded.priority),
+  };
 }

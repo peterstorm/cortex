@@ -113,7 +113,7 @@ Options:
 - `--scope`: `project` or `global` (default project)
 - `--pinned`: Exempt from decay
 - `--tags`: Comma-separated keywords
-- `--replaces=<tag>`: This memory is the new version of whatever is stored under `<tag>`: every other active memory carrying the tag in the same database (project or global, per `--scope`) is superseded — pinned ones included — and the tag is added to this memory, so the next version finds it. The duplicate check is skipped, since the old version is by design a near-duplicate. The tag must be non-empty with no commas or whitespace.
+- `--replaces=<tag>`: This memory is the new version of whatever is stored under `<tag>`: every other active memory carrying the tag in the same database (project or global, per `--scope`) is superseded — pinned ones included — and the tag is added to this memory, so the next version finds it. The new version is pinned when any version it replaces was, and takes the highest priority among them, so replacing a fact never quietly unpins or demotes it. The duplicate check is skipped, since the old version is by design a near-duplicate. The tag must be non-empty with no commas or whitespace.
 
 ```
 /remember "Deploy: run release.sh, then tag the commit" --type=decision --replaces=deploy-procedure
@@ -373,7 +373,7 @@ The potion numbers come from 9,260 real memories, with pairs hand-graded per ban
 
 ### Restatement Cleanup (`dedupe`)
 
-`bun engine/src/cli.ts dedupe <cwd> [--dry-run]` finds memories that restate a newer one and supersedes the older copy, per database (project and global, one transaction each). Within each memory type, memories are taken newest first; each joins the most similar newer leader at or above the restatement cosine, or becomes a leader itself — no chaining, so A ≈ B ≈ C never retires A for C. Pinned memories may lead but are never superseded; `code` memories and memories without a current-model vector are left out. Superseding writes a `supersedes` edge kept → older and re-points the older memory's edges and facts to the kept one. A second run finds nothing. It runs in every `maintenance` pass (after lifecycle, before AI prune) and needs no LLM and no model load; with an uncalibrated model it reports itself disabled.
+`bun engine/src/cli.ts dedupe <cwd> [--dry-run]` finds memories that restate a newer one and supersedes the older copy, per database (project and global, one transaction each). Within each memory type, memories are taken newest first; each joins the most similar newer leader at or above the restatement cosine, or becomes a leader itself — no chaining, so A ≈ B ≈ C never retires A for C. Pinned memories and merge products (memories an extraction merge appended content to, which a newer copy of the summary may lack) may lead but are never superseded; `code` memories and memories without a current-model vector are left out. Superseding writes a `supersedes` edge kept → older, re-points the older memory's edges and facts to the kept one, and hands the kept memory the copy's tags (appended after its own, without repeats) and the higher of the two priorities — a lost tag would leave a later `/remember --replaces=<tag>` with nothing to supersede. A second run finds nothing. It runs in every `maintenance` pass (after lifecycle, before AI prune) and needs no LLM and no model load; with an uncalibrated model it reports itself disabled.
 
 ### Distinct Recall
 
@@ -407,7 +407,7 @@ Memories are inserted **without** embeddings to avoid blocking extraction. A bac
 |---|---|---|---|
 | potion-retrieval-32M (local, static) | 512 (Float32) | `local_embedding` | Always — runs on CPU in-process, no API key |
 
-Embedding text format: `[memory_type] [project:name] summary` — enables type-aware and project-aware similarity.
+Embedding text format: `[memory_type] [project:name] summary` — enables type-aware and project-aware similarity. `name` is the project's name for a project-scoped memory and `global` for a global-scoped one, so a memory's vector depends only on the memory: a global fact embeds the same whether extraction, `/remember` or backfill wrote it, and from whichever project. (Before, a global memory took the name of the project that embedded it, and the same summary restated from two projects scored only 0.82–0.93 — under the 0.92 duplicate floor.)
 
 `code` type memories are never embedded (security + cost). They're found via `source_of` edges from their paired `code_description`.
 

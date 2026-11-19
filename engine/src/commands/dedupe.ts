@@ -5,8 +5,8 @@
  * load the active memories, plan (pure), then apply the whole plan in ONE
  * transaction — each older memory is superseded by the newer one it restates
  * (supersedeMemory: edges and fact sources re-pointed, `supersedes` edge
- * kept → older). No LLM and no model load: it reads the stored current-model
- * vectors.
+ * kept → older) and the kept memory takes over its tags and priority. No LLM
+ * and no model load: it reads the stored current-model vectors.
  *
  * Idempotent: once applied, the survivors contain no restatement, so a second
  * run plans nothing (the planner's own guarantee, see planRestatements).
@@ -14,8 +14,8 @@
 
 import type { Database } from 'bun:sqlite';
 import type { Memory } from '../core/types.js';
-import { planRestatements, type Restatement } from '../core/restatement.js';
-import { getActiveMemories, getMemory, supersedeMemory } from '../infra/db.js';
+import { absorb, planRestatements, type Restatement } from '../core/restatement.js';
+import { getActiveMemories, getMemory, supersedeMemory, updateMemory } from '../infra/db.js';
 import { LOCAL_EMBED_MODEL } from '../config.js';
 
 /** One database to dedupe, named for the report. */
@@ -62,14 +62,23 @@ function describePlan(plan: readonly Restatement[], memories: readonly Memory[])
  * no longer both active (another writer got there between the read and the
  * write) is left out, so a concurrent run cannot supersede a memory twice or
  * make a retired memory a replacement.
+ *
+ * The kept memory absorbs each copy's tags and priority (absorb). Both are
+ * read fresh per pair, so a leader that absorbs several copies in one plan
+ * accumulates all of them.
  */
 function applyPlan(db: Database, pairs: readonly DedupePair[]): readonly DedupePair[] {
   return db.transaction((): readonly DedupePair[] => {
-    const isActive = (id: string): boolean => getMemory(db, id)?.status === 'active';
     const applied: DedupePair[] = [];
     for (const pair of pairs) {
-      if (!isActive(pair.kept) || !isActive(pair.superseded)) continue;
-      supersedeMemory(db, pair.superseded, pair.kept);
+      const kept = getMemory(db, pair.kept);
+      const copy = getMemory(db, pair.superseded);
+      if (kept?.status !== 'active' || copy?.status !== 'active') continue;
+      supersedeMemory(db, copy.id, kept.id);
+      const absorbed = absorb(kept, copy);
+      if (absorbed.priority !== kept.priority || absorbed.tags.length !== kept.tags.length) {
+        updateMemory(db, kept.id, absorbed);
+      }
       applied.push(pair);
     }
     return applied;

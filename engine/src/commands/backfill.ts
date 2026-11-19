@@ -79,7 +79,9 @@ async function backfillLocal(
  * 3. Return summary: { processed, failed, method }
  *
  * @param db - Database instance (project or global)
- * @param projectName - Project name for embedding metadata prefix
+ * @param projectName - Prefix for project-scoped memories; a global-scoped
+ *   memory always embeds as `global` (buildEmbeddingText), so the name passed
+ *   for the global database does not change its vectors
  * @returns Result with stats or error
  */
 export async function backfill(

@@ -356,7 +356,7 @@ The measurement behind each record (corpus, graded pairs per band, failure modes
 ### Distinct facts and restatements (`core/restatement.ts`)
 
 - `distinctFacts(ranked, memoryOf, threshold)` — order-preserving: drops an item when an already-KEPT item of the same `memory_type` is at or above `threshold` cosine. Items without a current-model vector are kept; a null threshold returns the list unchanged. `recall` applies it to the merged project + global list before `limit` (over-fetching `limit × 5` while it is on); prompt-recall applies it to the semantic hits before their slot cut and to the merged semantic + strict-keyword list before its limit.
-- `planRestatements(memories, threshold)` — the `dedupe` plan, as data: per type, newest first (ties by id), each memory joins its most similar newer leader at or above `threshold` or becomes a leader. No chaining; pinned memories lead but are never superseded; `code` and unembedded memories are left out. Planning over the survivors yields nothing (idempotent), and the plan does not depend on input order.
+- `planRestatements(memories, threshold)` — the `dedupe` plan, as data: per type, newest first (ties by id), each memory joins its most similar newer leader at or above `threshold` or becomes a leader. No chaining; pinned memories and merge products (`isMergeProduct`: content holds the extraction merge separator) lead but are never superseded; `code` and unembedded memories are left out. Planning over the survivors yields nothing (idempotent), and the plan does not depend on input order.
 
 ### Cosine Similarity (at search time)
 
@@ -387,6 +387,8 @@ Every absolute cosine cutoff comes from the active model's calibration (see [Per
 ```
 [memory_type] [project:name] summary text
 ```
+
+`buildEmbeddingText` takes `name` from the memory's scope: `global` for a global-scoped memory, the project's name otherwise. The text is therefore a function of the memory alone, and every embedding path stores the same vector for it.
 
 For queries:
 ```
@@ -427,7 +429,7 @@ Explicit memory creation. Args: `<cwd> <content> [--type=TYPE] [--priority=N] [-
 
 A new memory is refused as a near-duplicate at its similarity space's duplicate floor (`duplicateFloor`: the merge floor where a merge band exists, else the skip floor — 0.75 Jaccard, 0.92 potion cosine). The candidate is embedded for that check only when the active model has a cosine calibration.
 
-`--replaces=TAG` (parsed at the CLI boundary by `parseReplacementTag`: non-empty, no commas, no whitespace) makes the new memory the current version of `TAG`: in one transaction it is inserted and every other active memory carrying `TAG` in the same database — pinned ones included — is superseded via `supersedeMemory` (status `superseded`, `supersedes` edge new → old, edges and facts re-pointed). The tag is added to the new memory's tags, and the duplicate check is skipped. The output appends `(superseded N: ids)`.
+`--replaces=TAG` (parsed at the CLI boundary by `parseReplacementTag`: non-empty, no commas, no whitespace) makes the new memory the current version of `TAG`: in one transaction it is inserted and every other active memory carrying `TAG` in the same database — pinned ones included — is superseded via `supersedeMemory` (status `superseded`, `supersedes` edge new → old, edges and facts re-pointed). The tag is added to the new memory's tags, the new memory is pinned when any replaced one was and takes the highest priority (`carryForward`), and the duplicate check is skipped. The output appends `(superseded N: ids)`.
 
 ### recall
 
@@ -447,7 +449,7 @@ Two modes, project DB only.
 
 ### dedupe
 
-Restatement cleanup. Args: `<cwd> [--dry-run]`. For the project and the global database separately (one transaction each) it plans with `planRestatements` at the active calibration's `restatement` cosine and supersedes each older memory by the newer one it restates (`supersedeMemory`). `--dry-run` prints every pair (`cos`, kept and superseded id + summary) and writes nothing. A pair whose members are no longer both active when the transaction runs is skipped. Idempotent: a second run supersedes 0. Invalidates the surface cache when it superseded anything. With no restatement calibration it prints `Dedupe disabled: <model> has no restatement calibration` and touches nothing. Runs in every `maintenance` pass.
+Restatement cleanup. Args: `<cwd> [--dry-run]`. For the project and the global database separately (one transaction each) it plans with `planRestatements` at the active calibration's `restatement` cosine and supersedes each older memory by the newer one it restates (`supersedeMemory`); the kept memory takes over the copy's tags and the higher priority (`absorb`). `--dry-run` prints every pair (`cos`, kept and superseded id + summary) and writes nothing. A pair whose members are no longer both active when the transaction runs is skipped. Idempotent: a second run supersedes 0. Invalidates the surface cache when it superseded anything. With no restatement calibration it prints `Dedupe disabled: <model> has no restatement calibration` and touches nothing. Runs in every `maintenance` pass.
 
 ### lifecycle
 

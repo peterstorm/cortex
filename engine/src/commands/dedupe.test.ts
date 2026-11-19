@@ -34,15 +34,18 @@ const at = (degrees: number): Float32Array => {
   return new Float32Array([Math.cos(r), Math.sin(r), 0, 0]);
 };
 
-const seed = (db: Database, id: string, degrees: number, day: number): Memory => {
+type SeedOptions = Readonly<{ tags?: readonly string[]; priority?: number; content?: string }>;
+
+const seed = (db: Database, id: string, degrees: number, day: number, options: SeedOptions = {}): Memory => {
   const memory = createMemory({
     id,
-    content: `${id} content`,
+    content: options.content ?? `${id} content`,
     summary: `${id} summary`,
     memory_type: 'decision',
     scope: 'project',
     confidence: 0.9,
-    priority: 5,
+    priority: options.priority ?? 5,
+    tags: options.tags ?? [],
     source_type: 'extraction',
     source_session: 's',
     source_context: '{}',
@@ -174,6 +177,41 @@ describe('executeDedupe', () => {
     expect(formatDedupeOutcome(outcome)).toBe('Dedupe superseded 1 restatement(s) (project 1, global 0)');
     expect(getMemory(global, 'g-only')?.status).toBe('active');
     expect(getMemory(project, 'p-old')?.status).toBe('superseded');
+  });
+
+  it('the kept memory absorbs the union of tags and the highest priority of every copy it supersedes', () => {
+    seed(project, 'oldest', 0, 0, { tags: ['ops', 'deploy-target'], priority: 3 });
+    seed(project, 'older', 2, 1, { tags: ['release', 'ops'], priority: 8 });
+    seed(project, 'newest', 1, 2, { tags: ['deploy'], priority: 4 });
+
+    const outcome = executeDedupe(targets, THRESHOLD, false);
+
+    expect(formatDedupeOutcome(outcome)).toBe('Dedupe superseded 2 restatement(s) (project 2, global 0)');
+    const kept = getMemory(project, 'newest');
+    expect(kept?.status).toBe('active');
+    expect(kept?.tags).toEqual(['deploy', 'release', 'ops', 'deploy-target']);
+    expect(kept?.priority).toBe(8);
+  });
+
+  it('leaves the kept memory untouched when the copy adds no tag and no priority', () => {
+    seed(project, 'old', 0, 0, { tags: ['ops'], priority: 2 });
+    const kept = seed(project, 'new', 3, 1, { tags: ['ops'], priority: 5 });
+
+    executeDedupe(targets, THRESHOLD, false);
+
+    expect(getMemory(project, 'old')?.status).toBe('superseded');
+    expect(getMemory(project, 'new')).toEqual(expect.objectContaining({ tags: ['ops'], priority: 5, updated_at: kept.updated_at }));
+  });
+
+  it('never supersedes a merge product, which keeps the content its merges appended', () => {
+    seed(project, 'merged', 0, 0, { content: 'merged content\n---\ndetail only the merge holds' });
+    seed(project, 'restated', 2, 1);
+
+    const outcome = executeDedupe(targets, THRESHOLD, false);
+
+    expect(dedupeChangedMemories(outcome)).toBe(false);
+    expect(getMemory(project, 'merged')?.status).toBe('active');
+    expect(getMemory(project, 'restated')?.status).toBe('active');
   });
 
   it('leaves dissimilar memories alone', () => {

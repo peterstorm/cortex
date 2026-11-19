@@ -33,6 +33,7 @@ import {
   buildExtractionPrompt,
   parseExtractionResponse,
   buildEmbeddingText,
+  MERGED_CONTENT_SEPARATOR,
 } from '../core/extraction.js';
 import { PROJECTION_VERSION } from '../core/transcript-projection.js';
 import {
@@ -377,10 +378,7 @@ export async function executeExtract(
 
       // I/O: Generate local embeddings for candidates (async, for hybrid dedup)
       // Non-fatal: if embedding fails, dedup falls back to Jaccard-only
-      const candidateEmbeddings = await generateCandidateEmbeddings(
-        candidates,
-        (candidate) => (routesToGlobal(candidate) ? 'global' : projectName),
-      );
+      const candidateEmbeddings = await generateCandidateEmbeddings(candidates, projectName);
 
       const projectCandidates: MemoryCandidate[] = [];
       const projectEmbeddings = new Map<number, Float32Array>();
@@ -740,10 +738,10 @@ export function applyDedupMerges(
         fallbackInserted.push(memory);
         continue;
       }
-      const mergedSegments = existingMem.content.split('\n---\n');
+      const mergedSegments = existingMem.content.split(MERGED_CONTENT_SEPARATOR);
       if (!mergedSegments.includes(merge.candidate.content)) {
         updateMemory(db, merge.existingMemoryId, {
-          content: `${existingMem.content}\n---\n${merge.candidate.content}`,
+          content: `${existingMem.content}${MERGED_CONTENT_SEPARATOR}${merge.candidate.content}`,
           // Null out embeddings so backfill regenerates with updated content
           embedding: null,
           local_embedding: null,
@@ -997,13 +995,12 @@ export function computeSimilarityAndCreateEdges(
  * Returns Map<candidateIndex, Float32Array> for successfully embedded candidates.
  * Non-fatal: returns empty map if model unavailable.
  *
- * Each candidate is embedded with the project prefix its database's backfill
- * would use (`global` for a global-scoped candidate routed to the global DB),
- * so a stored vector is the one backfill would have written.
+ * Each candidate is embedded with buildEmbeddingText, whose prefix follows the
+ * candidate's scope, so a stored vector is the one backfill would have written.
  */
 async function generateCandidateEmbeddings(
   candidates: readonly MemoryCandidate[],
-  prefixFor: (candidate: MemoryCandidate) => string,
+  projectName: string,
   calibration: CosineCalibration | null = ACTIVE_COSINE_CALIBRATION
 ): Promise<Map<number, Float32Array>> {
   const embeddings = new Map<number, Float32Array>();
@@ -1036,7 +1033,7 @@ async function generateCandidateEmbeddings(
 
   for (let i = 0; i < candidates.length; i++) {
     try {
-      const text = buildEmbeddingText(candidates[i], prefixFor(candidates[i]));
+      const text = buildEmbeddingText(candidates[i], projectName);
       const embedding = await embedLocal(text);
       embeddings.set(i, embedding);
     } catch (err) {

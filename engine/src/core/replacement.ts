@@ -31,7 +31,8 @@ export function parseReplacementTag(raw: string): ReplacementTagResult {
 /**
  * The memories a new memory replaces: every OTHER active memory carrying the
  * tag, pinned ones included — the caller named the replacement explicitly,
- * and pinning protects a memory from decay, not from being restated.
+ * and pinning protects a memory from decay, not from being restated. The pin
+ * is not lost with it: carryForward moves it to the replacement.
  */
 export function replacedBy(
   replacementId: string,
@@ -41,4 +42,22 @@ export function replacedBy(
   return memories.filter(
     (memory) => memory.id !== replacementId && memory.status === 'active' && memory.tags.includes(tag)
   );
+}
+
+/**
+ * The replacement as it is written: pinned when it or any memory it replaces
+ * is pinned, at the highest priority among them.
+ *
+ * A new version states the same fact, so it inherits the standing the fact
+ * already had. Without this, replacing a pinned memory without repeating
+ * `--pinned` left the current version unpinned: decay could archive it,
+ * prune and vacuum it, and the fact would leave the active set entirely while
+ * every older version sat superseded behind it.
+ */
+export function carryForward(memory: Memory, replaced: readonly Memory[]): Memory {
+  return {
+    ...memory,
+    pinned: memory.pinned || replaced.some((old) => old.pinned),
+    priority: Math.max(memory.priority, ...replaced.map((old) => old.priority)),
+  };
 }

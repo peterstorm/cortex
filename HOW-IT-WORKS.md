@@ -185,7 +185,7 @@ The potion numbers were measured on 9,260 real memories with hand-graded pairs p
 
 ### Restatement cleanup (`dedupe`)
 
-Extraction catches a restatement only while both copies are new. Older copies are retired by `dedupe <cwd> [--dry-run]`, which `maintenance` runs after lifecycle and before AI prune (so the LLM never reviews copies). Per database, one transaction each, the pure planner `planRestatements` (`core/restatement.ts`) groups active memories by type, takes them newest first, and lets each join the most similar newer *leader* at or above the restatement cosine (0.90 on potion) or become a leader itself. Leaders never chain: a memory close only to an already-superseded copy stays. Pinned memories may lead but are never superseded; `code` memories and memories without a current-model vector are skipped. Each older copy is marked `superseded`, gets a `supersedes` edge from the kept memory, and its edges and facts are re-pointed to the kept memory. A second run finds nothing. No LLM, no model load; an uncalibrated model reports "disabled".
+Extraction catches a restatement only while both copies are new. Older copies are retired by `dedupe <cwd> [--dry-run]`, which `maintenance` runs after lifecycle and before AI prune (so the LLM never reviews copies). Per database, one transaction each, the pure planner `planRestatements` (`core/restatement.ts`) groups active memories by type, takes them newest first, and lets each join the most similar newer *leader* at or above the restatement cosine (0.90 on potion) or become a leader itself. Leaders never chain: a memory close only to an already-superseded copy stays. Pinned memories and merge products (content an extraction merge appended to, which the summary vector does not show) may lead but are never superseded; `code` memories and memories without a current-model vector are skipped. Each older copy is marked `superseded`, gets a `supersedes` edge from the kept memory, and its edges and facts are re-pointed to the kept memory, which also takes over the copy's tags (after its own, no repeats) and the higher priority (`absorb`), so a later `--replaces=<tag>` still finds it. A second run finds nothing. No LLM, no model load; an uncalibrated model reports "disabled".
 
 ### Distinct recall
 
@@ -193,7 +193,7 @@ Prompt recall has three semantic slots, and a fact stored five times used to fil
 
 ### Explicit replacement (`/remember --replaces=<tag>`)
 
-When you know a memory is the new version of an old one, `--replaces=<tag>` says so: every other active memory with that tag in the target database is superseded (pinned ones too — pinning protects from decay, not from being restated), the new memory carries the tag, and the duplicate check is skipped. The insert and the supersedes happen in one transaction.
+When you know a memory is the new version of an old one, `--replaces=<tag>` says so: every other active memory with that tag in the target database is superseded (pinned ones too — pinning protects from decay, not from being restated), the new memory carries the tag, and the duplicate check is skipped. The new version is pinned if any replaced version was and takes their highest priority (`carryForward`), so replacing a fact never unpins it. The insert and the supersedes happen in one transaction.
 
 ### Semantic Edge Classification
 
@@ -240,7 +240,7 @@ On top of decay, an AI prune pass has the LLM review active memories in batches 
 ### Semantic (default, always available)
 1. Embed the query with the local static model (`minishlab/potion-retrieval-32M`)
 2. Query is prefixed: `[query] [project:name] <your query>`
-3. Memories are prefixed: `[memory_type] [project:name] <summary>`
+3. Memories are prefixed: `[memory_type] [project:name] <summary>`, where `name` is `global` for a global-scoped memory — the text depends only on the memory, so every path that embeds it (extraction, remember, backfill) writes the same vector
 4. Cosine similarity search against stored embeddings in both DBs (archived and superseded memories are excluded)
 5. Results merged (project first), enriched with graph-traversed related memories
 
