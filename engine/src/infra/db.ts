@@ -410,6 +410,8 @@ type MemoryRow = {
   scope: string;
   embedding: Buffer | null;
   local_embedding: Buffer | null;
+  // Null on rows written before the column existed (migrateLocalEmbeddingModel).
+  local_embedding_model: string | null;
   confidence: number;
   priority: number;
   pinned: number;
@@ -513,6 +515,15 @@ function parseSourceType(raw: string, memoryId: string): SourceType {
  * project, so nothing there was archived, pruned or vacuumed for months. The
  * row is the unit of failure, exactly as it is for edges, entities and facts:
  * it is skipped and named, and the row itself is left as it was found.
+ *
+ * `Memory.local_embedding` is filled only from a vector tagged with the
+ * CURRENT model. A vector from another model (or an untagged legacy one)
+ * shares the column but not the vector space, and any comparison against it
+ * returns a plausible, meaningless score — so every consumer (dedup,
+ * consolidation, edges, distinct recall, dedupe) sees such a row as having no
+ * vector and falls back to Jaccard, and none has to re-check the tag. The row
+ * keeps its stored vector; backfill re-embeds it (it is in the embedding
+ * queue, getActiveMemoriesNeedingEmbedding).
  */
 function rowToMemory(row: MemoryRow): Memory | null {
   // Narrowed into consts for the same reason rowToEdge does it: a property
@@ -540,7 +551,10 @@ function rowToMemory(row: MemoryRow): Memory | null {
       memory_type: memoryType,
       scope,
       embedding: row.embedding ? deserializeFloat64Array(row.embedding) : null,
-      local_embedding: row.local_embedding ? deserializeFloat32Array(row.local_embedding) : null,
+      local_embedding:
+        row.local_embedding && row.local_embedding_model === LOCAL_EMBED_MODEL
+          ? deserializeFloat32Array(row.local_embedding)
+          : null,
       confidence: row.confidence,
       priority: row.priority,
       pinned: row.pinned === 1,
@@ -1631,6 +1645,50 @@ export function repointFactSources(db: Database, fromId: string, toId: string): 
     `UPDATE facts SET source_memory_id = ? WHERE source_memory_id = ?`
   ).run(toId, fromId);
   return result.changes;
+}
+
+/**
+ * Supersede one memory by another (FR-076, FR-077): the replacement inherits
+ * the old memory's non-supersedes edges and fact sources, the old memory is
+ * marked 'superseded', and a `supersedes` edge records replacement → old.
+ *
+ * The one shape every supersession writes — consolidate's merge, dedupe's
+ * restatements and remember --replaces — so the graph a superseded memory
+ * leaves behind is the same whichever path retired it.
+ *
+ * I/O: Writes to database. Caller wraps it in a transaction with whatever
+ * else must land together (the replacement's insert, sibling supersessions).
+ *
+ * @param db - Database instance
+ * @param oldId - Memory to retire
+ * @param replacementId - Active memory that replaces it (must exist)
+ */
+export function supersedeMemory(db: Database, oldId: string, replacementId: string): void {
+  // Re-point first: superseding does not delete edges, but an edge left on a
+  // superseded memory is invisible to every reader that follows active ones.
+  repointEdgesToMemory(db, oldId, replacementId);
+  repointFactSources(db, oldId, replacementId);
+  updateMemory(db, oldId, { status: 'superseded' });
+  // The graph may already hold this exact edge: the retired semantic-edges pass
+  // labelled restating pairs `supersedes` without retiring the older memory, so
+  // a later dedupe meets the edge it would write. Edges are unique per
+  // (source, target, relation), so the edge is asserted rather than inserted
+  // blindly — otherwise one such pair aborts the whole database's transaction.
+  const existing = db
+    .prepare(`SELECT id FROM edges WHERE source_id = ? AND target_id = ? AND relation_type = 'supersedes'`)
+    .get(replacementId, oldId) as { id: string } | null;
+  if (existing) {
+    db.prepare(`UPDATE edges SET strength = 1.0, bidirectional = 0, status = 'active' WHERE id = ?`).run(existing.id);
+    return;
+  }
+  insertEdge(db, {
+    source_id: replacementId,
+    target_id: oldId,
+    relation_type: 'supersedes',
+    strength: 1.0,
+    bidirectional: false,
+    status: 'active',
+  });
 }
 
 /**

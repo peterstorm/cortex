@@ -6,7 +6,7 @@
 
 import { join, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
-import type { SimilaritySpace } from './core/types.js';
+import type { CosineCalibration, DedupPolicy, DedupThresholds } from './core/calibration.js';
 
 // ============================================================================
 // ENVIRONMENT VARIABLES
@@ -254,50 +254,146 @@ export const LOCAL_EMBED_MODEL = 'minishlab/potion-retrieval-32M';
  */
 export const LOCAL_EMBEDDING_DIMENSIONS = 512;
 
-/**
- * The local model whose cosine space the thresholds further down were
- * empirically calibrated against.
- *
- * Cosine thresholds are a property of a MODEL, not of "local embeddings" in
- * general. Every band below (DEDUP_SIMILARITY_THRESHOLD, MERGE_CEILING_THRESHOLD,
- * CONSOLIDATION_LOCAL_COSINE_THRESHOLD, INTRA_BATCH_DEDUP_THRESHOLD, and the
- * 'local-cosine' bands in core/similarity.ts) was tuned on BGE-small-en-v1.5's
- * distribution. Pointing LOCAL_EMBED_MODEL at a different model does not
- * re-tune them, and nothing else in the system would notice.
- */
-// Annotated `string` rather than left as a literal type: these two are
-// configuration knobs meant to be repointed, and as literals TypeScript
-// narrows the comparison below to "these can never be equal" (TS2367). That
-// happens to be true today — the gate is currently always closed — but it is a
-// fact about the current values, not about the type.
-export const LOCAL_COSINE_CALIBRATED_MODEL: string = 'Xenova/bge-small-en-v1.5';
+// ============================================================================
+// COSINE CALIBRATION
+// ============================================================================
 
 /**
- * Whether the active local model's cosine space is the calibrated one.
+ * Duplicate thresholds in the Jaccard token-overlap space: the fallback for
+ * every comparison where cosine is not calibrated or a side has no
+ * current-model vector.
  *
- * WHY THIS GATE EXISTS — measured 2026-08-15 over 1770 pairs drawn from 60 real
- * memories, embedded with EmbeddingGemma-300M (768d):
+ * Extraction merges an existing-memory match from 0.75 up to 0.85 and skips it
+ * as a true duplicate from 0.85; remember refuses a match from 0.75; an
+ * extraction candidate at or above 0.75 against an already-kept candidate of
+ * the same batch is skipped whatever its existing-memory outcome, which is what
+ * stops near-identical content landing twice inside one session (see
+ * deduplicateCandidates). These numbers were first tuned on BGE cosine (where
+ * same-domain memories about different aspects score 0.6-0.75) and have been
+ * the effective Jaccard thresholds ever since cosine dedup was closed off.
+ */
+export const JACCARD_DEDUP: DedupThresholds = {
+  existing: { kind: 'merge-then-skip', mergeFrom: 0.75, skipFrom: 0.85 },
+  intraBatch: 0.75,
+};
+
+/**
+ * Xenova/bge-small-en-v1.5 (384d), the model every cosine threshold was first
+ * tuned on. Its cosine runs "hot": same-domain memories about different aspects
+ * routinely score 0.6-0.75, true content duplicates 0.85+, and
+ * same-topic-different-detail pairs 0.75-0.85 — hence a merge band below the
+ * skip ceiling. Consolidation at 0.8 sits above the same-domain band and just
+ * below the true-duplicate band (at 0.5 nearly every same-project pair was
+ * flagged: O(n²) false positives). Edge bands: < 0.6 ignore (same-domain
+ * background), 0.6-0.75 relate, 0.75-0.82 suggest, >= 0.82 consolidate.
+ * Never measured for restatement or distinct recall.
+ */
+const BGE_SMALL_EN_V1_5: CosineCalibration = {
+  dedup: {
+    existing: { kind: 'merge-then-skip', mergeFrom: 0.75, skipFrom: 0.85 },
+    intraBatch: 0.75,
+  },
+  consolidationCandidate: 0.8,
+  edgeBands: { relateFrom: 0.6, suggestFrom: 0.75, consolidateFrom: 0.82 },
+  restatement: null,
+  distinctRecall: null,
+};
+
+/**
+ * minishlab/potion-retrieval-32M (512d), the active model.
+ *
+ * Measured 2026-11-20, read-only, over 9,260 real active memories: potion
+ * cosine between memories of the same memory_type, newest-anchored leader
+ * clustering (no chaining), 15 random pairs hand-graded per band:
+ *
+ *   cosine       same fact
+ *   >= 0.95      15/15
+ *   0.90-0.95    15/15
+ *   0.85-0.90    ~12/15  misses: two different rules on one subject
+ *   0.80-0.85    ~13/15  but the older memory is often the richer one
+ *   0.70-0.80    ~11/15  only with a shared rare tag
+ *   0.60-0.70    ~4/15
+ *
+ * The EmbeddingGemma failure mode (high cosine, unrelated content — see below)
+ * was checked on all 195 pairs at >= 0.90: their token-Jaccard was min 0.18,
+ * p10 0.45, p50 0.64, and every low-overlap pair was the same fact reworded.
+ * One borderline at 0.921: a memory giving an implementation order and a later
+ * one giving the details of the same fixes, the second more detailed.
+ *
+ * Prevalence: 494 memories (5.3%) restate a newer one at >= 0.85, 195 (2.1%)
+ * at >= 0.90; one decision existed 19 times in one project. The harm is in
+ * prompt-recall, which filled its slots with copies of one fact (3/3 and 4/5
+ * results on two test prompts); the push surface was barely affected (0-2 of
+ * ~28 lines).
+ *
+ * What follows from it:
+ * - dedup skips from 0.92 with NO merge band: 0.85-0.90 still holds "two rules
+ *   on one subject", and appending one rule to another loses both. Above 0.92
+ *   (past the 0.921 borderline) a candidate adds nothing.
+ * - consolidation lists from 0.85: a human reviews every pair.
+ * - restatement (dedupe) supersedes from 0.90: 30/30 graded pairs above it
+ *   were one fact, and the newer memory is kept.
+ * - distinct recall hides from 0.80: hiding a hit costs little (it is still
+ *   stored and searchable), while a slot filled with a copy costs a real hit.
+ *   Re-measured after dedupe had run on copies of the real databases: 75
+ *   prompts built from memories that still had a 0.80-0.90 neighbour (cortex,
+ *   fugue, loom) returned 9 same-type pairs at 0.80-0.85, and all 9 were one
+ *   fact restated. 0.85 left every one of them in the slots. Below 0.80 the
+ *   graded rate falls (0.70-0.80 needed a shared rare tag), so it stops here.
+ * - no edge bands: the relates_to bands were never measured on this model, so
+ *   edges keep the Jaccard bands.
+ */
+const POTION_RETRIEVAL_32M: CosineCalibration = {
+  dedup: {
+    existing: { kind: 'skip-only', skipFrom: 0.92 },
+    intraBatch: 0.92,
+  },
+  consolidationCandidate: 0.85,
+  edgeBands: null,
+  restatement: 0.9,
+  distinctRecall: 0.8,
+};
+
+/**
+ * Every measured model, by id. A model missing here is UNCALIBRATED.
+ *
+ * WHY UNCALIBRATED FAILS CLOSED — measured 2026-08-15 over 1770 pairs drawn
+ * from 60 real memories, embedded with EmbeddingGemma-300M (768d):
  *
  *   min 0.491  p10 0.581  p50 0.646  p90 0.727  p99 0.823  max 0.899
  *
- * Under the BGE-tuned bands that distribution classifies 73.8% of ALL pairs as
+ * Under the BGE bands that distribution classified 73.8% of ALL pairs as
  * 'relate' and 1.2% as 'consolidate'. The highest-scoring pair scored cos=0.899
  * with a Jaccard overlap of 0.063 — two memories about entirely different
- * subjects, above MERGE_CEILING_THRESHOLD (0.85), where a new memory is
- * silently DISCARDED as a true duplicate. The band from 0.75 to 0.85 merges new
- * content into an unrelated memory instead.
- *
- * That is data loss with no error surfaced anywhere, so destructive paths
- * (dedup skip/merge, consolidation) fail closed to Jaccard when this is false.
- * Recall ranking is unaffected: it needs relative order, not absolute cutoffs,
- * and the swapped model is better at that.
- *
- * Re-enabling requires re-deriving every threshold above against the new
- * model's distribution — note that no cutoff separates the 0.899/0.063 pair, so
- * recalibration alone may not be sufficient for the dedup use case.
+ * subjects, above BGE's 0.85 skip ceiling, where a new memory is silently
+ * DISCARDED as a true duplicate. That is data loss with no error surfaced
+ * anywhere, so a model joins this table only with its own measurements.
  */
-export const LOCAL_COSINE_CALIBRATED: boolean =
-  LOCAL_EMBED_MODEL === LOCAL_COSINE_CALIBRATED_MODEL;
+const COSINE_CALIBRATIONS: ReadonlyMap<string, CosineCalibration> = new Map([
+  ['Xenova/bge-small-en-v1.5', BGE_SMALL_EN_V1_5],
+  ['minishlab/potion-retrieval-32M', POTION_RETRIEVAL_32M],
+]);
+
+/**
+ * The calibration measured for a model, or null when there is none: then every
+ * comparison falls back to Jaccard and the cosine-only uses (dedupe, distinct
+ * recall) are off.
+ */
+export function cosineCalibrationFor(model: string): CosineCalibration | null {
+  return COSINE_CALIBRATIONS.get(model) ?? null;
+}
+
+/** The calibration of LOCAL_EMBED_MODEL. */
+export const ACTIVE_COSINE_CALIBRATION: CosineCalibration | null =
+  cosineCalibrationFor(LOCAL_EMBED_MODEL);
+
+/** Duplicate thresholds per space for a calibration (null: Jaccard only). */
+export function dedupPolicyFor(calibration: CosineCalibration | null): DedupPolicy {
+  return { jaccard: JACCARD_DEDUP, cosine: calibration?.dedup ?? null };
+}
+
+/** Duplicate thresholds per space for LOCAL_EMBED_MODEL. */
+export const ACTIVE_DEDUP_POLICY: DedupPolicy = dedupPolicyFor(ACTIVE_COSINE_CALIBRATION);
 
 /**
  * Recency decay half-life in days for ranking formula.
@@ -404,63 +500,12 @@ export const AI_PRUNE_BATCH_SIZE = 80;
 export const AI_PRUNE_MIN_AGE_DAYS = 3;
 
 /**
- * Dedup similarity threshold shared by extraction and remember.
- * Extraction merges existing-memory matches in the interval from this value
- * up to MERGE_CEILING_THRESHOLD, then skips matches at or above the ceiling as
- * true duplicates. Remember treats a threshold hit as an existing duplicate
- * rather than appending content.
- *
- * CALIBRATION NOTE: tuned against BGE-small-en-v1.5, where same-domain
- * memories about different aspects routinely score 0.6-0.75. A threshold of
- * 0.75 ensures only truly overlapping content triggers merge, not merely
- * related concepts within the same project domain.
- *
- * This number is bound to THAT model, and applying it to another local model's
- * cosine is a data-loss bug rather than an approximation — see
- * LOCAL_COSINE_CALIBRATED, which is why cosine reaches this threshold only when
- * the active model is the calibrated one.
- */
-export const DEDUP_SIMILARITY_THRESHOLD = 0.75;
-
-/**
- * Intra-batch dedup threshold for candidates within a single extraction.
- * Equal to the cross-session threshold (0.75); the real distinction is that
- * intra-batch dedup runs REGARDLESS of the existing-memory match outcome,
- * which is what stops near-identical content from landing twice inside one
- * session (see deduplicateCandidates). 0.75 catches only truly redundant
- * candidates (near-identical content); the previous "higher than cross-
- * session" rationale collapsed when both constants were aligned at 0.75.
- */
-export const INTRA_BATCH_DEDUP_THRESHOLD = 0.75;
-
-/**
  * Consolidation similarity threshold for detecting duplicate memory pairs
  * in the WELL-SEPARATED Jaccard token-overlap space. Pairs scoring above this
- * are flagged for merge review.
+ * are flagged for merge review. A pair compared by cosine uses the active
+ * calibration's consolidationCandidate instead.
  */
 export const CONSOLIDATION_SIMILARITY_THRESHOLD = 0.5;
-
-/**
- * Consolidation threshold for raw cosine between LOCAL embeddings, calibrated
- * on LOCAL_COSINE_CALIBRATED_MODEL and applied only while
- * LOCAL_COSINE_CALIBRATED holds. Its cosine runs "hot": same-domain memories about
- * DIFFERENT aspects routinely score 0.6-0.75 (see DEDUP_SIMILARITY_THRESHOLD
- * calibration note). At 0.5 nearly every same-project pair was flagged as a
- * "duplicate" — O(n²) false positives. 0.8 sits above the same-domain band
- * (0.6-0.75) and just below the true-duplicate band (0.85+), flagging only
- * genuinely overlapping content for merge review.
- */
-export const CONSOLIDATION_LOCAL_COSINE_THRESHOLD = 0.8;
-
-/**
- * Pick the consolidation duplicate-detection threshold for the similarity
- * space a pair's score was computed in. Pure function.
- */
-export function consolidationThresholdFor(space: SimilaritySpace): number {
-  return space === 'local-cosine'
-    ? CONSOLIDATION_LOCAL_COSINE_THRESHOLD
-    : CONSOLIDATION_SIMILARITY_THRESHOLD;
-}
 
 /**
  * Max relates_to edges created per newly inserted memory during extraction.
@@ -470,20 +515,6 @@ export function consolidationThresholdFor(space: SimilaritySpace): number {
  * toward the surface's in-degree centrality.
  */
 export const MAX_EDGES_PER_MEMORY = 3;
-
-/**
- * Score ceiling for merge-into-existing during extraction dedup.
- * Candidates with score in [DEDUP_SIMILARITY_THRESHOLD, MERGE_CEILING_THRESHOLD)
- * are merged into the existing memory rather than skipped.
- * Candidates with score >= MERGE_CEILING_THRESHOLD are true duplicates and skipped.
- *
- * CALIBRATION NOTE: tuned against BGE-small-en-v1.5, where true content
- * duplicates score 0.85+ and same-topic-different-detail pairs score 0.75-0.85.
- * Bound to that model — under EmbeddingGemma, measured pairs with no shared
- * content reached 0.899, i.e. above this ceiling, where the new memory is
- * DISCARDED. See LOCAL_COSINE_CALIBRATED.
- */
-export const MERGE_CEILING_THRESHOLD = 0.85;
 
 /**
  * Retention period in days for pruned memories before hard-delete.

@@ -3,7 +3,8 @@
  * Pure functional implementations with no I/O
  */
 
-import type { SimilarityAction, SimilaritySpace, Memory } from './types.js';
+import type { SimilarityAction, Memory } from './types.js';
+import type { CosineEdgeBands } from './calibration.js';
 import { KEYWORD_OVERLAP_WEIGHT } from '../config.js';
 
 /**
@@ -146,38 +147,35 @@ export function jaccardSimilarity(tokensA: ReadonlySet<string>, tokensB: Readonl
  * produced O(n²) relates_to edges (nearly every same-project pair landed in
  * consolidate/suggest).
  *
- * Jaccard bands (FR-059, a well-separated space):
+ * Jaccard bands (FR-059, a well-separated space), used when `cosineBands` is
+ * null:
  * - < 0.1: ignore (unrelated)
  * - 0.1-0.4: relate (create relates_to edge)
  * - 0.4-0.5: suggest (create suggested edge for review)
  * - > 0.5: consolidate (flag for merge)
  *
- * Local-cosine bands (BGE-small-en-v1.5 specifically, which runs hot —
- * consistent with the 0.75 dedup threshold and 0.85 merge ceiling in
- * config.ts). These numbers are a property of THAT model's distribution, not
- * of local embeddings in general; LOCAL_COSINE_CALIBRATED keeps a different
- * local model out of the destructive paths that use them:
- * - < 0.6: ignore (same-domain background similarity)
- * - 0.6-0.75: relate
- * - 0.75-0.82: suggest
- * - >= 0.82: consolidate
+ * Cosine bands are a property of ONE model's distribution, so they come from
+ * that model's calibration (CosineCalibration.edgeBands in config.ts): below
+ * relateFrom ignore, then relate, suggest from suggestFrom, consolidate from
+ * consolidateFrom.
  *
  * @param score - Similarity score in range [0, 1]
- * @param space - Similarity space the score was computed in (default 'jaccard')
+ * @param cosineBands - The bands of the cosine space the score was computed
+ *   in, or null for a Jaccard score (default)
  * @returns Similarity action with action type and strength (where applicable)
  */
 export function classifySimilarity(
   score: number,
-  space: SimilaritySpace = 'jaccard'
+  cosineBands: CosineEdgeBands | null = null
 ): SimilarityAction {
-  if (space === 'local-cosine') {
-    if (score < 0.6) {
+  if (cosineBands !== null) {
+    if (score < cosineBands.relateFrom) {
       return { action: 'ignore' };
     }
-    if (score < 0.75) {
+    if (score < cosineBands.suggestFrom) {
       return { action: 'relate', strength: score };
     }
-    if (score < 0.82) {
+    if (score < cosineBands.consolidateFrom) {
       return { action: 'suggest', strength: score };
     }
     return { action: 'consolidate' };

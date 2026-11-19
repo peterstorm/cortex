@@ -429,15 +429,18 @@ describe('extractUnigrams', () => {
 });
 
 // Unit-length 512-d vector whose cosine against `queryVec()` is exactly `score`.
+// The remainder lies on `axis`, so two memories on different axes are
+// distinct facts (their cosine is the product of their scores) while two on
+// the same axis restate each other — distinct recall keeps only one of those.
 const queryVec = (): Float32Array => {
   const v = new Float32Array(512);
   v[0] = 1;
   return v;
 };
-const vecWithScore = (score: number): Float32Array => {
+const vecWithScore = (score: number, axis = 1): Float32Array => {
   const v = new Float32Array(512);
   v[0] = score;
-  v[1] = Math.sqrt(1 - score * score);
+  v[axis] = Math.sqrt(1 - score * score);
   return v;
 };
 
@@ -478,6 +481,17 @@ describe('mergePromptRecall', () => {
   test('caps at limit', () => {
     const merged = mergePromptRecall([mem('a'), mem('b')], [mem('c'), mem('d')], 3);
     expect(merged.map(m => m.id)).toEqual(['a', 'b', 'c']);
+  });
+
+  test('with a distinct threshold, a keyword hit restating a semantic hit gives its slot to the next fact', () => {
+    const at = (id: string, axis: number) => createTestMemory({ id, local_embedding: vecWithScore(0.7, axis) });
+    const merged = mergePromptRecall([at('s1', 1)], [at('k-restates-s1', 1), mem('k-unembedded'), at('k2', 2)], 3, 0.85);
+    expect(merged.map(m => m.id)).toEqual(['s1', 'k-unembedded', 'k2']);
+  });
+
+  test('a null distinct threshold leaves restatements in', () => {
+    const at = (id: string) => createTestMemory({ id, local_embedding: vecWithScore(0.7) });
+    expect(mergePromptRecall([at('a')], [at('b')], 3, null).map(m => m.id)).toEqual(['a', 'b']);
   });
 });
 
@@ -601,7 +615,7 @@ describe('executePromptRecallWithFallback — semantic-first', () => {
   test('drops a barely-passing neighbour of a strong match (relative band)', async () => {
     const { projectDb, globalDb } = setupTestDbs();
     insertMemory(projectDb, createTestMemory({ id: 'strong', content: 'a', summary: 'strong', local_embedding: vecWithScore(0.8) }));
-    insertMemory(projectDb, createTestMemory({ id: 'weak', content: 'b', summary: 'weak', local_embedding: vecWithScore(0.55) }));
+    insertMemory(projectDb, createTestMemory({ id: 'weak', content: 'b', summary: 'weak', local_embedding: vecWithScore(0.55, 2) }));
     mockEmbedLocal.mockResolvedValue(queryVec());
 
     const results = await executePromptRecallWithFallback(projectDb, globalDb, {
@@ -618,7 +632,7 @@ describe('executePromptRecallWithFallback — semantic-first', () => {
   test('ranks across BOTH databases', async () => {
     const { projectDb, globalDb } = setupTestDbs();
     insertMemory(projectDb, createTestMemory({ id: 'proj', content: 'p', summary: 'proj', local_embedding: vecWithScore(0.6) }));
-    insertMemory(globalDb, createTestMemory({ id: 'glob', content: 'g', summary: 'glob', scope: 'global', local_embedding: vecWithScore(0.7) }));
+    insertMemory(globalDb, createTestMemory({ id: 'glob', content: 'g', summary: 'glob', scope: 'global', local_embedding: vecWithScore(0.7, 2) }));
     mockEmbedLocal.mockResolvedValue(queryVec());
 
     const results = await executePromptRecallWithFallback(projectDb, globalDb, {
@@ -641,14 +655,14 @@ describe('executePromptRecallWithFallback — semantic-first', () => {
         id: `in-surface-${i}`,
         content: `c${i}`,
         summary: `Already in surface ${i}`,
-        local_embedding: vecWithScore(0.9),
+        local_embedding: vecWithScore(0.9, i + 1),
       }));
     }
     insertMemory(projectDb, createTestMemory({
       id: 'fresh',
       content: 'fresh',
       summary: 'Fresh relevant memory',
-      local_embedding: vecWithScore(0.7),
+      local_embedding: vecWithScore(0.7, 5),
     }));
     mockEmbedLocal.mockResolvedValue(queryVec());
 
@@ -696,7 +710,7 @@ describe('executePromptRecallWithFallback — semantic-first', () => {
   test('respects limit', async () => {
     const { projectDb, globalDb } = setupTestDbs();
     for (let i = 0; i < 3; i++) {
-      insertMemory(projectDb, createTestMemory({ id: `m${i}`, content: `c${i}`, summary: `s${i}`, local_embedding: vecWithScore(0.7) }));
+      insertMemory(projectDb, createTestMemory({ id: `m${i}`, content: `c${i}`, summary: `s${i}`, local_embedding: vecWithScore(0.7, i + 1) }));
     }
     mockEmbedLocal.mockResolvedValue(queryVec());
 
@@ -707,6 +721,30 @@ describe('executePromptRecallWithFallback — semantic-first', () => {
     });
 
     expect(results).toHaveLength(2);
+
+    projectDb.close();
+    globalDb.close();
+  });
+
+  test('restatements of a hit do not fill the semantic slots: the next distinct facts get them', async () => {
+    // Three wordings of one fact (same axis) outrank everything else; without
+    // distinct recall they would take all three semantic slots.
+    const { projectDb, globalDb } = setupTestDbs();
+    const seed = (id: string, score: number, axis: number, memory_type: 'decision' | 'gotcha' = 'decision') =>
+      insertMemory(projectDb, createTestMemory({ id, content: id, summary: id, memory_type, local_embedding: vecWithScore(score, axis) }));
+    seed('fact', 0.8, 1);
+    seed('fact-reworded', 0.79, 1);
+    seed('fact-reworded-again', 0.78, 1);
+    seed('same-direction-other-type', 0.77, 1, 'gotcha');
+    seed('other-fact', 0.75, 2);
+    mockEmbedLocal.mockResolvedValue(queryVec());
+
+    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+      prompt: 'truly novel xyzzy plugh frobnicate',
+      surfaceContent: '',
+    });
+
+    expect(results.map(r => r.id)).toEqual(['fact', 'same-direction-other-type', 'other-fact']);
 
     projectDb.close();
     globalDb.close();

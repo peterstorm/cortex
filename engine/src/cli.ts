@@ -19,13 +19,14 @@
  * - index-code: Prose-code pairing
  * - forget: Archive memories
  * - consolidate: Merge duplicates
+ * - dedupe: Supersede memories that restate a newer one (no LLM)
  * - lifecycle: Apply decay + archival
  * - traverse: Graph traversal
  * - inspect: Telemetry display
  * - backfill: Process embedding queue
  * - prompt-recall: Semantic-first recall from user prompt, strict keyword AND supplement (UserPromptSubmit hook)
  * - ai-prune: AI-powered memory pruning
- * - maintenance: Combined lifecycle + ai-prune + surface maintenance
+ * - maintenance: Combined lifecycle + dedupe + ai-prune + surface maintenance
  * - semantic-edges: Typed-edge classification by LLM, on demand only
  * - load-surface: Surface load cache
  * - entity-query: Entity/fact graph queries
@@ -46,7 +47,7 @@ import {
   getTelemetryPath,
   DEFAULT_SEARCH_LIMIT,
   GITIGNORE_PATTERNS,
-  LOCAL_COSINE_CALIBRATED,
+  ACTIVE_COSINE_CALIBRATION,
 } from './config.js';
 import { openDatabase, openDatabaseReadOnly, getActiveMemories, getMemoriesByIds } from './infra/db.js';
 import { ensureGitignored, writeSurface } from './infra/filesystem.js';
@@ -72,6 +73,8 @@ import { executeRemember } from './commands/remember.js';
 import { executeIndexCode } from './commands/index-code.js';
 import { forgetById, forgetByQuery } from './commands/forget.js';
 import { findSimilarPairs, formatPairForReview, mergePair } from './commands/consolidate.js';
+import { dedupeChangedMemories, executeDedupe, formatDedupeOutcome } from './commands/dedupe.js';
+import { invalidateSurfaceCache } from './commands/generate.js';
 import { runFullLifecycle, runLifecycleIfNeeded } from './commands/lifecycle.js';
 import { runAiPrune, runAiPruneIfNeeded } from './commands/ai-prune.js';
 import { executeTraverse } from './commands/traverse.js';
@@ -396,7 +399,7 @@ async function handleRemember(args: string[]): Promise<CommandResult> {
   if (args.length < 2) {
     return {
       kind: 'failed',
-      error: 'Usage: remember <cwd> <content> [--type=TYPE] [--priority=N] [--scope=SCOPE] [--pinned] [--tags=tag1,tag2]',
+      error: 'Usage: remember <cwd> <content> [--type=TYPE] [--priority=N] [--scope=SCOPE] [--pinned] [--tags=tag1,tag2] [--replaces=TAG]',
     };
   }
 
@@ -410,10 +413,10 @@ async function handleRemember(args: string[]): Promise<CommandResult> {
       projectDb,
       globalDb,
       {
-        // Cosine dedup only when the active local model is the one the
-        // thresholds were calibrated against; otherwise a threshold hit would
-        // drop a genuinely new memory as a duplicate. See LOCAL_COSINE_CALIBRATED.
-        embedFn: LOCAL_COSINE_CALIBRATED ? embedLocal : null,
+        // Cosine dedup only when the active local model has a dedup
+        // calibration; otherwise a threshold hit would drop a genuinely new
+        // memory as a duplicate. See COSINE_CALIBRATIONS in config.ts.
+        embedFn: ACTIVE_COSINE_CALIBRATION !== null ? embedLocal : null,
         projectName: project.name,
         projectRoot: project.root,
         // Drain the embedding queue NOW instead of at the next session start
@@ -434,9 +437,33 @@ async function handleRemember(args: string[]): Promise<CommandResult> {
       }
     );
 
-    return result.success
-      ? { kind: 'succeeded', output: `Created memory: ${result.memory_id}` }
-      : { kind: 'failed', error: result.error };
+    if (!result.success) return { kind: 'failed', error: result.error };
+    const superseded = result.superseded.length > 0
+      ? ` (superseded ${result.superseded.length}: ${result.superseded.join(', ')})`
+      : '';
+    return { kind: 'succeeded', output: `Created memory: ${result.memory_id}${superseded}` };
+  });
+}
+
+/**
+ * Handle 'dedupe' subcommand: supersede memories that restate a newer one, in
+ * the project and the global database. `--dry-run` prints the plan only.
+ */
+async function handleDedupe(args: string[]): Promise<CommandResult> {
+  if (args.length < 1) {
+    return { kind: 'failed', error: 'Usage: dedupe <cwd> [--dry-run]' };
+  }
+  const dryRun = args.includes('--dry-run');
+
+  return withProjectSession(args[0], 'Dedupe', ({ project, projectDb, globalDb }) => {
+    const outcome = executeDedupe(
+      [{ label: 'project', db: projectDb }, { label: 'global', db: globalDb }],
+      ACTIVE_COSINE_CALIBRATION?.restatement ?? null,
+      dryRun,
+    );
+    // Superseded memories must not be served from a stale cached surface.
+    if (dedupeChangedMemories(outcome)) invalidateSurfaceCache(project.root);
+    return { kind: 'succeeded', output: formatDedupeOutcome(outcome) };
   });
 }
 
@@ -1177,8 +1204,12 @@ async function handleMaintenance(args: string[]): Promise<CommandResult> {
     // left 99.6% as plain relates_to, and only `traverse` reads the type, so
     // it spent subscription quota for nothing the surface or recall uses.
     // `semantic-edges` stays available as an explicit command.
+    // Dedupe after lifecycle (no point comparing what was just archived) and
+    // before ai-prune, so the LLM never reviews restatements: it needs no LLM
+    // and no model load, only the stored vectors.
     const steps: readonly (() => Promise<CommandResult>)[] = [
       () => handleLifecycle([cwd, '--if-needed']),
+      () => handleDedupe([cwd]),
       () => handleAiPrune([cwd, '--if-needed']),
       () => handleGenerate([cwd]),
     ];
@@ -1408,6 +1439,7 @@ const SUBCOMMANDS = {
   'index-code': handleIndexCode,
   forget: handleForget,
   consolidate: handleConsolidate,
+  dedupe: handleDedupe,
   lifecycle: handleLifecycle,
   'ai-prune': handleAiPrune,
   maintenance: handleMaintenance,

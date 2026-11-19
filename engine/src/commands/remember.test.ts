@@ -9,8 +9,10 @@ import {
   type RememberArgs,
   type ParseResult,
 } from './remember.js';
-import { openDatabase, getMemory, insertMemory } from '../infra/db.js';
+import { createHash } from 'node:crypto';
+import { openDatabase, getMemory, insertMemory, updateMemory } from '../infra/db.js';
 import { createMemory } from '../core/types.js';
+import { buildEmbeddingText } from '../core/extraction.js';
 import type { Database } from 'bun:sqlite';
 import type { Memory } from '../core/types.js';
 
@@ -46,6 +48,7 @@ describe('Remember Command', () => {
         pinned: false,
         tags: [],
         sessionId,
+        replaces: null,
       });
     });
 
@@ -71,6 +74,7 @@ describe('Remember Command', () => {
         pinned: true,
         tags: ['architecture', 'database', 'critical'],
         sessionId,
+        replaces: null,
       });
     });
 
@@ -210,6 +214,7 @@ describe('Remember Command', () => {
         pinned: true,
         tags: ['tag1', 'tag2'],
         sessionId: 'session-123',
+        replaces: null,
       };
 
       const memory = buildMemoryFromArgs(args);
@@ -253,6 +258,7 @@ describe('Remember Command', () => {
         pinned: false,
         tags: [],
         sessionId: 'session-123',
+        replaces: null,
       };
 
       const memory = buildMemoryFromArgs(args);
@@ -272,6 +278,7 @@ describe('Remember Command', () => {
         pinned: false,
         tags: [],
         sessionId: 'session-123',
+        replaces: null,
       };
 
       const memory = buildMemoryFromArgs(args);
@@ -289,6 +296,7 @@ describe('Remember Command', () => {
         pinned: false,
         tags: [],
         sessionId: 'session-123',
+        replaces: null,
       };
 
       const mem1 = buildMemoryFromArgs(args);
@@ -306,6 +314,7 @@ describe('Remember Command', () => {
         pinned: false,
         tags: [],
         sessionId: 'session-123',
+        replaces: null,
       };
 
       const memory = buildMemoryFromArgs(args);
@@ -324,6 +333,7 @@ describe('Remember Command', () => {
         pinned: true,
         tags: [],
         sessionId: 'session-123',
+        replaces: null,
       });
 
       const result = formatSuccessResult(memory);
@@ -345,6 +355,7 @@ describe('Remember Command', () => {
         pinned: false,
         tags: [],
         sessionId: 'session-123',
+        replaces: null,
       });
 
       const result = formatSuccessResult(memory);
@@ -690,6 +701,36 @@ describe('Remember Command', () => {
       expect(result.success).toBe(true);
       if (!result.success) return;
       expect(getMemory(projectDb, result.memory_id)).not.toBeNull();
+    });
+
+    it('refuses a global memory restated from another project: the embed text does not carry the calling project', async () => {
+      // Deterministic fake embedder: identical text -> identical vector,
+      // different text -> an unrelated one. The flush mirrors cli.ts, which
+      // backfills with the CALLING project's name whatever the target DB.
+      const fakeEmbed = async (text: string): Promise<Float32Array> => {
+        const digest = createHash('sha256').update(text).digest();
+        return Float32Array.from(digest.subarray(0, 16), (byte) => byte - 127.5);
+      };
+      const rememberFrom = (projectName: string) =>
+        executeRemember(['Prefer small pull requests', '--scope=global'], sessionId, projectDb, globalDb, {
+          embedFn: fakeEmbed,
+          projectName,
+          flushEmbedding: async (db, memory) => {
+            updateMemory(db, memory.id, {
+              local_embedding: await fakeEmbed(buildEmbeddingText(memory, projectName)),
+            });
+          },
+        });
+
+      const first = await rememberFrom('project-a');
+      expect(first.success).toBe(true);
+      if (!first.success) return;
+      expect(getMemory(globalDb, first.memory_id)?.local_embedding).not.toBeNull();
+
+      const second = await rememberFrom('project-b');
+      expect(second.success).toBe(false);
+      if (second.success) return;
+      expect(second.error).toContain('near-duplicate');
     });
 
     it('still detects exact duplicates via Jaccard when embedFn throws', async () => {

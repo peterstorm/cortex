@@ -43,10 +43,11 @@ A `SessionEnd` hook detaches a background worker (so nothing blocks the session)
 1. **Extract** — Stream the session transcript (JSONL), project it to what the model actually saw (dropping subagent `details`, tool-result siblings and snapshots — ~96% of bytes on subagent-heavy sessions) and read it in resumable 100KB chunks of that projection, add git context (branch, commits, changed files), and use the configured direct OpenAI-compatible endpoint with thinking disabled (under both known chat-template conventions — `thinking` and `enable_thinking` — since the served model family is not known in advance), falling back to a headless coding-agent CLI when no direct endpoint is available; each invocation is bounded to five chunks, and in Claude Code the rest waits for the next run on the same session (Pi's detached ingestion worker instead keeps extracting before backfill, with one budget per reason: up to 121 attempts, about ten minutes, while another extraction holds the lock, but only 3 while extraction keeps failing, and none for a provider refusal; whatever is left resumes from the chunk cursor next run); global-scoped candidates are routed to the global DB, while entity-only/global-only responses receive a project-local provenance memory so extracted facts are retained; once the transcript's end is reached, extract also runs a lifecycle pass
 2. **Backfill** — Compute embeddings for newly extracted memories (local static model, no API)
 3. **Lifecycle** — Decay confidence, archive stale memories, prune old ones
-4. **AI Prune** — When due, the LLM evaluates active memories and archives low-value ones
-5. **Generate** — Rebuild the surface file LAST, after all archival, so the next session never starts from a surface containing just-archived memories
+4. **Dedupe** — Supersede memories that restate a newer one (stored vectors only, no LLM; see [Restatement Cleanup](#restatement-cleanup-dedupe))
+5. **AI Prune** — When due, the LLM evaluates active memories and archives low-value ones
+6. **Generate** — Rebuild the surface file LAST, after all archival, so the next session never starts from a surface containing just-archived memories
 
-Steps 3-5 run through one per-project-locked `maintenance` command. Simultaneous session shutdowns therefore cannot multiply expensive LLM workers, and a separate AI-prune lock protects manual invocations. Claude Code's detached hook worker writes PID-scoped extraction, backfill, and maintenance logs under `/tmp`. Maintenance does not ask an LLM to type the similarity edges; `semantic-edges` is a manual command (see [Memory Graph](#memory-graph) for why).
+Steps 3-6 run through one per-project-locked `maintenance` command. Simultaneous session shutdowns therefore cannot multiply expensive LLM workers, and a separate AI-prune lock protects manual invocations. Claude Code's detached hook worker writes PID-scoped extraction, backfill, and maintenance logs under `/tmp`. Maintenance does not ask an LLM to type the similarity edges; `semantic-edges` is a manual command (see [Memory Graph](#memory-graph) for why).
 
 The Pi extension launches extract → backfill → maintenance as one detached `ingest-session` worker. Its `session_shutdown` handler returns immediately, so `/new` and `/q` do not wait for transcript ingestion. Ephemeral sessions — subagent spawns run `pi -p --no-session` — have no persisted transcript, so their shutdown spawns **nothing** (no extraction, no maintenance): nothing new entered the store, and running ai-prune would only spend LLM budget competing with the live agents that spawned the session. The spawning session's own ingestion pipeline maintains the store, and manual `bun engine/src/cli.ts maintenance <cwd>` remains available for catch-up.
 
@@ -112,6 +113,13 @@ Options:
 - `--scope`: `project` or `global` (default project)
 - `--pinned`: Exempt from decay
 - `--tags`: Comma-separated keywords
+- `--replaces=<tag>`: This memory is the new version of whatever is stored under `<tag>`: every other active memory carrying the tag in the same database (project or global, per `--scope`) is superseded — pinned ones included — and the tag is added to this memory, so the next version finds it. The new version is pinned when any version it replaces was, and takes the highest priority among them, so replacing a fact never quietly unpins or demotes it. The duplicate check is skipped, since the old version is by design a near-duplicate. The tag must be non-empty with no commas or whitespace.
+
+```
+/remember "Deploy: run release.sh, then tag the commit" --type=decision --replaces=deploy-procedure
+```
+
+A memory is refused as a near-duplicate of a stored one at the duplicate floor of its similarity space (see [Similarity & Deduplication](#similarity--deduplication)).
 
 ### `/recall`
 
@@ -319,7 +327,7 @@ Memories are connected through typed edges, forming a knowledge graph.
 
 ### Where Types Come From
 
-Every edge starts as similarity-created `relates_to` (below). The other types are written by code that knows the relation for certain: `/consolidate` merges write `supersedes`, `/index-code` writes `source_of` (and `supersedes` when it re-indexes). An LLM can also type `relates_to` edges, but only when you run `bun engine/src/cli.ts semantic-edges <cwd>` yourself.
+Every edge starts as similarity-created `relates_to` (below). The other types are written by code that knows the relation for certain: `/consolidate` merges, `dedupe` and `/remember --replaces` write `supersedes` (new → old), `/index-code` writes `source_of` (and `supersedes` when it re-indexes). An LLM can also type `relates_to` edges, but only when you run `bun engine/src/cli.ts semantic-edges <cwd>` yourself.
 
 That pass used to run in every session-end maintenance. It was taken out because it bought nothing. On 139,123 recorded pairs it typed 545 (0.4%); the rest stayed `relates_to` or were judged unrelated, which leaves the edge unchanged too. And only `traverse` reads the type: centrality counts every edge whatever its type, and prompt recall reads no edges. Its calls also used the same subscription quota whose limits were failing AI prune.
 
@@ -335,9 +343,11 @@ That pass used to run in every session-end maintenance. It was taken out because
 
 **Tier 1: Edge classification** (at insertion time)
 
-Hybrid similarity — cosine on local embeddings when both sides have one, Jaccard token overlap otherwise — with bands calibrated per similarity space. Raw local cosine on BGE-small-en-v1.5 runs "hot" (same-domain memories about different aspects routinely score 0.6-0.75), so it uses higher cutoffs. These bands belong to that specific model; when a different local model is active they are disabled rather than reused (see `LOCAL_COSINE_CALIBRATED`):
+Hybrid similarity — cosine on local embeddings when both sides have one, Jaccard token overlap otherwise. Every cosine cutoff belongs to one embedding model: a model's cosine scores mean nothing under another model's bands. So each cutoff comes from a **per-model calibration** (`cosineCalibrationFor(model)` in `engine/src/config.ts`), and a model without one is compared on Jaccard only — it fails closed. Only vectors produced by the current model are ever compared; older vectors read as missing until `backfill` replaces them.
 
-| Band | Jaccard score | Local cosine score | Action |
+Edge bands (the active potion model has none measured, so edges use the Jaccard column; the cosine column is BGE-small-en-v1.5's):
+
+| Band | Jaccard score | BGE cosine score | Action |
 |---|---|---|---|
 | ignore | < 0.1 | < 0.6 | Skip |
 | relate | 0.1 - 0.4 | 0.6 - 0.75 | Create `relates_to` edge |
@@ -348,7 +358,26 @@ Each new memory keeps at most its 3 strongest edges (structural guard against ed
 
 **Tier 2: Cosine Similarity** (embeddings)
 
-Used by `/recall` for search ranking and by `/consolidate` for duplicate detection. Consolidation thresholds are per-space: Jaccard flags pairs above 0.5; raw local cosine flags pairs above 0.8 — but only when the active local model is the calibrated one, otherwise local cosine is excluded from consolidation entirely.
+Used by `/recall` for search ranking (relative order, no calibration needed) and, through the calibration, for duplicate detection:
+
+| Use | Jaccard | potion-retrieval-32M cosine (active) | BGE-small-en-v1.5 cosine |
+|---|---|---|---|
+| Extraction dedup against stored memories | merge 0.75-0.85, skip ≥ 0.85 | skip ≥ 0.92, **no merge band** | merge 0.75-0.85, skip ≥ 0.85 |
+| Extraction dedup within one batch | skip ≥ 0.75 | skip ≥ 0.92 | skip ≥ 0.75 |
+| `/remember` duplicate refusal | ≥ 0.75 | ≥ 0.92 | ≥ 0.75 |
+| `/consolidate` candidate pairs | ≥ 0.5 | ≥ 0.85 | ≥ 0.8 |
+| `dedupe` restatement cleanup | off | ≥ 0.90 | off |
+| Distinct recall | off | ≥ 0.80 | off |
+
+The potion numbers come from 9,260 real memories, with pairs hand-graded per band: every pair at ≥ 0.90 was one fact restated, while 0.85-0.90 still holds pairs of different rules on one subject — which is why dedup never merges on potion (appending one rule to another loses both). About 5% of memories restated a newer one at ≥ 0.85; the harm was in prompt recall, whose few slots filled with copies of one fact. Distinct recall sits lower, at 0.80, because hiding a hit only affects display: after `dedupe`, every same-type pair that recall still returned at 0.80-0.85 (9 of 9, over 75 probe prompts) was one fact restated.
+
+### Restatement Cleanup (`dedupe`)
+
+`bun engine/src/cli.ts dedupe <cwd> [--dry-run]` finds memories that restate a newer one and supersedes the older copy, per database (project and global, one transaction each). Within each memory type, memories are taken newest first; each joins the most similar newer leader at or above the restatement cosine, or becomes a leader itself — no chaining, so A ≈ B ≈ C never retires A for C. Pinned memories and merge products (memories an extraction merge appended content to, which a newer copy of the summary may lack) may lead but are never superseded; `code` memories and memories without a current-model vector are left out. Superseding writes a `supersedes` edge kept → older, re-points the older memory's edges and facts to the kept one, and hands the kept memory the copy's tags (appended after its own, without repeats) and the higher of the two priorities — a lost tag would leave a later `/remember --replaces=<tag>` with nothing to supersede. A second run finds nothing. It runs in every `maintenance` pass (after lifecycle, before AI prune) and needs no LLM and no model load; with an uncalibrated model it reports itself disabled.
+
+### Distinct Recall
+
+`/recall` and the prompt-recall hook drop a hit when an already-chosen, higher-ranked hit of the same memory type is at or above the distinct-recall cosine, **before** the result limit — so the freed slot goes to the next distinct fact. Hits without a current-model vector are always kept. The output format is unchanged.
 
 ### Consolidation
 
@@ -378,7 +407,7 @@ Memories are inserted **without** embeddings to avoid blocking extraction. A bac
 |---|---|---|---|
 | potion-retrieval-32M (local, static) | 512 (Float32) | `local_embedding` | Always — runs on CPU in-process, no API key |
 
-Embedding text format: `[memory_type] [project:name] summary` — enables type-aware and project-aware similarity.
+Embedding text format: `[memory_type] [project:name] summary` — enables type-aware and project-aware similarity. `name` is the project's name for a project-scoped memory and `global` for a global-scoped one, so a memory's vector depends only on the memory: a global fact embeds the same whether extraction, `/remember` or backfill wrote it, and from whichever project. (Before, a global memory took the name of the project that embedded it, and the same summary restated from two projects scored only 0.82–0.93 — under the 0.92 duplicate floor.)
 
 `code` type memories are never embedded (security + cost). They're found via `source_of` edges from their paired `code_description`.
 
@@ -589,6 +618,7 @@ bun engine/src/cli.ts recall <cwd> "query"
 bun engine/src/cli.ts forget <cwd> "id-or-query"
 bun engine/src/cli.ts consolidate <cwd> [--threshold=N]
 bun engine/src/cli.ts consolidate <cwd> --merge --a=<idA> --b=<idB> --summary=<text> --content=<text>
+bun engine/src/cli.ts dedupe <cwd> [--dry-run]   # supersede restatements; maintenance runs it
 bun engine/src/cli.ts inspect <cwd>
 bun engine/src/cli.ts index-code <cwd> <proseId> <codePath>
 bun engine/src/cli.ts traverse <cwd> <memoryId> [maxDepth]

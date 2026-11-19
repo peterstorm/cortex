@@ -387,7 +387,7 @@ export async function executeIndexCode(
     try {
       // Build embedding text with metadata prefix
       const embeddingText = buildEmbeddingText(
-        { memory_type: 'code_description', summary: args.summary },
+        { memory_type: 'code_description', summary: args.summary, scope: args.scope },
         projectName
       );
 

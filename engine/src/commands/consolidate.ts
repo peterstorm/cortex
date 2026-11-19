@@ -14,16 +14,13 @@ import {
   createDbSnapshot,
   restoreDbSnapshot,
   insertMemory,
-  insertEdge,
-  updateMemory,
   getMemory,
-  repointEdgesToMemory,
-  repointFactSources,
+  supersedeMemory,
 } from '../infra/db.js';
 import { tokenize, hybridSimilarityScored } from '../core/similarity.js';
 import { createMemory, serializeSourceContext } from '../core/types.js';
-import type { SimilaritySpace } from '../core/types.js';
-import { consolidationThresholdFor, LOCAL_COSINE_CALIBRATED } from '../config.js';
+import type { CosineCalibration } from '../core/calibration.js';
+import { ACTIVE_COSINE_CALIBRATION, CONSOLIDATION_SIMILARITY_THRESHOLD } from '../config.js';
 import { invalidateSurfaceCache } from './generate.js';
 
 // ============================================================================
@@ -46,61 +43,47 @@ export interface MemoryPair {
  *
  * Uses Jaccard pre-filter to avoid unnecessary cosine computations.
  *
- * The duplicate threshold is calibrated PER SIMILARITY SPACE: raw local-BGE
- * cosine runs hot (same-domain pairs score 0.6-0.75), so it uses
- * CONSOLIDATION_LOCAL_COSINE_THRESHOLD (0.8) while Jaccard uses
- * CONSOLIDATION_SIMILARITY_THRESHOLD (0.5). An explicit `threshold` argument
- * overrides the per-space defaults uniformly.
+ * The duplicate threshold is calibrated PER SIMILARITY SPACE: a cosine pair
+ * uses the active model's consolidationCandidate (BGE 0.8, potion 0.85),
+ * a Jaccard pair CONSOLIDATION_SIMILARITY_THRESHOLD (0.5). An explicit
+ * `threshold` argument overrides the per-space defaults uniformly.
  *
  * @param memories - Active memories to compare
  * @param threshold - Optional uniform threshold override (default: per-space)
- * @param allowLocalCosine - Whether local-cosine may be used as a comparison
- *   space. Defaults to LOCAL_COSINE_CALIBRATED, i.e. false whenever the active
- *   local model is not the one the thresholds were tuned against. Exposed as a
- *   parameter so the calibrated behaviour stays under test regardless of which
- *   model is configured.
+ * @param calibration - The model's cosine calibration, or null to compare on
+ *   Jaccard only (default: the active model's). Exposed so each model's
+ *   behaviour stays under test regardless of which model is configured.
  * @returns Array of similar pairs sorted by similarity (descending)
  */
 export function findSimilarPairs(
   memories: readonly Memory[],
   threshold?: number,
-  allowLocalCosine: boolean = LOCAL_COSINE_CALIBRATED
+  calibration: CosineCalibration | null = ACTIVE_COSINE_CALIBRATION
 ): readonly MemoryPair[] {
   const pairs: MemoryPair[] = [];
 
   // Pre-tokenize all memories once (summary+content) to avoid O(n^2) re-tokenization
   const tokenSets = memories.map(m => tokenize(`${m.summary} ${m.content}`));
 
-  // Per pair, compare within a common embedding space: local-local when both
-  // sides have a vector, else no embeddings (Jaccard fallback).
-  const commonEmbeddings = (
-    a: Memory,
-    b: Memory
-  ): {
-    embA: Float32Array | null;
-    embB: Float32Array | null;
-    cosineSpace: SimilaritySpace;
-  } => {
-    // Local cosine only participates when the active model is the one the
-    // consolidation threshold was calibrated against. Consolidation MERGES
-    // memories, and an uncalibrated space scores unrelated pairs above the
-    // cutoff — see LOCAL_COSINE_CALIBRATED. Falling through to Jaccard is the
-    // fail-closed choice: it under-merges rather than destroying content.
-    if (allowLocalCosine && a.local_embedding && b.local_embedding) {
-      return { embA: a.local_embedding, embB: b.local_embedding, cosineSpace: 'local-cosine' };
-    }
-    return { embA: null, embB: null, cosineSpace: 'jaccard' };
-  };
+  // Local cosine only participates when the active model is calibrated for
+  // it. Consolidation MERGES memories, and an uncalibrated space scores
+  // unrelated pairs above the cutoff — see COSINE_CALIBRATIONS in config.ts.
+  // Falling through to Jaccard is the fail-closed choice: it under-merges
+  // rather than destroying content.
+  const embeddingOf = (memory: Memory): Float32Array | null =>
+    calibration === null ? null : memory.local_embedding;
 
   // Compare each pair exactly once (i < j ensures no duplicates)
   for (let i = 0; i < memories.length; i++) {
     for (let j = i + 1; j < memories.length; j++) {
-      const { embA, embB, cosineSpace } = commonEmbeddings(memories[i], memories[j]);
-      const { score, method } = hybridSimilarityScored(tokenSets[i], tokenSets[j], embA, embB);
+      const { score, method } = hybridSimilarityScored(
+        tokenSets[i], tokenSets[j], embeddingOf(memories[i]), embeddingOf(memories[j])
+      );
       // Dimension mismatch inside hybridSimilarityScored falls back to
       // Jaccard even when embeddings were provided — trust `method`.
-      const space: SimilaritySpace = method === 'cosine' ? cosineSpace : 'jaccard';
-      const pairThreshold = threshold ?? consolidationThresholdFor(space);
+      const pairThreshold = threshold ?? (method === 'cosine' && calibration !== null
+        ? calibration.consolidationCandidate
+        : CONSOLIDATION_SIMILARITY_THRESHOLD);
 
       if (score >= pairThreshold) {
         pairs.push({ memoryA: memories[i], memoryB: memories[j], similarity: score });
@@ -237,7 +220,7 @@ export interface ConsolidateResult {
  * through mergePair (FR-082), which takes its own sessionId.
  */
 export interface ConsolidateOptions {
-  readonly threshold?: number; // Default: per-space (consolidationThresholdFor)
+  readonly threshold?: number; // Default: per-space (see findSimilarPairs)
 }
 
 /**
@@ -336,35 +319,11 @@ export function mergePair(
 
     insertMemory(db, mergedMemory);
 
-    // Re-point graph edges and facts from old members to the merged memory
-    // (must precede superseding; deleting them would orphan code pairings)
-    repointEdgesToMemory(db, pair.memoryA.id, mergedMemory.id);
-    repointEdgesToMemory(db, pair.memoryB.id, mergedMemory.id);
-    repointFactSources(db, pair.memoryA.id, mergedMemory.id);
-    repointFactSources(db, pair.memoryB.id, mergedMemory.id);
-
-    // Mark old memories as superseded (FR-077)
-    updateMemory(db, pair.memoryA.id, { status: 'superseded' });
-    updateMemory(db, pair.memoryB.id, { status: 'superseded' });
-
-    // Create supersedes edges (FR-076)
-    insertEdge(db, {
-      source_id: mergedMemory.id,
-      target_id: pair.memoryA.id,
-      relation_type: 'supersedes',
-      strength: 1.0,
-      bidirectional: false,
-      status: 'active',
-    });
-
-    insertEdge(db, {
-      source_id: mergedMemory.id,
-      target_id: pair.memoryB.id,
-      relation_type: 'supersedes',
-      strength: 1.0,
-      bidirectional: false,
-      status: 'active',
-    });
+    // Both members hand their edges and facts to the merged memory (deleting
+    // them would orphan code pairings), are superseded (FR-077) and get a
+    // supersedes edge from it (FR-076).
+    supersedeMemory(db, pair.memoryA.id, mergedMemory.id);
+    supersedeMemory(db, pair.memoryB.id, mergedMemory.id);
   });
 
   tx();

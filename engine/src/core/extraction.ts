@@ -474,19 +474,36 @@ function isValidCandidate(obj: unknown): obj is MemoryCandidate {
 }
 
 /**
+ * What an extraction merge puts between an existing memory's content and the
+ * candidate content appended to it. The summary is left as it was, so a memory
+ * containing it holds content its summary (and so its vector) does not show.
+ */
+export const MERGED_CONTENT_SEPARATOR = '\n---\n';
+
+/**
  * Builds embedding text with metadata prefix for semantic search.
  *
  * FR-108: Embedding metadata prefix: '[memory_type] [project:name] summary'
  * (only the summary is embedded, never the full content).
  *
- * @param memory - The two fields the text is built from; a candidate and a
- *   stored memory both satisfy it
- * @param projectName - Project name for prefix
+ * The prefix is decided by the memory's own scope: a global memory always
+ * embeds as `[project:global]`, a project memory as `[project:<projectName>]`.
+ * So the text is a function of the memory alone, and every path that embeds it
+ * (extraction, remember, the post-remember flush, backfill) produces the same
+ * vector. Dedup compares vectors within one database; when the global
+ * database held rows embedded under whichever project the remember or flush
+ * happened to run in, identical summaries scored 0.82-0.93 cosine against each
+ * other on potion — below the 0.92 skip, so verbatim duplicates were stored.
+ *
+ * @param memory - The fields the text is built from; a candidate and a stored
+ *   memory both satisfy it
+ * @param projectName - Project name for a project-scoped memory's prefix
  * @returns Formatted text for embedding
  */
 export function buildEmbeddingText(
-  memory: Pick<MemoryCandidate, 'memory_type' | 'summary'>,
+  memory: Pick<MemoryCandidate, 'memory_type' | 'summary' | 'scope'>,
   projectName: string
 ): string {
-  return `[${memory.memory_type}] [project:${projectName}] ${memory.summary}`;
+  const prefix = memory.scope === 'global' ? 'global' : projectName;
+  return `[${memory.memory_type}] [project:${prefix}] ${memory.summary}`;
 }

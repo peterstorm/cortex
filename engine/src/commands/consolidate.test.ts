@@ -17,6 +17,10 @@ import {
 } from './consolidate.js';
 import { createMemory } from '../core/types.js';
 import type { Memory } from '../core/types.js';
+import { cosineCalibrationFor } from '../config.js';
+
+/** BGE carries cosine bands for every use, so the calibrated paths stay under test. */
+const BGE = cosineCalibrationFor('Xenova/bge-small-en-v1.5');
 import { openDatabase, insertMemory, getMemory, getAllEdges } from '../infra/db.js';
 
 // ============================================================================
@@ -129,7 +133,7 @@ describe('findSimilarPairs', () => {
       local_embedding: new Float32Array([0.1, 0.2, 0.3, 0.4, 0.5]),
     });
 
-    const pairs = findSimilarPairs([memoryA, memoryB], 0.5, true);
+    const pairs = findSimilarPairs([memoryA, memoryB], 0.5, BGE);
 
     expect(pairs.length).toBe(1);
     expect(pairs[0].similarity).toBeCloseTo(1.0, 2);
@@ -139,7 +143,7 @@ describe('findSimilarPairs', () => {
     const memoryA = createTestMemory({ local_embedding: new Float32Array([0.5, 0.5, 0.5]) });
     const memoryB = createTestMemory({ local_embedding: new Float32Array([0.5, 0.5, 0.5]) });
 
-    const pairs = findSimilarPairs([memoryA, memoryB], 0.5, true);
+    const pairs = findSimilarPairs([memoryA, memoryB], 0.5, BGE);
 
     // Identical vectors = 1.0 similarity
     expect(pairs.length).toBe(1);
@@ -208,9 +212,9 @@ describe('findSimilarPairs - embedding type selection', () => {
       local_embedding: new Float32Array([1, 0, 0]),       // identical local vector
     });
 
-    // allowLocalCosine: true — local cosine is only a comparison space when the
-    // active model matches the one the thresholds were calibrated against.
-    const pairs = findSimilarPairs([memoryA, memoryB], 0.9, true);
+    // A calibration is passed: local cosine is only a comparison space when
+    // the model has one.
+    const pairs = findSimilarPairs([memoryA, memoryB], 0.9, BGE);
     // Identical local vectors → cosine 1.0. Cross-type selection would have
     // hit a dimension mismatch and fallen back to Jaccard (~0, no pair).
     expect(pairs.length).toBe(1);
@@ -230,16 +234,16 @@ describe('findSimilarPairs - per-space default thresholds (calibration regressio
     createTestMemory({ ...contentB, local_embedding: new Float32Array([c, Math.sqrt(1 - c * c)]) }),
   ];
 
-  test('local-cosine 0.7 (same-domain-different-aspect band) is NOT flagged when calibrated', () => {
+  test('BGE cosine 0.7 (same-domain-different-aspect band) is NOT flagged when calibrated', () => {
     // Raw 384-dim BGE cosine runs hot: 0.6-0.75 is routine for unrelated
     // aspects of the same project. Under the old uniform 0.5 threshold this
     // produced O(n²) false "duplicate" pairs.
-    const pairs = findSimilarPairs(localPairAt(0.7), undefined, true);
+    const pairs = findSimilarPairs(localPairAt(0.7), undefined, BGE);
     expect(pairs.length).toBe(0);
   });
 
-  test('local-cosine 0.85 (true-duplicate band) IS flagged when calibrated', () => {
-    const pairs = findSimilarPairs(localPairAt(0.85), undefined, true);
+  test('BGE cosine 0.85 (true-duplicate band) IS flagged when calibrated', () => {
+    const pairs = findSimilarPairs(localPairAt(0.85), undefined, BGE);
     expect(pairs.length).toBe(1);
     expect(pairs[0].similarity).toBeCloseTo(0.85, 5);
   });
@@ -250,8 +254,15 @@ describe('findSimilarPairs - per-space default thresholds (calibration regressio
     // unrelated memory pairs reach cosine 0.899 — so under an uncalibrated
     // model a 0.85 must carry no duplicate signal at all. The pair falls
     // through to Jaccard, which scores these disjoint summaries near zero.
-    const pairs = findSimilarPairs(localPairAt(0.85), undefined, false);
+    const pairs = findSimilarPairs(localPairAt(0.85), undefined, null);
     expect(pairs.length).toBe(0);
+  });
+
+  test('potion lists pairs from its own 0.85, not BGE\'s 0.8', () => {
+    const POTION = cosineCalibrationFor('minishlab/potion-retrieval-32M');
+    expect(findSimilarPairs(localPairAt(0.82), undefined, POTION)).toHaveLength(0);
+    expect(findSimilarPairs(localPairAt(0.82), undefined, BGE)).toHaveLength(1);
+    expect(findSimilarPairs(localPairAt(0.86), undefined, POTION)).toHaveLength(1);
   });
 
   test('Jaccard 0.55 is flagged by default (well-separated space keeps 0.5)', () => {
@@ -271,8 +282,8 @@ describe('findSimilarPairs - per-space default thresholds (calibration regressio
 
 
   test('explicit threshold overrides the per-space defaults uniformly', () => {
-    expect(findSimilarPairs(localPairAt(0.7), 0.6, true).length).toBe(1);
-    expect(findSimilarPairs(localPairAt(0.7), 0.75, true).length).toBe(0);
+    expect(findSimilarPairs(localPairAt(0.7), 0.6, BGE).length).toBe(1);
+    expect(findSimilarPairs(localPairAt(0.7), 0.75, BGE).length).toBe(0);
   });
 
   test('dimension-mismatch fallback uses the jaccard threshold, not the cosine one', () => {
@@ -288,7 +299,7 @@ describe('findSimilarPairs - per-space default thresholds (calibration regressio
       local_embedding: new Float32Array([1, 0, 0]),
     });
 
-    // Jaccard ≈ 0.545 — above 0.5 (jaccard threshold), below 0.8 (local-cosine)
+    // Jaccard ≈ 0.545 — above 0.5 (jaccard threshold), below 0.8 (BGE cosine)
     const pairs = findSimilarPairs([memoryA, memoryB]);
     expect(pairs.length).toBe(1);
   });

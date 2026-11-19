@@ -23,10 +23,12 @@ import type { Memory, RecallPath } from '../core/types.js';
 import { searchByKeywordOr, searchByKeywordAnd, getMemoriesWithEmbedding } from '../infra/db.js';
 import { embedLocal } from '../infra/local-embed.js';
 import { rankBySimilarity, STOP_WORDS, extractUnigrams } from '../core/similarity.js';
+import { distinctFacts } from '../core/restatement.js';
 import { buildQueryEmbeddingText } from './recall.js';
 import { sanitizeSurfaceText } from '../core/surface.js';
 import { admitAll, type MemoryAdmission } from '../core/admission.js';
 import {
+  ACTIVE_COSINE_CALIBRATION,
   RECALL_MAX_BLOCK_BYTES,
   SUMMARY_MAX_CHARS,
   UNTRUSTED_MEMORY_WARNING,
@@ -132,22 +134,23 @@ export function selectSemanticHits(
 
 /**
  * Merge semantic hits (first: ranked by relevance) with strict keyword hits,
- * deduplicated by id and capped at `limit`.
+ * deduplicated by id, then by fact (distinctFacts at `distinctThreshold`, null
+ * = off), and capped at `limit`. The fact dedup runs before the cap, so a slot
+ * a restatement would have taken goes to the next distinct hit.
  */
 export function mergePromptRecall(
   semantic: readonly Memory[],
   keyword: readonly Memory[],
   limit: number,
+  distinctThreshold: number | null = null,
 ): readonly Memory[] {
   const seen = new Set<string>();
-  const merged: Memory[] = [];
-  for (const mem of [...semantic, ...keyword]) {
-    if (seen.has(mem.id)) continue;
+  const merged = [...semantic, ...keyword].filter((mem) => {
+    if (seen.has(mem.id)) return false;
     seen.add(mem.id);
-    merged.push(mem);
-    if (merged.length >= limit) break;
-  }
-  return merged;
+    return true;
+  });
+  return distinctFacts(merged, (mem) => mem, distinctThreshold).slice(0, limit);
 }
 
 /**
@@ -312,6 +315,7 @@ export async function recallForPrompt(
 
   const limit = options.limit ?? PROMPT_RECALL_LIMIT;
   const admit = options.admit ?? admitAll;
+  const distinctThreshold = ACTIVE_COSINE_CALIBRATION?.distinctRecall ?? null;
 
   let semantic: readonly Memory[];
   try {
@@ -326,10 +330,17 @@ export async function recallForPrompt(
       ...(globalDb ? getMemoriesWithEmbedding(globalDb) : []),
     ].filter(({ memory }) => admit(memory) && !isInSurface(memory, options.surfaceContent));
 
-    semantic = selectSemanticHits(
-      rankBySimilarity(candidates, queryEmbedding, SEMANTIC_LIMIT, SEMANTIC_COSINE_FLOOR),
-      SEMANTIC_RELATIVE_BAND,
-    );
+    // Rank every candidate, drop restatements of a better hit, THEN cut to
+    // SEMANTIC_LIMIT: a slot a copy of one fact would have taken goes to the
+    // next distinct hit instead of being lost.
+    semantic = distinctFacts(
+      selectSemanticHits(
+        rankBySimilarity(candidates, queryEmbedding, candidates.length, SEMANTIC_COSINE_FLOOR),
+        SEMANTIC_RELATIVE_BAND,
+      ),
+      (mem) => mem,
+      distinctThreshold,
+    ).slice(0, SEMANTIC_LIMIT);
   } catch {
     // Best-effort: embedder/DB failure degrades to keyword-only recall.
     return { path: 'keyword-fallback', memories: executePromptRecall(projectDb, globalDb, options) };
@@ -340,7 +351,7 @@ export async function recallForPrompt(
       admit(mem) && !isTagOnlyMatch(mem, unigrams) && !isInSurface(mem, options.surfaceContent),
   );
 
-  return { path: 'semantic', memories: mergePromptRecall(semantic, strict, limit) };
+  return { path: 'semantic', memories: mergePromptRecall(semantic, strict, limit, distinctThreshold) };
 }
 
 /** recallForPrompt for callers that only inject the memories: the hook. */

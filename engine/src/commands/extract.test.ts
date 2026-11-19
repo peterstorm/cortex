@@ -31,6 +31,8 @@ import {
 } from './extract.js';
 import { locateProject } from '../core/project-location.js';
 import { PROJECTION_VERSION } from '../core/transcript-projection.js';
+import type { DedupPolicy, DedupThresholds } from '../core/calibration.js';
+import { MAX_EDGES_PER_MEMORY, cosineCalibrationFor, dedupPolicyFor } from '../config.js';
 import { LlmProviderRefusedError } from '../infra/llm-failure.js';
 
 /** Extract for a session whose directory is its own project: it is in no repository. */
@@ -56,15 +58,15 @@ vi.mock('../infra/claude-llm.js', () => ({
 vi.mock('../infra/llm-client.js', () => ({
   resolveOpenAiCompatEndpoint: () => mockResolveEndpoint(),
 }));
+const mockEmbedLocal = vi.fn();
 vi.mock('../infra/local-embed.js', () => ({
   ensureModelLoaded: () => mockEnsureModelLoaded(),
-  embedLocal: async () => {
-    throw new Error('local embedding model disabled in tests');
-  },
+  embedLocal: (text: string) => mockEmbedLocal(text),
 }));
 
 beforeEach(() => {
   mockEnsureModelLoaded.mockReset().mockResolvedValue(false);
+  mockEmbedLocal.mockReset().mockRejectedValue(new Error('local embedding model disabled in tests'));
 });
 
 describe('extract command - core logic', () => {
@@ -358,6 +360,17 @@ describe('extract command - core logic', () => {
 describe('deduplicateCandidates', () => {
   const now = new Date().toISOString();
 
+  /** One set of merge/skip/intra-batch thresholds for both spaces. */
+  const policyAt = (mergeFrom: number, skipFrom = 0.85, intraBatch = 0.75): DedupPolicy => {
+    const thresholds: DedupThresholds = {
+      existing: { kind: 'merge-then-skip', mergeFrom, skipFrom },
+      intraBatch,
+    };
+    return { jaccard: thresholds, cosine: thresholds };
+  };
+  const BGE_POLICY = dedupPolicyFor(cosineCalibrationFor('Xenova/bge-small-en-v1.5'));
+  const POTION_POLICY = dedupPolicyFor(cosineCalibrationFor('minishlab/potion-retrieval-32M'));
+
   function makeMemory(overrides: Partial<Memory>): Memory {
     return createMemory({
       id: 'test-id',
@@ -407,7 +420,7 @@ describe('deduplicateCandidates', () => {
     })];
 
     // High Jaccard overlap (~0.82) + no embeddings → merge (between threshold and ceiling)
-    const { kept, merges } = deduplicateCandidates(candidates, existing, 0.75, new Map(), 0.90);
+    const { kept, merges } = deduplicateCandidates(candidates, existing, new Map(), policyAt(0.75, 0.90));
     expect(merges).toHaveLength(1);
     expect(kept).toHaveLength(0);
   });
@@ -422,7 +435,7 @@ describe('deduplicateCandidates', () => {
       content: 'Frontend uses React hooks for state management',
     })];
 
-    const { kept, skipped } = deduplicateCandidates(candidates, existing, 0.45);
+    const { kept, skipped } = deduplicateCandidates(candidates, existing, new Map(), policyAt(0.45));
     expect(skipped).toBe(0);
     expect(kept).toHaveLength(1);
   });
@@ -450,7 +463,7 @@ describe('deduplicateCandidates', () => {
     candidateEmbeddings.set(0, sharedEmbedding);
 
     const { kept, skipped } = deduplicateCandidates(
-      candidates, existing, 0.45, candidateEmbeddings
+      candidates, existing, candidateEmbeddings, policyAt(0.45)
     );
     // Cosine of identical embeddings = 1.0, well above 0.45
     expect(skipped).toBe(1);
@@ -468,7 +481,7 @@ describe('deduplicateCandidates', () => {
       }),
     ];
 
-    const { kept, skipped } = deduplicateCandidates(candidates, [], 0.45);
+    const { kept, skipped } = deduplicateCandidates(candidates, [], new Map(), policyAt(0.45));
     expect(skipped).toBe(1);
     expect(kept).toHaveLength(1);
   });
@@ -479,7 +492,7 @@ describe('deduplicateCandidates', () => {
       content: 'Test content here for dedup',
     })];
 
-    const { kept, skipped } = deduplicateCandidates(candidates, [], 0.45);
+    const { kept, skipped } = deduplicateCandidates(candidates, [], new Map(), policyAt(0.45));
     expect(kept).toHaveLength(1);
     expect(skipped).toBe(0);
   });
@@ -516,7 +529,7 @@ describe('deduplicateCandidates', () => {
       embeddings.set(1, vecAtAngle(Math.acos(0.8)));
 
       const { kept, skipped, merges } = deduplicateCandidates(
-        candidates, existing, 0.75, embeddings, 0.85, 0.75
+        candidates, existing, embeddings, BGE_POLICY
       );
 
       expect(kept).toHaveLength(1);
@@ -540,13 +553,86 @@ describe('deduplicateCandidates', () => {
       embeddings.set(0, vecAtAngle(Math.acos(0.8)));
 
       const { kept, skipped, merges } = deduplicateCandidates(
-        candidates, existing, 0.75, embeddings, 0.85, 0.75
+        candidates, existing, embeddings, BGE_POLICY
       );
 
       expect(kept).toHaveLength(0);
       expect(skipped).toBe(0);
       expect(merges).toHaveLength(1);
       expect(merges[0].existingMemoryId).toBe('existing-x');
+    });
+  });
+
+  describe('per-model calibration', () => {
+    function vecAt(cosine: number): Float32Array {
+      const v = new Float32Array(512);
+      v[0] = cosine;
+      v[1] = Math.sqrt(1 - cosine * cosine);
+      return v;
+    }
+    const existingAtZero = () => [makeMemory({
+      id: 'existing-x',
+      summary: 'alpha bravo charlie',
+      content: 'alpha bravo charlie',
+      local_embedding: vecAt(1),
+    })];
+    const oneCandidate = [makeCandidate({ summary: 'delta echo foxtrot', content: 'delta echo foxtrot' })];
+
+    it('potion has no merge band: a 0.88 cosine (two rules on one subject) is kept, not merged', () => {
+      const { kept, merges, skipped } = deduplicateCandidates(
+        oneCandidate, existingAtZero(), new Map([[0, vecAt(0.88)]]), POTION_POLICY
+      );
+      expect(merges).toHaveLength(0);
+      expect(skipped).toBe(0);
+      expect(kept).toHaveLength(1);
+    });
+
+    it('potion skips a candidate at cosine >= 0.92 and reuses the match', () => {
+      const { kept, reused, skipped } = deduplicateCandidates(
+        oneCandidate, existingAtZero(), new Map([[0, vecAt(0.93)]]), POTION_POLICY
+      );
+      expect(kept).toHaveLength(0);
+      expect(skipped).toBe(1);
+      expect(reused.map((m) => m.id)).toEqual(['existing-x']);
+    });
+
+    it('BGE keeps its merge band: 0.8 merges, 0.88 is past its 0.85 ceiling and skips', () => {
+      expect(deduplicateCandidates(oneCandidate, existingAtZero(), new Map([[0, vecAt(0.88)]]), BGE_POLICY).skipped).toBe(1);
+      expect(deduplicateCandidates(oneCandidate, existingAtZero(), new Map([[0, vecAt(0.8)]]), BGE_POLICY).merges).toHaveLength(1);
+    });
+
+    it('potion intra-batch skips from 0.92 only', () => {
+      const pair = [
+        makeCandidate({ summary: 'one', content: 'one' }),
+        makeCandidate({ summary: 'two', content: 'two' }),
+      ];
+      const near = deduplicateCandidates(pair, [], new Map([[0, vecAt(1)], [1, vecAt(0.93)]]), POTION_POLICY);
+      expect(near.kept).toHaveLength(1);
+      const apart = deduplicateCandidates(pair, [], new Map([[0, vecAt(1)], [1, vecAt(0.9)]]), POTION_POLICY);
+      expect(apart.kept).toHaveLength(2);
+    });
+
+    it('an uncalibrated policy ignores vectors entirely, even identical ones', () => {
+      const { kept, skipped } = deduplicateCandidates(
+        oneCandidate, existingAtZero(), new Map([[0, vecAt(1)]]), dedupPolicyFor(null)
+      );
+      expect(skipped).toBe(0);
+      expect(kept).toHaveLength(1);
+    });
+
+    it('a Jaccard comparison is read against the Jaccard bands even under potion', () => {
+      // No vector on the existing memory → Jaccard ≈ 0.82, in Jaccard's merge
+      // band [0.75, 0.85) although potion itself has no merge band.
+      const existing = [makeMemory({
+        summary: 'Use functional core imperative shell pattern for commands',
+        content: 'Use functional core imperative shell pattern to separate pure logic from IO in all commands',
+      })];
+      const candidates = [makeCandidate({
+        summary: 'Functional core imperative shell pattern for commands',
+        content: 'Apply functional core imperative shell pattern to separate pure logic from IO in all services',
+      })];
+      const { merges } = deduplicateCandidates(candidates, existing, new Map([[0, vecAt(1)]]), POTION_POLICY);
+      expect(merges).toHaveLength(1);
     });
   });
 });
@@ -974,13 +1060,10 @@ describe('executeExtract (mocked LLM)', () => {
     secondDb.close();
   });
 
-  it('does not even attempt a model load while local cosine is uncalibrated', async () => {
-    // Cosine dedup is gated on the active local model matching the one the
-    // thresholds were calibrated against (LOCAL_COSINE_CALIBRATED). While it
-    // does not, extraction must fall through to Jaccard WITHOUT paying for a
-    // model load — bringing the embedder up costs seconds and ~1.6 GB, and
-    // none of it would be used. The load-error surfacing this test used to
-    // cover is unreachable until the gate opens.
+  it('falls back to Jaccard dedup, and still extracts, when the calibrated model fails to load', async () => {
+    // The active model (potion) is calibrated for dedup, so extraction asks
+    // for the model. A load failure is surfaced and the run carries on with
+    // Jaccard-only dedup instead of failing the chunk.
     const transcript = '{"role":"user","content":"a durable decision"}\n';
     const { cwd, transcriptPath } = makeTestProject(transcript);
     const db = openDatabase(':memory:');
@@ -992,16 +1075,56 @@ describe('executeExtract (mocked LLM)', () => {
       const result = await executeExtract(
         { session_id: 's-model-fallback', transcript_path: transcriptPath, cwd }, db
       );
-      expect(result.kind).toBe('succeeded');
-      expect(mockEnsureModelLoaded).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ kind: 'succeeded', extracted_count: 1 });
+      expect(mockEnsureModelLoaded).toHaveBeenCalled();
       expect(stderr).toHaveBeenCalledWith(
-        expect.stringContaining('Local cosine dedup disabled'),
-      );
-      expect(stderr).not.toHaveBeenCalledWith(
         expect.stringContaining('ONNX initialization failed'),
       );
+      expect(getActiveMemories(db)[0].local_embedding).toBeNull();
     } finally {
       stderr.mockRestore();
+      db.close();
+    }
+  });
+
+  it('embeds candidates with the calibrated model, skips a paraphrase by cosine and stores the vector', async () => {
+    // Different words, identical vectors: Jaccard alone would keep both, the
+    // calibrated cosine (1.0 >= potion's 0.92) recognises the restatement.
+    const transcript = '{"role":"user","content":"two decisions"}\n';
+    const { cwd, transcriptPath } = makeTestProject(transcript);
+    const db = openDatabase(':memory:');
+    const vector = new Float32Array(512).fill(0.1);
+    insertMemory(db, createMemory({
+      id: 'stored-decision',
+      content: 'Always run migrations before deploying',
+      summary: 'Always run migrations before deploying',
+      memory_type: 'decision',
+      scope: 'project',
+      confidence: 0.9,
+      priority: 5,
+      source_type: 'extraction',
+      source_session: 'older',
+      source_context: '{}',
+      local_embedding: vector,
+    }));
+    mockExtractMemories.mockResolvedValue(memoriesResponse(
+      'Execute schema migrations first whenever shipping a release',
+      'Frontend state lives in one store',
+    ));
+    mockEnsureModelLoaded.mockResolvedValue(true);
+    mockEmbedLocal.mockImplementation(async (text: string) =>
+      text.includes('migrations') ? vector : new Float32Array(512).map((_, i) => (i % 2 === 0 ? 1 : -1))
+    );
+
+    try {
+      const result = await executeExtract(
+        { session_id: 's-cosine-dedup', transcript_path: transcriptPath, cwd }, db
+      );
+      expect(result).toMatchObject({ kind: 'succeeded', extracted_count: 1, dedup_skipped: 1 });
+      const inserted = getActiveMemories(db).find((m) => m.id !== 'stored-decision');
+      expect(inserted?.summary).toBe('Frontend state lives in one store');
+      expect(inserted?.local_embedding?.length).toBe(512);
+    } finally {
       db.close();
     }
   });
@@ -1581,6 +1704,9 @@ describe('computeEdgeCandidates', () => {
   const localVecAt = (c: number): Float32Array =>
     new Float32Array([c, Math.sqrt(1 - c * c)]);
 
+  /** The only measured cosine edge bands; the active model (potion) has none. */
+  const BGE_EDGE_BANDS = cosineCalibrationFor('Xenova/bge-small-en-v1.5')?.edgeBands ?? null;
+
   // Orthogonal vocabulary so Jaccard is ~0 and cosine drives everything
   const newMemText = { summary: 'alpha bravo', content: 'alpha bravo charlie delta' };
   const existingText = (i: number) => ({
@@ -1599,7 +1725,7 @@ describe('computeEdgeCandidates', () => {
       makeEdgeMemory(`e${i}`, { ...existingText(i), local_embedding: localVecAt(c) })
     );
 
-    const edges = computeEdgeCandidates(newMem, existing);
+    const edges = computeEdgeCandidates(newMem, existing, MAX_EDGES_PER_MEMORY, BGE_EDGE_BANDS);
 
     expect(edges.length).toBe(3); // cap, not 10
     // Strongest three, sorted descending
@@ -1611,16 +1737,16 @@ describe('computeEdgeCandidates', () => {
     }
   });
 
-  it('local-cosine below 0.6 creates NO edges (same-domain background)', () => {
+  it('BGE cosine below 0.6 creates NO edges (same-domain background)', () => {
     const newMem = makeEdgeMemory('new', { ...newMemText, local_embedding: localVecAt(1) });
     const existing = [0.3, 0.45, 0.55, 0.59].map((c, i) =>
       makeEdgeMemory(`e${i}`, { ...existingText(i), local_embedding: localVecAt(c) })
     );
 
-    expect(computeEdgeCandidates(newMem, existing)).toEqual([]);
+    expect(computeEdgeCandidates(newMem, existing, MAX_EDGES_PER_MEMORY, BGE_EDGE_BANDS)).toEqual([]);
   });
 
-  it('local-cosine maps bands: relate→active, suggest→suggested, consolidate→active', () => {
+  it('BGE cosine maps bands: relate→active, suggest→suggested, consolidate→active', () => {
     const newMem = makeEdgeMemory('new', { ...newMemText, local_embedding: localVecAt(1) });
     const existing = [
       makeEdgeMemory('relate', { ...existingText(0), local_embedding: localVecAt(0.7) }),
@@ -1628,7 +1754,7 @@ describe('computeEdgeCandidates', () => {
       makeEdgeMemory('consolidate', { ...existingText(2), local_embedding: localVecAt(0.9) }),
     ];
 
-    const edges = computeEdgeCandidates(newMem, existing);
+    const edges = computeEdgeCandidates(newMem, existing, MAX_EDGES_PER_MEMORY, BGE_EDGE_BANDS);
 
     expect(edges.map(e => e.targetId)).toEqual(['consolidate', 'suggest', 'relate']);
     expect(edges.find(e => e.targetId === 'relate')!.status).toBe('active');
@@ -1655,10 +1781,25 @@ describe('computeEdgeCandidates', () => {
     expect(edges[0].score).toBeCloseTo(2 / 6, 5);
   });
 
+  it('a model without edge bands (potion, the default) classifies on Jaccard even when both sides carry vectors', () => {
+    // Cosine 0.9 would be 'consolidate' under BGE's bands; with no bands the
+    // vectors are ignored and the disjoint vocabulary scores Jaccard ~0.
+    const newMem = makeEdgeMemory('new', { ...newMemText, local_embedding: localVecAt(1) });
+    const existing = [makeEdgeMemory('e0', { ...existingText(0), local_embedding: localVecAt(0.9) })];
+
+    expect(computeEdgeCandidates(newMem, existing)).toEqual([]);
+    expect(computeEdgeCandidates(newMem, existing, MAX_EDGES_PER_MEMORY, null)).toEqual([]);
+  });
+
+  // Overlapping vocabulary: Jaccard 2/6 → a relate edge in the default (Jaccard) space.
+  const relatedPair = (): readonly [Memory, Memory] => [
+    makeEdgeMemory('new', { summary: 'one two', content: 'one two three four', local_embedding: localVecAt(1) }),
+    makeEdgeMemory('existing', { summary: 'one two', content: 'one two five six', local_embedding: localVecAt(0.7) }),
+  ];
+
   it('reports non-unique edge insertion failures', async () => {
     const db = openDatabase(':memory:');
-    const newMem = makeEdgeMemory('new', { ...newMemText, local_embedding: localVecAt(1) });
-    const existing = makeEdgeMemory('existing', { ...existingText(0), local_embedding: localVecAt(0.7) });
+    const [newMem, existing] = relatedPair();
     insertMemory(db, newMem);
     insertMemory(db, existing);
     const dbModule = await import('../infra/db.js');
@@ -1680,8 +1821,7 @@ describe('computeEdgeCandidates', () => {
 
   it('treats an existing edge as an idempotent retry success', () => {
     const db = openDatabase(':memory:');
-    const newMem = makeEdgeMemory('new', { ...newMemText, local_embedding: localVecAt(1) });
-    const existing = makeEdgeMemory('existing', { ...existingText(0), local_embedding: localVecAt(0.7) });
+    const [newMem, existing] = relatedPair();
     insertMemory(db, newMem);
     insertMemory(db, existing);
     db.run(`
