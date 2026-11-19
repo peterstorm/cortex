@@ -35,7 +35,7 @@ engine/src/
 │   ├── consolidate.ts  Duplicate detection + merge with checkpoint/rollback
 │   ├── lifecycle.ts    Decay + archive + prune pass
 │   ├── ai-prune.ts     LLM-driven pruning of low-value memories
-│   ├── semantic-edges.ts  Typed edge classification via LLM CLI
+│   ├── semantic-edges.ts  Typed edge classification via LLM (manual command only)
 │   ├── prompt-recall.ts   UserPromptSubmit semantic-first recall + strict keyword AND
 │   ├── entity-query.ts    Entity-first temporal retrieval
 │   ├── index-code.ts   Prose-code memory pairing
@@ -136,7 +136,7 @@ SessionStart hook
 
 ### Session End (detached worker)
 
-The hook re-invokes itself as a detached worker (`setsid`, or `spawn({detached: true})` on macOS) so the pipeline survives Claude Code reaping the hook's process group. It runs three commands **sequentially**: `extract`, then `backfill` (only when extract succeeded), then `maintenance`, which runs its own four steps one after another behind a per-project lock — SQLite allows one writer, and lifecycle + ai-prune both read-modify-write telemetry.json. Each command logs to `/tmp/cortex-{extract,backfill,maintenance}.<pid>.log`; the worker deletes such logs once they are a week old. The hook needs no API key for embeddings; on NixOS it puts a 64-bit `libstdc++` on `LD_LIBRARY_PATH` for `onnxruntime-node` (`CORTEX_ONNX_LD_PATH` pins the directory, otherwise it probes the nix store).
+The hook re-invokes itself as a detached worker (`setsid`, or `spawn({detached: true})` on macOS) so the pipeline survives Claude Code reaping the hook's process group. It runs three commands **sequentially**: `extract`, then `backfill` (only when extract succeeded), then `maintenance`, which runs its own three steps one after another behind a per-project lock — SQLite allows one writer, and lifecycle + ai-prune both read-modify-write telemetry.json. Each command logs to `/tmp/cortex-{extract,backfill,maintenance}.<pid>.log`; the worker deletes such logs once they are a week old. The hook needs no API key for embeddings; on NixOS it puts a 64-bit `libstdc++` on `LD_LIBRARY_PATH` for `onnxruntime-node` (`CORTEX_ONNX_LD_PATH` pins the directory, otherwise it probes the nix store).
 
 ```
 SessionEnd hook (JSON stdin: {session_id, transcript_path, cwd})
@@ -175,12 +175,13 @@ SessionEnd hook (JSON stdin: {session_id, transcript_path, cwd})
                                                when extract failed)
     → Step 3: bun cli.ts maintenance <cwd>    (per-project maintenance.lock;
                                                a second run skips)
-        1. semantic-edges <cwd>               (typed edge classification)
-        2. lifecycle <cwd> --if-needed
-        3. ai-prune <cwd> --if-needed
-        4. generate <cwd>                     (LAST, after archival — see
+        1. lifecycle <cwd> --if-needed
+        2. ai-prune <cwd> --if-needed
+        3. generate <cwd>                     (LAST, after archival — see
                                                Surface Generation Pipeline)
 ```
+
+Maintenance does not run `semantic-edges`. On 139,123 recorded pairs the LLM pass typed 545 (0.4%) and left the rest unchanged, and only `traverse` reads an edge's type (centrality is in-degree over every edge; prompt recall reads none). `maintenance.e2e.test.ts` pins this: it runs the real command against a closed LLM port and asserts no edge was asked about.
 
 Pi runs the same three commands in one detached `ingest-session` worker, which retries a deferred or transiently failed extract until the transcript is drained before it backfills. Every detached Pi child appends to `<cwd>/.memory/logs/pi-detached.log`, each run opened by a `===== <ISO time> <command> =====` header (the engine's own lines carry no timestamps). Past 5 MiB the log is renamed to `pi-detached.log.1` before the next run opens it, so one previous generation is kept.
 
@@ -401,6 +402,10 @@ Decay + archive + prune pass. Runs automatically after extraction. Computes cent
 ### index-code
 
 Prose-code memory pairing. Creates two memories: `code_description` (with embedding) + `code` (without), linked via `source_of` edge. Re-indexing supersedes old versions for same file path. All writes in a single transaction.
+
+### semantic-edges
+
+Manual only; `maintenance` never runs it. Args: `<cwd>`. Sends batches of `relates_to` edge pairs to the LLM and rewrites each to the typed relation it names. A pair judged unrelated, or plain `relates_to`, keeps its edge unchanged and is stamped so it is not asked again until either memory's content changes; a failed batch is backed off for 24h.
 
 ### traverse
 

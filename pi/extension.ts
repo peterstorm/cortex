@@ -177,8 +177,8 @@ export default function (pi: ExtensionAPI, cli: CliRunner = defaultCliRunner) {
 
     // Ephemeral sessions (subagent spawns run `pi -p --no-session`) have no
     // transcript, so extraction never ran and nothing new entered the store.
-    // Running maintenance here would spend LLM budget (semantic-edges,
-    // ai-prune) fighting the live agents that spawned this session for server
+    // Running maintenance here would spend LLM budget (ai-prune) fighting
+    // the live agents that spawned this session for server
     // capacity, for no new data: the spawning session's own ingest-session
     // pipeline maintains the store after its extraction, and the next
     // session's session_start refreshes the surface. Manual `maintenance`

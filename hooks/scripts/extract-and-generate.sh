@@ -8,7 +8,7 @@
 #
 # Architecture:
 # Thin shell orchestrator - reads stdin JSON, pipes to extract CLI, backfills
-# embeddings, runs maintenance (semantic-edges, lifecycle, ai-prune), and
+# embeddings, runs maintenance (lifecycle, ai-prune), and
 # generates the surface LAST so it reflects post-archival state.
 # ALL errors caught and logged, NEVER block session (exit 0 always).
 #
@@ -108,8 +108,8 @@ main() {
   fi
 
   # Step 3: The worker is already detached. Run one per-project-locked
-  # maintenance command instead of spawning independent semantic-edge,
-  # lifecycle, AI-prune, and generate processes.
+  # maintenance command instead of spawning independent lifecycle,
+  # AI-prune, and generate processes.
   if [[ -n "$cwd" ]]; then
     log_info "Running locked maintenance pipeline for cwd: $cwd"
     if ! bun "$CLI_PATH" maintenance "$cwd" >"$MAINTENANCE_LOG" 2>&1; then
