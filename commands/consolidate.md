@@ -39,7 +39,9 @@ bun ${CLAUDE_PLUGIN_ROOT}/engine/src/cli.ts consolidate <cwd> --merge \
 - `<cwd>` - Project working directory (consolidate operates on the project DB only)
 
 **Optional (list mode):**
-- `--threshold=N` - Uniform similarity threshold in (0, 1]. Default is per similarity space: 0.5 for Jaccard, 0.8 for raw local-embedding cosine (which scores same-domain pairs 0.6-0.75 even when they are not duplicates)
+- `--threshold=N` - Uniform similarity threshold in (0, 1]. Default is per similarity space: 0.5 for Jaccard, and for cosine the threshold calibrated for the active embedding model (0.85 for potion-retrieval-32M). A model with no calibration is compared on Jaccard only
+
+Plain restatements (one fact stored twice, the newer copy as good as the older) do not need this command: `dedupe` supersedes them automatically in every maintenance pass. Use consolidate for pairs where a human should write the merged text.
 
 **Required (merge mode):**
 - `--merge` - Switch to merge mode

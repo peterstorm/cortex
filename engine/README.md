@@ -14,6 +14,9 @@ engine/src/
 │   ├── types.ts        Factory functions + domain types with invariant validation
 │   ├── extraction.ts   Prompt building, response parsing, transcript truncation
 │   ├── similarity.ts   Jaccard, cosine, pre-filter classification
+│   ├── calibration.ts  Per-model cosine calibration types, dedup verdicts per space
+│   ├── restatement.ts  distinctFacts (recall) + planRestatements (dedupe)
+│   ├── replacement.ts  remember --replaces: tag parser, what a replacement supersedes
 │   ├── graph.ts        BFS traversal, in-degree centrality, edge sanitization
 │   ├── ranking.ts      Composite rank formula, budget-aware selection
 │   ├── surface.ts      Markdown generation, token estimation, budget allocation
@@ -33,6 +36,7 @@ engine/src/
 │   ├── recall.ts       Semantic/keyword search with graph enrichment
 │   ├── forget.ts       Archive by ID or fuzzy query
 │   ├── consolidate.ts  Duplicate detection + merge with checkpoint/rollback
+│   ├── dedupe.ts       Supersede restatements of newer memories (maintenance step)
 │   ├── lifecycle.ts    Decay + archive + prune pass
 │   ├── ai-prune.ts     LLM-driven pruning of low-value memories
 │   ├── semantic-edges.ts  Typed edge classification via LLM (manual command only)
@@ -176,12 +180,14 @@ SessionEnd hook (JSON stdin: {session_id, transcript_path, cwd})
     → Step 3: bun cli.ts maintenance <cwd>    (per-project maintenance.lock;
                                                a second run skips)
         1. lifecycle <cwd> --if-needed
-        2. ai-prune <cwd> --if-needed
-        3. generate <cwd>                     (LAST, after archival — see
+        2. dedupe <cwd>                       (supersede restatements; stored
+                                               vectors only, no LLM, no model)
+        3. ai-prune <cwd> --if-needed
+        4. generate <cwd>                     (LAST, after archival — see
                                                Surface Generation Pipeline)
 ```
 
-Maintenance does not run `semantic-edges`. On 139,123 recorded pairs the LLM pass typed 545 (0.4%) and left the rest unchanged, and only `traverse` reads an edge's type (centrality is in-degree over every edge; prompt recall reads none). `maintenance.e2e.test.ts` pins this: it runs the real command against a closed LLM port and asserts no edge was asked about.
+Dedupe runs after lifecycle, so it does not compare what was just archived, and before ai-prune, so the LLM never spends a review on copies. Maintenance does not run `semantic-edges`. On 139,123 recorded pairs the LLM pass typed 545 (0.4%) and left the rest unchanged, and only `traverse` reads an edge's type (centrality is in-degree over every edge; prompt recall reads none). `maintenance.e2e.test.ts` pins this: it runs the real command against a closed LLM port and asserts no edge was asked about.
 
 Pi runs the same three commands in one detached `ingest-session` worker, which retries a deferred or transiently failed extract until the transcript is drained before it backfills. Every detached Pi child appends to `<cwd>/.memory/logs/pi-detached.log`, each run opened by a `===== <ISO time> <command> =====` header (the engine's own lines carry no timestamps). Past 5 MiB the log is renamed to `pi-detached.log.1` before the next run opens it, so one previous generation is kept.
 
@@ -304,17 +310,57 @@ hybridSimilarityScored(tokens, tokens, localEmbA, localEmbB) → {score, method}
   method = cosine  when both sides have local embeddings (same dims)
   method = jaccard otherwise (with <0.1 pre-filter → score 0)
 
-classifySimilarity(score, space) — bands calibrated PER SPACE:
-  jaccard:                  ignore <0.1 | relate <0.4 | suggest ≤0.5 | consolidate >0.5
-  local-cosine (runs hot):  ignore <0.6 | relate <0.75 | suggest <0.82 | consolidate ≥0.82
+classifySimilarity(score, cosineBands) — cosineBands is the active model's
+calibration edgeBands, or null (then the score is Jaccard's):
+  jaccard (null):        ignore <0.1 | relate <0.4 | suggest ≤0.5 | consolidate >0.5
+  BGE-small edge bands:  ignore <0.6 | relate <0.75 | suggest <0.82 | consolidate ≥0.82
+  potion-retrieval-32M:  no edge bands → computeEdgeCandidates passes no vectors, Jaccard only
 
 relate/consolidate → active relates_to edge, suggest → suggested edge.
 Cap: top MAX_EDGES_PER_MEMORY (3) strongest edges per new memory.
 ```
 
+### Per-model cosine calibration (`config.ts`, types in `core/calibration.ts`)
+
+Every absolute cosine cutoff belongs to one embedding model, so they live in one record per model:
+
+```ts
+type DuplicateBands =
+  | { kind: 'skip-only'; skipFrom }              // no merge band can exist
+  | { kind: 'merge-then-skip'; mergeFrom; skipFrom };
+type DedupThresholds = { existing: DuplicateBands; intraBatch: number };
+type CosineCalibration = {
+  dedup: DedupThresholds;
+  consolidationCandidate: number;
+  edgeBands: CosineEdgeBands | null;   // null: edges stay on Jaccard
+  restatement: number | null;          // null: dedupe disabled
+  distinctRecall: number | null;       // null: distinct recall is a no-op
+};
+cosineCalibrationFor(model): CosineCalibration | null   // null: uncalibrated → Jaccard everywhere
+```
+
+`ACTIVE_COSINE_CALIBRATION` is the record for `LOCAL_EMBED_MODEL`; `ACTIVE_DEDUP_POLICY` (`{ jaccard: JACCARD_DEDUP, cosine: dedup | null }`) is what extraction and `remember` compare against. `compareForDedup` scores a pair in exactly one space and returns that space's thresholds, so a cosine score is never read against Jaccard bands or the reverse; `dedupVerdict` maps a score to keep / merge / skip.
+
+| | Jaccard | potion-retrieval-32M (active) | BGE-small-en-v1.5 |
+|---|---|---|---|
+| dedup vs stored | merge-then-skip 0.75 / 0.85 | skip-only 0.92 | merge-then-skip 0.75 / 0.85 |
+| dedup within batch | 0.75 | 0.92 | 0.75 |
+| `remember` refusal (`duplicateFloor`) | 0.75 | 0.92 | 0.75 |
+| `consolidate` candidates | 0.5 | 0.85 | 0.8 |
+| edge bands | Jaccard bands | none | 0.6 / 0.75 / 0.82 |
+| `dedupe` restatement | — | 0.90 | — |
+| distinct recall | — | 0.85 | — |
+
+The measurement behind each record (corpus, graded pairs per band, failure modes) is the comment above it in `config.ts`.
+
+### Distinct facts and restatements (`core/restatement.ts`)
+
+- `distinctFacts(ranked, memoryOf, threshold)` — order-preserving: drops an item when an already-KEPT item of the same `memory_type` is at or above `threshold` cosine. Items without a current-model vector are kept; a null threshold returns the list unchanged. `recall` applies it to the merged project + global list before `limit` (over-fetching `limit × 5` while it is on); prompt-recall applies it to the semantic hits before their slot cut and to the merged semantic + strict-keyword list before its limit.
+- `planRestatements(memories, threshold)` — the `dedupe` plan, as data: per type, newest first (ties by id), each memory joins its most similar newer leader at or above `threshold` or becomes a leader. No chaining; pinned memories lead but are never superseded; `code` and unembedded memories are left out. Planning over the survivors yields nothing (idempotent), and the plan does not depend on input order.
+
 ### Cosine Similarity (at search time)
 
-Used by `/recall` and prompt-recall when embeddings are available, and by `consolidate` via hybrid similarity for duplicate-pair detection with per-space thresholds (`consolidationThresholdFor`: 0.5 Jaccard, 0.8 local cosine).
+Used by `/recall` and prompt-recall for ranking when embeddings are available (relative order, no calibration), and by `consolidate` via hybrid similarity for duplicate-pair detection (0.5 Jaccard, the calibration's `consolidationCandidate` for cosine).
 
 ### Tokenizer
 
@@ -330,11 +376,11 @@ Lowercases, strips punctuation, splits on whitespace, returns `Set<string>`.
 
 The model id and width are constants in `config.ts` (`LOCAL_EMBED_MODEL`, `LOCAL_EMBEDDING_DIMENSIONS`). A static model was chosen because the prompt-recall hook starts a fresh `bun` process per prompt, so load time is paid every time.
 
-Each row records the model that embedded it in `local_embedding_model`. Recall only ranks rows tagged with the current model; backfill re-embeds the rest.
+Each row records the model that embedded it in `local_embedding_model`. Recall only ranks rows tagged with the current model; backfill re-embeds the rest. `rowToMemory` enforces the same rule for every `Memory` read: `memory.local_embedding` is filled only when the row's tag is `LOCAL_EMBED_MODEL`, so dedup, consolidation, `dedupe` and distinct recall can never compare vectors from two models.
 
-The `local-cosine` bands and thresholds (edge classification, dedup, consolidation) were calibrated on a different model, `Xenova/bge-small-en-v1.5`. While `LOCAL_EMBED_MODEL` is not that model, `LOCAL_COSINE_CALIBRATED` is false: extraction embeds nothing (so its dedup and its edge classification run on Jaccard), and `remember`'s duplicate check and `consolidate` use Jaccard instead of cosine. Recall ranking still uses cosine: it needs relative order, not absolute cutoffs.
+Every absolute cosine cutoff comes from the active model's calibration (see [Per-model cosine calibration](#per-model-cosine-calibration-configts-types-in-corecalibrationts)). When the model has a dedup calibration, extraction embeds its candidates (project candidates with the project prefix, global ones with `global`), dedups them by cosine and stores the vector it computed; when the model has none, extraction embeds nothing and dedups on Jaccard, and `remember` gets no embedder. Recall ranking always uses cosine: it needs relative order, not absolute cutoffs.
 
-**The `embedding` column** (Float64 BLOB) is what remains of the removed remote provider. No code computes a vector for it. It is still part of the `Memory` type, so it is stored when a caller passes one and read back with the row; `remember`'s duplicate check falls back to it when its length matches the candidate vector. Recall never reads it, so a memory holding only this vector is still in the backfill queue, and `inspect` counts it there.
+**The `embedding` column** (Float64 BLOB) is what remains of the removed remote provider. No code computes a vector for it. It is still part of the `Memory` type, so it is stored when a caller passes one and read back with the row. No similarity reads it — `remember`'s duplicate check used to fall back to it, but a vector of unknown provenance is exactly what the calibration rule keeps out. A memory holding only this vector is still in the backfill queue, and `inspect` counts it there.
 
 ### Embedding Text Format
 
@@ -351,7 +397,7 @@ Prefix alignment ensures type-aware and project-aware similarity.
 
 ### Backfill
 
-`remember` inserts memories with `local_embedding = null`, and so does extraction while `LOCAL_COSINE_CALIBRATED` is false (when it is true, extraction stores the vector it computed for dedup). `index-code` embeds its description inline. The `backfill` command processes the queue:
+`remember` inserts memories with `local_embedding = null`, and so does extraction when the active model has no cosine calibration (with one, extraction stores the vector it computed for dedup). `index-code` embeds its description inline. The `backfill` command processes the queue:
 1. Fetch active, non-`code` memories recall cannot see: no `local_embedding`, or one from another model (`getActiveMemoriesNeedingEmbedding`)
 2. Build embedding texts with metadata prefix
 3. Embed them one at a time with the local model (it does not batch)
@@ -377,11 +423,15 @@ Builds surface from ranked memories. Args: `<cwd>`. Opens both DBs, runs full pi
 
 ### remember
 
-Explicit memory creation. Args: `<cwd> <content> [--type=TYPE] [--priority=N] [--scope=SCOPE] [--pinned] [--tags=t1,t2]`. Defaults: type=context, priority=5, scope=project, confidence=1.0.
+Explicit memory creation. Args: `<cwd> <content> [--type=TYPE] [--priority=N] [--scope=SCOPE] [--pinned] [--tags=t1,t2] [--replaces=TAG]`. Defaults: type=context, priority=5, scope=project, confidence=1.0.
+
+A new memory is refused as a near-duplicate at its similarity space's duplicate floor (`duplicateFloor`: the merge floor where a merge band exists, else the skip floor — 0.75 Jaccard, 0.92 potion cosine). The candidate is embedded for that check only when the active model has a cosine calibration.
+
+`--replaces=TAG` (parsed at the CLI boundary by `parseReplacementTag`: non-empty, no commas, no whitespace) makes the new memory the current version of `TAG`: in one transaction it is inserted and every other active memory carrying `TAG` in the same database — pinned ones included — is superseded via `supersedeMemory` (status `superseded`, `supersedes` edge new → old, edges and facts re-pointed). The tag is added to the new memory's tags, and the duplicate check is skipped. The output appends `(superseded N: ids)`.
 
 ### recall
 
-Semantic or keyword search. Args: `<cwd> <query> [--branch=B] [--limit=N] [--keyword]`. Searches both DBs, merges results (project first), follows `source_of` edges for linked code, BFS depth-2 for related memories. Updates `access_count` and `last_accessed_at`. Semantic search excludes archived and superseded memories; the `--branch` filter is applied before the result limit (with over-fetch) so branch matches aren't cut off; an empty keyword query returns empty results rather than erroring.
+Semantic or keyword search. Args: `<cwd> <query> [--branch=B] [--limit=N] [--keyword]`. Searches both DBs, merges results (project first), follows `source_of` edges for linked code, BFS depth-2 for related memories. Updates `access_count` and `last_accessed_at`. Semantic search excludes archived and superseded memories; the `--branch` filter and distinct recall (`distinctFacts`, see above) are applied before the result limit (with over-fetch) so branch matches and distinct facts aren't cut off; an empty keyword query returns empty results rather than erroring.
 
 ### forget
 
@@ -391,9 +441,13 @@ Archive by ID or fuzzy keyword query. Tries ID lookup in project → global, the
 
 Two modes, project DB only.
 
-**List mode** — `consolidate <cwd> [--threshold=N]`: detects duplicate pairs via hybrid similarity (cosine when both sides share an embedding type, Jaccard otherwise) and prints each pair with IDs, similarity %, type, priority, summary, and content for human review. Default threshold is per similarity space — 0.5 for Jaccard, 0.8 for raw local-BGE cosine (which scores same-domain non-duplicates 0.6-0.75); `--threshold=N` overrides uniformly.
+**List mode** — `consolidate <cwd> [--threshold=N]`: detects duplicate pairs via hybrid similarity (cosine when both sides share an embedding type, Jaccard otherwise) and prints each pair with IDs, similarity %, type, priority, summary, and content for human review. Default threshold is per similarity space — 0.5 for Jaccard, the active calibration's `consolidationCandidate` for cosine (0.85 potion, 0.8 BGE); an uncalibrated model compares on Jaccard only. `--threshold=N` overrides uniformly.
 
 **Merge mode** — `consolidate <cwd> --merge --a=<idA> --b=<idB> --summary=<text> --content=<text>`: merges one reviewed pair. The merged memory gets confidence 1.0 (human-approved), the higher priority of the two, combined tags, pinned if either was pinned, and null embeddings (backfill re-embeds the new content). Both originals are marked `superseded` with `supersedes` edges, and the new memory ID is printed. Run `backfill` + `generate` afterwards.
+
+### dedupe
+
+Restatement cleanup. Args: `<cwd> [--dry-run]`. For the project and the global database separately (one transaction each) it plans with `planRestatements` at the active calibration's `restatement` cosine and supersedes each older memory by the newer one it restates (`supersedeMemory`). `--dry-run` prints every pair (`cos`, kept and superseded id + summary) and writes nothing. A pair whose members are no longer both active when the transaction runs is skipped. Idempotent: a second run supersedes 0. Invalidates the surface cache when it superseded anything. With no restatement calibration it prints `Dedupe disabled: <model> has no restatement calibration` and touches nothing. Runs in every `maintenance` pass.
 
 ### lifecycle
 
@@ -502,4 +556,5 @@ Dependencies: `vitest`, `fast-check` (property-based). All core/ functions testa
 | `LOCAL_EMBEDDING_DIMENSIONS` | 512 | `config.ts` |
 | LLM CLI (extraction/prune/edges) | `claude -p --model haiku` (or `pi -p`) | `claude-llm.ts` |
 | `LOCAL_EMBED_MODEL` | `minishlab/potion-retrieval-32M` | `config.ts` |
-| `LOCAL_COSINE_CALIBRATED_MODEL` | `Xenova/bge-small-en-v1.5` | `config.ts` |
+| `cosineCalibrationFor(model)` | potion-retrieval-32M, bge-small-en-v1.5 (others: null → Jaccard) | `config.ts` |
+| `JACCARD_DEDUP` | merge 0.75 / skip 0.85, intra-batch 0.75 | `config.ts` |

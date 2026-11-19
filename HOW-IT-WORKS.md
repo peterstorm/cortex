@@ -68,7 +68,7 @@ When your session ends, the hook detaches a background worker (so nothing blocks
 5. **Store in DB** — insert memories, retain the chunk checkpoint on any memory/fact write failure, and compute similarity edges; entity-only or global-only responses get a deterministic project-local provenance memory so facts always have a valid source
    Once the transcript's end is reached, extraction also runs a lifecycle pass (decay/archive/prune)
 6. **Backfill embeddings** — embed newly stored memories with the local static model (skipped when extraction failed)
-7. **Maintenance (sequential)** — one `maintenance` command, behind a per-project lock so overlapping session ends cannot run it twice: lifecycle (decay/archive/prune), then AI prune. It does not classify edges (see "Semantic Edge Classification" below). These used to be concurrent detached spawns, but SQLite allows one writer and lifecycle + AI prune both read-modify-write telemetry — so they now run one after another.
+7. **Maintenance (sequential)** — one `maintenance` command, behind a per-project lock so overlapping session ends cannot run it twice: lifecycle (decay/archive/prune), then `dedupe` (supersede restatements, see "Restatement cleanup" below), then AI prune. It does not classify edges (see "Semantic Edge Classification" below). These used to be concurrent detached spawns, but SQLite allows one writer and lifecycle + AI prune both read-modify-write telemetry — so they now run one after another.
 8. **Regenerate surface LAST** (the last step of `maintenance`) — after all archival, so the surface never contains memories archived earlier in the same pipeline; the next session starts fresh
 
 In Pi, `session_shutdown` only starts a detached `ingest-session` worker and then returns. The worker owns all eight ordered steps, so `/new` and `/q` never await transcript extraction, embedding, or maintenance. It retries extraction with one budget per reason: up to 121 attempts (about ten minutes of backoff) while another extraction holds the per-project lock, which is cheap and nearly certain to clear, but only 3 while extraction keeps failing. A failure is a bet on a struggling server, and the chunk cursor already carries the work to the next run. The two budgets used to be one shared 121, which re-sent a failing extraction for ten minutes. Ephemeral sessions (subagent spawns run `pi -p --no-session`) have no transcript, so their shutdown spawns nothing at all — no extraction and no maintenance — because nothing new entered the store; the spawning session's ingestion pipeline does the maintaining, and the next session's start refreshes the surface.
@@ -153,9 +153,11 @@ When new memories are inserted, they're compared to all existing active memories
 
 ### Tier 1: Edge classification (at insertion time)
 
-Hybrid similarity per pair — cosine on local embeddings when both sides have one, Jaccard token overlap otherwise. Classification bands are calibrated PER SIMILARITY SPACE, because raw local cosine on BGE-small-en-v1.5 runs "hot": same-domain memories about different aspects routinely score 0.6-0.75, while Jaccard is much better separated. The bands below belong to that model specifically — a different local model disables them rather than inheriting them (see `LOCAL_COSINE_CALIBRATED`):
+Hybrid similarity per pair — cosine on local embeddings when both sides have one, Jaccard token overlap otherwise. Every cosine cutoff is measured for ONE embedding model and lives in that model's calibration (`cosineCalibrationFor(model)` in `config.ts`): BGE-small-en-v1.5's cosine, for instance, runs "hot" (same-domain memories about different aspects routinely score 0.6-0.75), and a different model's scores mean something else entirely. A model without a calibration, or without a band for some use, falls back to Jaccard there — it fails closed. Only vectors tagged with the current model are compared at all.
 
-| Band | Jaccard score | Local cosine score | Action |
+The cosine edge bands below are BGE's. The active model, potion-retrieval-32M, has no edge bands measured, so its edges are classified on the Jaccard column:
+
+| Band | Jaccard score | BGE cosine score | Action |
 |---|---|---|---|
 | ignore | < 0.1 | < 0.6 | Skip entirely |
 | relate | 0.1 - 0.4 | 0.6 - 0.75 | Create `relates_to` edge (strength = score) |
@@ -166,11 +168,36 @@ Each new memory keeps at most its 3 strongest edges — a structural guard again
 
 ### Tier 2: Cosine Similarity on Embeddings (wired)
 
-`cosineSimilarity()` in `core/similarity.ts` is used throughout: `/recall` and the prompt-recall hook rank results by cosine similarity, and `/consolidate` detects duplicate pairs via hybrid similarity (Jaccard + cosine) with per-space thresholds — 0.5 for Jaccard, 0.8 for raw local cosine when the calibrated model is active (otherwise local cosine is excluded).
+`cosineSimilarity()` in `core/similarity.ts` is used throughout. `/recall` and the prompt-recall hook rank results by cosine — relative order, which needs no calibration. Every absolute cutoff comes from the active model's calibration:
+
+| Use | Jaccard | potion-retrieval-32M (active) | BGE-small-en-v1.5 |
+|---|---|---|---|
+| Extraction dedup vs stored memories | merge 0.75-0.85, skip ≥ 0.85 | skip ≥ 0.92, no merge band | merge 0.75-0.85, skip ≥ 0.85 |
+| Extraction dedup within one batch | ≥ 0.75 | ≥ 0.92 | ≥ 0.75 |
+| `/remember` duplicate refusal | ≥ 0.75 | ≥ 0.92 | ≥ 0.75 |
+| `/consolidate` candidates | ≥ 0.5 | ≥ 0.85 | ≥ 0.8 |
+| `dedupe` restatements | — | ≥ 0.90 | — |
+| Distinct recall | — | ≥ 0.85 | — |
+
+Each score is read only against its own space's thresholds; when a side has no current-model vector the pair is compared on Jaccard. Extraction embeds its candidates with the active model whenever the model has a dedup calibration (and stores the vector it computed), so paraphrases are caught by cosine and the backfill has less to do.
+
+The potion numbers were measured on 9,260 real memories with hand-graded pairs per band (the description lives next to the numbers in `config.ts`): ≥ 0.90 was always one fact restated; 0.85-0.90 still holds different rules about one subject, so dedup only ever *skips* on potion, from 0.92 — merging two rules into one memory would lose both.
+
+### Restatement cleanup (`dedupe`)
+
+Extraction catches a restatement only while both copies are new. Older copies are retired by `dedupe <cwd> [--dry-run]`, which `maintenance` runs after lifecycle and before AI prune (so the LLM never reviews copies). Per database, one transaction each, the pure planner `planRestatements` (`core/restatement.ts`) groups active memories by type, takes them newest first, and lets each join the most similar newer *leader* at or above the restatement cosine (0.90 on potion) or become a leader itself. Leaders never chain: a memory close only to an already-superseded copy stays. Pinned memories may lead but are never superseded; `code` memories and memories without a current-model vector are skipped. Each older copy is marked `superseded`, gets a `supersedes` edge from the kept memory, and its edges and facts are re-pointed to the kept memory. A second run finds nothing. No LLM, no model load; an uncalibrated model reports "disabled".
+
+### Distinct recall
+
+Prompt recall has three semantic slots, and a fact stored five times used to fill all of them. `/recall` and the prompt-recall hook now pass their ranked list through `distinctFacts` (`core/restatement.ts`) **before** cutting it to the limit: a hit is dropped when a higher-ranked, already-kept hit of the same memory type is at or above the distinct-recall cosine (0.85 on potion). Hits without a current-model vector are always kept. Prompt recall applies it on the semantic hits before their slot cut and again on the merged semantic + strict-keyword list — both after admission and surface filtering, so a refused or already-surfaced copy can never hide the hit it restates.
+
+### Explicit replacement (`/remember --replaces=<tag>`)
+
+When you know a memory is the new version of an old one, `--replaces=<tag>` says so: every other active memory with that tag in the target database is superseded (pinned ones too — pinning protects from decay, not from being restated), the new memory carries the tag, and the duplicate check is skipped. The insert and the supersedes happen in one transaction.
 
 ### Semantic Edge Classification
 
-Jaccard/cosine-created `relates_to` edges can be upgraded to typed relationships by the `semantic-edges` command, which runs only when you invoke it (`bun engine/src/cli.ts semantic-edges <cwd>`). It used to run in every SessionEnd worker. It was taken out of maintenance because on 139,123 recorded pairs it typed 545 (0.4%) and left the rest unchanged, and only `traverse` reads an edge's type: centrality counts every edge, and prompt recall reads none. The types that matter are written deterministically instead: `supersedes` by `/consolidate` and `/index-code`, `source_of` by `/index-code`.
+Jaccard/cosine-created `relates_to` edges can be upgraded to typed relationships by the `semantic-edges` command, which runs only when you invoke it (`bun engine/src/cli.ts semantic-edges <cwd>`). It used to run in every SessionEnd worker. It was taken out of maintenance because on 139,123 recorded pairs it typed 545 (0.4%) and left the rest unchanged, and only `traverse` reads an edge's type: centrality counts every edge, and prompt recall reads none. The types that matter are written deterministically instead: `supersedes` by `/consolidate`, `dedupe`, `/remember --replaces` and `/index-code`, `source_of` by `/index-code`.
 
 When run, it batches edge pairs to the configured LLM and classifies each pair into a typed relation with a strength score. Calls prefer the **direct OpenAI-compatible endpoint** (`CORTEX_LLM_API_URL`/`CORTEX_LLM_API_KEY`/`CORTEX_LLM_MODEL`, or the pi provider config in `~/.pi/agent/models.json`) with thinking disabled and schema-guided JSON output; the headless CLI (`pi -p` / `claude -p`) is only the fallback. A single direct failure still falls back, but after the saturation threshold (default 3 consecutive failures, `CORTEX_LLM_MAX_DIRECT_FAILURES`) the fallback is suppressed and the batch fails cleanly so unmarked edges stay retryable instead of escalating load on a saturated server. That, or a provider refusal from the CLI, also stops the run from sending further batches: the edges it never asked about stay unstamped, with no backoff, and are candidates again next run. Every LLM call across the engine (this step, extraction, AI prune, subprocess fallbacks) also acquires a slot from a per-process pool capped at `CORTEX_LLM_MAX_CONCURRENCY` (default 2), so background work occupies a bounded share of a server that live agents already use. Attempt tracking (`edges.classified_at` + content hash) prevents declined pairs from being re-classified on every run, and failed attempts carry a 24h backoff (`edges.last_failed_at`) so an unhealthy server is not re-hammered with the same failed batch on every run — a content change resets the backoff immediately.
 
