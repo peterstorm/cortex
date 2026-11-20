@@ -13,6 +13,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { shouldRunShutdownPipeline, isCortexShutdownReason } from "./shutdown-policy.js";
 import { showSurface } from "../engine/src/commands/show-surface.js";
 import { nodeCliRunner, type CliRunner } from "./cli-runner.js";
+import { appendPromptRecallLog, type PromptRecallLog } from "../engine/src/infra/prompt-recall-log.js";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const CLI_PATH = join(PACKAGE_ROOT, "engine", "src", "cli.ts");
@@ -42,14 +43,15 @@ function getCortexLlmEnvironment(model: PiModelSelection | undefined): NodeJS.Pr
  * @param cli - The engine boundary. Defaults to the real subprocess adapter;
  *   tests pass a plain-object fake, which is why this file needs no mocking
  *   framework and cannot be broken by one.
+ * @param recallLog - Where a failed prompt-recall run is recorded: the same
+ *   prompt-recall log the engine appends its own warnings to, so a broken
+ *   recall under Pi leaves the same trace it does under Claude Code.
  */
-export default function (pi: ExtensionAPI, cli: CliRunner = defaultCliRunner) {
-  /** Best-effort stdout adapter for lifecycle hooks that intentionally degrade. */
-  const runCli = (args: readonly string[], options?: Parameters<CliRunner["run"]>[1]): string => {
-    const result = cli.run(args, options);
-    return result.ok ? result.output : "";
-  };
-
+export default function (
+  pi: ExtensionAPI,
+  cli: CliRunner = defaultCliRunner,
+  recallLog: PromptRecallLog = appendPromptRecallLog,
+) {
   // Session shutdown can invalidate SessionManager's file reference. Retain
   // immutable session metadata from session_start for transcript extraction.
   let sessionFile: string | undefined;
@@ -78,15 +80,20 @@ export default function (pi: ExtensionAPI, cli: CliRunner = defaultCliRunner) {
       process.stderr.write(`[cortex] Failed to read memory surface ${shown.path}: ${shown.error}\n`);
     }
 
-    // 3. Prompt recall (keyword search based on user's prompt)
+    // 3. Prompt recall, ranked against the user's prompt alone. Pi keeps
+    // `--append-system-prompt` text in event.systemPrompt, never in
+    // event.prompt, so a harness's standing instructions cannot steer it.
+    // The engine logs its own warnings (a degraded recall exits 0, and this
+    // runner keeps no stderr on success); a failed run is logged here, and
+    // contributes nothing rather than an error blob.
     if (event.prompt) {
-      const hookInput = JSON.stringify({ prompt: event.prompt, cwd });
-      const recall = runCli(["prompt-recall"], {
-        stdin: hookInput,
+      const recall = cli.run(["prompt-recall"], {
+        stdin: JSON.stringify({ prompt: event.prompt, cwd }),
         timeout: 5_000,
         cwd,
       });
-      if (recall) parts.push(recall);
+      if (!recall.ok) recallLog(`[cortex] WARN: ${recall.error}`);
+      else if (recall.output) parts.push(recall.output);
     }
 
     const result: Record<string, unknown> = { systemPrompt };
