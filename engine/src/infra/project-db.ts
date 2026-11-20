@@ -73,7 +73,13 @@ export function classifyProbeFailure(error: unknown): ProbeFailure {
 const describeThrown = (thrown: unknown): string =>
   typeof thrown === 'string' && thrown !== '' ? thrown : 'git failed without saying why';
 
-const PROBE_TIMEOUT_MS = 5_000;
+/**
+ * How long `git worktree list` may take before the directory is treated as its
+ * own project. Exported for the test preload: a test that locates a project
+ * must allow longer than this, or a loaded machine fails the test before the
+ * probe can time out and degrade the way production does.
+ */
+export const PROBE_TIMEOUT_MS = 5_000;
 
 const warnToStderr = (message: string): void => {
   process.stderr.write(`[cortex] WARN: ${message}\n`);
