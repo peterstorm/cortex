@@ -17,12 +17,22 @@
  *
  * Tests of the merge itself call migrateGlobalDb and resolveGlobalDbPath with
  * explicit paths under their own temp directories.
+ *
+ * Every test also gets a default timeout of three git probes. Locating a
+ * project runs `git worktree list` with its own PROBE_TIMEOUT_MS; under the
+ * bun default (5 s, the same as the probe's) a slow git on a loaded machine
+ * failed the test before the probe could time out and degrade, as it does in
+ * production (seen: project-session.test.ts, 6.2 s). Some tests locate several
+ * times or build repositories with git first, hence the margin.
  */
 
-import { afterAll } from 'bun:test';
+import { afterAll, setDefaultTimeout } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { PROBE_TIMEOUT_MS } from './infra/project-db.js';
+
+setDefaultTimeout(PROBE_TIMEOUT_MS * 3);
 
 const dir = mkdtempSync(join(tmpdir(), 'cortex-test-'));
 process.env.CORTEX_GLOBAL_DB = join(dir, 'global.db');
