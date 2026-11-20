@@ -82,7 +82,7 @@ import { runInspect } from './commands/inspect.js';
 import { backfill } from './commands/backfill.js';
 import type { BackfillResult } from './commands/backfill.js';
 import { executeSemanticEdges } from './commands/semantic-edges.js';
-import { executePromptRecallWithFallback, formatPromptRecall } from './commands/prompt-recall.js';
+import { degradedRecallWarning, formatPromptRecall, recallForPrompt } from './commands/prompt-recall.js';
 import { executeEntityQuery, formatEntityQueryResult } from './commands/entity-query.js';
 import {
   formatSessionIngestionResult,
@@ -1093,8 +1093,10 @@ export function openPromptRecallDatabase(
 
 /**
  * Handle 'prompt-recall' subcommand (UserPromptSubmit hook)
- * Reads stdin JSON with prompt + cwd, runs keyword FTS5 recall
- * Always succeeds — never exits non-zero
+ * Reads stdin JSON with prompt + cwd, runs semantic-first recall (keyword
+ * search only when the embedder fails, with a WARN naming why).
+ * Always succeeds — never exits non-zero; warnings go to stderr, which the
+ * hook shim appends to the prompt-recall log.
  */
 async function handlePromptRecall(): Promise<CommandResult> {
   try {
@@ -1154,12 +1156,14 @@ async function handlePromptRecall(): Promise<CommandResult> {
     const globalDb = hasGlobalDb ? openPromptRecallDatabase(globalDbPath) : null;
 
     try {
-      const memories = await executePromptRecallWithFallback(projectDb, globalDb, {
+      const recalled = await recallForPrompt(projectDb, globalDb, {
         prompt,
         surfaceContent,
         projectName: project.name,
       });
-      const output = formatPromptRecall(memories);
+      const warning = degradedRecallWarning(recalled);
+      if (warning !== null) process.stderr.write(`${warning}\n`);
+      const output = formatPromptRecall(recalled.memories);
 
       return {
         kind: 'succeeded',

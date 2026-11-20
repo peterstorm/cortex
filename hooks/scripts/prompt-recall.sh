@@ -8,6 +8,7 @@
 # Architecture:
 # Thin shell orchestrator - pipes stdin to CLI command.
 # ALL errors caught, NEVER block prompt submission (exit 0 always).
+# Warnings land in ${CORTEX_LOG_DIR:-~/.local/state/cortex}/prompt-recall.log.
 
 set -euo pipefail
 
@@ -44,7 +45,32 @@ if [[ -n "${CORTEX_ONNX_LD_PATH:-}" ]]; then
   export LD_LIBRARY_PATH="${CORTEX_ONNX_LD_PATH}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 
-# Pipe stdin JSON to prompt-recall command, suppress stderr
-cat | bun "$CLI_PATH" prompt-recall 2>/dev/null || true
+# Pipe stdin JSON to prompt-recall. Its stdout is the injected block and goes
+# to Claude Code untouched (fd 3). Its stderr is NOT discarded: the CLI warns
+# there when recall degrades (embedder down → keyword search) or a database
+# will not open, and before this log existed those warnings went to
+# /dev/null, so a broken embedder looked exactly like "no relevant memories".
+# A hook's stderr on exit 0 reaches neither the model nor the user, so it is
+# captured and appended, timestamped, to a size-capped log instead.
+LOG_DIR="${CORTEX_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/cortex}"
+LOG_FILE="${LOG_DIR}/prompt-recall.log"
+LOG_MAX_BYTES=1048576
+
+exec 3>&1
+recall_stderr="$(cat | bun "$CLI_PATH" prompt-recall 2>&1 1>&3)" || true
+exec 3>&-
+
+if [[ -n "$recall_stderr" ]]; then
+  {
+    mkdir -p "$LOG_DIR"
+    if [[ -f "$LOG_FILE" ]] && (( $(stat -c %s "$LOG_FILE") > LOG_MAX_BYTES )); then
+      mv -f "$LOG_FILE" "${LOG_FILE}.1"
+    fi
+    stamp="$(date -Is)"
+    while IFS= read -r line; do
+      printf '%s %s\n' "$stamp" "$line"
+    done <<< "$recall_stderr" >> "$LOG_FILE"
+  } 2>/dev/null || true
+fi
 
 exit 0
