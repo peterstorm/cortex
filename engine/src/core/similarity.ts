@@ -286,36 +286,6 @@ export function hybridSimilarity(
 }
 
 /**
- * Batch similarity comparison result
- */
-export type SimilarityResult = {
-  targetIndex: number;
-  score: number;
-  action: SimilarityAction;
-};
-
-/**
- * Compare a single embedding against multiple target embeddings
- * Returns sorted results by similarity score (descending)
- *
- * @param query - Query embedding vector
- * @param targets - Array of target embedding vectors
- * @returns Array of similarity results sorted by score (highest first)
- */
-export function batchCosineSimilarity(
-  query: Float64Array | Float32Array,
-  targets: (Float64Array | Float32Array)[]
-): SimilarityResult[] {
-  return targets
-    .map((target, index) => {
-      const score = cosineSimilarity(query, target);
-      const action = classifySimilarity(score);
-      return { targetIndex: index, score, action };
-    })
-    .sort((a, b) => b.score - a.score);
-}
-
-/**
  * Rank memory candidates by cosine similarity to a query embedding.
  * Pure function — takes pre-fetched candidates and returns sorted results.
  *

@@ -6,16 +6,14 @@ import {
   jaccardSimilarity,
   classifySimilarity,
   jaccardPreFilter,
-  batchCosineSimilarity,
   hybridSimilarity,
   hybridSimilarityScored,
   rankBySimilarity,
   rankByFusedSimilarity,
   queryCoverage,
-  type JaccardPreFilter,
 } from './similarity';
 import { createMemory } from './types';
-import type { Memory, SimilarityAction } from './types';
+import type { Memory } from './types';
 import { cosineCalibrationFor } from '../config';
 
 describe('cosineSimilarity', () => {
@@ -496,83 +494,6 @@ describe('jaccardPreFilter', () => {
       expect(result2.result).toBe('definitely_different');
       expect(result2.score).toBe(0.09999);
     });
-  });
-});
-
-describe('batchCosineSimilarity', () => {
-  it('computes similarity for all targets', () => {
-    const query = new Float64Array([1, 0, 0]);
-    const targets = [
-      new Float64Array([1, 0, 0]),    // sim = 1.0
-      new Float64Array([0, 1, 0]),    // sim = 0.0
-      new Float64Array([-1, 0, 0]),   // sim = -1.0
-    ];
-
-    const results = batchCosineSimilarity(query, targets);
-
-    expect(results).toHaveLength(3);
-    expect(results[0].score).toBeCloseTo(1.0, 10);
-    expect(results[0].targetIndex).toBe(0);
-    expect(results[1].score).toBeCloseTo(0.0, 10);
-    expect(results[1].targetIndex).toBe(1);
-    expect(results[2].score).toBeCloseTo(-1.0, 10);
-    expect(results[2].targetIndex).toBe(2);
-  });
-
-  it('sorts results by score descending', () => {
-    const query = new Float64Array([1, 0]);
-    const targets = [
-      new Float64Array([0, 1]),       // sim = 0.0
-      new Float64Array([1, 1]),       // sim = 0.707
-      new Float64Array([1, 0]),       // sim = 1.0
-      new Float64Array([-1, 0]),      // sim = -1.0
-    ];
-
-    const results = batchCosineSimilarity(query, targets);
-
-    expect(results[0].targetIndex).toBe(2); // highest (1.0)
-    expect(results[1].targetIndex).toBe(1); // second (0.707)
-    expect(results[2].targetIndex).toBe(0); // third (0.0)
-    expect(results[3].targetIndex).toBe(3); // lowest (-1.0)
-  });
-
-  it('includes action classification for each result', () => {
-    const query = new Float64Array([1, 0]);
-    const targets = [
-      new Float64Array([1, 0]),       // sim = 1.0 → consolidate
-      new Float64Array([1, 1]),       // sim = 0.707 → consolidate
-      new Float64Array([0.5, 1]),     // sim ≈ 0.45 → suggest
-      new Float64Array([0.2, 1]),     // sim ≈ 0.20 → relate
-      new Float64Array([0, 1]),       // sim = 0.0 → ignore
-    ];
-
-    const results = batchCosineSimilarity(query, targets);
-
-    expect(results[0].action.action).toBe('consolidate');
-    expect(results[1].action.action).toBe('consolidate');
-    expect(results[2].action.action).toBe('suggest');
-    expect(results[3].action.action).toBe('relate');
-    expect(results[4].action.action).toBe('ignore');
-  });
-
-  it('handles empty targets array', () => {
-    const query = new Float64Array([1, 0]);
-    const results = batchCosineSimilarity(query, []);
-    expect(results).toHaveLength(0);
-  });
-
-  it('preserves target indices after sorting', () => {
-    const query = new Float64Array([1, 0]);
-    const targets = [
-      new Float64Array([0, 1]),       // index 0, sim = 0.0
-      new Float64Array([1, 0]),       // index 1, sim = 1.0
-    ];
-
-    const results = batchCosineSimilarity(query, targets);
-
-    // After sorting, highest score (index 1) comes first
-    expect(results[0].targetIndex).toBe(1);
-    expect(results[1].targetIndex).toBe(0);
   });
 });
 
