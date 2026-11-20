@@ -122,6 +122,7 @@ import { renderReport } from './core/eval-rubric.js';
 import { getCurrentBranch } from './infra/git-context.js';
 import { disposeLocalModel, embedLocal } from './infra/local-embed.js';
 import { ensureNativeLibraryPath } from './infra/native-library-path.js';
+import { appendPromptRecallLog } from './infra/prompt-recall-log.js';
 
 // ============================================================================
 // STDIN PARSING
@@ -1057,6 +1058,16 @@ async function handleEntityQuery(args: string[]): Promise<CommandResult> {
   });
 }
 
+/**
+ * Every prompt-recall warning goes to stderr (for a person running the CLI)
+ * AND to the prompt-recall log, because neither harness keeps the stderr of a
+ * run that exits 0: Claude Code drops it, and Pi's extension discards it.
+ */
+function warnPromptRecall(message: string): void {
+  process.stderr.write(`${message}\n`);
+  appendPromptRecallLog(message);
+}
+
 export type PromptRecallDatabaseOpeners = Readonly<{
   readOnly: (path: string) => Database;
   readWrite: (path: string) => Database;
@@ -1069,7 +1080,7 @@ export function openPromptRecallDatabase(
   openers: PromptRecallDatabaseOpeners = {
     readOnly: openDatabaseReadOnly,
     readWrite: openDatabase,
-    warn: (message) => process.stderr.write(`${message}\n`),
+    warn: warnPromptRecall,
   },
 ): Database | null {
   try {
@@ -1095,8 +1106,8 @@ export function openPromptRecallDatabase(
  * Handle 'prompt-recall' subcommand (UserPromptSubmit hook)
  * Reads stdin JSON with prompt + cwd, runs semantic-first recall (keyword
  * search only when the embedder fails, with a WARN naming why).
- * Always succeeds — never exits non-zero; warnings go to stderr, which the
- * hook shim appends to the prompt-recall log.
+ * Always succeeds — never exits non-zero; every warning goes through
+ * warnPromptRecall, so it reaches the prompt-recall log under any harness.
  */
 async function handlePromptRecall(): Promise<CommandResult> {
   try {
@@ -1110,9 +1121,7 @@ async function handlePromptRecall(): Promise<CommandResult> {
     const prompt = parsed?.prompt;
     const cwd = parsed?.cwd;
     if (typeof prompt !== 'string' || typeof cwd !== 'string') {
-      process.stderr.write(
-        '[cortex] WARN: prompt-recall ignored malformed input: expected string prompt and cwd\n'
-      );
+      warnPromptRecall('[cortex] WARN: prompt-recall ignored malformed input: expected string prompt and cwd');
       return { kind: 'succeeded' };
     }
 
@@ -1142,9 +1151,9 @@ async function handlePromptRecall(): Promise<CommandResult> {
     } catch (err) {
       // Best-effort hook: a surface read failure must not fail the prompt,
       // but it must not vanish without a trace either.
-      process.stderr.write(
+      warnPromptRecall(
         `[cortex] WARN: prompt-recall could not read surface file ${surfacePath}: ` +
-          `${err instanceof Error ? err.message : String(err)}\n`
+          `${err instanceof Error ? err.message : String(err)}`
       );
     }
 
@@ -1162,7 +1171,7 @@ async function handlePromptRecall(): Promise<CommandResult> {
         projectName: project.name,
       });
       const warning = degradedRecallWarning(recalled);
-      if (warning !== null) process.stderr.write(`${warning}\n`);
+      if (warning !== null) warnPromptRecall(warning);
       const output = formatPromptRecall(recalled.memories);
 
       return {
@@ -1177,9 +1186,9 @@ async function handlePromptRecall(): Promise<CommandResult> {
     // Never fail — prompt-recall is best-effort. But never silent: a broken
     // hook must leave a trace, or a corrupt DB would dead-silence memory
     // injection on every prompt with no way to diagnose it.
-    process.stderr.write(
+    warnPromptRecall(
       `[cortex] WARN: prompt-recall failed (best-effort, continuing): ` +
-        `${err instanceof Error ? err.message : String(err)}\n`
+        `${err instanceof Error ? err.message : String(err)}`
     );
     return { kind: 'succeeded' };
   }

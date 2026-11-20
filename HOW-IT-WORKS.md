@@ -43,9 +43,9 @@ Claude Code loads this file as context. The surface targets ~1500 tokens (hard m
 
 **Every prompt** triggers two `UserPromptSubmit` hooks: one pipes the surface file into context (reloading it first when a `git switch` since it was written left it naming another branch; Pi does the same before each agent start), and one (`prompt-recall.sh`) runs recall against your prompt. It is semantic-first: the prompt is embedded, memories from both databases that are not already in the surface are ranked by cosine, and only hits at or above 0.50 and within 0.15 of the best are kept (max 3). Strict keyword AND matches (every prompt keyword present) supplement them. Broad keyword OR search is not used on the healthy path — it matched any single generic word and injected unrelated memories every turn — and survives only as the degraded path when the embedder fails.
 
-A degraded recall still injects a block, so from inside the session it looks like a healthy one that found worse memories. The hook therefore never discards the CLI's stderr: each warning — `prompt-recall fell back to keyword search: <why>`, a database that would not open, malformed hook input — is appended, timestamped, to `${CORTEX_LOG_DIR:-${XDG_STATE_HOME:-~/.local/state}/cortex}/prompt-recall.log` (past 1 MiB it moves to `prompt-recall.log.1`). A healthy recall writes nothing there, so an empty or missing log means every prompt took the semantic path.
+A degraded recall still injects a block, so from inside the session it looks like a healthy one that found worse memories, and it exits 0, so neither harness keeps its stderr (Claude Code drops a hook's stderr; Pi's extension pipes it and keeps it only on failure). The CLI therefore appends each of its own warnings — `prompt-recall fell back to keyword search: <why>`, a database that would not open, malformed hook input — timestamped, to `${CORTEX_LOG_DIR:-${XDG_STATE_HOME:-~/.local/state}/cortex}/prompt-recall.log` (`engine/src/infra/prompt-recall-log.ts`; past 1 MiB it moves to `prompt-recall.log.1`). A CLI that crashes cannot, so the Claude Code shim logs a non-zero exit's stderr there and Pi's extension logs a failed run there. A healthy recall writes nothing, so an empty or missing log means every prompt, under either harness, took the semantic path.
 
-The hook embeds the whole prompt, and the static model averages its tokens, so whatever else the prompt carries dilutes the question. A harness that wraps instructions around the user's message (a personality, a system preamble) should pass them as a system prompt instead; otherwise recall matches the instructions, not the question.
+Recall embeds the whole prompt, and the static model averages its tokens, so whatever else the prompt carries dilutes the question. A harness that wraps instructions around the user's message (a personality, a system preamble) should pass them as a system prompt instead (`--append-system-prompt` in both Claude Code and Pi; Pi's extension ranks `event.prompt`, which never contains it); otherwise recall matches the instructions, not the question.
 
 You can also interact with cortex manually:
 
@@ -274,7 +274,7 @@ Memories are inserted without embeddings (to avoid blocking extraction). A backg
   global.db                # Global SQLite database, shared by every harness
 
 ~/.local/state/cortex/     # ($CORTEX_LOG_DIR, else $XDG_STATE_HOME/cortex)
-  prompt-recall.log        # prompt-recall hook warnings (degraded recall, DB open failures)
+  prompt-recall.log        # prompt-recall warnings, both harnesses (degraded recall, DB open failures, crashes)
 
 ~/.claude/
   plugins/
@@ -300,7 +300,7 @@ Memories are inserted without embeddings (to avoid blocking extraction). A backg
 |---|---|---|
 | `CORTEX_ONNX_LD_PATH` | Directory holding a 64-bit `libstdc++.so.6` for onnxruntime. Hooks probe the nix store when unset; needed on NixOS, a no-op elsewhere | No |
 | `CORTEX_GLOBAL_DB` | Path of the global database shared by every harness (default `${XDG_DATA_HOME:-~/.local/share}/cortex/global.db`) | No |
-| `CORTEX_LOG_DIR` | Directory of the prompt-recall hook's warning log, `prompt-recall.log` (default `${XDG_STATE_HOME:-~/.local/state}/cortex`) | No |
+| `CORTEX_LOG_DIR` | Directory of the prompt-recall warning log, `prompt-recall.log`, under Claude Code and Pi (default `${XDG_STATE_HOME:-~/.local/state}/cortex`) | No |
 | `CORTEX_LLM_API_URL` | Base URL (or `/chat/completions` URL) for an explicit OpenAI-compatible LLM endpoint | No |
 | `CORTEX_LLM_API_KEY` | API key for the explicit OpenAI-compatible LLM endpoint | Required with `CORTEX_LLM_API_URL` |
 | `CORTEX_LLM_BINARY` | Force the headless LLM binary (`claude` or `pi`) | No (auto-detected) |

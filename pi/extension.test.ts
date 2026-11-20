@@ -53,7 +53,10 @@ function tempProject(): string {
   return dir;
 }
 
-function registerHandlers(cli: CliRunner): Map<string, (...args: unknown[]) => unknown> {
+function registerHandlers(
+  cli: CliRunner,
+  recallLog: (message: string) => void = () => undefined,
+): Map<string, (...args: unknown[]) => unknown> {
   const handlers = new Map<string, (...args: unknown[]) => unknown>();
   registerCortex({
     on: (name: string, handler: (...args: unknown[]) => unknown) => {
@@ -62,7 +65,7 @@ function registerHandlers(cli: CliRunner): Map<string, (...args: unknown[]) => u
     registerCommand: (name: string, command: { handler: (...args: unknown[]) => unknown }) => {
       handlers.set(`command:${name}`, command.handler);
     },
-  } as never, cli);
+  } as never, cli, recallLog);
   return handlers;
 }
 
@@ -283,10 +286,11 @@ describe('Cortex Pi extension diagnostics and surface contract', () => {
     expect(notify).toHaveBeenCalledWith('No cortex data found for this project', 'info');
   });
 
-  it('degrades to the system prompt alone when prompt-recall fails', async () => {
+  it('degrades to the system prompt alone when prompt-recall fails, and logs why', async () => {
     const cli = fakeCli();
     cli.answerWith({ ok: false, error: 'CLI failed: bun prompt-recall (status=2): database is corrupt' });
-    const handlers = registerHandlers(cli.runner);
+    const logged: string[] = [];
+    const handlers = registerHandlers(cli.runner, (message) => logged.push(message));
     const cwd = tempProject();
 
     const result = (await handlers.get('before_agent_start')?.(
@@ -296,9 +300,33 @@ describe('Cortex Pi extension diagnostics and surface contract', () => {
 
     expect(cli.runs).toHaveLength(1);
     expect(cli.runs[0].args).toEqual(['prompt-recall']);
-    // A failed recall contributes nothing rather than injecting an error blob.
+    // A failed recall contributes nothing rather than injecting an error blob,
+    // and leaves the same trace in the prompt-recall log as under Claude Code.
     expect(result.message).toBeUndefined();
     expect(result.systemPrompt).toContain('Cortex Memory CLI');
+    expect(logged).toEqual(['[cortex] WARN: CLI failed: bun prompt-recall (status=2): database is corrupt']);
+  });
+
+  it('ranks recall against the user prompt alone, never the system prompt a harness appended to', async () => {
+    // reclaw passes its personality as --append-system-prompt, which Pi puts
+    // in event.systemPrompt. Recall must not see it: ranked against a 3.6 KB
+    // persona, it returned memories about the persona whatever was asked.
+    const cli = fakeCli();
+    cli.answerWith({ ok: true, output: '<!-- CORTEX_RECALL_START -->\nrecalled\n<!-- CORTEX_RECALL_END -->' });
+    const logged: string[] = [];
+    const handlers = registerHandlers(cli.runner, (message) => logged.push(message));
+    const cwd = tempProject();
+
+    const result = (await handlers.get('before_agent_start')?.(
+      { systemPrompt: 'base\n<addendum>\nYou are a personal AI assistant\n</addendum>', prompt: 'which nvme slot' },
+      { cwd },
+    )) as { message?: { content: string } };
+
+    const [recall] = cli.runs;
+    expect(recall.args).toEqual(['prompt-recall']);
+    expect(JSON.parse((recall.options as CliRunOptions).stdin ?? '')).toEqual({ prompt: 'which nvme slot', cwd });
+    expect(result.message?.content).toBe('<!-- CORTEX_RECALL_START -->\nrecalled\n<!-- CORTEX_RECALL_END -->');
+    expect(logged).toEqual([]);
   });
 
   it('loading the extension leaves the host process environment as it was', () => {

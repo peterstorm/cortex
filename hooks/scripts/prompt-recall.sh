@@ -46,21 +46,23 @@ if [[ -n "${CORTEX_ONNX_LD_PATH:-}" ]]; then
 fi
 
 # Pipe stdin JSON to prompt-recall. Its stdout is the injected block and goes
-# to Claude Code untouched (fd 3). Its stderr is NOT discarded: the CLI warns
-# there when recall degrades (embedder down → keyword search) or a database
-# will not open, and before this log existed those warnings went to
-# /dev/null, so a broken embedder looked exactly like "no relevant memories".
-# A hook's stderr on exit 0 reaches neither the model nor the user, so it is
-# captured and appended, timestamped, to a size-capped log instead.
+# to Claude Code untouched (fd 3). The CLI appends its own warnings (embedder
+# down → keyword search, a database that will not open) to the prompt-recall
+# log, so they are recorded under Pi too, where no shim runs. What it cannot
+# log is its own crash: a non-zero exit (bun cannot start, an import fails).
+# That stderr is appended here, timestamped, to the same size-capped log,
+# whose path engine/src/infra/prompt-recall-log.ts resolves identically.
+# A hook's stderr reaches neither the model nor the user, hence the log.
 LOG_DIR="${CORTEX_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/cortex}"
 LOG_FILE="${LOG_DIR}/prompt-recall.log"
 LOG_MAX_BYTES=1048576
 
 exec 3>&1
-recall_stderr="$(cat | bun "$CLI_PATH" prompt-recall 2>&1 1>&3)" || true
+recall_status=0
+recall_stderr="$(cat | bun "$CLI_PATH" prompt-recall 2>&1 1>&3)" || recall_status=$?
 exec 3>&-
 
-if [[ -n "$recall_stderr" ]]; then
+if (( recall_status != 0 )) && [[ -n "$recall_stderr" ]]; then
   {
     mkdir -p "$LOG_DIR"
     # POSIX forms only: `stat -c` and `date -I` are GNU-only, and on macOS
