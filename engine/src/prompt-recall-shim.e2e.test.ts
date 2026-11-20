@@ -64,7 +64,9 @@ describe('prompt-recall hook shim', () => {
     });
     const lines = readFileSync(logFile(), 'utf8').trimEnd().split('\n');
     expect(lines).toHaveLength(2);
-    expect(lines[0]).toMatch(/^\d{4}-\d{2}-\d{2}T\S+ \[cortex\] WARN: prompt-recall fell back to keyword search: embedder down$/);
+    expect(lines[0]).toMatch(
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z \[cortex\] WARN: prompt-recall fell back to keyword search: embedder down$/,
+    );
     expect(lines[1]).toMatch(/ \[cortex\] WARN: second line$/);
   });
 

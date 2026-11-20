@@ -63,10 +63,12 @@ exec 3>&-
 if [[ -n "$recall_stderr" ]]; then
   {
     mkdir -p "$LOG_DIR"
-    if [[ -f "$LOG_FILE" ]] && (( $(stat -c %s "$LOG_FILE") > LOG_MAX_BYTES )); then
+    # POSIX forms only: `stat -c` and `date -I` are GNU-only, and on macOS
+    # they fail silently inside this block — no rotation, empty timestamps.
+    if [[ -f "$LOG_FILE" ]] && (( $(wc -c < "$LOG_FILE") > LOG_MAX_BYTES )); then
       mv -f "$LOG_FILE" "${LOG_FILE}.1"
     fi
-    stamp="$(date -Is)"
+    stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     while IFS= read -r line; do
       printf '%s %s\n' "$stamp" "$line"
     done <<< "$recall_stderr" >> "$LOG_FILE"
