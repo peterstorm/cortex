@@ -11,7 +11,7 @@ import {
   extractKeywords,
   extractUnigrams,
   executePromptRecall,
-  executePromptRecallWithFallback,
+  recallForPrompt,
   formatPromptRecall,
   isTagOnlyMatch,
   STOP_WORDS,
@@ -22,6 +22,10 @@ import {
   isInSurface,
 } from './prompt-recall.js';
 import { RECALL_MAX_BLOCK_BYTES } from '../config.js';
+
+/** The memories recallForPrompt injects, without the path that produced them. */
+const recalledMemories = async (...args: Parameters<typeof recallForPrompt>) =>
+  (await recallForPrompt(...args)).memories;
 
 // Mock the local embedder at module level so the fallback path never loads a
 // real model. Each test sets the desired behavior via mockEmbedLocal.
@@ -504,7 +508,7 @@ describe('isInSurface', () => {
   });
 });
 
-describe('executePromptRecallWithFallback — gates', () => {
+describe('recallForPrompt — gates', () => {
   beforeEach(() => {
     mockEmbedLocal.mockReset();
   });
@@ -519,7 +523,7 @@ describe('executePromptRecallWithFallback — gates', () => {
     }));
 
     // "okay do it" → every token is a stop word or a single char
-    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+    const results = await recalledMemories(projectDb, globalDb, {
       prompt: 'okay do it',
       surfaceContent: '',
     });
@@ -533,7 +537,7 @@ describe('executePromptRecallWithFallback — gates', () => {
 
   test('handles null databases', async () => {
     mockEmbedLocal.mockResolvedValue(queryVec());
-    const results = await executePromptRecallWithFallback(null, null, {
+    const results = await recalledMemories(null, null, {
       prompt: 'extraction pipeline transcripts',
       surfaceContent: '',
     });
@@ -541,7 +545,7 @@ describe('executePromptRecallWithFallback — gates', () => {
   });
 });
 
-describe('executePromptRecallWithFallback — semantic-first', () => {
+describe('recallForPrompt — semantic-first', () => {
   beforeEach(() => {
     mockEmbedLocal.mockReset();
   });
@@ -556,7 +560,7 @@ describe('executePromptRecallWithFallback — semantic-first', () => {
     }));
     mockEmbedLocal.mockResolvedValue(queryVec());
 
-    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+    const results = await recalledMemories(projectDb, globalDb, {
       prompt: 'truly novel xyzzy plugh frobnicate',
       surfaceContent: '',
     });
@@ -580,7 +584,7 @@ describe('executePromptRecallWithFallback — semantic-first', () => {
     }));
     mockEmbedLocal.mockResolvedValue(queryVec());
 
-    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+    const results = await recalledMemories(projectDb, globalDb, {
       prompt: 'what was the watch sync problem again',
       surfaceContent: '',
     });
@@ -601,7 +605,7 @@ describe('executePromptRecallWithFallback — semantic-first', () => {
     }));
     mockEmbedLocal.mockResolvedValue(queryVec());
 
-    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+    const results = await recalledMemories(projectDb, globalDb, {
       prompt: 'truly novel xyzzy plugh frobnicate',
       surfaceContent: '',
     });
@@ -618,7 +622,7 @@ describe('executePromptRecallWithFallback — semantic-first', () => {
     insertMemory(projectDb, createTestMemory({ id: 'weak', content: 'b', summary: 'weak', local_embedding: vecWithScore(0.55, 2) }));
     mockEmbedLocal.mockResolvedValue(queryVec());
 
-    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+    const results = await recalledMemories(projectDb, globalDb, {
       prompt: 'truly novel xyzzy plugh frobnicate',
       surfaceContent: '',
     });
@@ -635,7 +639,7 @@ describe('executePromptRecallWithFallback — semantic-first', () => {
     insertMemory(globalDb, createTestMemory({ id: 'glob', content: 'g', summary: 'glob', scope: 'global', local_embedding: vecWithScore(0.7, 2) }));
     mockEmbedLocal.mockResolvedValue(queryVec());
 
-    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+    const results = await recalledMemories(projectDb, globalDb, {
       prompt: 'truly novel xyzzy plugh frobnicate',
       surfaceContent: '',
     });
@@ -666,7 +670,7 @@ describe('executePromptRecallWithFallback — semantic-first', () => {
     }));
     mockEmbedLocal.mockResolvedValue(queryVec());
 
-    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+    const results = await recalledMemories(projectDb, globalDb, {
       prompt: 'truly novel xyzzy plugh frobnicate',
       surfaceContent: 'Already in surface 0 Already in surface 1 Already in surface 2 Already in surface 3',
     });
@@ -693,7 +697,7 @@ describe('executePromptRecallWithFallback — semantic-first', () => {
     }));
     mockEmbedLocal.mockResolvedValue(queryVec());
 
-    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+    const results = await recalledMemories(projectDb, globalDb, {
       prompt: 'extraction pipeline transcripts',
       surfaceContent: '',
     });
@@ -714,7 +718,7 @@ describe('executePromptRecallWithFallback — semantic-first', () => {
     }
     mockEmbedLocal.mockResolvedValue(queryVec());
 
-    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+    const results = await recalledMemories(projectDb, globalDb, {
       prompt: 'truly novel xyzzy plugh frobnicate',
       surfaceContent: '',
       limit: 2,
@@ -739,7 +743,7 @@ describe('executePromptRecallWithFallback — semantic-first', () => {
     seed('other-fact', 0.75, 2);
     mockEmbedLocal.mockResolvedValue(queryVec());
 
-    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+    const results = await recalledMemories(projectDb, globalDb, {
       prompt: 'truly novel xyzzy plugh frobnicate',
       surfaceContent: '',
     });
@@ -751,7 +755,7 @@ describe('executePromptRecallWithFallback — semantic-first', () => {
   });
 });
 
-describe('executePromptRecallWithFallback — degraded path', () => {
+describe('recallForPrompt — degraded path', () => {
   beforeEach(() => {
     mockEmbedLocal.mockReset();
   });
@@ -765,7 +769,7 @@ describe('executePromptRecallWithFallback — degraded path', () => {
     }));
     mockEmbedLocal.mockRejectedValue(new Error('model failed to load'));
 
-    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+    const results = await recalledMemories(projectDb, globalDb, {
       prompt: 'extraction pipeline transcripts running',
       surfaceContent: '',
     });
@@ -780,7 +784,7 @@ describe('executePromptRecallWithFallback — degraded path', () => {
     const { projectDb, globalDb } = setupTestDbs();
     mockEmbedLocal.mockRejectedValue(new Error('Network failure'));
 
-    const results = await executePromptRecallWithFallback(projectDb, globalDb, {
+    const results = await recalledMemories(projectDb, globalDb, {
       prompt: 'truly novel xyzzy plugh frobnicate',
       surfaceContent: '',
     });

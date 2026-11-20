@@ -10,7 +10,15 @@ import type { MemoryAdmission } from '../core/admission.js';
 import { createMemory } from '../core/types.js';
 import { insertFact, insertMemory, openDatabase, upsertEntity } from '../infra/db.js';
 import { composeSurface } from './generate.js';
-import { executePromptRecall, executePromptRecallWithFallback, recallForPrompt } from './prompt-recall.js';
+import {
+  degradedRecallWarning,
+  executePromptRecall,
+  recallForPrompt,
+} from './prompt-recall.js';
+
+/** The memories recallForPrompt injects, without the path that produced them. */
+const recalledMemories = async (...args: Parameters<typeof recallForPrompt>) =>
+  (await recallForPrompt(...args)).memories;
 
 const mockEmbedLocal = vi.fn();
 vi.mock('../infra/local-embed.js', () => ({
@@ -115,8 +123,8 @@ describe('prompt recall', () => {
 
   test('the semantic path skips refused memories', async () => {
     mockEmbedLocal.mockResolvedValue(unit(1));
-    const all = await executePromptRecallWithFallback(projectDb, globalDb, options);
-    const admitted = await executePromptRecallWithFallback(projectDb, globalDb, { ...options, admit: refuseAuthor });
+    const all = await recalledMemories(projectDb, globalDb, options);
+    const admitted = await recalledMemories(projectDb, globalDb, { ...options, admit: refuseAuthor });
     expect(all.map((m) => m.id).sort()).toEqual(['kept', 'refused']);
     expect(admitted.map((m) => m.id)).toEqual(['kept']);
   });
@@ -129,13 +137,13 @@ describe('prompt recall', () => {
       'refused',
     ]);
     mockEmbedLocal.mockResolvedValue(unit(1));
-    const admitted = await executePromptRecallWithFallback(projectDb, globalDb, { ...options, admit: refuseAuthor });
+    const admitted = await recalledMemories(projectDb, globalDb, { ...options, admit: refuseAuthor });
     expect(admitted.map((m) => m.id)).toEqual(['kept']);
   });
 
   test('the degraded keyword path skips refused memories', async () => {
     mockEmbedLocal.mockRejectedValue(new Error('embedder down'));
-    const admitted = await executePromptRecallWithFallback(projectDb, globalDb, { ...options, admit: refuseAuthor });
+    const admitted = await recalledMemories(projectDb, globalDb, { ...options, admit: refuseAuthor });
     expect(admitted.map((m) => m.id)).toEqual(['kept']);
     expect(executePromptRecall(projectDb, globalDb, { ...options, admit: refuseAuthor }).map((m) => m.id)).toEqual(['kept']);
   });
@@ -146,12 +154,31 @@ describe('prompt recall', () => {
 
     mockEmbedLocal.mockRejectedValue(new Error('embedder down'));
     const degraded = await recallForPrompt(projectDb, globalDb, options);
-    expect(degraded.path).toBe('keyword-fallback');
+    expect(degraded).toMatchObject({ path: 'keyword-fallback', reason: 'embedder down' });
     expect(degraded.memories.map((m) => m.id).sort()).toEqual(['kept', 'refused']);
 
     expect(await recallForPrompt(projectDb, globalDb, { ...options, prompt: 'hi' })).toEqual({
       path: 'not-run',
       memories: [],
     });
+  });
+
+  test('a degraded recall names a non-Error rejection too', async () => {
+    mockEmbedLocal.mockRejectedValue('libstdc++.so.6: cannot open shared object file');
+    expect(await recallForPrompt(projectDb, globalDb, options)).toMatchObject({
+      path: 'keyword-fallback',
+      reason: 'libstdc++.so.6: cannot open shared object file',
+    });
+  });
+
+  test('only a degraded recall leaves a warning, and it names why', async () => {
+    mockEmbedLocal.mockRejectedValue(new Error('embedder down'));
+    expect(degradedRecallWarning(await recallForPrompt(projectDb, globalDb, options))).toBe(
+      '[cortex] WARN: prompt-recall fell back to keyword search: embedder down',
+    );
+
+    mockEmbedLocal.mockResolvedValue(unit(1));
+    expect(degradedRecallWarning(await recallForPrompt(projectDb, globalDb, options))).toBeNull();
+    expect(degradedRecallWarning({ path: 'not-run', memories: [] })).toBeNull();
   });
 });

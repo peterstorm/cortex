@@ -14,8 +14,8 @@
  *
  * Design: Pure functions (extractUnigrams, extractKeywords, selectSemanticHits,
  * mergePromptRecall, formatPromptRecall) + sync I/O boundary
- * (executePromptRecall, keyword only) + async I/O wrapper
- * (executePromptRecallWithFallback). Always succeeds — returns empty on errors.
+ * (executePromptRecall, keyword only) + async I/O (recallForPrompt). Never
+ * throws: a failed embed degrades to keyword search and returns its reason.
  */
 
 import type { Database } from 'bun:sqlite';
@@ -209,8 +209,27 @@ export type PromptRecallOptions = {
   readonly admit?: MemoryAdmission;
 };
 
-/** The recalled memories, best first, and the path that produced them. */
-export type PromptRecall = Readonly<{ path: RecallPath; memories: readonly Memory[] }>;
+/**
+ * The recalled memories, best first, and the path that produced them. The
+ * degraded path carries why it degraded: the hook runs on every prompt and
+ * must never fail it, so this reason is the only trace a broken embedder
+ * leaves (the CLI writes it to the hook log).
+ */
+export type PromptRecall =
+  | Readonly<{ path: Exclude<RecallPath, 'keyword-fallback'>; memories: readonly Memory[] }>
+  | Readonly<{ path: 'keyword-fallback'; memories: readonly Memory[]; reason: string }>;
+
+/**
+ * The warning a degraded recall leaves in the hook log, or null for a recall
+ * that took its intended path. A degraded recall still answers, so the
+ * injected block looks the same, only worse: without this line nothing tells
+ * "no relevant memories" from "the embedder is broken".
+ */
+export function degradedRecallWarning(recall: PromptRecall): string | null {
+  return recall.path === 'keyword-fallback'
+    ? `[cortex] WARN: prompt-recall fell back to keyword search: ${recall.reason}`
+    : null;
+}
 
 /**
  * Strict keyword AND search across both databases: a memory matches only when
@@ -341,9 +360,14 @@ export async function recallForPrompt(
       (mem) => mem,
       distinctThreshold,
     ).slice(0, SEMANTIC_LIMIT);
-  } catch {
-    // Best-effort: embedder/DB failure degrades to keyword-only recall.
-    return { path: 'keyword-fallback', memories: executePromptRecall(projectDb, globalDb, options) };
+  } catch (error) {
+    // Best-effort: embedder/DB failure degrades to keyword-only recall, and
+    // says why so the caller can record it.
+    return {
+      path: 'keyword-fallback',
+      reason: error instanceof Error ? error.message : String(error),
+      memories: executePromptRecall(projectDb, globalDb, options),
+    };
   }
 
   const strict = searchStrictKeyword(projectDb, globalDb, unigrams, limit).filter(
@@ -352,13 +376,4 @@ export async function recallForPrompt(
   );
 
   return { path: 'semantic', memories: mergePromptRecall(semantic, strict, limit, distinctThreshold) };
-}
-
-/** recallForPrompt for callers that only inject the memories: the hook. */
-export async function executePromptRecallWithFallback(
-  projectDb: Database | null,
-  globalDb: Database | null,
-  options: PromptRecallOptions,
-): Promise<readonly Memory[]> {
-  return (await recallForPrompt(projectDb, globalDb, options)).memories;
 }
